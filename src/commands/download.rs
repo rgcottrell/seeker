@@ -133,10 +133,33 @@ async fn fetch_or_resolve(
     }
 }
 
-pub async fn run(args: DownloadArgs) -> Result<(), Box<dyn Error>> {
-    let (repo_id, quant_hint) = match args.hf_repo.split_once(':') {
+/// Inputs to the shared HF-resolution helper. Both `download` and `inspect`
+/// build one of these from their respective `Args` structs.
+pub(crate) struct HfResolveArgs {
+    pub repo: String,
+    pub file: Option<String>,
+    pub token: Option<String>,
+    pub offline: bool,
+}
+
+/// Result of resolving an HF repo to local paths. `mmproj` is `None` when the
+/// caller passed `want_mmproj = false` or when the repo has no sidecar.
+pub(crate) struct Resolved {
+    pub main: PathBuf,
+    pub mmproj: Option<PathBuf>,
+}
+
+/// Shared HF resolver used by `download` and `inspect`. Splits `repo` on `:`,
+/// lists the repo (online or offline), picks the main `.gguf` by quant rules,
+/// and fetches it. When `want_mmproj` is true and the repo ships a matching
+/// mmproj sidecar, fetches that too.
+pub(crate) async fn resolve_hf(
+    args: &HfResolveArgs,
+    want_mmproj: bool,
+) -> Result<Resolved, Box<dyn Error>> {
+    let (repo_id, quant_hint) = match args.repo.split_once(':') {
         Some((r, q)) => (r.to_string(), Some(q.to_string())),
-        None => (args.hf_repo.clone(), None),
+        None => (args.repo.clone(), None),
     };
     if !repo_id.contains('/') {
         return Err("--hf-repo must be in the form ORG/NAME[:QUANT]".into());
@@ -146,7 +169,7 @@ pub async fn run(args: DownloadArgs) -> Result<(), Box<dyn Error>> {
     let cache_repo = cache.model(repo_id.clone());
 
     let mut builder = ApiBuilder::from_env();
-    if let Some(t) = args.hf_token.clone() {
+    if let Some(t) = args.token.clone() {
         builder = builder.with_token(Some(t));
     }
     let api = builder.build()?;
@@ -162,7 +185,7 @@ pub async fn run(args: DownloadArgs) -> Result<(), Box<dyn Error>> {
 
     // Resolve main file. `effective_quant` is what we pass to the mmproj picker:
     // the user's :QUANT if any, "Q4_K_M" if the default kicked in, else None.
-    let (main_file, effective_quant): (String, Option<String>) = match args.hf_file.as_deref() {
+    let (main_file, effective_quant): (String, Option<String>) = match args.file.as_deref() {
         Some(f) => (f.to_string(), quant_hint.clone()),
         None => match quant_hint.as_deref() {
             Some(q) => {
@@ -183,17 +206,37 @@ pub async fn run(args: DownloadArgs) -> Result<(), Box<dyn Error>> {
     };
 
     info!(file = %main_file, quant = ?effective_quant, "selected main file");
-    let main_path = fetch_or_resolve(&api_repo, &cache_repo, &main_file, args.offline).await?;
-    println!("{}", main_path.display());
+    let main = fetch_or_resolve(&api_repo, &cache_repo, &main_file, args.offline).await?;
 
-    if !args.no_mmproj {
+    let mmproj = if want_mmproj {
         if let Some(mmproj) = pick_mmproj(&files, effective_quant.as_deref()) {
             info!(file = %mmproj, "selected mmproj sidecar");
-            let p = fetch_or_resolve(&api_repo, &cache_repo, &mmproj, args.offline).await?;
-            println!("{}", p.display());
+            Some(fetch_or_resolve(&api_repo, &cache_repo, &mmproj, args.offline).await?)
         } else {
             debug!("no mmproj sidecar found in repo");
+            None
         }
+    } else {
+        None
+    };
+
+    Ok(Resolved { main, mmproj })
+}
+
+pub async fn run(args: DownloadArgs) -> Result<(), Box<dyn Error>> {
+    let resolved = resolve_hf(
+        &HfResolveArgs {
+            repo: args.hf_repo,
+            file: args.hf_file,
+            token: args.hf_token,
+            offline: args.offline,
+        },
+        !args.no_mmproj,
+    )
+    .await?;
+    println!("{}", resolved.main.display());
+    if let Some(mmproj) = resolved.mmproj {
+        println!("{}", mmproj.display());
     }
     Ok(())
 }

@@ -8,10 +8,10 @@ pub use tensor::TensorInfo;
 pub use types::{GgmlType, MetadataValueType};
 pub use value::MetadataValue;
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+use indexmap::IndexMap;
 use memmap2::Mmap;
 
 const MAGIC: [u8; 4] = *b"GGUF";
@@ -21,7 +21,7 @@ pub struct GgufFile {
     mmap: Mmap,
     version: u32,
     alignment: u64,
-    metadata: HashMap<String, MetadataValue>,
+    metadata: IndexMap<String, MetadataValue>,
     tensors: Vec<TensorInfo>,
     tensor_data_start: usize,
 }
@@ -49,7 +49,17 @@ impl GgufFile {
         self.alignment
     }
 
-    pub fn metadata(&self) -> &HashMap<String, MetadataValue> {
+    /// Absolute byte offset within the file where the tensor data section begins.
+    pub fn data_offset(&self) -> usize {
+        self.tensor_data_start
+    }
+
+    /// Total file size in bytes (equivalent to the mmap length).
+    pub fn file_size(&self) -> usize {
+        self.mmap.len()
+    }
+
+    pub fn metadata(&self) -> &IndexMap<String, MetadataValue> {
         &self.metadata
     }
 
@@ -84,7 +94,7 @@ impl GgufFile {
 struct Parsed {
     version: u32,
     alignment: u64,
-    metadata: HashMap<String, MetadataValue>,
+    metadata: IndexMap<String, MetadataValue>,
     tensors: Vec<TensorInfo>,
     tensor_data_start: usize,
 }
@@ -104,7 +114,7 @@ fn parse_index(data: &[u8]) -> Result<Parsed, GgufError> {
         _ => return Err(GgufError::UnsupportedVersion(version)),
     };
 
-    let mut metadata: HashMap<String, MetadataValue> = HashMap::with_capacity(kv_count as usize);
+    let mut metadata: IndexMap<String, MetadataValue> = IndexMap::with_capacity(kv_count as usize);
     for _ in 0..kv_count {
         let key = r.read_string()?;
         let ty = MetadataValueType::from_u32(r.read_u32()?)?;

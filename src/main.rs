@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::commands::download::{self, DownloadArgs};
+use crate::commands::inspect::{self, InspectArgs};
 
 mod commands;
 #[allow(dead_code)]
@@ -25,6 +26,8 @@ struct Cli {
 enum Command {
     /// Download a model file from a Hugging Face repository.
     Download(DownloadArgs),
+    /// Dump the header, metadata, and tensor table of a GGUF file.
+    Inspect(InspectArgs),
 }
 
 #[tokio::main]
@@ -39,6 +42,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse_from(rewrite_shorts(std::env::args()));
     match cli.command {
         Command::Download(args) => download::run(args).await,
+        Command::Inspect(args) => inspect::run(args).await,
     }
 }
 
