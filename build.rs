@@ -163,6 +163,19 @@ fn main() {
                 // coopMatMulAdd, Load/Store, etc. Required for mul_mm cooperative
                 // matmul tile and flash-attention cooperative-matrix variants.
                 "-capability", "cooperative_matrix",
+                // NV cooperative_matrix2 — tensor-layout/tensor-view loads/stores
+                // (OpCooperativeMatrixLoadTensorNV, OpTensorLayoutSliceNV, etc.),
+                // per-element ops, reductions, conversions, block loads. Slang
+                // surfaces these via linalg's TensorLayout<>, CoopMat.MapElement,
+                // CoopMat.ReduceRow/Column/Row2x2/RowAndColumn. Needed for the
+                // mul_mm_cm2 / flash_attn_cm2 ports.
+                "-capability", "cooperative_matrix_2",
+                "-capability", "spvCooperativeMatrixTensorAddressingNV",
+                "-capability", "spvCooperativeMatrixBlockLoadsNV",
+                "-capability", "spvCooperativeMatrixReductionsNV",
+                "-capability", "spvCooperativeMatrixConversionsNV",
+                "-capability", "spvCooperativeMatrixPerElementOperationsNV",
+                "-capability", "spvTensorAddressingNV",
                 "-O3",
                 "-stage", "compute",
                 "-entry", "main",
