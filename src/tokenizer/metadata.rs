@@ -1,47 +1,47 @@
-//! Small typed accessors over `GgufFile::get` that surface a `BuildError` with
+//! Small typed accessors over `GgufFile::get` that surface a `TokenizerError` with
 //! the offending field name. The tokenizer builder calls these instead of
 //! matching on `MetadataValue` directly so the dispatch + error message lives
 //! in one place.
 
 use crate::gguf::{GgufFile, MetadataValue};
-use crate::tokenizer::error::BuildError;
+use crate::tokenizer::error::TokenizerError;
 
-pub(super) fn read_string(gguf: &GgufFile, key: &'static str) -> Result<String, BuildError> {
+pub(super) fn read_string(gguf: &GgufFile, key: &'static str) -> Result<String, TokenizerError> {
     match gguf.get(key) {
         Some(MetadataValue::String(s)) => Ok(s.clone()),
-        Some(_) => Err(BuildError::WrongFieldType(key)),
-        None => Err(BuildError::MissingField(key)),
+        Some(_) => Err(TokenizerError::WrongFieldType(key)),
+        None => Err(TokenizerError::MissingField(key)),
     }
 }
 
 pub(super) fn read_string_array(
     gguf: &GgufFile,
     key: &'static str,
-) -> Result<Vec<String>, BuildError> {
+) -> Result<Vec<String>, TokenizerError> {
     let arr = match gguf.get(key) {
         Some(MetadataValue::Array(a)) => a,
-        Some(_) => return Err(BuildError::WrongFieldType(key)),
-        None => return Err(BuildError::MissingField(key)),
+        Some(_) => return Err(TokenizerError::WrongFieldType(key)),
+        None => return Err(TokenizerError::MissingField(key)),
     };
     arr.iter()
         .map(|v| match v {
             MetadataValue::String(s) => Ok(s.clone()),
-            _ => Err(BuildError::WrongFieldType(key)),
+            _ => Err(TokenizerError::WrongFieldType(key)),
         })
         .collect()
 }
 
-pub(super) fn read_f32_array(gguf: &GgufFile, key: &'static str) -> Result<Vec<f32>, BuildError> {
+pub(super) fn read_f32_array(gguf: &GgufFile, key: &'static str) -> Result<Vec<f32>, TokenizerError> {
     let arr = match gguf.get(key) {
         Some(MetadataValue::Array(a)) => a,
-        Some(_) => return Err(BuildError::WrongFieldType(key)),
-        None => return Err(BuildError::MissingField(key)),
+        Some(_) => return Err(TokenizerError::WrongFieldType(key)),
+        None => return Err(TokenizerError::MissingField(key)),
     };
     arr.iter()
         .map(|v| match v {
             MetadataValue::F32(f) => Ok(*f),
             MetadataValue::F64(f) => Ok(*f as f32),
-            _ => Err(BuildError::WrongFieldType(key)),
+            _ => Err(TokenizerError::WrongFieldType(key)),
         })
         .collect()
 }

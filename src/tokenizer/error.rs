@@ -7,7 +7,7 @@ use thiserror::Error as ThisError;
 /// user exactly which key was off. `Inner` wraps anything that bubbles up
 /// from the `tokenizers` crate itself (model construction, template build).
 #[derive(Debug, ThisError)]
-pub enum BuildError {
+pub enum TokenizerError {
     #[error("GGUF is missing required field `{0}`")]
     MissingField(&'static str),
 

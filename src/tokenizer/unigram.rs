@@ -13,17 +13,17 @@ use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 
 use crate::gguf::GgufFile;
 use crate::tokenizer::bundle::Tokenizer;
-use crate::tokenizer::error::BuildError;
+use crate::tokenizer::error::TokenizerError;
 use crate::tokenizer::metadata::{read_f32_array, read_optional_i32_array};
 
 pub(super) fn build(
     tokens: &[String],
     gguf: &GgufFile,
     unk_id: Option<u32>,
-) -> Result<Tokenizer, BuildError> {
+) -> Result<Tokenizer, TokenizerError> {
     let scores = read_f32_array(gguf, "tokenizer.ggml.scores")?;
     if scores.len() != tokens.len() {
-        return Err(BuildError::WrongFieldType("tokenizer.ggml.scores"));
+        return Err(TokenizerError::WrongFieldType("tokenizer.ggml.scores"));
     }
     let token_types = read_optional_i32_array(gguf, "tokenizer.ggml.token_type");
     let byte_fallback = token_types
@@ -37,7 +37,7 @@ pub(super) fn build(
         .collect();
 
     let unigram = Unigram::from(vocab, unk_id.map(|u| u as usize), byte_fallback)
-        .map_err(|e| BuildError::Inner(e as Box<dyn Error + Send + Sync>))?;
+        .map_err(|e| TokenizerError::Inner(e as Box<dyn Error + Send + Sync>))?;
 
     let mut tokenizer = Tokenizer::new(ModelWrapper::Unigram(unigram));
     let metaspace = Metaspace::new('▁', PrependScheme::Always, /* split */ true);

@@ -10,7 +10,7 @@
 //!     (SentencePiece-style; LLaMA, Llama 2, CodeLlama, Mistral v0.1, …).
 //!     See [`unigram`].
 //!
-//! Anything else returns [`BuildError::UnsupportedModel`] so callers can render
+//! Anything else returns [`TokenizerError::UnsupportedModel`] so callers can render
 //! a useful message rather than panic.
 
 mod bpe;
@@ -20,7 +20,7 @@ mod metadata;
 mod unigram;
 
 pub use bundle::{Tokenizer, TokenizerBundle};
-pub use error::BuildError;
+pub use error::TokenizerError;
 
 use tokenizers::processors::template::TemplateProcessing;
 use tokenizers::processors::PostProcessorWrapper;
@@ -31,11 +31,11 @@ use crate::tokenizer::metadata::{
     read_optional_bool, read_optional_u32, read_string, read_string_array,
 };
 
-pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, BuildError> {
+pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerError> {
     let model_kind = read_string(gguf, "tokenizer.ggml.model")?;
     let tokens = read_string_array(gguf, "tokenizer.ggml.tokens")?;
     if tokens.is_empty() {
-        return Err(BuildError::EmptyVocab);
+        return Err(TokenizerError::EmptyVocab);
     }
 
     let bos_id = read_optional_u32(gguf, "tokenizer.ggml.bos_token_id");
@@ -47,7 +47,7 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, BuildError> {
     let mut tokenizer = match model_kind.as_str() {
         "gpt2" => bpe::build(&tokens, gguf)?,
         "llama" => unigram::build(&tokens, gguf, unk_id)?,
-        other => return Err(BuildError::UnsupportedModel(other.to_string())),
+        other => return Err(TokenizerError::UnsupportedModel(other.to_string())),
     };
 
     install_specials(&mut tokenizer, &tokens, bos_id, eos_id, unk_id);

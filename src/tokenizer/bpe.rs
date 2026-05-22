@@ -13,17 +13,17 @@ use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 
 use crate::gguf::GgufFile;
 use crate::tokenizer::bundle::Tokenizer;
-use crate::tokenizer::error::BuildError;
+use crate::tokenizer::error::TokenizerError;
 use crate::tokenizer::metadata::read_string_array;
 
-pub(super) fn build(tokens: &[String], gguf: &GgufFile) -> Result<Tokenizer, BuildError> {
+pub(super) fn build(tokens: &[String], gguf: &GgufFile) -> Result<Tokenizer, TokenizerError> {
     let merges_raw = read_string_array(gguf, "tokenizer.ggml.merges").unwrap_or_default();
     let merges: Vec<(String, String)> = merges_raw
         .iter()
         .map(|m| {
             m.split_once(' ')
                 .map(|(a, b)| (a.to_string(), b.to_string()))
-                .ok_or_else(|| BuildError::BadMerge(m.clone()))
+                .ok_or_else(|| TokenizerError::BadMerge(m.clone()))
         })
         .collect::<Result<_, _>>()?;
 
@@ -39,7 +39,7 @@ pub(super) fn build(tokens: &[String], gguf: &GgufFile) -> Result<Tokenizer, Bui
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
         .build()
-        .map_err(|e| BuildError::Inner(e as Box<dyn Error + Send + Sync>))?;
+        .map_err(|e| TokenizerError::Inner(e as Box<dyn Error + Send + Sync>))?;
 
     let mut tokenizer = Tokenizer::new(ModelWrapper::BPE(bpe));
     let bl = ByteLevel::new(/* add_prefix_space */ false, /* trim_offsets */ true, /* use_regex */ true);
