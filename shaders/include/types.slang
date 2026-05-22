@@ -55,7 +55,12 @@ struct block_q8_0_packed16 { float16_t d; int16_t qs[16]; };
 
 #define QUANT_K_Q8_1 32
 #define QUANT_R_Q8_1 1
-struct block_q8_1 { float16_t2 ds; int8_t qs[32]; };
+struct block_q8_1            { float16_t2 ds;    int8_t  qs[32]; };
+struct block_q8_1_packed16   { float16_t2 ds;    int16_t qs[16]; };
+struct block_q8_1_packed32   { float16_t2 ds;    int32_t qs[8];  };
+// 4 blocks bundled together to allow 128-bit-aligned loads/stores.
+struct block_q8_1_x4         { float16_t2 ds[4]; int32_t qs[32]; };
+struct block_q8_1_x4_packed128 { float16_t2 ds[4]; int4 qs[8]; };
 
 #define QUANT_K_Q2_K 256
 struct block_q2_K {
