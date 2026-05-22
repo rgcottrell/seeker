@@ -49,6 +49,16 @@
 //  iq3_xxs_f32: DATA_A_IQ3_XXS=1 B_TYPE=float      D_TYPE=float
 //  nvfp4_f16:   DATA_A_NVFP4=1   B_TYPE=float16_t  D_TYPE=float
 //  nvfp4_f32:   DATA_A_NVFP4=1   B_TYPE=float      D_TYPE=float
+//  iq2_xs_f16:  DATA_A_IQ2_XS=1  B_TYPE=float16_t  D_TYPE=float
+//  iq2_xs_f32:  DATA_A_IQ2_XS=1  B_TYPE=float      D_TYPE=float
+//  iq2_s_f16:   DATA_A_IQ2_S=1   B_TYPE=float16_t  D_TYPE=float
+//  iq2_s_f32:   DATA_A_IQ2_S=1   B_TYPE=float      D_TYPE=float
+//  iq3_s_f16:   DATA_A_IQ3_S=1   B_TYPE=float16_t  D_TYPE=float
+//  iq3_s_f32:   DATA_A_IQ3_S=1   B_TYPE=float      D_TYPE=float
+//  iq1_s_f16:   DATA_A_IQ1_S=1   B_TYPE=float16_t  D_TYPE=float
+//  iq1_s_f32:   DATA_A_IQ1_S=1   B_TYPE=float      D_TYPE=float
+//  iq1_m_f16:   DATA_A_IQ1_M=1   B_TYPE=float16_t  D_TYPE=float
+//  iq1_m_f32:   DATA_A_IQ1_M=1   B_TYPE=float      D_TYPE=float
 //@end-variants
 
 import glsl;
@@ -503,6 +513,221 @@ void stage_a_tile(uint row0, uint k0, uint tid, uint a_base_blocks) {
                 const uint nibble = (half_high == 0u) ? (qb & 0xFu) : (qb >> 4);
                 const float d     = ue4m3_to_fp32(data_a[bi].d[sub]) * 0.5f;
                 v = float16_t(d * float(kvalues_mxfp4[nibble]));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_IQ2_XS)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;             // 0..255
+                const uint ib32 = p_b >> 5;                 // 0..7
+                const uint p_s  = p_b & 0x1Fu;              // 0..31
+                const uint l    = p_s >> 3;                 // 0..3
+                const uint k_in = p_s & 7u;                 // 0..7
+
+                const uint qs_val   = uint(data_a[bi].qs[4u * ib32 + l]);
+                const uint grid_idx = qs_val & 0x1FFu;
+                const uint sign7    = qs_val >> 9;
+                const uint sign8    = sign7 | (countbits(sign7) << 7);
+                const uint sign_bit = (sign8 >> k_in) & 1u;
+
+                const uint2 grid = iq2xs_grid[grid_idx];
+                const uint4 g0 = unpack8_u(grid.x);
+                const uint4 g1 = unpack8_u(grid.y);
+                uint gv;
+                switch (k_in) {
+                    case 0: gv = g0.x; break;
+                    case 1: gv = g0.y; break;
+                    case 2: gv = g0.z; break;
+                    case 3: gv = g0.w; break;
+                    case 4: gv = g1.x; break;
+                    case 5: gv = g1.y; break;
+                    case 6: gv = g1.z; break;
+                    default: gv = g1.w; break;
+                }
+
+                const uint sc_byte = uint(data_a[bi].scales[ib32]);
+                const uint scale_nibble = (l < 2u) ? (sc_byte & 0xFu) : (sc_byte >> 4);
+                const float d  = float(data_a[bi].d);
+                const float db = d * (0.5f + float(scale_nibble)) * 0.25f;
+
+                v = float16_t(db * float(gv) * (sign_bit != 0u ? -1.0f : 1.0f));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_IQ2_S)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;
+                const uint ib32 = p_b >> 5;
+                const uint p_s  = p_b & 0x1Fu;
+                const uint l    = p_s >> 3;
+                const uint k_in = p_s & 7u;
+
+                const uint qs_lo = uint(data_a[bi].qs[4u * ib32 + l]);
+                const uint qh_b  = uint(data_a[bi].qh[ib32]);
+                // Two extra high bits from qh per `l`, shifted to bits 8..9 of grid_idx.
+                const uint grid_idx = qs_lo | ((qh_b << (8u - 2u * l)) & 0x300u);
+                // Sign byte lives in the second half of qs[].
+                const uint sign_byte = uint(data_a[bi].qs[QUANT_K / 8u + 4u * ib32 + l]);
+                const uint sign_bit  = (sign_byte >> k_in) & 1u;
+
+                const uint2 grid = iq2s_grid[grid_idx];
+                const uint4 g0 = unpack8_u(grid.x);
+                const uint4 g1 = unpack8_u(grid.y);
+                uint gv;
+                switch (k_in) {
+                    case 0: gv = g0.x; break;
+                    case 1: gv = g0.y; break;
+                    case 2: gv = g0.z; break;
+                    case 3: gv = g0.w; break;
+                    case 4: gv = g1.x; break;
+                    case 5: gv = g1.y; break;
+                    case 6: gv = g1.z; break;
+                    default: gv = g1.w; break;
+                }
+
+                const uint sc_byte = uint(data_a[bi].scales[ib32]);
+                const uint scale_nibble = (l < 2u) ? (sc_byte & 0xFu) : (sc_byte >> 4);
+                const float d  = float(data_a[bi].d);
+                const float db = d * (0.5f + float(scale_nibble)) * 0.25f;
+
+                v = float16_t(db * float(gv) * (sign_bit != 0u ? -1.0f : 1.0f));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_IQ3_S)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;
+                const uint is   = p_b >> 5;                 // 0..7
+                const uint p_s  = p_b & 0x1Fu;              // 0..31
+                const uint l    = p_s >> 2;                 // 0..7  (4-weight groups)
+                const uint k_in = p_s & 3u;                 // 0..3
+
+                const uint iqs   = 8u * is + l;
+                const uint qs_b  = uint(data_a[bi].qs[iqs]);
+                const uint qh_b  = uint(data_a[bi].qh[is]);
+                const uint gidx  = qs_b | (((qh_b >> l) & 1u) << 8);
+                const uint signs = uint(data_a[bi].signs[iqs / 2u]) >> (4u * (l & 1u));
+                const uint sign_bit = (signs >> k_in) & 1u;
+
+                const uint4 g = unpack8_u(iq3s_grid[gidx]);
+                uint gv;
+                switch (k_in) {
+                    case 0: gv = g.x; break;
+                    case 1: gv = g.y; break;
+                    case 2: gv = g.z; break;
+                    default: gv = g.w; break;
+                }
+
+                const uint sc_byte = uint(data_a[bi].scales[is >> 1]);
+                const uint scale_nibble = (sc_byte >> (4u * (is & 1u))) & 0xFu;
+                const float d  = float(data_a[bi].d);
+                const float db = d * (1.0f + 2.0f * float(scale_nibble));
+
+                v = float16_t(db * float(gv) * (sign_bit != 0u ? -1.0f : 1.0f));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_IQ1_S)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;
+                const uint ib32 = p_b >> 5;
+                const uint p_s  = p_b & 0x1Fu;
+                const uint l    = p_s >> 3;                 // 0..3
+                const uint j    = p_s & 7u;                 // 0..7  (2-bit value within grid u16)
+
+                const uint qh    = uint(data_a[bi].qh[ib32]);
+                const uint hi    = (qh >> (3u * l)) & 7u;
+                const uint qs_b  = uint(data_a[bi].qs[4u * ib32 + l]);
+                const int  grid  = int(iq1s_grid[qs_b | (hi << 8)]);
+
+                // Sign-extend the 2 bits at offset 2*j.
+                const int signed_2bit = (grid << (30 - int(2u * j))) >> 30;
+
+                const float d     = float(data_a[bi].d);
+                const float dl    = d * float(2u * ((qh >> 12) & 7u) + 1u);
+                const float delta = ((qh & 0x8000u) != 0u) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+                v = float16_t(dl * (float(signed_2bit) + delta));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_IQ1_M)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;
+                const uint ib32 = p_b >> 5;
+                const uint p_s  = p_b & 0x1Fu;
+                const uint l    = p_s >> 3;
+                const uint j    = p_s & 7u;
+                const uint ib16 = 2u * ib32 + (l >> 1);   // 0..15
+
+                // Reconstruct f16 d from the high nibbles of scales[0..3].
+                const uint s0 = uint(data_a[bi].scales[0]) >> 12;
+                const uint s1 = uint(data_a[bi].scales[1]) >> 12;
+                const uint s2 = uint(data_a[bi].scales[2]) >> 12;
+                const uint s3 = uint(data_a[bi].scales[3]) >> 12;
+                const float d = float(asfloat16(uint16_t(s0 | (s1 << 4) | (s2 << 8) | (s3 << 12))));
+
+                // Sub-scale: 3 bits per sub-block, packed in scales[ib32/2] >> (6 * (ib32 & 1)).
+                const uint sc = uint(data_a[bi].scales[ib32 >> 1]) >> (6u * (ib32 & 1u));
+                const float dl = d * float(2u * ((sc >> (3u * (ib16 & 3u))) & 7u) + 1u);
+
+                const uint qh_b  = uint(data_a[bi].qh[ib16]) >> (4u * (l & 1u));
+                const uint qs_b  = uint(data_a[bi].qs[4u * ib32 + l]);
+                const int  grid  = int(iq1s_grid[qs_b | ((qh_b & 7u) << 8)]);
+                const int  signed_2bit = (grid << (30 - int(2u * j))) >> 30;
+                const float delta = (qh_b & 8u) != 0u ? -IQ1M_DELTA : IQ1M_DELTA;
+
+                v = float16_t(dl * (float(signed_2bit) + delta));
             }
             buf_a[r * AS_STRIDE + c] = v;
         }
