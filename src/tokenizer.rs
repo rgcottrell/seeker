@@ -17,8 +17,8 @@
 //! callers decide how to honor those.
 
 use std::error::Error;
-use std::fmt;
 
+use thiserror::Error as ThisError;
 use tokenizers::decoders::DecoderWrapper;
 use tokenizers::models::bpe::{Vocab as BpeVocab, BPE};
 use tokenizers::models::unigram::Unigram;
@@ -59,33 +59,26 @@ pub struct TokenizerBundle {
     pub add_eos_default: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, ThisError)]
 pub enum BuildError {
+    #[error("GGUF is missing required field `{0}`")]
     MissingField(&'static str),
+
+    #[error("GGUF field `{0}` has unexpected type")]
     WrongFieldType(&'static str),
+
+    #[error("unsupported tokenizer.ggml.model: `{0}`; only `gpt2` (BPE) and `llama` (Unigram) are wired up")]
     UnsupportedModel(String),
+
+    #[error("tokenizer.ggml.tokens is empty")]
     EmptyVocab,
+
+    #[error("malformed BPE merge `{0}` (expected `left right`)")]
     BadMerge(String),
-    Inner(Box<dyn Error + Send + Sync>),
-}
 
-impl fmt::Display for BuildError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingField(k) => write!(f, "GGUF is missing required field `{k}`"),
-            Self::WrongFieldType(k) => write!(f, "GGUF field `{k}` has unexpected type"),
-            Self::UnsupportedModel(m) => write!(
-                f,
-                "unsupported tokenizer.ggml.model: `{m}`; only `gpt2` (BPE) and `llama` (Unigram) are wired up"
-            ),
-            Self::EmptyVocab => write!(f, "tokenizer.ggml.tokens is empty"),
-            Self::BadMerge(m) => write!(f, "malformed BPE merge `{m}` (expected `left right`)"),
-            Self::Inner(e) => write!(f, "tokenizers crate error: {e}"),
-        }
-    }
+    #[error("tokenizers crate error: {0}")]
+    Inner(#[source] Box<dyn Error + Send + Sync>),
 }
-
-impl Error for BuildError {}
 
 pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, BuildError> {
     let model_kind = read_string(gguf, "tokenizer.ggml.model")?;
