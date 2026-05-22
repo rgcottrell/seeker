@@ -31,6 +31,16 @@
 //  iq4_nl_f32: DATA_A_IQ4_NL=1 B_TYPE=float       D_TYPE=float
 //  mxfp4_f16: DATA_A_MXFP4=1   B_TYPE=float16_t   D_TYPE=float
 //  mxfp4_f32: DATA_A_MXFP4=1   B_TYPE=float       D_TYPE=float
+//  q2_k_f16:  DATA_A_Q2_K=1    B_TYPE=float16_t   D_TYPE=float
+//  q2_k_f32:  DATA_A_Q2_K=1    B_TYPE=float       D_TYPE=float
+//  q4_k_f16:  DATA_A_Q4_K=1    B_TYPE=float16_t   D_TYPE=float
+//  q4_k_f32:  DATA_A_Q4_K=1    B_TYPE=float       D_TYPE=float
+//  q5_k_f16:  DATA_A_Q5_K=1    B_TYPE=float16_t   D_TYPE=float
+//  q5_k_f32:  DATA_A_Q5_K=1    B_TYPE=float       D_TYPE=float
+//  q6_k_f16:  DATA_A_Q6_K=1    B_TYPE=float16_t   D_TYPE=float
+//  q6_k_f32:  DATA_A_Q6_K=1    B_TYPE=float       D_TYPE=float
+//  iq4_xs_f16: DATA_A_IQ4_XS=1  B_TYPE=float16_t   D_TYPE=float
+//  iq4_xs_f32: DATA_A_IQ4_XS=1  B_TYPE=float       D_TYPE=float
 //@end-variants
 
 import glsl;
@@ -44,13 +54,11 @@ static const uint TM = 16;
 static const uint TN = 16;
 static const uint TK = 16;
 
-// Workgroup tile dims. BK is set per A type — quant blocks set their own QUANT_K,
-// dense types use 32 so the inner loop still runs BK/TK = 2 CoopMat MulAdds.
-#if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
+// BK = 32 universally. For legacy quants (Q4_0..MXFP4) this matches QUANT_K, so each
+// outer step covers exactly one A block. For K-quants (256-element super-blocks) each
+// outer step covers 1/8 of a block; the dequant code computes the right sub-block from
+// gk % QUANT_K. Keeping BK fixed at 32 also caps the shmem footprint at ~5 KB.
 static const uint BK = 32;
-#else
-static const uint BK = QUANT_K;
-#endif
 
 static const uint BM = 32;
 static const uint BN = 32;
@@ -270,6 +278,184 @@ void stage_a_tile(uint row0, uint k0, uint tid, uint a_base_blocks) {
             }
             buf_a[r * AS_STRIDE + j        ] = v_lo;
             buf_a[r * AS_STRIDE + j + (BK / 2) ] = v_hi;
+        }
+    }
+// ── K-quants (256-element super-blocks) ───────────────────────────────────────
+// All K-quants iterate element-by-element. For position p inside a block, the
+// sub-block layout is consistent across Q2_K / Q4_K / Q5_K (different from Q6_K):
+//   sub_idx = p / 32 (0..7)     — selects scale/min pair
+//   il      = sub_idx / 2       — il-pair index 0..3
+//   half_hi = sub_idx & 1       — low (0) or high (1) of the pair
+//   qs_off  = il * 32 + (p % 32)  (or il * 16 + (p % 32) / 2 for some)
+//
+// Q2_K layout uses a different partition (16 sub-blocks of 16 elements).
+// Q6_K stripes scales across 4 sub-rows × 2 halves with il_high.
+#elif defined(DATA_A_Q4_K)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi      = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_in_b  = gk % QUANT_K;             // 0..255
+                const uint sub_idx = p_in_b >> 5;              // 0..7
+                const uint half_hi = sub_idx & 1u;
+                const uint il      = sub_idx >> 1;             // 0..3
+                const uint qs_off  = il * 32u + (p_in_b & 31u);
+
+                const float dall = float(data_a[bi].dm.x);
+                const float dmin = float(data_a[bi].dm.y);
+
+                uint sc_raw, mb_raw;
+                if (sub_idx < 4u) {
+                    sc_raw = uint(data_a[bi].scales[sub_idx])         & 0x3Fu;
+                    mb_raw = uint(data_a[bi].scales[sub_idx + 4u])    & 0x3Fu;
+                } else {
+                    sc_raw = (uint(data_a[bi].scales[sub_idx + 4u]) & 0x0Fu)
+                           | ((uint(data_a[bi].scales[sub_idx - 4u]) & 0xC0u) >> 2);
+                    mb_raw = (uint(data_a[bi].scales[sub_idx + 4u]) >> 4)
+                           | ((uint(data_a[bi].scales[sub_idx])     & 0xC0u) >> 2);
+                }
+                const uint qb = uint(data_a[bi].qs[qs_off]);
+                const uint nibble = (half_hi == 0u) ? (qb & 0xFu) : (qb >> 4);
+                v = float16_t(dall * float(sc_raw) * float(nibble) - dmin * float(mb_raw));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_Q5_K)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi      = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_in_b  = gk % QUANT_K;
+                const uint sub_idx = p_in_b >> 5;
+                const uint half_hi = sub_idx & 1u;
+                const uint il      = sub_idx >> 1;
+                const uint qs_off  = il * 32u + (p_in_b & 31u);
+
+                const float dall = float(data_a[bi].dm.x);
+                const float dmin = float(data_a[bi].dm.y);
+
+                uint sc_raw, mb_raw;
+                if (sub_idx < 4u) {
+                    sc_raw = uint(data_a[bi].scales[sub_idx])      & 0x3Fu;
+                    mb_raw = uint(data_a[bi].scales[sub_idx + 4u]) & 0x3Fu;
+                } else {
+                    sc_raw = (uint(data_a[bi].scales[sub_idx + 4u]) & 0x0Fu)
+                           | ((uint(data_a[bi].scales[sub_idx - 4u]) & 0xC0u) >> 2);
+                    mb_raw = (uint(data_a[bi].scales[sub_idx + 4u]) >> 4)
+                           | ((uint(data_a[bi].scales[sub_idx])     & 0xC0u) >> 2);
+                }
+                // 5th bit lives in qh[]; bit position sub_idx within byte qh[p_in_b % 32].
+                const uint qb     = uint(data_a[bi].qs[qs_off]);
+                const uint qh_byt = uint(data_a[bi].qh[p_in_b & 31u]);
+                const uint nibble = (half_hi == 0u) ? (qb & 0xFu) : (qb >> 4);
+                const uint hbit   = (qh_byt >> sub_idx) & 1u;
+                const uint val5   = nibble | (hbit << 4);
+                v = float16_t(dall * float(sc_raw) * float(val5) - dmin * float(mb_raw));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_Q6_K)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;                  // 0..255
+                const uint ip   = p_b >> 7;                      // 0 or 1 (which 128-half)
+                const uint p_h  = p_b & 0x7Fu;                   // position in half (0..127)
+                const uint sub_row = p_h >> 5;                   // 0..3
+                const uint il_in_h = p_h & 0x1Fu;                // 0..31
+                // ql layout: low nibble for sub_row < 2, high for sub_row >= 2; offset 0 or 32.
+                const uint ql_off  = 64u * ip + il_in_h + ((sub_row & 1u) * 32u);
+                const uint qb_raw  = uint(data_a[bi].ql[ql_off]);
+                const uint nibble  = (sub_row < 2u) ? (qb_raw & 0xFu) : (qb_raw >> 4);
+                // High 2 bits at qh[32*ip + il_in_h] bits (2*sub_row, 2*sub_row+1).
+                const uint qh_raw  = uint(data_a[bi].qh[32u * ip + il_in_h]);
+                const uint hi2     = (qh_raw >> (2u * sub_row)) & 3u;
+                const int  six_bit = int(nibble | (hi2 << 4));
+                const int  signed_v = six_bit - 32;
+                const uint scale_idx = 8u * ip + (il_in_h >> 4) + 2u * sub_row;
+                const int  sc       = int(data_a[bi].scales[scale_idx]);
+                const float d       = float(data_a[bi].d);
+                v = float16_t(d * float(sc) * float(signed_v));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_Q2_K)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;
+                const uint ip   = p_b >> 7;                       // 0 or 1
+                const uint p_h  = p_b & 0x7Fu;                    // 0..127
+                const uint sub_row = p_h >> 5;                    // 0..3
+                const uint il   = p_h & 0x1Fu;                    // 0..31
+                const uint qs_byte = uint(data_a[bi].qs[32u * ip + il]);
+                const uint two_bit = (qs_byte >> (2u * sub_row)) & 3u;
+                const uint sc_idx  = 8u * ip + (il >> 4) + 2u * sub_row;
+                const uint scale_b = uint(data_a[bi].scales[sc_idx]);
+                const float dall = float(data_a[bi].dm.x);
+                const float dmin = float(data_a[bi].dm.y);
+                v = float16_t(dall * float(scale_b & 0xFu) * float(two_bit)
+                            - dmin * float(scale_b >> 4));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_IQ4_XS)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;
+                const uint ib32 = p_b >> 5;                  // 0..7
+                const uint l    = p_b & 0x1Fu;               // 0..31 within sub-block
+                const uint use_hi = (l >= 16u) ? 1u : 0u;
+                const uint q_off  = 16u * ib32 + (l & 15u);
+                const uint qb     = uint(data_a[bi].qs[q_off]);
+                const uint nibble = (use_hi == 0u) ? (qb & 0xFu) : (qb >> 4);
+                // 6-bit scale: 4 low bits from scales_l, 2 high bits from scales_h.
+                const uint sc_lo = (uint(data_a[bi].scales_l[ib32 >> 1]) >> (4u * (ib32 & 1u))) & 0xFu;
+                const uint sc_hi = (uint(data_a[bi].scales_h) >> (2u * ib32)) & 3u;
+                const int  scale = int(sc_lo | (sc_hi << 4));
+                const float d    = float(data_a[bi].d);
+                const float dl   = d * float(scale - 32);
+                v = float16_t(dl * float(kvalues_iq4nl[nibble]));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
         }
     }
 #endif
