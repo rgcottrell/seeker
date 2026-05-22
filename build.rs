@@ -159,6 +159,10 @@ fn main() {
                 // HLSL SM 6.4 → dot4add_{i8,u8}_packed → OpSDot/OpUDot with
                 // PackedVectorFormat4x8Bit (SPV_KHR_integer_dot_product).
                 "-capability", "sm_6_4",
+                // SPV_KHR_cooperative_matrix — Slang's `linalg::CoopMat<>` type +
+                // coopMatMulAdd, Load/Store, etc. Required for mul_mm cooperative
+                // matmul tile and flash-attention cooperative-matrix variants.
+                "-capability", "cooperative_matrix",
                 "-O3",
                 "-stage", "compute",
                 "-entry", "main",
