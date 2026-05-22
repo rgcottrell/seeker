@@ -146,36 +146,10 @@ fn main() {
             cmd.args([
                 "-target", "spirv",
                 "-profile", "spirv_1_6",
-                // Vulkan memory model — required for vk_mem_model-aware ops.
                 "-capability", "vk_mem_model",
-                // Specific subgroup OpGroupNonUniform* variants we need across
-                // the shader set. Slang's restrictive check insists we declare
-                // every capability we actually emit. Bare `spvGroupNonUniform`
-                // is implied by these derived caps in this slangc version.
-                "-capability", "spvGroupNonUniformArithmetic", // WaveActiveSum/Max
-                "-capability", "spvGroupNonUniformBallot",     // WaveActiveBallot
-                "-capability", "spvGroupNonUniformShuffle",    // WaveReadLaneAt
-                "-capability", "subgroup_clustered",           // clustered reductions
-                // HLSL SM 6.4 → dot4add_{i8,u8}_packed → OpSDot/OpUDot with
-                // PackedVectorFormat4x8Bit (SPV_KHR_integer_dot_product).
                 "-capability", "sm_6_4",
-                // SPV_KHR_cooperative_matrix — Slang's `linalg::CoopMat<>` type +
-                // coopMatMulAdd, Load/Store, etc. Required for mul_mm cooperative
-                // matmul tile and flash-attention cooperative-matrix variants.
                 "-capability", "cooperative_matrix",
-                // NV cooperative_matrix2 — tensor-layout/tensor-view loads/stores
-                // (OpCooperativeMatrixLoadTensorNV, OpTensorLayoutSliceNV, etc.),
-                // per-element ops, reductions, conversions, block loads. Slang
-                // surfaces these via linalg's TensorLayout<>, CoopMat.MapElement,
-                // CoopMat.ReduceRow/Column/Row2x2/RowAndColumn. Needed for the
-                // mul_mm_cm2 / flash_attn_cm2 ports.
                 "-capability", "cooperative_matrix_2",
-                "-capability", "spvCooperativeMatrixTensorAddressingNV",
-                "-capability", "spvCooperativeMatrixBlockLoadsNV",
-                "-capability", "spvCooperativeMatrixReductionsNV",
-                "-capability", "spvCooperativeMatrixConversionsNV",
-                "-capability", "spvCooperativeMatrixPerElementOperationsNV",
-                "-capability", "spvTensorAddressingNV",
                 "-O3",
                 "-stage", "compute",
                 "-entry", "main",
