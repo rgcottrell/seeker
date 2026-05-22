@@ -1,0 +1,36 @@
+// Ported from llama.cpp ggml-vulkan rope_params.glsl, MIT license — see LICENSE.llama-cpp
+
+#ifndef ROPE_PARAMS_SLANG
+#define ROPE_PARAMS_SLANG
+
+struct rope_params {
+    uint  rope_mode;
+    uint  nrows;
+    uint  n_dims;
+    float freq_scale;
+    float freq_base;
+    float ext_factor;
+    float attn_factor;
+    float corr_dims[2];
+    float theta_scale;
+    uint  has_ff;
+    int   sections[4];
+    uint  is_imrope;
+    uint  is_back;
+    uint  set_rows_stride;
+
+    uint  ne00;
+    uint  ne01;
+    uint  ne02;
+    uint  nb01;
+    uint  nb02;
+    uint  nb03;
+    uint  nb11;
+    uint  nb12;
+    uint  nb13;
+
+    uint  a_offset;
+    uint  d_offset;
+};
+
+#endif

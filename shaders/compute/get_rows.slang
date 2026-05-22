@@ -1,0 +1,41 @@
+// Ported from llama.cpp ggml-vulkan get_rows.comp, MIT license — see LICENSE.llama-cpp
+//
+// Phase 3: DATA_A_BF16 conversion branch and OPTIMIZATION_ERROR_WORKAROUND
+// are omitted; only the straight cast path is ported.
+
+//@variants
+//  f32: A_TYPE=float       B_TYPE=int         D_TYPE=float       FLOAT_TYPE=float
+//  f16: A_TYPE=float16_t   B_TYPE=int         D_TYPE=float16_t   FLOAT_TYPE=float
+//@end-variants
+
+import glsl;  // for gl_WorkGroupSize / gl_NumWorkGroups in the strided loops
+
+#include "types.slang"
+#include "generic_binary_head.slang"
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void main(uint3 gl_GlobalInvocationID : SV_DispatchThreadID) {
+    const uint i00 = gl_GlobalInvocationID.x;
+    if (i00 >= p.ne00) { return; }
+
+    uint gid_z = gl_GlobalInvocationID.z;
+    while (gid_z < p.ne11 * p.ne12) {
+        uint gid_y = gl_GlobalInvocationID.y;
+        while (gid_y < p.ne10) {
+            const uint i10 = gid_y;
+            const uint i11 = gid_z / p.ne12;
+            const uint i12 = gid_z % p.ne12;
+
+            const uint i01 = data_b[get_boffset() + i10 * p.nb10 + i11 * p.nb11 + i12 * p.nb12];
+
+            const uint a_offset = get_aoffset() + i01 * p.nb01 + i11 * p.nb02 + i12 * p.nb03;
+            const uint d_offset = get_doffset() + i10 * p.nb21 + i11 * p.nb22 + i12 * p.nb23;
+
+            data_d[d_offset + i00] = D_TYPE(FLOAT_TYPE(data_a[a_offset + i00]));
+
+            gid_y += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
+        }
+        gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z;
+    }
+}
