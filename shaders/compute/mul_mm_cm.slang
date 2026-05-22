@@ -41,6 +41,8 @@
 //  q6_k_f32:  DATA_A_Q6_K=1    B_TYPE=float       D_TYPE=float
 //  iq4_xs_f16: DATA_A_IQ4_XS=1  B_TYPE=float16_t   D_TYPE=float
 //  iq4_xs_f32: DATA_A_IQ4_XS=1  B_TYPE=float       D_TYPE=float
+//  q3_k_f16:  DATA_A_Q3_K=1    B_TYPE=float16_t   D_TYPE=float
+//  q3_k_f32:  DATA_A_Q3_K=1    B_TYPE=float       D_TYPE=float
 //@end-variants
 
 import glsl;
@@ -425,6 +427,52 @@ void stage_a_tile(uint row0, uint k0, uint tid, uint a_base_blocks) {
                 const float dmin = float(data_a[bi].dm.y);
                 v = float16_t(dall * float(scale_b & 0xFu) * float(two_bit)
                             - dmin * float(scale_b >> 4));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_Q3_K)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;             // 0..255
+                const uint n    = p_b >> 7;                 // 0 or 1
+                const uint p_h  = p_b & 0x7Fu;              // 0..127
+                const uint sub_row = p_h >> 5;              // 0..3
+                const uint p_sr = p_b & 0x1Fu;              // 0..31
+
+                const uint qs_byte = uint(data_a[bi].qs[32u * n + p_sr]);
+                const uint two_bit = (qs_byte >> (2u * sub_row)) & 3u;
+                const uint hmask_b = uint(data_a[bi].hmask[p_sr]);
+                const uint hbit    = (hmask_b >> (p_b >> 5)) & 1u;
+                const int  signed3 = int(two_bit) - (hbit != 0u ? 0 : 4);
+
+                // Scale extraction: 6-bit value `us`, then dl = d * (us - 32).
+                const uint is = p_b >> 4;                   // 0..15
+                uint us;
+                if (is < 4u) {
+                    us = (uint(data_a[bi].scales[is])      & 0x0Fu)
+                       | (((uint(data_a[bi].scales[is + 8u]) >> 0) & 3u) << 4);
+                } else if (is < 8u) {
+                    us = (uint(data_a[bi].scales[is])      & 0x0Fu)
+                       | (((uint(data_a[bi].scales[is + 4u]) >> 2) & 3u) << 4);
+                } else if (is < 12u) {
+                    us = (uint(data_a[bi].scales[is - 8u]) >> 4)
+                       | (((uint(data_a[bi].scales[is])      >> 4) & 3u) << 4);
+                } else {
+                    us = (uint(data_a[bi].scales[is - 8u]) >> 4)
+                       | (((uint(data_a[bi].scales[is - 4u]) >> 6) & 3u) << 4);
+                }
+                const float d  = float(data_a[bi].d);
+                const float dl = d * float(int(us) - 32);
+                v = float16_t(dl * float(signed3));
             }
             buf_a[r * AS_STRIDE + c] = v;
         }
