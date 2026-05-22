@@ -199,6 +199,15 @@ struct block_mxfp4 {
     uint8_t   qs[16];        // QUANT_K_MXFP4/2
 };
 
+// NVFP4: 64-element block, with a 4-bit nibble per weight (kvalues_mxfp4 lattice) and
+// four UE4M3 7-bit scales (one per 16-element sub-block).
+#define QUANT_K_NVFP4 64
+#define QUANT_R_NVFP4 1
+struct block_nvfp4 {
+    uint8_t d[4];                    // QUANT_K_NVFP4 / 16
+    uint8_t qs[32];                  // QUANT_K_NVFP4 / 2
+};
+
 #define QUANT_K_IQ4_NL 32
 #define QUANT_R_IQ4_NL 2
 struct block_iq4_nl {
@@ -328,6 +337,10 @@ struct block_iq4_xs_packed32 {
     #define A_TYPE          block_mxfp4
     #define QUANT_K         QUANT_K_MXFP4
     #define QUANT_R         QUANT_R_MXFP4
+#elif defined(DATA_A_NVFP4)
+    #define A_TYPE          block_nvfp4
+    #define QUANT_K         QUANT_K_NVFP4
+    #define QUANT_R         QUANT_R_NVFP4
 #elif defined(DATA_A_IQ4_NL)
     #define A_TYPE          block_iq4_nl
     #define A_TYPE_PACKED16 block_iq4_nl_packed16
@@ -419,7 +432,7 @@ void init_iq_shmem(uint3 wgsize) {
 }
 #endif
 
-#if defined(DATA_A_MXFP4)
+#if defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
 // 4-bit signed lattice: low nibble selects from positive half, high nibble
 // from the symmetric negative half (shifted by 8). Stored as int8 in shmem
 // (no fp conversion at init) so the multiply can use the integer fast path.
@@ -430,11 +443,33 @@ static const int8_t kvalues_mxfp4_const[16] = {
 
 groupshared int8_t kvalues_mxfp4[16];
 
+#if defined(DATA_A_NVFP4)
+// UE4M3 scales in NVFP4 use only 7 bits (sign is always zero). Decoded at workgroup
+// startup into a 128-entry float LUT so per-element fetches are constant-time.
+groupshared float ue4m3_fp32_lut[128];
+
+float ue4m3_to_fp32_build(uint u) {
+    if (u == 0u || u == 127u) { return 0.0f; }
+    const uint expo = (u >> 3) & 15u;
+    const uint man  = u & 7u;
+    if (expo == 0u) { return float(man) * (1.0f / 512.0f); }
+    const uint bits = (expo + 120u) << 23 | (man << 20);
+    return asfloat(bits);
+}
+
+float ue4m3_to_fp32(uint8_t x) { return ue4m3_fp32_lut[uint(x)]; }
+#endif
+
 #define NEEDS_INIT_IQ_SHMEM
 void init_iq_shmem(uint3 wgsize) {
     for (uint i = gl_LocalInvocationIndex; i < 16u; i += wgsize.x) {
         kvalues_mxfp4[i] = kvalues_mxfp4_const[i];
     }
+#if defined(DATA_A_NVFP4)
+    for (uint i = gl_LocalInvocationIndex; i < 128u; i += wgsize.x) {
+        ue4m3_fp32_lut[i] = ue4m3_to_fp32_build(i);
+    }
+#endif
     GroupMemoryBarrierWithGroupSync();
 }
 #endif
