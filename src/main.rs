@@ -3,8 +3,10 @@ use std::error::Error;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use crate::commands::detokenize::{self, DetokenizeArgs};
 use crate::commands::download::{self, DownloadArgs};
 use crate::commands::inspect::{self, InspectArgs};
+use crate::commands::tokenize::{self, TokenizeArgs};
 
 mod commands;
 #[allow(dead_code)]
@@ -28,6 +30,10 @@ enum Command {
     Download(DownloadArgs),
     /// Dump the header, metadata, and tensor table of a GGUF file.
     Inspect(InspectArgs),
+    /// Encode text using the tokenizer embedded in a GGUF model.
+    Tokenize(TokenizeArgs),
+    /// Decode token ids using the tokenizer embedded in a GGUF model.
+    Detokenize(DetokenizeArgs),
 }
 
 #[tokio::main]
@@ -43,6 +49,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Download(args) => download::run(args).await,
         Command::Inspect(args) => inspect::run(args).await,
+        Command::Tokenize(args) => tokenize::run(args).await,
+        Command::Detokenize(args) => detokenize::run(args).await,
     }
 }
 
