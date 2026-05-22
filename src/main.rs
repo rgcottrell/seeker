@@ -11,6 +11,7 @@ use crate::commands::tokenize::{self, TokenizeArgs};
 mod commands;
 #[allow(dead_code)]
 mod gguf;
+mod tokenizer;
 
 #[allow(dead_code)]
 mod shaders {

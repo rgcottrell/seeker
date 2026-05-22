@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::commands::download::{resolve_hf, HfResolveArgs};
-use crate::commands::tokenizer_loader::{build_tokenizer, TokenizerBundle};
 use crate::gguf::GgufFile;
+use crate::tokenizer::{build_tokenizer, TokenizerBundle};
 
 #[derive(Args)]
 pub struct TokenizeArgs {
