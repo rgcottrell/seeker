@@ -43,6 +43,10 @@
 //  iq4_xs_f32: DATA_A_IQ4_XS=1  B_TYPE=float       D_TYPE=float
 //  q3_k_f16:  DATA_A_Q3_K=1    B_TYPE=float16_t   D_TYPE=float
 //  q3_k_f32:  DATA_A_Q3_K=1    B_TYPE=float       D_TYPE=float
+//  iq2_xxs_f16: DATA_A_IQ2_XXS=1 B_TYPE=float16_t  D_TYPE=float
+//  iq2_xxs_f32: DATA_A_IQ2_XXS=1 B_TYPE=float      D_TYPE=float
+//  iq3_xxs_f16: DATA_A_IQ3_XXS=1 B_TYPE=float16_t  D_TYPE=float
+//  iq3_xxs_f32: DATA_A_IQ3_XXS=1 B_TYPE=float      D_TYPE=float
 //@end-variants
 
 import glsl;
@@ -473,6 +477,102 @@ void stage_a_tile(uint row0, uint k0, uint tid, uint a_base_blocks) {
                 const float d  = float(data_a[bi].d);
                 const float dl = d * float(int(us) - 32);
                 v = float16_t(dl * float(signed3));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_IQ2_XXS)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi    = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b   = gk % QUANT_K;             // 0..255
+                const uint is    = p_b >> 5;                 // 0..7  scale-block
+                const uint p_s   = p_b & 0x1Fu;              // 0..31 position in scale-block
+                const uint l     = p_s >> 3;                 // 0..3  grid-index quartet
+                const uint k_in  = p_s & 7u;                 // 0..7  position within 8-weight grid
+
+                // signscale: bytes [8*is+4 .. 8*is+7] packed LE
+                const uint ss = uint(data_a[bi].qs[8u * is + 4u])
+                              | (uint(data_a[bi].qs[8u * is + 5u]) <<  8)
+                              | (uint(data_a[bi].qs[8u * is + 6u]) << 16)
+                              | (uint(data_a[bi].qs[8u * is + 7u]) << 24);
+                const float d  = float(data_a[bi].d);
+                const float db = d * (0.5f + float(ss >> 28)) * 0.25f;
+
+                const uint sign7 = (ss >> (7u * l)) & 0x7Fu;
+                const uint sign8 = sign7 | (countbits(sign7) << 7);
+                const uint sign_bit = (sign8 >> k_in) & 1u;
+
+                const uint grid_idx = uint(data_a[bi].qs[8u * is + l]);
+                const uint2 grid    = iq2xxs_grid[grid_idx];
+                const uint4 g0 = unpack8_u(grid.x);
+                const uint4 g1 = unpack8_u(grid.y);
+                uint g;
+                switch (k_in) {
+                    case 0: g = g0.x; break;
+                    case 1: g = g0.y; break;
+                    case 2: g = g0.z; break;
+                    case 3: g = g0.w; break;
+                    case 4: g = g1.x; break;
+                    case 5: g = g1.y; break;
+                    case 6: g = g1.z; break;
+                    default: g = g1.w; break;
+                }
+                v = float16_t(db * float(g) * (sign_bit != 0u ? -1.0f : 1.0f));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_IQ3_XXS)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi   = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b  = gk % QUANT_K;
+                const uint is   = p_b >> 5;
+                const uint p_s  = p_b & 0x1Fu;
+                const uint l    = p_s >> 3;
+                const uint k_in = p_s & 7u;
+
+                // Sign-scale bytes start after the 64 grid bytes (= QUANT_K / 4).
+                const uint ss_off = (QUANT_K / 4u) + 4u * is;
+                const uint ss = uint(data_a[bi].qs[ss_off + 0u])
+                              | (uint(data_a[bi].qs[ss_off + 1u]) <<  8)
+                              | (uint(data_a[bi].qs[ss_off + 2u]) << 16)
+                              | (uint(data_a[bi].qs[ss_off + 3u]) << 24);
+                const float d  = float(data_a[bi].d);
+                const float db = d * (0.5f + float(ss >> 28)) * 0.5f;
+
+                const uint sign7 = (ss >> (7u * l)) & 0x7Fu;
+                const uint sign8 = sign7 | (countbits(sign7) << 7);
+                const uint sign_bit = (sign8 >> k_in) & 1u;
+
+                // Pair of grid indices per "l".
+                const uint qs_idx = (k_in < 4u)
+                    ? uint(data_a[bi].qs[8u * is + 2u * l])
+                    : uint(data_a[bi].qs[8u * is + 2u * l + 1u]);
+                const uint4 g = unpack8_u(iq3xxs_grid[qs_idx]);
+                uint gv;
+                switch (k_in & 3u) {
+                    case 0: gv = g.x; break;
+                    case 1: gv = g.y; break;
+                    case 2: gv = g.z; break;
+                    default: gv = g.w; break;
+                }
+                v = float16_t(db * float(gv) * (sign_bit != 0u ? -1.0f : 1.0f));
             }
             buf_a[r * AS_STRIDE + c] = v;
         }
