@@ -47,6 +47,8 @@
 //  iq2_xxs_f32: DATA_A_IQ2_XXS=1 B_TYPE=float      D_TYPE=float
 //  iq3_xxs_f16: DATA_A_IQ3_XXS=1 B_TYPE=float16_t  D_TYPE=float
 //  iq3_xxs_f32: DATA_A_IQ3_XXS=1 B_TYPE=float      D_TYPE=float
+//  nvfp4_f16:   DATA_A_NVFP4=1   B_TYPE=float16_t  D_TYPE=float
+//  nvfp4_f32:   DATA_A_NVFP4=1   B_TYPE=float      D_TYPE=float
 //@end-variants
 
 import glsl;
@@ -477,6 +479,30 @@ void stage_a_tile(uint row0, uint k0, uint tid, uint a_base_blocks) {
                 const float d  = float(data_a[bi].d);
                 const float dl = d * float(int(us) - 32);
                 v = float16_t(dl * float(signed3));
+            }
+            buf_a[r * AS_STRIDE + c] = v;
+        }
+    }
+#elif defined(DATA_A_NVFP4)
+    [unroll] for (uint i = 0; i < BM * BK; i += WORKGROUP_SIZE) {
+        const uint idx = i + tid;
+        if (idx < BM * BK) {
+            const uint r = idx / BK;
+            const uint c = idx % BK;
+            const uint gr = row0 + r;
+            const uint gk = k0 + c;
+            float16_t v = float16_t(0);
+            if (gr < p.M && gk < p.K) {
+                const uint bi    = a_base_blocks + gr * (p.stride_a / QUANT_K) + gk / QUANT_K;
+                const uint p_b   = gk % QUANT_K;       // 0..63
+                const uint sub   = p_b >> 4;           // 0..3 sub-block (16 elem)
+                const uint p_s   = p_b & 0xFu;         // 0..15
+                const uint l     = p_s & 7u;           // 0..7
+                const uint half_high = p_s >> 3;       // 0 or 1
+                const uint qb     = uint(data_a[bi].qs[8u * sub + l]);
+                const uint nibble = (half_high == 0u) ? (qb & 0xFu) : (qb >> 4);
+                const float d     = ue4m3_to_fp32(data_a[bi].d[sub]) * 0.5f;
+                v = float16_t(d * float(kvalues_mxfp4[nibble]));
             }
             buf_a[r * AS_STRIDE + c] = v;
         }
