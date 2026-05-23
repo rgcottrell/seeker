@@ -116,7 +116,7 @@ impl Model for LlamaModel {
         cache: &mut KvCache,
         tokens: &[u32],
         position_offset: u32,
-    ) -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+    ) -> Result<crate::inference::weights::TensorView, Box<dyn Error>> {
         let p = &self.params;
         let l = tokens.len() as u32;
         if l == 0 {
@@ -286,19 +286,27 @@ impl Model for LlamaModel {
         let all_logits = ctx.alloc_tensor([p.n_vocab as u64, l as u64, 1, 1], GgmlType::F32)?;
         matmul::record(ctx, lm_head, final_norm, all_logits)?;
 
+        // Slice out the [n_vocab, 1, 1, 1] row for the final position. We
+        // synthesize a TensorView pointing into the same scratch buffer at
+        // the byte offset of the last token's logits.
         let elem_size = 4u64;
         let vocab = p.n_vocab as u64;
-        let logits_range = crate::inference::buffer::BufferRange {
+        let last_offset = all_logits.byte_offset + (l as u64 - 1) * vocab * elem_size;
+        let last_logits = crate::inference::weights::TensorView {
             buffer: all_logits.buffer,
-            offset: all_logits.byte_offset + (l as u64 - 1) * vocab * elem_size,
-            size: vocab * elem_size,
+            byte_offset: last_offset,
+            byte_size: vocab * elem_size,
+            dims: [vocab, 1, 1, 1],
+            byte_stride: [elem_size, vocab * elem_size, vocab * elem_size, vocab * elem_size],
+            element_stride: [1, vocab, vocab, vocab],
+            dtype: GgmlType::F32,
         };
 
         // Advance cache position for the next call. (All cache writes were
         // already recorded above; the GPU executes them in order before the
         // logits readback.)
         cache_io::advance(cache, l);
-        Ok(logits_range)
+        Ok(last_logits)
     }
 }
 

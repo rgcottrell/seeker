@@ -172,6 +172,76 @@ impl Engine {
         Ok(out)
     }
 
+    /// Run a forward pass and sample a token, all on the GPU. The closure
+    /// records the model forward and returns the logits `TensorView`; the
+    /// `sampler` then appends its chain into the same command buffer. After
+    /// submit/wait the engine reads back exactly 4 bytes — the sampled token
+    /// id — instead of pulling the full logits buffer to host. The sampler's
+    /// recent-token window is updated automatically via `accept`.
+    pub fn forward_sampled<F>(
+        &mut self,
+        weights: &WeightsHandle,
+        sampler: &mut sample::Sampler,
+        record_logits: F,
+    ) -> Result<u32, Box<dyn Error>>
+    where
+        F: FnOnce(&mut DispatchContext) -> Result<weights::TensorView, Box<dyn Error>>,
+    {
+        self.scratch.reset();
+        self.descriptors.reset(&self.device)?;
+
+        unsafe {
+            self.device
+                .device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)?;
+        }
+
+        let token_range = {
+            let mut ctx = DispatchContext {
+                device: &self.device,
+                weights,
+                scratch: &mut self.scratch,
+                pipelines: &mut self.pipelines,
+                descriptors: &self.descriptors,
+                cmd: self.command_buffer,
+            };
+            let logits = record_logits(&mut ctx)?;
+            sampler.record_chain(&mut ctx, logits)?
+        };
+
+        unsafe {
+            self.device.device.end_command_buffer(self.command_buffer)?;
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+
+        if token_range.size < 4 {
+            return Err(format!("sampler output too small: {} bytes", token_range.size).into());
+        }
+        let host_ptr = self
+            .scratch
+            .host_ptr
+            .ok_or("scratch region is not host-visible — readback requires host-visible scratch")?;
+        let token = unsafe {
+            let src = host_ptr.add(token_range.offset as usize) as *const u32;
+            std::ptr::read(src)
+        };
+        sampler.accept(token);
+        Ok(token)
+    }
+
     /// Write F32 data into a scratch slot via the mapped host pointer. Used
     /// for inputs that originate on the CPU side (token id positions, etc.).
     pub fn write_scratch_f32(&self, range: BufferRange, data: &[f32]) -> Result<(), Box<dyn Error>> {

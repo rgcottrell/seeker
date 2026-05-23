@@ -7,6 +7,7 @@
 //  f32:     A_TYPE=float       B_TYPE=int         D_TYPE=float       FLOAT_TYPE=float
 //  f16:     A_TYPE=float16_t   B_TYPE=int         D_TYPE=float16_t   FLOAT_TYPE=float
 //  f16_f32: A_TYPE=float16_t   B_TYPE=int         D_TYPE=float       FLOAT_TYPE=float
+//  i32:     A_TYPE=int         B_TYPE=int         D_TYPE=int         FLOAT_TYPE=int
 //@end-variants
 
 import glsl;  // for gl_WorkGroupSize / gl_NumWorkGroups in the strided loops

@@ -12,6 +12,7 @@
 //  f16_to_f32:  A_TYPE=float16_t   D_TYPE=float       FLOAT_TYPE=float
 //  f32_to_bf16: A_TYPE=float       D_TYPE=uint16_t    FLOAT_TYPE=float DATA_D_BF16=1
 //  bf16_to_f32: DATA_A_BF16=1      D_TYPE=float       FLOAT_TYPE=float
+//  f32_to_i32:  A_TYPE=float       D_TYPE=int         FLOAT_TYPE=float
 //@end-variants
 
 #include "types.slang"

@@ -1,6 +1,6 @@
 //! `seeker run` — single-shot forward pass: feed the prompt through the
-//! model, take logits at the last position, argmax → print the predicted
-//! next token. Exits.
+//! model, sample from the last-position logits via the GPU sampler chain,
+//! print the generated tokens. Exits.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use clap::Args;
 use crate::commands::download::{resolve_hf, HfResolveArgs};
 use crate::gguf::{GgmlType, GgufFile};
 use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
-use crate::inference::sample::argmax;
+use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
 use crate::tokenizer::build_tokenizer;
 
@@ -53,6 +53,59 @@ pub struct RunArgs {
     /// KV cache V dtype. Same legal values as --cache-type-k.
     #[arg(long = "cache-type-v", default_value = "f16", value_parser = parse_dtype_arg)]
     cache_type_v: GgmlType,
+
+    // ─── Sampling ───────────────────────────────────────────────────────
+    /// Sampling temperature. 0 → greedy argmax.
+    #[arg(long = "temp", alias = "temperature", default_value_t = 0.0)]
+    temperature: f32,
+
+    /// Top-K filter (0 = disabled, full vocab).
+    #[arg(long = "top-k", default_value_t = 20)]
+    top_k: u32,
+
+    /// Top-P (nucleus) filter (1.0 = disabled).
+    #[arg(long = "top-p", default_value_t = 0.95)]
+    top_p: f32,
+
+    /// Min-P filter (0.0 = disabled).
+    #[arg(long = "min-p", default_value_t = 0.0)]
+    min_p: f32,
+
+    /// Presence penalty (subtract from any repeated-token logit; 0.0 = off).
+    #[arg(long = "presence-penalty", default_value_t = 0.0)]
+    presence_penalty: f32,
+
+    /// Frequency penalty (subtract count×p from repeated-token logits; 0.0 = off).
+    #[arg(long = "frequency-penalty", default_value_t = 0.0)]
+    frequency_penalty: f32,
+
+    /// Repetition penalty (multiply/divide repeated logits; 1.0 = off).
+    #[arg(long = "repeat-penalty", alias = "repetition-penalty", default_value_t = 1.0)]
+    repeat_penalty: f32,
+
+    /// How many trailing tokens contribute to penalties (≤ scratch budget).
+    #[arg(long = "penalty-last-n", default_value_t = 64)]
+    penalty_last_n: usize,
+
+    /// RNG seed for stochastic sampling.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+}
+
+impl RunArgs {
+    fn sampler_config(&self) -> SamplerConfig {
+        SamplerConfig {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            repeat_penalty: self.repeat_penalty,
+            penalty_last_n: self.penalty_last_n,
+            seed: self.seed,
+        }
+    }
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -126,14 +179,14 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         "kv cache allocated",
     );
 
+    let mut sampler = Sampler::new(args.sampler_config());
     let mut step_tokens: Vec<u32> = tokens.clone();
     let mut generated: Vec<u32> = Vec::with_capacity(args.max_tokens as usize);
     for _ in 0..args.max_tokens {
         let position_offset = cache.position;
-        let logits = engine.forward(model.weights(), |ctx| {
+        let next_id = engine.forward_sampled(model.weights(), &mut sampler, |ctx| {
             model.record_forward(ctx, &mut cache, &step_tokens, position_offset)
         })?;
-        let next_id = argmax(&logits) as u32;
         generated.push(next_id);
         step_tokens = vec![next_id];
     }

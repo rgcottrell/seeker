@@ -6,10 +6,9 @@
 use std::error::Error;
 
 use crate::gguf::GgufFile;
-use crate::inference::buffer::BufferRange;
 use crate::inference::context::DispatchContext;
 use crate::inference::kv_cache::KvCache;
-use crate::inference::weights::WeightsHandle;
+use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
 
 pub mod llama;
@@ -45,15 +44,16 @@ pub trait Model: Send + Sync {
     /// full prefix `[0, position_offset + tokens.len())` for attention,
     /// and on success advances `cache.position` by `tokens.len()`.
     ///
-    /// Returns the scratch slot that, after submission, will hold the
-    /// next-token logits (`vocab_size` F32s) for the last token.
+    /// Returns the scratch tensor that, after submission, will hold the
+    /// next-token logits (`vocab_size` F32s) for the last token — shape
+    /// `[vocab_size, 1, 1, 1]`, dtype F32.
     fn record_forward(
         &self,
         ctx: &mut DispatchContext,
         cache: &mut KvCache,
         tokens: &[u32],
         position_offset: u32,
-    ) -> Result<BufferRange, Box<dyn Error>>;
+    ) -> Result<TensorView, Box<dyn Error>>;
 }
 
 #[derive(Debug, Clone, Copy)]

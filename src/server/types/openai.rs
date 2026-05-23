@@ -26,10 +26,30 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    // ─── Sampling (OpenAI + llama-server extensions) ──────────────────
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// llama-server extension. OpenAI itself doesn't expose top_k.
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    /// llama-server extension.
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// llama-server extension; OpenAI doesn't expose a multiplicative
+    /// repetition penalty.
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
+    /// llama-server extension. Defaults to 64 when present.
+    #[serde(default)]
+    pub repeat_last_n: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
     #[serde(default)]
     pub n: Option<u32>,
     #[serde(default)]
@@ -42,6 +62,27 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub response_format: Option<Value>,
+}
+
+impl ChatCompletionRequest {
+    /// Translate the request's sampling fields into a `SamplerConfig`,
+    /// filling unspecified fields from the Qwen3-recommended defaults.
+    /// llama-server-flavored: presence/frequency penalties have llama.cpp
+    /// semantics, NOT OpenAI's additive [-2, 2] semantics.
+    pub fn sampler_config(&self) -> crate::inference::sample::SamplerConfig {
+        let d = crate::inference::sample::SamplerConfig::default();
+        crate::inference::sample::SamplerConfig {
+            temperature: self.temperature.unwrap_or(d.temperature),
+            top_k: self.top_k.unwrap_or(d.top_k),
+            top_p: self.top_p.unwrap_or(d.top_p),
+            min_p: self.min_p.unwrap_or(d.min_p),
+            presence_penalty: self.presence_penalty.unwrap_or(d.presence_penalty),
+            frequency_penalty: self.frequency_penalty.unwrap_or(d.frequency_penalty),
+            repeat_penalty: self.repeat_penalty.unwrap_or(d.repeat_penalty),
+            penalty_last_n: self.repeat_last_n.unwrap_or(d.penalty_last_n),
+            seed: self.seed.unwrap_or(d.seed),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

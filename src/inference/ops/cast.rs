@@ -20,7 +20,7 @@ use crate::inference::pipeline::{CachedPipeline, PipelineKey};
 use crate::inference::weights::TensorView;
 use crate::shaders;
 
-const UNARY_PARAMS_BYTES: u32 = 32 * 4;
+use super::{unary_params_bytes, UNARY_PARAMS_BYTES};
 
 pub fn record_cast(
     ctx: &mut DispatchContext,
@@ -28,7 +28,7 @@ pub fn record_cast(
     dst: TensorView,
 ) -> Result<(), Box<dyn Error>> {
     let pick = pick_shader(src.dtype, dst.dtype)?;
-    let push = unary_params_bytes(&src, &dst);
+    let push = unary_params_bytes(&src, &dst, 0.0, 0.0);
 
     // Quant shaders need an aliased data_a_packed16 view at an extra
     // binding slot — 2 for copy_from_quant, 3 for copy_to_quant.
@@ -119,6 +119,7 @@ fn pick_shader(src: GgmlType, dst: GgmlType) -> Result<ShaderPick, Box<dyn Error
         (F16, F32) => plain("copy_f16_to_f32", shaders::COPY_F16_TO_F32_SPV.as_bytes()),
         (F32, BF16) => plain("copy_f32_to_bf16", shaders::COPY_F32_TO_BF16_SPV.as_bytes()),
         (BF16, F32) => plain("copy_bf16_to_f32", shaders::COPY_BF16_TO_F32_SPV.as_bytes()),
+        (F32, I32) => plain("copy_f32_to_i32", shaders::COPY_F32_TO_I32_SPV.as_bytes()),
 
         (F32, Q4_0) => to_quant("copy_to_quant_q4_0", shaders::COPY_TO_QUANT_Q4_0_SPV.as_bytes()),
         (F32, Q4_1) => to_quant("copy_to_quant_q4_1", shaders::COPY_TO_QUANT_Q4_1_SPV.as_bytes()),
@@ -138,68 +139,3 @@ fn pick_shader(src: GgmlType, dst: GgmlType) -> Result<ShaderPick, Box<dyn Error
     })
 }
 
-/// Pack the 128-byte `UnaryParams` push-constant block (matches
-/// `vk_op_unary_push_constants` in ggml-vulkan.cpp:1167-1281).
-fn unary_params_bytes(src: &TensorView, dst: &TensorView) -> [u8; UNARY_PARAMS_BYTES as usize] {
-    let mut out = [0u8; UNARY_PARAMS_BYTES as usize];
-    let mut w = 0usize;
-    let put = |out: &mut [u8], w: &mut usize, v: u32| {
-        out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
-        *w += 4;
-    };
-
-    let nelements: u64 = src.dims.iter().product();
-    put(&mut out, &mut w, nelements as u32);
-    for d in src.dims {
-        put(&mut out, &mut w, d as u32);
-    }
-    for s in src.element_stride {
-        put(&mut out, &mut w, s as u32);
-    }
-    for d in dst.dims {
-        put(&mut out, &mut w, d as u32);
-    }
-    for s in dst.element_stride {
-        put(&mut out, &mut w, s as u32);
-    }
-    put(&mut out, &mut w, 0); // misalign_offsets
-    out[w..w + 4].copy_from_slice(&0f32.to_ne_bytes()); // param1
-    w += 4;
-    out[w..w + 4].copy_from_slice(&0f32.to_ne_bytes()); // param2
-    w += 4;
-
-    // Fastdiv tables.
-    let (mp, l) = fastdiv_values((src.dims[2] * src.dims[1] * src.dims[0]) as u32);
-    put(&mut out, &mut w, mp);
-    put(&mut out, &mut w, l);
-    let (mp, l) = fastdiv_values((src.dims[1] * src.dims[0]) as u32);
-    put(&mut out, &mut w, mp);
-    put(&mut out, &mut w, l);
-    let (mp, l) = fastdiv_values(src.dims[0] as u32);
-    put(&mut out, &mut w, mp);
-    put(&mut out, &mut w, l);
-    let (mp, l) = fastdiv_values((dst.dims[2] * dst.dims[1] * dst.dims[0]) as u32);
-    put(&mut out, &mut w, mp);
-    put(&mut out, &mut w, l);
-    let (mp, l) = fastdiv_values((dst.dims[1] * dst.dims[0]) as u32);
-    put(&mut out, &mut w, mp);
-    put(&mut out, &mut w, l);
-    let (mp, l) = fastdiv_values(dst.dims[0] as u32);
-    put(&mut out, &mut w, mp);
-    put(&mut out, &mut w, l);
-    out
-}
-
-/// Compute the magic numbers (mp, L) used by the shader's `fastdiv`
-/// helper. Matches `init_fastdiv_values` in ggml-vulkan.cpp:1257.
-fn fastdiv_values(d: u32) -> (u32, u32) {
-    if d == 0 {
-        return (0, 0);
-    }
-    let mut l = 0u32;
-    while l < 32 && (1u64 << l) < d as u64 {
-        l += 1;
-    }
-    let mp = (((1u128 << 32) * ((1u128 << l) - d as u128) / d as u128) + 1) as u32;
-    (mp, l)
-}

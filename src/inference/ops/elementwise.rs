@@ -54,6 +54,22 @@ pub fn record_mul(
     )
 }
 
+pub fn record_sub(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    record_binary_f32(
+        ctx,
+        "sub_f32",
+        shaders::SUB_F32_SPV.as_bytes(),
+        a,
+        b,
+        dst,
+    )
+}
+
 fn record_binary_f32(
     ctx: &mut DispatchContext,
     name: &str,
@@ -157,6 +173,7 @@ pub fn record_get_rows(
         (GgmlType::F16, GgmlType::F32) => {
             ("get_rows_f16_f32", shaders::GET_ROWS_F16_F32_SPV.as_bytes())
         }
+        (GgmlType::I32, GgmlType::I32) => ("get_rows_i32", shaders::GET_ROWS_I32_SPV.as_bytes()),
         (s, d) => return Err(format!("get_rows: unsupported src/dst combo {s:?}/{d:?}").into()),
     };
 

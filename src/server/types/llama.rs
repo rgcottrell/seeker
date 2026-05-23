@@ -18,6 +18,22 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
+    #[serde(default)]
+    pub repeat_last_n: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
     pub stop: Option<Vec<String>>,
@@ -25,6 +41,25 @@ pub struct CompletionRequest {
     pub cache_prompt: Option<bool>,
     #[serde(default)]
     pub id_slot: Option<i32>,
+}
+
+impl CompletionRequest {
+    /// Translate sampling fields into a `SamplerConfig`, filling missing
+    /// fields from the Qwen3-recommended defaults.
+    pub fn sampler_config(&self) -> crate::inference::sample::SamplerConfig {
+        let d = crate::inference::sample::SamplerConfig::default();
+        crate::inference::sample::SamplerConfig {
+            temperature: self.temperature.unwrap_or(d.temperature),
+            top_k: self.top_k.unwrap_or(d.top_k),
+            top_p: self.top_p.unwrap_or(d.top_p),
+            min_p: self.min_p.unwrap_or(d.min_p),
+            presence_penalty: self.presence_penalty.unwrap_or(d.presence_penalty),
+            frequency_penalty: self.frequency_penalty.unwrap_or(d.frequency_penalty),
+            repeat_penalty: self.repeat_penalty.unwrap_or(d.repeat_penalty),
+            penalty_last_n: self.repeat_last_n.unwrap_or(d.penalty_last_n),
+            seed: self.seed.unwrap_or(d.seed),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
