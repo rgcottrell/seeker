@@ -8,13 +8,14 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use super::handlers::{anthropic, llama, ops, openai};
+use super::state::AppState;
 
 /// Build the router with all stub endpoints wired in.
 ///
 /// `cors` toggles a permissive `CorsLayer` (off by default). The
 /// `TraceLayer` is always on — it just emits structured tracing events,
 /// which our existing `tracing_subscriber` setup already filters.
-pub fn build_router(cors: bool) -> Router {
+pub fn build_router(cors: bool, state: AppState) -> Router {
     let mut app = Router::new()
         // -------------------- ops --------------------
         .route("/health", get(ops::health))
@@ -57,5 +58,5 @@ pub fn build_router(cors: bool) -> Router {
     if cors {
         app = app.layer(CorsLayer::permissive());
     }
-    app.layer(TraceLayer::new_for_http())
+    app.layer(TraceLayer::new_for_http()).with_state(state)
 }

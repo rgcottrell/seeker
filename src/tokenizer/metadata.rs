@@ -55,6 +55,13 @@ pub(super) fn read_optional_u32(gguf: &GgufFile, key: &str) -> Option<u32> {
     }
 }
 
+pub(super) fn read_optional_string(gguf: &GgufFile, key: &str) -> Option<String> {
+    match gguf.get(key)? {
+        MetadataValue::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 pub(super) fn read_optional_bool(gguf: &GgufFile, key: &str) -> Option<bool> {
     match gguf.get(key)? {
         MetadataValue::Bool(b) => Some(*b),

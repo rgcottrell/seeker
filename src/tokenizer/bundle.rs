@@ -29,4 +29,12 @@ pub struct TokenizerBundle {
     pub eos_id: Option<u32>,
     pub add_bos_default: bool,
     pub add_eos_default: bool,
+    /// Raw `tokenizer.chat_template` from the GGUF (jinja2 source). `None`
+    /// for base / non-chat-tuned models.
+    pub chat_template: Option<String>,
+    /// String form of the BOS/EOS tokens — chat templates reference these
+    /// via `{{ bos_token }}` / `{{ eos_token }}`. Resolved from the
+    /// `tokens` array using the corresponding `*_token_id`.
+    pub bos_token: Option<String>,
+    pub eos_token: Option<String>,
 }

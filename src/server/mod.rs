@@ -10,6 +10,7 @@
 pub mod config;
 pub mod handlers;
 pub mod router;
+pub mod state;
 pub mod stream;
 pub mod types;
 
@@ -17,10 +18,11 @@ use std::error::Error;
 
 pub use config::ServerConfig;
 pub use router::build_router;
+pub use state::AppState;
 
 /// Bind to `(host, port)` and serve until the process is interrupted.
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn Error>> {
-    let app = build_router(config.cors);
+    let app = build_router(config.cors, config.app_state.clone());
     let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound = listener.local_addr()?;

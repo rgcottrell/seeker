@@ -1,24 +1,27 @@
-//! `seeker chat` — interactive REPL stub. Model selection mirrors `inspect`
-//! / `tokenize` (either `--hf-*` or `-m/--model PATH`). Real inference isn't
-//! wired up yet — each prompt gets a canned assistant reply — but the model
-//! is fully loaded and each prompt runs through its embedded GGUF tokenizer
-//! so file-missing errors surface at startup and the user sees real token
-//! counts.
+//! `seeker chat` — interactive REPL. Loads the model, renders each turn
+//! through the GGUF's embedded chat template, and decodes via the GPU
+//! sampler chain. Model selection mirrors `inspect` / `tokenize` (either
+//! `--hf-*` or `-m/--model PATH`). KV cache persists across turns; the
+//! sampler's RNG / recent-token state survives `/clear`.
 
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Args;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+use crate::chat_template::{self, ChatMessage};
 use crate::commands::download::{resolve_hf, HfResolveArgs};
-use crate::gguf::{GgufFile, MetadataValue};
-use crate::tokenizer::{build_tokenizer, TokenizerBundle};
+use crate::gguf::{GgmlType, GgufFile, MetadataValue};
+use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
+use crate::inference::sample::{Sampler, SamplerConfig};
+use crate::inference::Engine;
+use crate::tokenizer::build_tokenizer;
 
-const STUB_REPLY: &str = "[stub] seeker chat has no inference backend wired up yet";
+const SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
 
 const BANNER: &str = r#"███████ ███████ ███████ ██  ██ ███████ ██████
 ██      ██      ██      ██ ██  ██      ██   ██
@@ -56,12 +59,128 @@ pub struct ChatArgs {
     /// path under the user's data directory.
     #[arg(long)]
     history_file: Option<PathBuf>,
+
+    /// Max tokens per assistant reply.
+    #[arg(long, default_value_t = 512)]
+    max_tokens: u32,
+
+    /// KV-cache budget for the whole conversation, in tokens.
+    #[arg(long = "ctx-size", default_value_t = 4096)]
+    ctx_size: u32,
+
+    /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1.
+    #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
+    cache_type_k: GgmlType,
+
+    /// KV cache V dtype. Same legal values as --cache-type-k.
+    #[arg(long = "cache-type-v", default_value = "f16", value_parser = parse_dtype_arg)]
+    cache_type_v: GgmlType,
+
+    // ─── Sampling ───────────────────────────────────────────────────────
+    /// Sampling temperature. 0 → greedy argmax.
+    #[arg(long = "temp", alias = "temperature", default_value_t = 0.6)]
+    temperature: f32,
+
+    /// Top-K filter (0 = disabled, full vocab).
+    #[arg(long = "top-k", default_value_t = 20)]
+    top_k: u32,
+
+    /// Top-P (nucleus) filter (1.0 = disabled).
+    #[arg(long = "top-p", default_value_t = 0.95)]
+    top_p: f32,
+
+    /// Min-P filter (0.0 = disabled).
+    #[arg(long = "min-p", default_value_t = 0.0)]
+    min_p: f32,
+
+    /// Presence penalty (subtract from any repeated-token logit; 0.0 = off).
+    #[arg(long = "presence-penalty", default_value_t = 1.5)]
+    presence_penalty: f32,
+
+    /// Frequency penalty (subtract count×p from repeated-token logits; 0.0 = off).
+    #[arg(long = "frequency-penalty", default_value_t = 0.0)]
+    frequency_penalty: f32,
+
+    /// Repetition penalty (multiply/divide repeated logits; 1.0 = off).
+    #[arg(long = "repeat-penalty", alias = "repetition-penalty", default_value_t = 1.0)]
+    repeat_penalty: f32,
+
+    /// How many trailing tokens contribute to penalties.
+    #[arg(long = "penalty-last-n", default_value_t = 64)]
+    penalty_last_n: usize,
+
+    /// RNG seed for stochastic sampling.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+}
+
+fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
+    parse_dtype(s)
+}
+
+impl ChatArgs {
+    fn sampler_config(&self) -> SamplerConfig {
+        SamplerConfig {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            repeat_penalty: self.repeat_penalty,
+            penalty_last_n: self.penalty_last_n,
+            seed: self.seed,
+        }
+    }
 }
 
 pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let path = resolve_model_path(&args).await?;
     let gguf = GgufFile::open(&path)?;
     let bundle = build_tokenizer(&gguf)?;
+    let chat_template = bundle.chat_template.clone().ok_or_else(|| -> Box<dyn Error> {
+        "model has no `tokenizer.chat_template` — use `seeker run` for base completions".into()
+    })?;
+
+    let engine = Engine::new(SCRATCH_BYTES)?;
+    tracing::info!(device = %engine.device.name(), "vulkan device opened");
+    let weights = engine.upload_weights(&gguf)?;
+    let model = crate::models::open(&gguf, weights, bundle)?;
+
+    let cache_config = KvCacheConfig {
+        k_dtype: args.cache_type_k,
+        v_dtype: args.cache_type_v,
+        max_seq_len: args.ctx_size,
+    };
+    let dims = model.cache_dims();
+    let cache = engine.allocate_kv_cache(
+        dims.n_layer,
+        dims.head_dim,
+        dims.n_head_kv,
+        cache_config,
+    )?;
+
+    let sampler = Sampler::new(args.sampler_config());
+
+    // Stop on the GGUF-declared EOS. For chat-tuned models this is
+    // usually `<|im_end|>` (or equivalent); for non-chat models we
+    // already errored above.
+    let mut eos_ids: Vec<u32> = Vec::new();
+    if let Some(id) = model.tokenizer().eos_id {
+        eos_ids.push(id);
+    }
+
+    let mut session = ChatSession {
+        engine,
+        model,
+        cache,
+        sampler,
+        messages: Vec::new(),
+        prior_tokens: Vec::new(),
+        chat_template,
+        eos_ids,
+        max_tokens: args.max_tokens,
+    };
 
     let history = if args.no_history {
         None
@@ -72,9 +191,9 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     };
 
     if std::io::stdin().is_terminal() {
-        run_interactive(&bundle, &gguf, &path, history.as_deref())
+        run_interactive(&mut session, &gguf, &path, history.as_deref())
     } else {
-        run_piped(&bundle)
+        run_piped(&mut session)
     }
 }
 
@@ -93,6 +212,158 @@ async fn resolve_model_path(args: &ChatArgs) -> Result<PathBuf, Box<dyn Error>> 
         .main),
         (None, Some(model)) => Ok(model),
         _ => unreachable!("clap group invariant"),
+    }
+}
+
+/// All conversation state plus the GPU resources needed to advance it.
+/// One per REPL session; persists across turns.
+struct ChatSession {
+    engine: Engine,
+    model: Box<dyn crate::models::Model>,
+    cache: crate::inference::kv_cache::KvCache,
+    sampler: Sampler,
+    /// Conversation so far, in the order the chat template iterates.
+    messages: Vec<ChatMessage>,
+    /// Token IDs currently in the KV cache. Used for prefix-matching
+    /// between turns so we re-prefill only the divergent suffix.
+    prior_tokens: Vec<u32>,
+    chat_template: String,
+    /// Tokens that terminate an assistant reply (GGUF `eos_token_id`).
+    eos_ids: Vec<u32>,
+    max_tokens: u32,
+}
+
+impl ChatSession {
+    /// Push a user turn, render + tokenize, decode the assistant reply,
+    /// print it, and store the turn. Returns the assistant text (without
+    /// trailing EOS markers) so callers that drive the REPL non-interactively
+    /// can do their own formatting.
+    fn handle_user_message(&mut self, text: &str) -> Result<String, Box<dyn Error>> {
+        self.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: text.to_string(),
+        });
+
+        let bundle = self.model.tokenizer();
+        let bos = bundle.bos_token.as_deref().unwrap_or("");
+        let eos = bundle.eos_token.as_deref().unwrap_or("");
+        let rendered = chat_template::render(
+            &self.chat_template,
+            &self.messages,
+            /* add_generation_prompt = */ true,
+            bos,
+            eos,
+        )?;
+
+        // Tokenize the full conversation. `add_special_tokens=false`: the
+        // template already includes any BOS markers it wants.
+        let enc = bundle
+            .tokenizer
+            .encode(rendered.as_str(), false)
+            .map_err(|e| format!("tokenize failed: {e}"))?;
+        let new_tokens: Vec<u32> = enc.get_ids().to_vec();
+
+        // Prefix reuse: keep the cache prefix that still matches.
+        let common = self
+            .prior_tokens
+            .iter()
+            .zip(new_tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common > self.cache.position as usize {
+            // Shouldn't happen — prior_tokens tracks what's in the cache —
+            // but be defensive.
+            return Err(format!(
+                "cache/prior_tokens drift: common={common} cache.position={}",
+                self.cache.position
+            )
+            .into());
+        }
+        self.cache.position = common as u32;
+        let delta: Vec<u32> = new_tokens[common..].to_vec();
+        if delta.is_empty() {
+            // Pathological: user typed nothing new after template render
+            // (e.g. empty content). Force at least the assistant opener
+            // by feeding one rendered token, otherwise the model has no
+            // logits to sample from.
+            return Err("nothing new to feed after template render".into());
+        }
+
+        if (common + delta.len()) as u32 > self.cache.config.max_seq_len {
+            return Err(format!(
+                "conversation length {} exceeds --ctx-size {}",
+                common + delta.len(),
+                self.cache.config.max_seq_len
+            )
+            .into());
+        }
+
+        // Prefill + decode in one loop. forward_sampled records the model
+        // forward then the sampler chain, returning the next token id.
+        let mut step_tokens = delta;
+        let mut assistant_tokens: Vec<u32> = Vec::new();
+        loop {
+            if (self.cache.position as usize + step_tokens.len() + 1) as u32
+                > self.cache.config.max_seq_len
+            {
+                break;
+            }
+            let cache = &mut self.cache;
+            let model = &self.model;
+            let token = self.engine.forward_sampled(
+                model.weights(),
+                &mut self.sampler,
+                |ctx| model.record_forward(ctx, cache, &step_tokens, cache.position),
+            )?;
+            if self.eos_ids.contains(&token) {
+                // Don't emit EOS — but it IS now in the cache (the model
+                // wrote K/V for it). Track that in prior_tokens so the
+                // next render's prefix-match accounts for it.
+                assistant_tokens.push(token);
+                break;
+            }
+            assistant_tokens.push(token);
+            if assistant_tokens.len() as u32 >= self.max_tokens {
+                break;
+            }
+            step_tokens = vec![token];
+        }
+
+        // Decode the assistant content (without specials so EOS doesn't
+        // leak into the visible string).
+        let reply = bundle
+            .tokenizer
+            .decode(&assistant_tokens, /* skip_special_tokens = */ true)
+            .map_err(|e| format!("decode failed: {e}"))?;
+
+        self.messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: reply.clone(),
+        });
+
+        // The cache holds K/V for every token whose forward we *fed* —
+        // that's the rendered prompt plus all but the most-recently
+        // sampled token (which was the *output* of the last forward,
+        // not an input, so it hasn't been encoded yet). prior_tokens
+        // mirrors what the cache holds so prefix-matching next turn
+        // lines up with cache.position.
+        self.prior_tokens = new_tokens;
+        if !assistant_tokens.is_empty() {
+            let n = assistant_tokens.len();
+            self.prior_tokens.extend(&assistant_tokens[..n - 1]);
+        }
+
+        Ok(reply)
+    }
+
+    /// Reset everything that ties to the current conversation; keep the
+    /// model / engine / sampler RNG so deterministic seeds still
+    /// reproduce after a `/clear`.
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.prior_tokens.clear();
+        self.cache.reset();
+        self.sampler.reset_recent();
     }
 }
 
@@ -128,10 +399,6 @@ fn device_name() -> String {
     format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Coerce any numeric GGUF metadata value into a `u64`. GGUF doesn't pin
-/// down which width different writers use for the same key (block_count
-/// shows up as both U32 and U64 in the wild), so we accept everything that
-/// fits.
 fn read_metadata_u64(g: &GgufFile, key: &str) -> Option<u64> {
     match g.get(key)? {
         MetadataValue::U8(n) => Some(*n as u64),
@@ -203,18 +470,8 @@ fn default_history_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".seeker_history"))
 }
 
-/// Populated as the conversation accumulates. Fields are unread in the stub
-/// pass — they're here so the future inference path can read prior turns
-/// without reshaping the loop.
-#[allow(dead_code)]
-#[derive(Clone)]
-struct ChatTurn {
-    role: &'static str,
-    content: String,
-}
-
 fn run_interactive(
-    bundle: &TokenizerBundle,
+    session: &mut ChatSession,
     gguf: &GgufFile,
     path: &Path,
     history: Option<&Path>,
@@ -228,9 +485,6 @@ fn run_interactive(
 
     print_banner(gguf, path);
 
-    let mut transcript: Vec<ChatTurn> = Vec::new();
-    let add_special = bundle.add_bos_default || bundle.add_eos_default;
-
     loop {
         match editor.readline("> ") {
             Ok(raw) => {
@@ -243,16 +497,16 @@ fn run_interactive(
                     if cmd == "exit" {
                         break;
                     } else if cmd == "clear" {
-                        transcript.clear();
-                        println!("(transcript cleared)");
+                        session.clear();
+                        println!("(conversation cleared)");
                     } else if let Some(arg) = cmd.strip_prefix("read") {
-                        handle_read(bundle, &mut transcript, add_special, arg.trim());
+                        handle_read(session, arg.trim());
                     } else {
                         println!("unknown command: /{cmd}");
                     }
                     continue;
                 }
-                handle_prompt(bundle, &mut transcript, add_special, line, None);
+                emit_reply(session, line);
             }
             Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
             Err(e) => return Err(Box::new(e)),
@@ -270,10 +524,7 @@ fn run_interactive(
     Ok(())
 }
 
-fn run_piped(bundle: &TokenizerBundle) -> Result<(), Box<dyn Error>> {
-    let mut transcript: Vec<ChatTurn> = Vec::new();
-    let add_special = bundle.add_bos_default || bundle.add_eos_default;
-
+fn run_piped(session: &mut ChatSession) -> Result<(), Box<dyn Error>> {
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let raw = line?;
@@ -281,42 +532,21 @@ fn run_piped(bundle: &TokenizerBundle) -> Result<(), Box<dyn Error>> {
         if trimmed.is_empty() {
             continue;
         }
-        handle_prompt(bundle, &mut transcript, add_special, trimmed, None);
+        emit_reply(session, trimmed);
     }
     Ok(())
 }
 
-fn handle_prompt(
-    bundle: &TokenizerBundle,
-    transcript: &mut Vec<ChatTurn>,
-    add_special: bool,
-    text: &str,
-    source: Option<&str>,
-) {
-    match bundle.tokenizer.encode(text, add_special) {
-        Ok(encoding) => match source {
-            Some(p) => eprintln!("[{} tokens from {p}]", encoding.get_ids().len()),
-            None => eprintln!("[{} tokens]", encoding.get_ids().len()),
-        },
-        Err(e) => eprintln!("[tokenize failed: {e}]"),
+fn emit_reply(session: &mut ChatSession, line: &str) {
+    print!("assistant: ");
+    let _ = std::io::stdout().flush();
+    match session.handle_user_message(line) {
+        Ok(reply) => println!("{reply}"),
+        Err(e) => println!("[error: {e}]"),
     }
-    transcript.push(ChatTurn {
-        role: "user",
-        content: text.to_string(),
-    });
-    transcript.push(ChatTurn {
-        role: "assistant",
-        content: STUB_REPLY.to_string(),
-    });
-    println!("assistant: {STUB_REPLY}");
 }
 
-fn handle_read(
-    bundle: &TokenizerBundle,
-    transcript: &mut Vec<ChatTurn>,
-    add_special: bool,
-    path: &str,
-) {
+fn handle_read(session: &mut ChatSession, path: &str) {
     if path.is_empty() {
         println!("usage: /read <path>");
         return;
@@ -328,7 +558,8 @@ fn handle_read(
                 println!("(file is empty: {path})");
                 return;
             }
-            handle_prompt(bundle, transcript, add_special, trimmed, Some(path));
+            eprintln!("[{} bytes from {path}]", trimmed.len());
+            emit_reply(session, trimmed);
         }
         Err(e) => println!("/read failed: {e}"),
     }

@@ -105,6 +105,13 @@ impl Sampler {
         &self.config
     }
 
+    /// Clear the recent-token ring (used when a `/clear` ends one logical
+    /// conversation but the same sampler instance keeps generating). The
+    /// RNG state is left alone so deterministic seeds still reproduce.
+    pub fn reset_recent(&mut self) {
+        self.recent.clear();
+    }
+
     /// Update the recent-token window after a token has been sampled. The
     /// next `record_chain` call will use this for penalties.
     pub fn accept(&mut self, token: u32) {

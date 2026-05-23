@@ -11,6 +11,7 @@ use crate::commands::run::{self as run_cmd, RunArgs};
 use crate::commands::serve::{self, ServeArgs};
 use crate::commands::tokenize::{self, TokenizeArgs};
 
+mod chat_template;
 mod commands;
 #[allow(dead_code)]
 mod gguf;

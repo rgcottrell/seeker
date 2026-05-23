@@ -28,7 +28,7 @@ use tokenizers::tokenizer::AddedToken;
 
 use crate::gguf::GgufFile;
 use crate::tokenizer::metadata::{
-    read_optional_bool, read_optional_u32, read_string, read_string_array,
+    read_optional_bool, read_optional_string, read_optional_u32, read_string, read_string_array,
 };
 
 pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerError> {
@@ -43,6 +43,10 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
     let unk_id = read_optional_u32(gguf, "tokenizer.ggml.unknown_token_id");
     let add_bos_default = read_optional_bool(gguf, "tokenizer.ggml.add_bos_token").unwrap_or(false);
     let add_eos_default = read_optional_bool(gguf, "tokenizer.ggml.add_eos_token").unwrap_or(false);
+
+    let bos_token = bos_id.and_then(|i| tokens.get(i as usize).cloned());
+    let eos_token = eos_id.and_then(|i| tokens.get(i as usize).cloned());
+    let chat_template = read_optional_string(gguf, "tokenizer.chat_template");
 
     let mut tokenizer = match model_kind.as_str() {
         "gpt2" => bpe::build(&tokens, gguf)?,
@@ -59,6 +63,9 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
         eos_id,
         add_bos_default,
         add_eos_default,
+        chat_template,
+        bos_token,
+        eos_token,
     })
 }
 

@@ -2,10 +2,13 @@
 //! [`crate::server::run`]: parse flags, build a [`ServerConfig`], hand off.
 
 use std::error::Error;
+use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::server::{run as server_run, ServerConfig};
+use crate::gguf::GgufFile;
+use crate::server::{run as server_run, AppState, ServerConfig};
+use crate::tokenizer::build_tokenizer;
 
 #[derive(Args)]
 pub struct ServeArgs {
@@ -20,13 +23,33 @@ pub struct ServeArgs {
     /// Attach a permissive CORS layer (off by default for safety in dev).
     #[arg(long)]
     cors: bool,
+
+    /// Path to a local .gguf model file. Only the tokenizer + chat
+    /// template are loaded today — needed by `/apply-template`. Full
+    /// inference lands when the OpenAI / llama-server completion
+    /// handlers stop returning stubs.
+    #[arg(short = 'm', long = "model")]
+    model: Option<PathBuf>,
 }
 
 pub async fn run(args: ServeArgs) -> Result<(), Box<dyn Error>> {
+    let app_state = match args.model.as_ref() {
+        Some(path) => {
+            let gguf = GgufFile::open(path)?;
+            let bundle = build_tokenizer(&gguf)?;
+            tracing::info!(
+                template_present = bundle.chat_template.is_some(),
+                "loaded tokenizer for serve state",
+            );
+            AppState::new(bundle.chat_template, bundle.bos_token, bundle.eos_token)
+        }
+        None => AppState::default(),
+    };
     server_run(ServerConfig {
         host: args.host,
         port: args.port,
         cors: args.cors,
+        app_state,
     })
     .await
 }
