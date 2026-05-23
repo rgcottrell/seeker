@@ -13,11 +13,12 @@ use super::buffer::BufferRange;
 use super::device::Device;
 use super::memory::Region;
 
-/// Logical view of a tensor uploaded to the GPU. Strides follow ggml
-/// convention: `stride[0] = element_size`, `stride[i] = dims[i-1] * stride[i-1]`.
-/// `byte_offset` is from the start of the weights buffer.
+/// Logical view of a tensor in GPU memory. Strides follow ggml convention:
+/// `stride[0] = element_size`, `stride[i] = dims[i-1] * stride[i-1]`.
+/// `byte_offset` is from the start of `buffer`.
 #[derive(Debug, Clone, Copy)]
 pub struct TensorView {
+    pub buffer: vk::Buffer,
     pub byte_offset: u64,
     pub byte_size: u64,
     pub dims: [u64; 4],
@@ -27,9 +28,9 @@ pub struct TensorView {
 }
 
 impl TensorView {
-    pub fn range(&self, buffer: vk::Buffer) -> BufferRange {
+    pub fn range(&self) -> BufferRange {
         BufferRange {
-            buffer,
+            buffer: self.buffer,
             offset: self.byte_offset,
             size: self.byte_size,
         }
@@ -50,7 +51,7 @@ impl WeightsHandle {
     }
 
     pub fn range(&self, name: &str) -> Result<BufferRange, Box<dyn Error>> {
-        Ok(self.view(name)?.range(self.region.buffer))
+        Ok(self.view(name)?.range())
     }
 }
 
@@ -126,6 +127,7 @@ pub fn upload(device: &Device, gguf: &GgufFile) -> Result<WeightsHandle, Box<dyn
         views.insert(
             t.name.clone(),
             TensorView {
+                buffer: region.buffer,
                 byte_offset: cursor,
                 byte_size: t.byte_size as u64,
                 dims,

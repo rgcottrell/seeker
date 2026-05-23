@@ -15,6 +15,7 @@
 
 //@variants
 //  f32_f16: Q_TYPE=float    KV_TYPE=float16_t    D_TYPE=float
+//  f32_f32: Q_TYPE=float    KV_TYPE=float        D_TYPE=float
 //@end-variants
 
 import glsl;  // gl_SubgroupInvocationID
@@ -178,8 +179,16 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     }
 
     // ── 4) Final normalize + write back.
+    //
+    // Output layout differs from llama.cpp's flash_attn.comp: we write
+    // directly into the post-permute layout [HSV, n_head, L] (= [hidden, L]
+    // contiguous) so the next op (the output projection matmul) can read it
+    // without an intervening permute/copy. ggml's graph normally inserts a
+    // permute after flash_attn; our MVP fuses that into the output write.
     const float inv_L = Lf == 0.0f ? 0.0f : 1.0f / Lf;
-    const uint o_off = iq3 * p.ne2 * p.ne1 * HSV + iq2 * p.ne1 * HSV + i_row * HSV;
+    const uint o_off = iq3 * p.ne2 * p.ne1 * HSV
+                     + i_row * p.ne2 * HSV
+                     + iq2 * HSV;
     [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
         const uint d_global = d * WORKGROUP_SIZE + tid;
         data_o[o_off + d_global] = D_TYPE(Of[d] * inv_L);

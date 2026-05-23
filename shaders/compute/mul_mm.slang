@@ -153,7 +153,10 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // Write C tile back to D.
+    // Write C tile back to D. Output is column-major in (M, N) to match
+    // ggml's natural layout: position(m, n) = n * stride_d + m, with
+    // stride_d = M (set host-side via dst->nb[1] / type_size). Cf.
+    // llama.cpp's mul_mm.comp line 404.
     const uint sub_row = row0 + warp_r * WM + tiwr * TM;
     const uint sub_col = col0 + warp_c * WN + tiwc * TN;
     [unroll] for (uint r = 0; r < TM; ++r) {
@@ -161,7 +164,7 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
             const uint gr = sub_row + r;
             const uint gc = sub_col + c;
             if (gr < p.M && gc < p.N) {
-                data_d[d_base + gr * p.stride_d + gc] = D_TYPE(regC[r][c]);
+                data_d[d_base + gc * p.stride_d + gr] = D_TYPE(regC[r][c]);
             }
         }
     }

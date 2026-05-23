@@ -29,13 +29,28 @@ impl DescriptorAllocator {
     }
 
     /// Allocate one descriptor set with the given layout and bind the
-    /// `bindings` slice into slots 0..N.
+    /// `bindings` slice into slots 0..N (contiguous).
     pub fn allocate_and_write(
         &self,
         device: &Device,
         set_layout: vk::DescriptorSetLayout,
         bindings: &[BufferRange],
     ) -> Result<vk::DescriptorSet, Box<dyn Error>> {
+        let indices: Vec<u32> = (0..bindings.len() as u32).collect();
+        self.allocate_and_write_indexed(device, set_layout, &indices, bindings)
+    }
+
+    /// Allocate one descriptor set with the given layout and bind each
+    /// `bindings[i]` into slot `indices[i]`. Use this for sparse layouts
+    /// (e.g. flash_attn skips binding 4).
+    pub fn allocate_and_write_indexed(
+        &self,
+        device: &Device,
+        set_layout: vk::DescriptorSetLayout,
+        indices: &[u32],
+        bindings: &[BufferRange],
+    ) -> Result<vk::DescriptorSet, Box<dyn Error>> {
+        assert_eq!(indices.len(), bindings.len(), "indices/bindings length mismatch");
         let layouts = [set_layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.pool)
@@ -47,11 +62,11 @@ impl DescriptorAllocator {
             bindings.iter().map(|b| b.descriptor_info()).collect();
         let writes: Vec<vk::WriteDescriptorSet> = infos
             .iter()
-            .enumerate()
-            .map(|(i, info)| {
+            .zip(indices.iter())
+            .map(|(info, &idx)| {
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
-                    .dst_binding(i as u32)
+                    .dst_binding(idx)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(std::slice::from_ref(info))
             })

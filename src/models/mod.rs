@@ -6,6 +6,7 @@
 use std::error::Error;
 
 use crate::gguf::GgufFile;
+use crate::inference::buffer::BufferRange;
 use crate::inference::context::DispatchContext;
 use crate::inference::weights::WeightsHandle;
 use crate::tokenizer::TokenizerBundle;
@@ -27,14 +28,20 @@ pub enum ModelError {
 pub trait Model: Send + Sync {
     fn arch(&self) -> &'static str;
     fn vocab_size(&self) -> u32;
-    /// Record the forward pass into `ctx`'s command buffer. The shape of the
-    /// final logits slot is `[vocab_size]` F32; the engine is responsible
-    /// for copying it out.
+    /// Borrow the model's uploaded weight buffer. Needed by the engine so
+    /// it can pass `&WeightsHandle` into the dispatch context.
+    fn weights(&self) -> &WeightsHandle;
+    /// Borrow the model's tokenizer (for prompt encoding / sampled-token
+    /// decoding by callers).
+    fn tokenizer(&self) -> &TokenizerBundle;
+    /// Record the forward pass into `ctx`'s command buffer and return the
+    /// scratch slot that, after submission, will hold the next-token logits
+    /// (`vocab_size` F32s).
     fn record_forward(
         &self,
         ctx: &mut DispatchContext,
         tokens: &[u32],
-    ) -> Result<(), Box<dyn Error>>;
+    ) -> Result<BufferRange, Box<dyn Error>>;
 }
 
 /// Construct the right `Model` for the given GGUF based on its
