@@ -91,8 +91,8 @@ fn build_pipeline(
     if spirv.len() % 4 != 0 {
         return Err(format!("SPIR-V size {} not 4-byte aligned", spirv.len()).into());
     }
-    // SAFETY: SPIR-V binaries are emitted by build.rs into Aligned4 blocks,
-    // so a u32-aligned reinterpret is sound.
+    // SAFETY: SPIR-V binaries are emitted by build.rs into Shader blocks
+    // with 4-byte alignment, so a u32-aligned reinterpret is sound.
     let words = unsafe {
         std::slice::from_raw_parts(spirv.as_ptr() as *const u32, spirv.len() / 4)
     };
