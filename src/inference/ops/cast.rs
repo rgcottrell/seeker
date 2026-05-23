@@ -3,7 +3,7 @@
 //!
 //! Dispatches the right shader based on (src.dtype, dst.dtype):
 //! - `F32 ↔ F32`, `F16 ↔ F16`, `F32 ↔ F16` → `copy.slang` variants
-//! - `F32 ↔ BF16`                          → `cast_bf16.slang`
+//! - `F32 ↔ BF16`                          → `copy.slang` (bf16 variants)
 //! - `F32 → quant`                         → `copy_to_quant.slang`
 //! - `quant → F32`                         → `copy_from_quant.slang`
 //!
@@ -63,7 +63,7 @@ pub fn record_cast(
     )?;
 
     // Workgroup count: each workgroup covers `elements_per_workgroup`
-    // elements of work. For plain casts (copy/cast_bf16) that's
+    // elements of work. For plain casts (copy variants) that's
     // `threads_per_workgroup * 1` element each. For copy_to_quant, 32
     // threads × QUANT_K=32 elements each = 1024. For copy_from_quant,
     // one workgroup processes one block = QUANT_K elements (LSX=1 for
@@ -117,8 +117,8 @@ fn pick_shader(src: GgmlType, dst: GgmlType) -> Result<ShaderPick, Box<dyn Error
         (F16, F16) => plain("copy_f16", shaders::COPY_F16_SPV.as_bytes()),
         (F32, F16) => plain("copy_f32_to_f16", shaders::COPY_F32_TO_F16_SPV.as_bytes()),
         (F16, F32) => plain("copy_f16_to_f32", shaders::COPY_F16_TO_F32_SPV.as_bytes()),
-        (F32, BF16) => plain("cast_bf16_f32_to_bf16", shaders::CAST_BF16_F32_TO_BF16_SPV.as_bytes()),
-        (BF16, F32) => plain("cast_bf16_bf16_to_f32", shaders::CAST_BF16_BF16_TO_F32_SPV.as_bytes()),
+        (F32, BF16) => plain("copy_f32_to_bf16", shaders::COPY_F32_TO_BF16_SPV.as_bytes()),
+        (BF16, F32) => plain("copy_bf16_to_f32", shaders::COPY_BF16_TO_F32_SPV.as_bytes()),
 
         (F32, Q4_0) => to_quant("copy_to_quant_q4_0", shaders::COPY_TO_QUANT_Q4_0_SPV.as_bytes()),
         (F32, Q4_1) => to_quant("copy_to_quant_q4_1", shaders::COPY_TO_QUANT_Q4_1_SPV.as_bytes()),

@@ -25,6 +25,24 @@ pub struct DispatchContext<'a> {
 }
 
 impl<'a> DispatchContext<'a> {
+    /// Snapshot the scratch bump cursor. Pair with [`scratch_restore`] to
+    /// reclaim any slots allocated since the checkpoint — useful for
+    /// scoping per-layer scratch within a forward pass.
+    ///
+    /// Safe to reuse the freed scratch range immediately on the CPU side
+    /// because the GPU executes the recorded command buffer in order, with
+    /// our barriers, so by the time later dispatches run the earlier ones
+    /// have already finished reading their scratch slots.
+    pub fn scratch_checkpoint(&self) -> u64 {
+        self.scratch.cursor
+    }
+
+    /// Restore the scratch bump cursor to a previous checkpoint, freeing
+    /// every slot allocated since then.
+    pub fn scratch_restore(&mut self, cursor: u64) {
+        self.scratch.cursor = cursor;
+    }
+
     /// Reserve a `bytes`-byte slot in scratch and return its `BufferRange`.
     /// Cursor advances; the slot is valid only until the next forward pass.
     pub fn alloc_scratch(&mut self, bytes: u64) -> Result<BufferRange, Box<dyn Error>> {

@@ -46,10 +46,29 @@ pub fn record(
     params: FlashAttnParams,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(q.dtype, GgmlType::F32);
-    debug_assert_eq!(k.dtype, GgmlType::F32, "MVP uses f32_f32 flash_attn variant");
-    debug_assert_eq!(v.dtype, GgmlType::F32);
     debug_assert_eq!(out.dtype, GgmlType::F32);
-    debug_assert_eq!(mask.dtype, GgmlType::F32);
+    debug_assert_eq!(
+        k.dtype, v.dtype,
+        "flash_attn requires K and V to share a dtype (existing shader variants \
+         are template-typed on a single KV_TYPE). Materialize one side to match \
+         the other if you need a heterogeneous combo.",
+    );
+    debug_assert_eq!(
+        mask.dtype, k.dtype,
+        "mask dtype must match K/V dtype (the shader's data_m binding shares KV_TYPE)",
+    );
+
+    let (variant_name, variant_spv) = match k.dtype {
+        GgmlType::F32 => ("flash_attn_f32_f32", shaders::FLASH_ATTN_F32_F32_SPV.as_bytes()),
+        GgmlType::F16 => ("flash_attn_f32_f16", shaders::FLASH_ATTN_F32_F16_SPV.as_bytes()),
+        other => {
+            return Err(format!(
+                "flash_attn: no shader variant for K/V dtype {other:?} \
+                 (caller should materialize to F32 or F16 first)"
+            )
+            .into());
+        }
+    };
 
     let n = q.dims[1] as u32; // L (rows of Q per head)
     let kv = k.dims[1] as u32;
@@ -128,17 +147,13 @@ pub fn record(
     ];
 
     let key = PipelineKey {
-        name: "flash_attn_f32_f32".to_string(),
+        name: variant_name.to_string(),
         binding_indices: vec![0, 1, 2, 3, 5],
         push_size: FA_PUSH_BYTES,
         spec_constants,
     };
     let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx.pipelines.get(
-            ctx.device,
-            key,
-            shaders::FLASH_ATTN_F32_F32_SPV.as_bytes(),
-        )?;
+        let p: &CachedPipeline = ctx.pipelines.get(ctx.device, key, variant_spv)?;
         (p.pipeline, p.layout, p.set_layout)
     };
     let set = ctx.descriptors.allocate_and_write_indexed(

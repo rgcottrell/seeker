@@ -145,12 +145,30 @@ impl Model for LlamaModel {
         let positions: Vec<u32> = (position_offset..position_offset + l).collect();
         write_u32(ctx, positions_buf, &positions)?;
 
-        // Causal mask [kv_len, L] in F32: M[i, j] = 0 if j <= position_offset+i else -inf.
-        let mask = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
-        write_causal_mask(ctx, mask, l, position_offset)?;
+        // F32 / F16 cache: flash_attn binds the cache layer directly (no
+        // copy, no dequant). Anything else (BF16, quants): materialize via
+        // cache_io::record_read into F32 scratch.
+        let cache_direct = matches!(cache.config.k_dtype, GgmlType::F32 | GgmlType::F16)
+            && cache.config.k_dtype == cache.config.v_dtype;
+
+        // Causal mask `[kv_len, L]`: M[i, j] = 0 if j <= position_offset+i else -inf.
+        //
+        // Dtype must match what flash_attn binds as `data_m` (which shares
+        // `KV_TYPE` with K and V). For materialize paths everything's F32;
+        // for direct-bind we follow the cache's K dtype.
+        let mask_dtype = if cache_direct {
+            cache.config.k_dtype
+        } else {
+            GgmlType::F32
+        };
+        let mask = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], mask_dtype)?;
+        write_causal_mask(ctx, mask, l, position_offset, mask_dtype)?;
 
         // ---- embedding lookup ----
-        let mut residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
+        // Residual is one persistent slot, reused across layers via in-place
+        // adds. Everything else allocated below the loop checkpoint is
+        // reclaimed on `scratch_restore` between layers.
+        let residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
         elementwise::record_get_rows(
             ctx,
             self.weights.token_embd,
@@ -158,6 +176,7 @@ impl Model for LlamaModel {
             l,
             residual,
         )?;
+        let layer_checkpoint = ctx.scratch_checkpoint();
 
         let rope_params = rope::RopeParams::llama_default(p.rope_dim, p.rope_freq_base);
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -171,6 +190,8 @@ impl Model for LlamaModel {
 
         // ---- per-layer loop ----
         for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
+            ctx.scratch_restore(layer_checkpoint);
+
             // x_norm = rms_norm(residual) * attn_norm
             let x_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             rms_norm::record(ctx, residual, block.attn_norm, x_norm, p.rms_eps)?;
@@ -201,15 +222,28 @@ impl Model for LlamaModel {
             cache_io::record_write(ctx, k_natural, cache.k_layers[layer_idx], position_offset)?;
             cache_io::record_write(ctx, v_natural, cache.v_layers[layer_idx], position_offset)?;
 
-            // Read back the full prefix [0, total_len) for attention.
-            let k_full = cache_io::record_read(ctx, cache.k_layers[layer_idx], total_len)?;
-            let v_full = cache_io::record_read(ctx, cache.v_layers[layer_idx], total_len)?;
+            // Source the K/V views fed to flash_attn:
+            //   - F32 / F16 cache: bind cache layer directly (zero copy).
+            //   - BF16 / quants:   materialize the [0, total_len) prefix
+            //     into F32 scratch (transient — reclaimed on next
+            //     layer's `scratch_restore`).
+            let (k_src, v_src) = if cache_direct {
+                (
+                    slice_cache_prefix(cache.k_layers[layer_idx], kv_len_u),
+                    slice_cache_prefix(cache.v_layers[layer_idx], kv_len_u),
+                )
+            } else {
+                (
+                    cache_io::record_read(ctx, cache.k_layers[layer_idx], total_len)?,
+                    cache_io::record_read(ctx, cache.v_layers[layer_idx], total_len)?,
+                )
+            };
 
             // Permute Q to [head_dim, L, n_head] and K/V to
             // [head_dim, total_len, n_head_kv] (flash_attn input layout).
             let q_perm = permute_to_attn(q_roped, head_dim, l as u64, p.n_head as u64);
-            let k_perm = permute_to_attn(k_full, head_dim, kv_len_u, p.n_head_kv as u64);
-            let v_perm = permute_to_attn(v_full, head_dim, kv_len_u, p.n_head_kv as u64);
+            let k_perm = permute_to_attn(k_src, head_dim, kv_len_u, p.n_head_kv as u64);
+            let v_perm = permute_to_attn(v_src, head_dim, kv_len_u, p.n_head_kv as u64);
 
             // attn_out = flash_attn(Q, K, V, mask) → [hidden, L]
             let attn_out = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
@@ -219,10 +253,8 @@ impl Model for LlamaModel {
             let proj = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             matmul::record(ctx, block.wo, attn_out, proj)?;
 
-            // residual += proj
-            let new_residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
-            elementwise::record_add(ctx, residual, proj, new_residual)?;
-            residual = new_residual;
+            // residual += proj (in-place into the persistent residual slot)
+            elementwise::record_add(ctx, residual, proj, residual)?;
 
             // x_norm = rms_norm(residual) * ffn_norm
             let x_norm2 = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
@@ -244,11 +276,10 @@ impl Model for LlamaModel {
             let down = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             matmul::record(ctx, block.ffn_down, ffn_hidden, down)?;
 
-            // residual += down
-            let new_residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
-            elementwise::record_add(ctx, residual, down, new_residual)?;
-            residual = new_residual;
+            // residual += down (in-place)
+            elementwise::record_add(ctx, residual, down, residual)?;
         }
+        ctx.scratch_restore(layer_checkpoint);
 
         // ---- final norm + lm_head ----
         let final_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
@@ -300,6 +331,7 @@ fn write_causal_mask(
     mask: TensorView,
     l: u32,
     position_offset: u32,
+    dtype: GgmlType,
 ) -> Result<(), Box<dyn Error>> {
     let host_ptr = ctx
         .scratch
@@ -308,17 +340,53 @@ fn write_causal_mask(
     let l = l as usize;
     let pos = position_offset as usize;
     let kv_len = pos + l;
-    let mut buf: Vec<f32> = vec![0.0; l * kv_len];
-    for i in 0..l {
-        for j in 0..kv_len {
-            buf[i * kv_len + j] = if j <= pos + i { 0.0 } else { f32::NEG_INFINITY };
+    let n = l * kv_len;
+
+    let unmasked = |i: usize, j: usize| j <= pos + i;
+    match dtype {
+        GgmlType::F32 => {
+            let mut buf: Vec<f32> = vec![0.0; n];
+            for i in 0..l {
+                for j in 0..kv_len {
+                    buf[i * kv_len + j] = if unmasked(i, j) { 0.0 } else { f32::NEG_INFINITY };
+                }
+            }
+            unsafe {
+                let dst = host_ptr.add(mask.byte_offset as usize) as *mut f32;
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len());
+            }
         }
-    }
-    unsafe {
-        let dst = host_ptr.add(mask.byte_offset as usize) as *mut f32;
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len());
+        GgmlType::F16 => {
+            // F16 bit patterns: +0.0 = 0x0000, -inf = 0xFC00.
+            let mut buf: Vec<u16> = vec![0u16; n];
+            for i in 0..l {
+                for j in 0..kv_len {
+                    buf[i * kv_len + j] = if unmasked(i, j) { 0x0000 } else { 0xFC00 };
+                }
+            }
+            unsafe {
+                let dst = host_ptr.add(mask.byte_offset as usize) as *mut u16;
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len());
+            }
+        }
+        other => return Err(format!("mask dtype {other:?} not supported").into()),
     }
     Ok(())
+}
+
+/// Take the first `total_len` token positions of a cache layer's K (or V)
+/// view, leaving strides intact (the prefix is contiguous in the cache's
+/// natural `[head_dim, n_head_kv, max_seq_len]` layout, so byte_stride[2] is
+/// the right per-token stride for the smaller slice too).
+fn slice_cache_prefix(layer: TensorView, total_len: u64) -> TensorView {
+    let mut dims = layer.dims;
+    dims[2] = total_len;
+    let byte_size = layer.byte_stride[2] * total_len;
+    TensorView {
+        dims,
+        byte_size,
+        ..layer
+    }
 }
 
 /// Reshape Q (or K) from matmul-output `[n_embd, L]` to RoPE-input
