@@ -11,6 +11,7 @@ pub mod command;
 pub mod context;
 pub mod descriptor;
 pub mod device;
+pub mod kv_cache;
 pub mod memory;
 pub mod ops;
 pub mod pipeline;
@@ -87,6 +88,18 @@ impl Engine {
     /// Upload every tensor in `gguf` into a new dedicated weights region.
     pub fn upload_weights(&self, gguf: &GgufFile) -> Result<WeightsHandle, Box<dyn Error>> {
         weights::upload(&self.device, gguf)
+    }
+
+    /// Allocate a KV cache sized for the given architecture. Caller picks
+    /// dtypes (independently for K and V) and `max_seq_len`.
+    pub fn allocate_kv_cache(
+        &self,
+        n_layer: u32,
+        head_dim: u32,
+        n_head_kv: u32,
+        config: kv_cache::KvCacheConfig,
+    ) -> Result<kv_cache::KvCache, Box<dyn Error>> {
+        kv_cache::KvCache::new(&self.device, n_layer, head_dim, n_head_kv, config)
     }
 
     /// Run a forward pass: the closure records dispatches into the

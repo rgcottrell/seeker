@@ -8,12 +8,13 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::commands::download::{resolve_hf, HfResolveArgs};
-use crate::gguf::GgufFile;
+use crate::gguf::{GgmlType, GgufFile};
+use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
 use crate::inference::sample::argmax;
 use crate::inference::Engine;
 use crate::tokenizer::build_tokenizer;
 
-const SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+const SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -40,6 +41,22 @@ pub struct RunArgs {
     /// Prompt to feed through one forward pass.
     #[arg(long, default_value = "Once upon a time")]
     prompt: String,
+
+    /// Number of tokens to generate (>= 1). 1 = single prefill, exit.
+    #[arg(long, default_value_t = 1)]
+    max_tokens: u32,
+
+    /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1.
+    #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
+    cache_type_k: GgmlType,
+
+    /// KV cache V dtype. Same legal values as --cache-type-k.
+    #[arg(long = "cache-type-v", default_value = "f16", value_parser = parse_dtype_arg)]
+    cache_type_v: GgmlType,
+}
+
+fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
+    parse_dtype(s)
 }
 
 pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
@@ -79,18 +96,64 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         get_rows_smoke_test(&mut engine, model.weights())?;
         return Ok(());
     }
+    if let Ok(dt_name) = std::env::var("SEEKER_QUANT_TEST") {
+        quant_roundtrip_test(&mut engine, model.weights(), &dt_name)?;
+        return Ok(());
+    }
 
-    let logits = engine.forward(model.weights(), |ctx| model.record_forward(ctx, &tokens))?;
-    let next_id = argmax(&logits) as u32;
-    let piece = model
+    let max_seq_len = args
+        .max_tokens
+        .saturating_add(tokens.len() as u32)
+        .max(tokens.len() as u32);
+    let cache_config = KvCacheConfig {
+        k_dtype: args.cache_type_k,
+        v_dtype: args.cache_type_v,
+        max_seq_len,
+    };
+    let dims = model.cache_dims();
+    let mut cache = engine.allocate_kv_cache(
+        dims.n_layer,
+        dims.head_dim,
+        dims.n_head_kv,
+        cache_config,
+    )?;
+    tracing::info!(
+        n_layer = dims.n_layer,
+        max_seq_len,
+        k_dtype = ?args.cache_type_k,
+        v_dtype = ?args.cache_type_v,
+        bytes = cache.region.cursor,
+        "kv cache allocated",
+    );
+
+    let mut step_tokens: Vec<u32> = tokens.clone();
+    let mut generated: Vec<u32> = Vec::with_capacity(args.max_tokens as usize);
+    for _ in 0..args.max_tokens {
+        let position_offset = cache.position;
+        let logits = engine.forward(model.weights(), |ctx| {
+            model.record_forward(ctx, &mut cache, &step_tokens, position_offset)
+        })?;
+        let next_id = argmax(&logits) as u32;
+        generated.push(next_id);
+        step_tokens = vec![next_id];
+    }
+
+    let generated_text = model
         .tokenizer()
         .tokenizer
-        .decode(&[next_id], false)
-        .unwrap_or_else(|_| format!("<id={next_id}>"));
+        .decode(&generated, false)
+        .unwrap_or_else(|_| {
+            generated
+                .iter()
+                .map(|id| format!("<id={id}>"))
+                .collect::<Vec<_>>()
+                .join("")
+        });
 
-    println!("prompt: {}", args.prompt);
-    println!("tokens: {tokens:?}");
-    println!("next:   {next_id} -> {piece:?}");
+    println!("prompt:    {}", args.prompt);
+    println!("tokens:    {tokens:?}");
+    println!("generated: {generated_text}");
+    println!("ids:       {generated:?}");
     Ok(())
 }
 
@@ -228,6 +291,51 @@ fn rms_norm_smoke_test(
     println!("  ~1.0 values:  {close_to_one}");
     println!("  first 4: {:?}", &logits[..4]);
     println!("  last 4:  {:?}", &logits[logits.len()-4..]);
+    Ok(())
+}
+
+fn quant_roundtrip_test(
+    engine: &mut Engine,
+    weights: &crate::inference::weights::WeightsHandle,
+    dt_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::kv_cache::parse_dtype;
+    use crate::inference::ops::cast::record_cast;
+    let cache_dtype = parse_dtype(dt_name)?;
+    // 64 hidden, 3 heads, 4 tokens = 768 elements
+    let hd: u64 = 64;
+    let nhkv: u64 = 3;
+    let l: u64 = 4;
+    let nel = (hd * nhkv * l) as usize;
+    let logits = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+        let f32_src = ctx.alloc_tensor([hd, nhkv, l, 1], GgmlType::F32)?;
+        let cache_buf = ctx.alloc_tensor([hd, nhkv, l, 1], cache_dtype)?;
+        let f32_dst = ctx.alloc_tensor([hd, nhkv, l, 1], GgmlType::F32)?;
+        // fill src: value = (i % 100) / 100.0 (range [0, 1))
+        let src_data: Vec<f32> = (0..nel).map(|i| (i as f32 % 100.0) / 100.0).collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_data.as_ptr(),
+                ctx.scratch.host_ptr.unwrap().add(f32_src.byte_offset as usize) as *mut f32,
+                nel,
+            );
+        }
+        record_cast(ctx, f32_src, cache_buf)?;
+        crate::inference::command::record_global_barrier(ctx.device, ctx.cmd);
+        record_cast(ctx, cache_buf, f32_dst)?;
+        Ok(f32_dst.range())
+    })?;
+    let expected: Vec<f32> = (0..nel).map(|i| (i as f32 % 100.0) / 100.0).collect();
+    let mut max_err = 0.0f32;
+    for (a, b) in logits.iter().zip(expected.iter()) {
+        max_err = max_err.max((a - b).abs());
+    }
+    println!("quant roundtrip via {dt_name}:");
+    println!("  src first 4: {:?}", &expected[..4]);
+    println!("  dst first 4: {:?}", &logits[..4]);
+    println!("  src last 4:  {:?}", &expected[nel-4..]);
+    println!("  dst last 4:  {:?}", &logits[nel-4..]);
+    println!("  max abs err: {max_err}");
     Ok(())
 }
 

@@ -10,11 +10,12 @@ use std::error::Error;
 
 use crate::gguf::{GgmlType, GgufFile, MetadataValue};
 use crate::inference::context::DispatchContext;
-use crate::inference::ops::{elementwise, flash_attn, matmul, rms_norm, rope};
+use crate::inference::kv_cache::KvCache;
+use crate::inference::ops::{cache_io, elementwise, flash_attn, matmul, rms_norm, rope};
 use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
 
-use super::{Model, ModelError};
+use super::{CacheDims, Model, ModelError};
 
 #[derive(Debug, Clone)]
 pub struct LlamaParams {
@@ -93,6 +94,14 @@ impl Model for LlamaModel {
         self.params.n_vocab
     }
 
+    fn cache_dims(&self) -> CacheDims {
+        CacheDims {
+            n_layer: self.params.n_layer,
+            head_dim: self.params.head_dim(),
+            n_head_kv: self.params.n_head_kv,
+        }
+    }
+
     fn weights(&self) -> &WeightsHandle {
         &self.handle
     }
@@ -104,7 +113,9 @@ impl Model for LlamaModel {
     fn record_forward(
         &self,
         ctx: &mut DispatchContext,
+        cache: &mut KvCache,
         tokens: &[u32],
+        position_offset: u32,
     ) -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
         let p = &self.params;
         let l = tokens.len() as u32;
@@ -116,18 +127,27 @@ impl Model for LlamaModel {
         let n_kv_embd = p.n_embd_kv() as u64;
         let n_ff = p.n_ff as u64;
 
+        if cache.position != position_offset {
+            return Err(format!(
+                "cache.position {} doesn't match caller-supplied position_offset {position_offset}",
+                cache.position
+            )
+            .into());
+        }
+        let total_len = position_offset + l; // KV-context length after this step
+        let kv_len_u = total_len as u64;
+
         // ---- prologue: positions + mask + token id buffer ----
         let token_buf = ctx.alloc_scratch((l as u64) * 4)?;
         write_u32(ctx, token_buf, tokens)?;
 
         let positions_buf = ctx.alloc_scratch((l as u64) * 4)?;
-        let positions: Vec<u32> = (0..l).collect();
+        let positions: Vec<u32> = (position_offset..position_offset + l).collect();
         write_u32(ctx, positions_buf, &positions)?;
 
-        // Causal mask [L, L] in F32 (matches the f32_f32 flash_attn variant):
-        // 0 if j <= i else -inf.
-        let mask = ctx.alloc_tensor([l as u64, l as u64, 1, 1], GgmlType::F32)?;
-        write_causal_mask(ctx, mask, l)?;
+        // Causal mask [kv_len, L] in F32: M[i, j] = 0 if j <= position_offset+i else -inf.
+        let mask = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
+        write_causal_mask(ctx, mask, l, position_offset)?;
 
         // ---- embedding lookup ----
         let mut residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
@@ -150,7 +170,7 @@ impl Model for LlamaModel {
         };
 
         // ---- per-layer loop ----
-        for block in self.weights.blocks.iter() {
+        for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
             // x_norm = rms_norm(residual) * attn_norm
             let x_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             rms_norm::record(ctx, residual, block.attn_norm, x_norm, p.rms_eps)?;
@@ -165,7 +185,7 @@ impl Model for LlamaModel {
             let v = ctx.alloc_tensor([n_kv_embd, l as u64, 1, 1], GgmlType::F32)?;
             matmul::record(ctx, block.wv, x_norm, v)?;
 
-            // RoPE on Q and K (in-place via separate scratch dst).
+            // RoPE on Q and K (separate scratch dst).
             let q_view = reshape_for_rope(q, head_dim, p.n_head as u64, l as u64);
             let k_view = reshape_for_rope(k, head_dim, p.n_head_kv as u64, l as u64);
             let q_roped = ctx.alloc_tensor(q_view.dims, GgmlType::F32)?;
@@ -173,15 +193,23 @@ impl Model for LlamaModel {
             rope::record(ctx, q_view, positions_buf, q_roped, rope_params)?;
             rope::record(ctx, k_view, positions_buf, k_roped, rope_params)?;
 
-            // Permute Q to [head_dim, L, n_head] and K/V to [head_dim, L, n_head_kv].
+            // K, V (post-RoPE for K, raw for V) in natural
+            // [head_dim, n_head_kv, L] layout for cache write.
+            // (reshape_for_rope produces exactly that layout.)
+            let k_natural = reshape_for_rope(k_roped, head_dim, p.n_head_kv as u64, l as u64);
+            let v_natural = reshape_for_rope(v, head_dim, p.n_head_kv as u64, l as u64);
+            cache_io::record_write(ctx, k_natural, cache.k_layers[layer_idx], position_offset)?;
+            cache_io::record_write(ctx, v_natural, cache.v_layers[layer_idx], position_offset)?;
+
+            // Read back the full prefix [0, total_len) for attention.
+            let k_full = cache_io::record_read(ctx, cache.k_layers[layer_idx], total_len)?;
+            let v_full = cache_io::record_read(ctx, cache.v_layers[layer_idx], total_len)?;
+
+            // Permute Q to [head_dim, L, n_head] and K/V to
+            // [head_dim, total_len, n_head_kv] (flash_attn input layout).
             let q_perm = permute_to_attn(q_roped, head_dim, l as u64, p.n_head as u64);
-            let k_perm = permute_to_attn(k_roped, head_dim, l as u64, p.n_head_kv as u64);
-            let v_perm = permute_to_attn(
-                reshape_for_rope(v, head_dim, p.n_head_kv as u64, l as u64),
-                head_dim,
-                l as u64,
-                p.n_head_kv as u64,
-            );
+            let k_perm = permute_to_attn(k_full, head_dim, kv_len_u, p.n_head_kv as u64);
+            let v_perm = permute_to_attn(v_full, head_dim, kv_len_u, p.n_head_kv as u64);
 
             // attn_out = flash_attn(Q, K, V, mask) → [hidden, L]
             let attn_out = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
@@ -242,6 +270,11 @@ impl Model for LlamaModel {
             offset: all_logits.byte_offset + (l as u64 - 1) * vocab * elem_size,
             size: vocab * elem_size,
         };
+
+        // Advance cache position for the next call. (All cache writes were
+        // already recorded above; the GPU executes them in order before the
+        // logits readback.)
+        cache_io::advance(cache, l);
         Ok(logits_range)
     }
 }
@@ -266,16 +299,19 @@ fn write_causal_mask(
     ctx: &mut DispatchContext,
     mask: TensorView,
     l: u32,
+    position_offset: u32,
 ) -> Result<(), Box<dyn Error>> {
     let host_ptr = ctx
         .scratch
         .host_ptr
         .ok_or("scratch region not host-visible")?;
     let l = l as usize;
-    let mut buf: Vec<f32> = vec![0.0; l * l];
+    let pos = position_offset as usize;
+    let kv_len = pos + l;
+    let mut buf: Vec<f32> = vec![0.0; l * kv_len];
     for i in 0..l {
-        for j in 0..l {
-            buf[i * l + j] = if j <= i { 0.0 } else { f32::NEG_INFINITY };
+        for j in 0..kv_len {
+            buf[i * kv_len + j] = if j <= pos + i { 0.0 } else { f32::NEG_INFINITY };
         }
     }
     unsafe {

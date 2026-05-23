@@ -72,6 +72,36 @@ pub fn record_compute_barrier(device: &Device, cmd: vk::CommandBuffer, buffer: v
     }
 }
 
+/// Heavyweight memory barrier that synchronizes COMPUTE and TRANSFER access
+/// to every buffer. Used between dispatches that share data through
+/// `vkCmdCopyBuffer` (e.g. KV cache write / read).
+pub fn record_global_barrier(device: &Device, cmd: vk::CommandBuffer) {
+    let bar = vk::MemoryBarrier::default()
+        .src_access_mask(
+            vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::TRANSFER_WRITE
+                | vk::AccessFlags::TRANSFER_READ,
+        )
+        .dst_access_mask(
+            vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::TRANSFER_WRITE
+                | vk::AccessFlags::TRANSFER_READ,
+        );
+    unsafe {
+        device.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            std::slice::from_ref(&bar),
+            &[],
+            &[],
+        );
+    }
+}
+
 /// Issue a buffer-to-buffer copy. Used to pull logits from scratch into the
 /// host-visible readback region at end-of-pass.
 pub fn record_copy(

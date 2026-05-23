@@ -1,12 +1,13 @@
 // Ported from llama.cpp ggml-vulkan copy.comp, MIT license — see LICENSE.llama-cpp
 //
-// Phase 1: the BF16-conversion branches and OPTIMIZATION_ERROR_WORKAROUND
-// path from the GLSL source are omitted; only the straight cast is ported.
-// Will revisit when we wire up bf16-capable variants.
+// Same-type copies (f32, f16) plus cross-type casts (f32↔f16). BF16 lives
+// in cast_bf16.slang since it needs explicit bit-level conversion on MoltenVK.
 
 //@variants
-//  f32: A_TYPE=float       D_TYPE=float       FLOAT_TYPE=float
-//  f16: A_TYPE=float16_t   D_TYPE=float16_t   FLOAT_TYPE=float
+//  f32:        A_TYPE=float       D_TYPE=float       FLOAT_TYPE=float
+//  f16:        A_TYPE=float16_t   D_TYPE=float16_t   FLOAT_TYPE=float
+//  f32_to_f16: A_TYPE=float       D_TYPE=float16_t   FLOAT_TYPE=float
+//  f16_to_f32: A_TYPE=float16_t   D_TYPE=float       FLOAT_TYPE=float
 //@end-variants
 
 #include "types.slang"

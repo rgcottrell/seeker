@@ -3,6 +3,8 @@
 //! the right slots, and records a single compute dispatch + barrier into
 //! the active command buffer.
 
+pub mod cache_io;
+pub mod cast;
 pub mod elementwise;
 pub mod flash_attn;
 pub mod matmul;
