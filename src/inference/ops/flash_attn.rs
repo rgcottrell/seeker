@@ -47,24 +47,30 @@ pub fn record(
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(q.dtype, GgmlType::F32);
     debug_assert_eq!(out.dtype, GgmlType::F32);
+    debug_assert_eq!(mask.dtype, GgmlType::F32, "mask is always F32 now");
     debug_assert_eq!(
         k.dtype, v.dtype,
-        "flash_attn requires K and V to share a dtype (existing shader variants \
-         are template-typed on a single KV_TYPE). Materialize one side to match \
-         the other if you need a heterogeneous combo.",
-    );
-    debug_assert_eq!(
-        mask.dtype, k.dtype,
-        "mask dtype must match K/V dtype (the shader's data_m binding shares KV_TYPE)",
+        "flash_attn requires K and V to share a dtype (one variant per cache dtype, \
+         not per K/V combo). Materialize the odd side to match if you need a \
+         heterogeneous combo.",
     );
 
     let (variant_name, variant_spv) = match k.dtype {
         GgmlType::F32 => ("flash_attn_f32_f32", shaders::FLASH_ATTN_F32_F32_SPV.as_bytes()),
         GgmlType::F16 => ("flash_attn_f32_f16", shaders::FLASH_ATTN_F32_F16_SPV.as_bytes()),
+        GgmlType::BF16 => ("flash_attn_f32_bf16", shaders::FLASH_ATTN_F32_BF16_SPV.as_bytes()),
+        GgmlType::Q4_0 => ("flash_attn_f32_q4_0", shaders::FLASH_ATTN_F32_Q4_0_SPV.as_bytes()),
+        GgmlType::Q4_1 => ("flash_attn_f32_q4_1", shaders::FLASH_ATTN_F32_Q4_1_SPV.as_bytes()),
+        GgmlType::Q5_0 => ("flash_attn_f32_q5_0", shaders::FLASH_ATTN_F32_Q5_0_SPV.as_bytes()),
+        GgmlType::Q5_1 => ("flash_attn_f32_q5_1", shaders::FLASH_ATTN_F32_Q5_1_SPV.as_bytes()),
+        GgmlType::Q8_0 => ("flash_attn_f32_q8_0", shaders::FLASH_ATTN_F32_Q8_0_SPV.as_bytes()),
+        GgmlType::IQ4_NL => (
+            "flash_attn_f32_iq4_nl",
+            shaders::FLASH_ATTN_F32_IQ4_NL_SPV.as_bytes(),
+        ),
         other => {
             return Err(format!(
-                "flash_attn: no shader variant for K/V dtype {other:?} \
-                 (caller should materialize to F32 or F16 first)"
+                "flash_attn: no shader variant for K/V dtype {other:?}"
             )
             .into());
         }

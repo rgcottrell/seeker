@@ -1,24 +1,32 @@
-// Minimal flash-attention forward pass — F32 Q, F16 K/V, F32 O.
+// Flash-attention forward pass with optional fused dequant of K/V.
 //
-// Scope: dense K/V (no quants), MASK_ENABLE-only via the basic data_m binding (no
-// MASK_OPT prefilter, no ALiBi slopes, no attention sinks, no split-K, no logit
-// softcap, no MMQ integer-dot path). This is the simplest correctness reference;
-// the production llama.cpp shader bolts the optimizations back on later.
+// Q is always F32. K and V (homogeneous dtype) can be F32, F16, BF16, or any
+// of the cache quants (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL). The mask is
+// always F32. Output is F32.
 //
-// One workgroup per (query-row, head, batch). 32 threads = 1 subgroup cooperate
-// across the head_size dim (HSK). The K/V iteration is sequential over Bc-wide
-// blocks. Per KV block:
-//   - Compute S[Bc] = Q · K^T[Bc]
-//   - Apply mask if MASK_ENABLE
-//   - Online softmax update (m, L)
-//   - Accumulate O += P · V
+// Scope (unchanged from the original scalar reference): MASK_ENABLE-only,
+// no MASK_OPT prefilter, no ALiBi slopes, no attention sinks, no split-K,
+// no logit softcap, no MMQ integer-dot path. The per-quant access goes
+// element-at-a-time inside the inner K-dot-Q / V-accumulator loops; the
+// Vulkan compiler hoists the block-scale read out of the per-element loop.
+//
+// One workgroup per (query-row, head, batch). 32 threads = 1 subgroup
+// cooperate across the head_size dim (HSK). The K/V iteration is
+// sequential over Bc-wide blocks.
 
 //@variants
-//  f32_f16: Q_TYPE=float    KV_TYPE=float16_t    D_TYPE=float
-//  f32_f32: Q_TYPE=float    KV_TYPE=float        D_TYPE=float
+//  f32_f32:    Q_TYPE=float    KV_TYPE=float       D_TYPE=float
+//  f32_f16:    Q_TYPE=float    KV_TYPE=float16_t   D_TYPE=float
+//  f32_bf16:   Q_TYPE=float    KV_TYPE=uint16_t    D_TYPE=float    DATA_KV_BF16=1
+//  f32_q4_0:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q4_0=1   DATA_KV_QUANT=1
+//  f32_q4_1:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q4_1=1   DATA_KV_QUANT=1
+//  f32_q5_0:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q5_0=1   DATA_KV_QUANT=1
+//  f32_q5_1:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q5_1=1   DATA_KV_QUANT=1
+//  f32_q8_0:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q8_0=1   DATA_KV_QUANT=1
+//  f32_iq4_nl: Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_IQ4_NL=1 DATA_KV_QUANT=1
 //@end-variants
 
-import glsl;  // gl_SubgroupInvocationID
+import glsl;  // gl_SubgroupInvocationID, gl_LocalInvocationIndex
 
 #include "types.slang"
 
@@ -31,8 +39,8 @@ import glsl;  // gl_SubgroupInvocationID
 static const uint WORKGROUP_SIZE = 32;
 
 struct FaParams {
-    uint N;      // sequence length (number of query rows)
-    uint KV;     // KV length
+    uint N;
+    uint KV;
 
     uint ne1;
     uint ne2;
@@ -59,12 +67,12 @@ struct FaParams {
     uint nb23;
 
     float scale;
-    float max_bias;          // unused in this stripped variant
-    float logit_softcap;     // unused
+    float max_bias;
+    float logit_softcap;
 
-    uint  mask_n_head_log2;  // unused
-    float m0;                // unused
-    float m1;                // unused
+    uint  mask_n_head_log2;
+    float m0;
+    float m1;
 
     uint gqa_ratio;
     uint split_kv;
@@ -73,28 +81,170 @@ struct FaParams {
 
 [[vk::push_constant]] ConstantBuffer<FaParams> p;
 
-[[vk::binding(0, 0)]] StructuredBuffer<Q_TYPE>   data_q;
-[[vk::binding(1, 0)]] StructuredBuffer<KV_TYPE>  data_k;
-[[vk::binding(2, 0)]] StructuredBuffer<KV_TYPE>  data_v;
-[[vk::binding(3, 0)]] StructuredBuffer<KV_TYPE>  data_m;
-[[vk::binding(5, 0)]] RWStructuredBuffer<D_TYPE> data_o;
+// Q always F32.
+[[vk::binding(0, 0)]] StructuredBuffer<Q_TYPE> data_q;
+
+// K and V: type depends on cache dtype. The push-constant strides
+// (nb01/nb11/nb21 etc.) stay in ELEMENTS, the same units regardless of
+// dtype; for quants the dequant helpers below convert element-indices to
+// (block-index, intra-block-index) by dividing by QUANT_K=32.
+#if defined(DATA_KV_QUANT)
+    // Quant variants: block-struct bindings.
+    #if defined(DATA_A_Q4_0)
+        [[vk::binding(1, 0)]] StructuredBuffer<block_q4_0> data_k;
+        [[vk::binding(2, 0)]] StructuredBuffer<block_q4_0> data_v;
+    #elif defined(DATA_A_Q4_1)
+        [[vk::binding(1, 0)]] StructuredBuffer<block_q4_1> data_k;
+        [[vk::binding(2, 0)]] StructuredBuffer<block_q4_1> data_v;
+    #elif defined(DATA_A_Q5_0)
+        [[vk::binding(1, 0)]] StructuredBuffer<block_q5_0> data_k;
+        [[vk::binding(2, 0)]] StructuredBuffer<block_q5_0> data_v;
+    #elif defined(DATA_A_Q5_1)
+        [[vk::binding(1, 0)]] StructuredBuffer<block_q5_1> data_k;
+        [[vk::binding(2, 0)]] StructuredBuffer<block_q5_1> data_v;
+    #elif defined(DATA_A_Q8_0)
+        [[vk::binding(1, 0)]] StructuredBuffer<block_q8_0> data_k;
+        [[vk::binding(2, 0)]] StructuredBuffer<block_q8_0> data_v;
+    #elif defined(DATA_A_IQ4_NL)
+        [[vk::binding(1, 0)]] StructuredBuffer<block_iq4_nl> data_k;
+        [[vk::binding(2, 0)]] StructuredBuffer<block_iq4_nl> data_v;
+    #endif
+#elif defined(DATA_KV_BF16)
+    // BF16: raw uint16_t storage, expanded to F32 via bit shift on read.
+    [[vk::binding(1, 0)]] StructuredBuffer<uint16_t> data_k;
+    [[vk::binding(2, 0)]] StructuredBuffer<uint16_t> data_v;
+#else
+    // F32 or F16: KV_TYPE templated directly.
+    [[vk::binding(1, 0)]] StructuredBuffer<KV_TYPE> data_k;
+    [[vk::binding(2, 0)]] StructuredBuffer<KV_TYPE> data_v;
+#endif
+
+// Mask is always F32 across every variant.
+[[vk::binding(3, 0)]] StructuredBuffer<float>      data_m;
+[[vk::binding(5, 0)]] RWStructuredBuffer<D_TYPE>   data_o;
 
 // Shared Q row (already premultiplied by scale).
 groupshared float Q_sh[HSK];
 // Per-block S values and probabilities.
 groupshared float S_sh[Bc];
 
+// Per-element scalar K/V read returning F32. Inlined per dtype.
+float read_k_element(uint elem_idx) {
+#if defined(DATA_KV_BF16)
+    return asfloat(uint(data_k[elem_idx]) << 16);
+#elif defined(DATA_A_Q8_0)
+    const uint ib  = elem_idx / 32;
+    const uint iqs = elem_idx % 32;
+    return float(data_k[ib].d) * float(int(data_k[ib].qs[iqs]));
+#elif defined(DATA_A_Q4_0)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint nibble;
+    if (d < 16) { nibble = uint(data_k[ib].qs[d])      & 0xFu; }
+    else        { nibble = uint(data_k[ib].qs[d - 16]) >> 4;   }
+    return float(data_k[ib].d) * (float(nibble) - 8.0f);
+#elif defined(DATA_A_Q4_1)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint nibble;
+    if (d < 16) { nibble = uint(data_k[ib].qs[d])      & 0xFu; }
+    else        { nibble = uint(data_k[ib].qs[d - 16]) >> 4;   }
+    return float(data_k[ib].d) * float(nibble) + float(data_k[ib].m);
+#elif defined(DATA_A_Q5_0)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint low_nibble;
+    if (d < 16) { low_nibble = uint(data_k[ib].qs[d])      & 0xFu; }
+    else        { low_nibble = uint(data_k[ib].qs[d - 16]) >> 4;   }
+    const uint qh = uint(data_k[ib].qh[0]) | (uint(data_k[ib].qh[1]) << 16);
+    const uint high_bit = (qh >> d) & 1u;
+    return float(data_k[ib].d) * (float(low_nibble | (high_bit << 4)) - 16.0f);
+#elif defined(DATA_A_Q5_1)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint low_nibble;
+    if (d < 16) { low_nibble = uint(data_k[ib].qs[d])      & 0xFu; }
+    else        { low_nibble = uint(data_k[ib].qs[d - 16]) >> 4;   }
+    const uint high_bit = (data_k[ib].qh >> d) & 1u;
+    return float(data_k[ib].d) * float(low_nibble | (high_bit << 4)) + float(data_k[ib].m);
+#elif defined(DATA_A_IQ4_NL)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint nibble;
+    if (d < 16) { nibble = uint(data_k[ib].qs[d])      & 0xFu; }
+    else        { nibble = uint(data_k[ib].qs[d - 16]) >> 4;   }
+    return float(data_k[ib].d) * float(kvalues_iq4nl[nibble]);
+#else
+    return float(data_k[elem_idx]);
+#endif
+}
+
+float read_v_element(uint elem_idx) {
+#if defined(DATA_KV_BF16)
+    return asfloat(uint(data_v[elem_idx]) << 16);
+#elif defined(DATA_A_Q8_0)
+    const uint ib  = elem_idx / 32;
+    const uint iqs = elem_idx % 32;
+    return float(data_v[ib].d) * float(int(data_v[ib].qs[iqs]));
+#elif defined(DATA_A_Q4_0)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint nibble;
+    if (d < 16) { nibble = uint(data_v[ib].qs[d])      & 0xFu; }
+    else        { nibble = uint(data_v[ib].qs[d - 16]) >> 4;   }
+    return float(data_v[ib].d) * (float(nibble) - 8.0f);
+#elif defined(DATA_A_Q4_1)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint nibble;
+    if (d < 16) { nibble = uint(data_v[ib].qs[d])      & 0xFu; }
+    else        { nibble = uint(data_v[ib].qs[d - 16]) >> 4;   }
+    return float(data_v[ib].d) * float(nibble) + float(data_v[ib].m);
+#elif defined(DATA_A_Q5_0)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint low_nibble;
+    if (d < 16) { low_nibble = uint(data_v[ib].qs[d])      & 0xFu; }
+    else        { low_nibble = uint(data_v[ib].qs[d - 16]) >> 4;   }
+    const uint qh = uint(data_v[ib].qh[0]) | (uint(data_v[ib].qh[1]) << 16);
+    const uint high_bit = (qh >> d) & 1u;
+    return float(data_v[ib].d) * (float(low_nibble | (high_bit << 4)) - 16.0f);
+#elif defined(DATA_A_Q5_1)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint low_nibble;
+    if (d < 16) { low_nibble = uint(data_v[ib].qs[d])      & 0xFu; }
+    else        { low_nibble = uint(data_v[ib].qs[d - 16]) >> 4;   }
+    const uint high_bit = (data_v[ib].qh >> d) & 1u;
+    return float(data_v[ib].d) * float(low_nibble | (high_bit << 4)) + float(data_v[ib].m);
+#elif defined(DATA_A_IQ4_NL)
+    const uint ib  = elem_idx / 32;
+    const uint d   = elem_idx % 32;
+    uint nibble;
+    if (d < 16) { nibble = uint(data_v[ib].qs[d])      & 0xFu; }
+    else        { nibble = uint(data_v[ib].qs[d - 16]) >> 4;   }
+    return float(data_v[ib].d) * float(kvalues_iq4nl[nibble]);
+#else
+    return float(data_v[elem_idx]);
+#endif
+}
+
 [shader("compute")]
 [numthreads(WORKGROUP_SIZE, 1, 1)]
 void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_GroupThreadID) {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    // IQ4_NL et al. need their kvalues_iq* lookup tables populated
+    // cooperatively before the first read_*_element call.
+    init_iq_shmem(uint3(WORKGROUP_SIZE, 1, 1));
+#endif
+
     const uint tid    = gl_LocalInvocationID.x;
-    const uint i_row  = gl_WorkGroupID.x;   // which Q row (within batch+head)
-    const uint iq2    = gl_WorkGroupID.y;   // head index
-    const uint iq3    = gl_WorkGroupID.z;   // batch index
+    const uint i_row  = gl_WorkGroupID.x;
+    const uint iq2    = gl_WorkGroupID.y;
+    const uint iq3    = gl_WorkGroupID.z;
 
     if (i_row >= p.N) { return; }
 
-    // Broadcast factors so K/V can have fewer heads/batches than Q.
     const uint rk2 = p.neq2 / p.nek2;
     const uint rk3 = p.neq3 / p.nek3;
     const uint rv2 = p.neq2 / p.nev2;
@@ -104,44 +254,38 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     const uint iv3 = iq3 / rv3;
     const uint iv2 = iq2 / rv2;
 
-    // Q offset for this (row, head, batch). nb01 == row stride in elements.
     const uint q_off = iq3 * p.nb03 + iq2 * p.nb02 + i_row * p.nb01;
 
-    // Load Q row into shmem, premultiplied by p.scale. 32 threads each load HSK/32 elems.
     for (uint d = tid; d < HSK; d += WORKGROUP_SIZE) {
         Q_sh[d] = float(data_q[q_off + d]) * p.scale;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Per-thread state. Each thread owns HSV/WORKGROUP_SIZE = HSV/32 output elements.
     const uint HSV_PER_THREAD = HSV / WORKGROUP_SIZE;
     float Of[HSV_PER_THREAD];
     [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) { Of[d] = 0.0f; }
     float Lf = 0.0f;
     float Mf = -1.0e30f;
 
-    // Mask base for this row (mask layout: [batch, head_kv, row, KV]).
     const uint m_off = (iq3 % p.nem3) * p.nem2 * p.nem1 * p.KV
                      + (iq2 % p.nem2) * p.nem1 * p.KV
                      + i_row * p.KV;
 
-    // Iterate KV blocks.
     const uint num_blocks = (p.KV + Bc - 1) / Bc;
     for (uint j = 0; j < num_blocks; ++j) {
         const uint kv_base = j * Bc;
 
-        // ── 1) Compute S[c] = dot(Q, K[kv_base+c]) for c in [0, Bc).
-        //     32 threads × Bc outputs: each thread does one or more S values.
+        // 1) S[c] = dot(Q, K[kv_base+c])
         for (uint c0 = 0; c0 < Bc; c0 += WORKGROUP_SIZE) {
             const uint c = c0 + tid;
             float s = 0.0f;
             if (c < Bc && kv_base + c < p.KV) {
                 const uint k_off = iq3 * p.nb13 + ik2 * p.nb12 + (kv_base + c) * p.nb11;
                 [unroll] for (uint d = 0; d < HSK; ++d) {
-                    s += Q_sh[d] * float(data_k[k_off + d]);
+                    s += Q_sh[d] * read_k_element(k_off + d);
                 }
                 if (MASK_ENABLE != 0) {
-                    s += float(data_m[m_off + kv_base + c]);
+                    s += data_m[m_off + kv_base + c];
                 }
             } else {
                 s = -1.0e30f;
@@ -150,20 +294,18 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         }
         GroupMemoryBarrierWithGroupSync();
 
-        // ── 2) Row max over the new S row + the running m.
+        // 2) Row max.
         float M_new = Mf;
         [unroll] for (uint c = 0; c < Bc; ++c) {
             M_new = max(M_new, S_sh[c]);
         }
 
-        // ── 3) Online softmax: rescale Of and Lf, then accumulate from this block.
+        // 3) Online softmax accumulate.
         const float m_scale = exp(Mf - M_new);
         Lf *= m_scale;
         [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
             Of[d] *= m_scale;
         }
-        // Compute P[c] = exp(S[c] - M_new), accumulate sum into Lf, and accumulate
-        // Of[d] += P[c] * V[kv_base+c, d_global].
         [unroll] for (uint c = 0; c < Bc; ++c) {
             if (kv_base + c >= p.KV) { break; }
             const float p_c = exp(S_sh[c] - M_new);
@@ -171,20 +313,14 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
             const uint v_off = iq3 * p.nb23 + iv2 * p.nb22 + (kv_base + c) * p.nb21;
             [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
                 const uint d_global = d * WORKGROUP_SIZE + tid;
-                Of[d] += p_c * float(data_v[v_off + d_global]);
+                Of[d] += p_c * read_v_element(v_off + d_global);
             }
         }
         Mf = M_new;
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // ── 4) Final normalize + write back.
-    //
-    // Output layout differs from llama.cpp's flash_attn.comp: we write
-    // directly into the post-permute layout [HSV, n_head, L] (= [hidden, L]
-    // contiguous) so the next op (the output projection matmul) can read it
-    // without an intervening permute/copy. ggml's graph normally inserts a
-    // permute after flash_attn; our MVP fuses that into the output write.
+    // 4) Final normalize + write back to [HSV, n_head, L] post-permute layout.
     const float inv_L = Lf == 0.0f ? 0.0f : 1.0f / Lf;
     const uint o_off = iq3 * p.ne2 * p.ne1 * HSV
                      + i_row * p.ne2 * HSV

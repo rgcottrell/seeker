@@ -145,24 +145,16 @@ impl Model for LlamaModel {
         let positions: Vec<u32> = (position_offset..position_offset + l).collect();
         write_u32(ctx, positions_buf, &positions)?;
 
-        // F32 / F16 cache: flash_attn binds the cache layer directly (no
-        // copy, no dequant). Anything else (BF16, quants): materialize via
-        // cache_io::record_read into F32 scratch.
-        let cache_direct = matches!(cache.config.k_dtype, GgmlType::F32 | GgmlType::F16)
-            && cache.config.k_dtype == cache.config.v_dtype;
+        // Homogeneous K=V cache: flash_attn binds the cache layer directly
+        // (no copy, no dequant) using its dtype-specialized variant —
+        // works for F32, F16, BF16, and all 6 cache quants. Heterogeneous
+        // K≠V (rare) falls back to materialize-then-attend.
+        let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
 
-        // Causal mask `[kv_len, L]`: M[i, j] = 0 if j <= position_offset+i else -inf.
-        //
-        // Dtype must match what flash_attn binds as `data_m` (which shares
-        // `KV_TYPE` with K and V). For materialize paths everything's F32;
-        // for direct-bind we follow the cache's K dtype.
-        let mask_dtype = if cache_direct {
-            cache.config.k_dtype
-        } else {
-            GgmlType::F32
-        };
-        let mask = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], mask_dtype)?;
-        write_causal_mask(ctx, mask, l, position_offset, mask_dtype)?;
+        // Mask is always F32 regardless of cache dtype (the shader's
+        // `data_m` binding is F32 across every variant since `e41661f`).
+        let mask = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
+        write_causal_mask(ctx, mask, l, position_offset, GgmlType::F32)?;
 
         // ---- embedding lookup ----
         // Residual is one persistent slot, reused across layers via in-place
