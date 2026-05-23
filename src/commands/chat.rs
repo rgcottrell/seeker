@@ -235,10 +235,16 @@ struct ChatSession {
 
 impl ChatSession {
     /// Push a user turn, render + tokenize, decode the assistant reply,
-    /// print it, and store the turn. Returns the assistant text (without
-    /// trailing EOS markers) so callers that drive the REPL non-interactively
-    /// can do their own formatting.
-    fn handle_user_message(&mut self, text: &str) -> Result<String, Box<dyn Error>> {
+    /// and store the turn. `on_text` fires once per sampled token with the
+    /// newly-emitted byte slice — used by the REPL to stream output as it's
+    /// generated. Returns the full assistant reply (without trailing EOS
+    /// markers) so callers that just want the final string can ignore the
+    /// callback.
+    fn handle_user_message(
+        &mut self,
+        text: &str,
+        mut on_text: impl FnMut(&str),
+    ) -> Result<String, Box<dyn Error>> {
         self.messages.push(ChatMessage {
             role: "user".to_string(),
             content: text.to_string(),
@@ -300,8 +306,14 @@ impl ChatSession {
 
         // Prefill + decode in one loop. forward_sampled records the model
         // forward then the sampler chain, returning the next token id.
+        // After each non-EOS token we cumulative-decode and emit the
+        // newly-completed byte slice. Cumulative-decode is the only
+        // reliable pattern: a single BPE token may be a fragment of a
+        // multi-byte UTF-8 char or a whitespace-managing prefix, but the
+        // running prefix always decodes cleanly with `skip_special_tokens=true`.
         let mut step_tokens = delta;
         let mut assistant_tokens: Vec<u32> = Vec::new();
+        let mut printed_len: usize = 0;
         loop {
             if (self.cache.position as usize + step_tokens.len() + 1) as u32
                 > self.cache.config.max_seq_len
@@ -323,15 +335,36 @@ impl ChatSession {
                 break;
             }
             assistant_tokens.push(token);
+
+            // Stream the new bytes. `decode` errors are rare (the tokenizer
+            // should always succeed on its own outputs); on the off-chance
+            // we hit one, skip the emit and try again next iteration —
+            // whatever bytes were withheld will reappear in the cumulative
+            // decode once the run is decodable.
+            if let Ok(text) = self
+                .model
+                .tokenizer()
+                .tokenizer
+                .decode(&assistant_tokens, /* skip_special_tokens = */ true)
+            {
+                if text.len() > printed_len {
+                    on_text(&text[printed_len..]);
+                    printed_len = text.len();
+                }
+            }
+
             if assistant_tokens.len() as u32 >= self.max_tokens {
                 break;
             }
             step_tokens = vec![token];
         }
 
-        // Decode the assistant content (without specials so EOS doesn't
-        // leak into the visible string).
-        let reply = bundle
+        // Final reply — same decode used for streaming, but we want the
+        // canonical string for storage. (When EOS was sampled the per-loop
+        // emit skipped it, so this matches what the user saw.)
+        let reply = self
+            .model
+            .tokenizer()
             .tokenizer
             .decode(&assistant_tokens, /* skip_special_tokens = */ true)
             .map_err(|e| format!("decode failed: {e}"))?;
@@ -540,9 +573,13 @@ fn run_piped(session: &mut ChatSession) -> Result<(), Box<dyn Error>> {
 fn emit_reply(session: &mut ChatSession, line: &str) {
     print!("assistant: ");
     let _ = std::io::stdout().flush();
-    match session.handle_user_message(line) {
-        Ok(reply) => println!("{reply}"),
-        Err(e) => println!("[error: {e}]"),
+    let result = session.handle_user_message(line, |delta| {
+        print!("{delta}");
+        let _ = std::io::stdout().flush();
+    });
+    match result {
+        Ok(_) => println!(),
+        Err(e) => println!("\n[error: {e}]"),
     }
 }
 
