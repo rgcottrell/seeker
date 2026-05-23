@@ -3,15 +3,21 @@ use std::error::Error;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use crate::commands::chat::{self, ChatArgs};
 use crate::commands::detokenize::{self, DetokenizeArgs};
 use crate::commands::download::{self, DownloadArgs};
 use crate::commands::inspect::{self, InspectArgs};
+use crate::commands::run::{self as run_cmd, RunArgs};
 use crate::commands::serve::{self, ServeArgs};
 use crate::commands::tokenize::{self, TokenizeArgs};
 
 mod commands;
 #[allow(dead_code)]
 mod gguf;
+#[allow(dead_code)]
+mod inference;
+#[allow(dead_code)]
+mod models;
 #[allow(dead_code)]
 mod server;
 mod tokenizer;
@@ -40,6 +46,10 @@ enum Command {
     Detokenize(DetokenizeArgs),
     /// Start an HTTP server that stubs out llama-server's full API surface.
     Serve(ServeArgs),
+    /// Interactive chat REPL against a model's embedded tokenizer (stubbed).
+    Chat(ChatArgs),
+    /// Run a single forward pass and print the predicted next token.
+    Run(RunArgs),
 }
 
 #[tokio::main]
@@ -58,6 +68,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Tokenize(args) => tokenize::run(args).await,
         Command::Detokenize(args) => detokenize::run(args).await,
         Command::Serve(args) => serve::run(args).await,
+        Command::Chat(args) => chat::run(args).await,
+        Command::Run(args) => run_cmd::run(args).await,
     }
 }
 
