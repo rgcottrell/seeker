@@ -4,13 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = { version = "0.8", features = ["macros"] }
 clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
 hf-hub = "0.5.0"
 indexmap = "2.14.0"
 memmap2 = "0.9.10"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

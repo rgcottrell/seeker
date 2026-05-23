@@ -1,4 +1,5 @@
 pub mod detokenize;
 pub mod download;
 pub mod inspect;
+pub mod serve;
 pub mod tokenize;

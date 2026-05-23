@@ -6,11 +6,14 @@ use tracing_subscriber::EnvFilter;
 use crate::commands::detokenize::{self, DetokenizeArgs};
 use crate::commands::download::{self, DownloadArgs};
 use crate::commands::inspect::{self, InspectArgs};
+use crate::commands::serve::{self, ServeArgs};
 use crate::commands::tokenize::{self, TokenizeArgs};
 
 mod commands;
 #[allow(dead_code)]
 mod gguf;
+#[allow(dead_code)]
+mod server;
 mod tokenizer;
 
 #[allow(dead_code)]
@@ -35,6 +38,8 @@ enum Command {
     Tokenize(TokenizeArgs),
     /// Decode token ids using the tokenizer embedded in a GGUF model.
     Detokenize(DetokenizeArgs),
+    /// Start an HTTP server that stubs out llama-server's full API surface.
+    Serve(ServeArgs),
 }
 
 #[tokio::main]
@@ -52,6 +57,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Inspect(args) => inspect::run(args).await,
         Command::Tokenize(args) => tokenize::run(args).await,
         Command::Detokenize(args) => detokenize::run(args).await,
+        Command::Serve(args) => serve::run(args).await,
     }
 }
 
