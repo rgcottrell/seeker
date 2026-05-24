@@ -67,7 +67,10 @@ fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
         GgmlType::BF16 => MmvVariant {
             name: "mul_mat_vec_bf16",
             spv: shaders::MUL_MAT_VEC_BF16_SPV.as_bytes(),
-            binding_indices: MMV_BINDINGS_NO_PACKED16,
+            // BF16 now defines A_TYPE_PACKED16 = uint (see types.slang) so
+            // the vectorized K_PER_ITER=8 path lands and the host has to
+            // bind A on slot 3 as well as 0.
+            binding_indices: MMV_BINDINGS_PACKED16,
         },
         GgmlType::Q4_0 => MmvVariant {
             name: "mul_mat_vec_q4_0",

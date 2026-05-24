@@ -22,7 +22,11 @@ float2 dequantize(uint ib, uint iqs, uint a_offset) {
     return float2(float(data_a[a_offset + ib]), float(data_a[a_offset + ib + 1]));
 }
 float2 get_dm(uint ib, uint a_offset) {
-    return float2(0.0f, 0.0f);
+    // FP weights have no scale/min — the K_PER_ITER=8 path treats `dm.x` as
+    // a multiplier on the partial sum, so 1.0 must be the identity, not 0.
+    // (The K_PER_ITER=2 scalar path never reads dm, so the prior `(0,0)`
+    //  was harmless for F16; correct it now so vectorized FP can use it.)
+    return float2(1.0f, 0.0f);
 }
 #endif
 
@@ -34,8 +38,26 @@ float2 dequantize(uint ib, uint iqs, uint a_offset) {
         bf16_to_fp32(uint(data_a[a_offset + ib + 1]))
     );
 }
+// Pack-load 4 bf16 elements via two 32-bit reads from `data_a_packed16`
+// (which the host binds as the same VkBuffer as `data_a`, viewed as
+// `uint` = 2 bf16 per element). For BF16 `ib` is the absolute element
+// index of the row-base and `iqs` is the sub-offset within the
+// K_PER_ITER=8 stride — see `mul_mat_vec.slang`. Caller guarantees
+// `ib + iqs` is even for the rows we dispatch (true when `p.ncols` is
+// even, which holds for every llama/qwen embedding dim).
+float4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint base = (a_offset + ib + iqs) / 2;
+    const uint pair0 = uint(data_a_packed16[base    ]);
+    const uint pair1 = uint(data_a_packed16[base + 1]);
+    return float4(
+        bf16_to_fp32(pair0 & 0xFFFFu),
+        bf16_to_fp32(pair0 >> 16),
+        bf16_to_fp32(pair1 & 0xFFFFu),
+        bf16_to_fp32(pair1 >> 16)
+    );
+}
 float2 get_dm(uint ib, uint a_offset) {
-    return float2(0.0f, 0.0f);
+    return float2(1.0f, 0.0f);
 }
 #endif
 

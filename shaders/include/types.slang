@@ -321,9 +321,12 @@ struct block_iq4_xs_packed32 {
     #define QUANT_R  1
 #elif defined(DATA_A_BF16)
     // bf16 is stored as a raw uint16 — consumers reinterpret via bf16_to_fp32 helpers.
-    #define A_TYPE   uint16_t
-    #define QUANT_K  1
-    #define QUANT_R  1
+    // The packed16 alias is `uint` (= 2 bf16 per element) so the K_PER_ITER=8
+    // mat-vec path can issue 32-bit loads instead of two 16-bit loads.
+    #define A_TYPE          uint16_t
+    #define A_TYPE_PACKED16 uint
+    #define QUANT_K         1
+    #define QUANT_R         1
 #elif defined(DATA_A_Q4_0)
     #define A_TYPE          block_q4_0
     #define A_TYPE_PACKED16 block_q4_0_packed16

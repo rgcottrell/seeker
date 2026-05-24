@@ -26,9 +26,11 @@ import glsl;  // for gl_NumWorkGroups in the row-stride math
 #include "types.slang"
 #include "mul_mat_vec_head.slang"
 
-// Matches the GLSL source: vectorized 8-elements path for quants, scalar
-// 2-elements path for unquantized FP weights.
-#if !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
+// Matches the GLSL source: vectorized 8-elements path for quants and BF16
+// (the latter via `dequantize4` over the uint-packed16 alias — see
+// `dequant_funcs.slang`); scalar 2-elements path for F32/F16, which lack
+// a packed16 alias today.
+#if !defined(DATA_A_F32) && !defined(DATA_A_F16)
 #define K_PER_ITER 8
 #else
 #define K_PER_ITER 2
