@@ -160,24 +160,37 @@ impl Device {
         // Probe feature support via the Vulkan 1.4 rollup structs (plus
         // coop-matrix structs only when the corresponding extension is
         // advertised — otherwise the driver may ignore them).
+        // `PhysicalDeviceFeatures2.features` itself carries the base 1.0
+        // boolean features (`shaderInt16`/`shaderInt64`/`shaderFloat64`)
+        // that the K-quant SPIR-V uses (block_q6_K has `int16_t scales`,
+        // some i-quants emit `int64_t`).
         let mut q11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut q12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut q13 = vk::PhysicalDeviceVulkan13Features::default();
         let mut q14 = vk::PhysicalDeviceVulkan14Features::default();
         let mut q_cm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut q_cm2 = vk::PhysicalDeviceCooperativeMatrix2FeaturesNV::default();
-        let mut features2 = vk::PhysicalDeviceFeatures2::default()
-            .push(&mut q11)
-            .push(&mut q12)
-            .push(&mut q13)
-            .push(&mut q14);
-        if coop_matrix_ext {
-            features2 = features2.push(&mut q_cm);
-        }
-        if coop_matrix2_ext {
-            features2 = features2.push(&mut q_cm2);
-        }
-        unsafe { instance.get_physical_device_features2(physical, &mut features2) };
+        // Run the query inside a scope so the &mut borrows of q11/q12/...
+        // are released before we read their fields below. Also snapshot
+        // the base-1.0 booleans we care about into locals here.
+        let (shader_int16, shader_int64) = {
+            let mut features2 = vk::PhysicalDeviceFeatures2::default()
+                .push(&mut q11)
+                .push(&mut q12)
+                .push(&mut q13)
+                .push(&mut q14);
+            if coop_matrix_ext {
+                features2 = features2.push(&mut q_cm);
+            }
+            if coop_matrix2_ext {
+                features2 = features2.push(&mut q_cm2);
+            }
+            unsafe { instance.get_physical_device_features2(physical, &mut features2) };
+            (
+                features2.features.shader_int16,
+                features2.features.shader_int64,
+            )
+        };
 
         let mut missing: Vec<&'static str> = Vec::new();
         let mut require = |name: &'static str, supported: vk::Bool32| {
@@ -209,6 +222,9 @@ impl Device {
         require("compute_full_subgroups", q13.compute_full_subgroups);
         require("shader_integer_dot_product", q13.shader_integer_dot_product);
         require("synchronization2", q13.synchronization2);
+        // Base 1.0 features required by K/I-quant shaders.
+        require("shader_int16", shader_int16);
+        require("shader_int64", shader_int64);
         if !missing.is_empty() {
             return Err(format!(
                 "physical device {} missing required Vulkan 1.4 features: {}",
@@ -254,6 +270,16 @@ impl Device {
         );
 
         // Enable-side feature structs: only the bits we actually want.
+        // PhysicalDeviceFeatures2 carries the base 1.0 booleans
+        // (`shaderInt16`/`shaderInt64`) the K-quant SPIR-V references.
+        // Mixing it with the Vulkan1{1,2,3,4}Features rollups in the
+        // pNext chain is explicitly allowed (the only restriction is that
+        // `pEnabledFeatures` must be NULL, which ash leaves unset here).
+        let mut feat2 = vk::PhysicalDeviceFeatures2::default().features(
+            vk::PhysicalDeviceFeatures::default()
+                .shader_int16(true)
+                .shader_int64(true),
+        );
         let mut feat11 = vk::PhysicalDeviceVulkan11Features::default()
             .storage_buffer16_bit_access(true)
             .uniform_and_storage_buffer16_bit_access(true);
@@ -323,6 +349,7 @@ impl Device {
         let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_exts)
+            .push(&mut feat2)
             .push(&mut feat11)
             .push(&mut feat12)
             .push(&mut feat13)

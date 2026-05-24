@@ -157,6 +157,11 @@ fn main() {
                 "-restrictive-capability-check",
                 "-emit-spirv-directly",
                 "-fvk-use-entrypoint-name",
+                // Tight (scalar) buffer layout — required for K-quant
+                // structs (e.g. `block_q6_K` is 210 bytes, not 224 as
+                // std430 would round to). The device side enables
+                // `scalarBlockLayout` via Vulkan12Features.
+                "-fvk-use-scalar-layout",
                 "-o",
             ])
             .arg(&spv_path);

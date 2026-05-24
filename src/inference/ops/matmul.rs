@@ -51,6 +51,10 @@ struct MmvVariant {
 
 const MMV_BINDINGS_NO_PACKED16: &[u32] = &[0, 1, 2, 4];
 const MMV_BINDINGS_PACKED16: &[u32] = &[0, 1, 2, 3, 4];
+/// K-quant variants that need both packed16 and packed32 aliases of A
+/// (slots 3 and 6 — see `mul_mat_vec_head.slang`). Q4_K and Q5_K want
+/// 32-bit-wide reads of `qs[]`; Q6_K is packed16-only.
+const MMV_BINDINGS_PACKED16_AND_32: &[u32] = &[0, 1, 2, 3, 4, 6];
 
 fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
     let v = match dtype {
@@ -106,6 +110,25 @@ fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
             name: "mul_mat_vec_mxfp4",
             spv: shaders::MUL_MAT_VEC_MXFP4_SPV.as_bytes(),
             binding_indices: MMV_BINDINGS_NO_PACKED16,
+        },
+        // K-quants — these have a separate kernel per dtype (no `q4_k`
+        // variant in `mul_mat_vec.slang`; see `mul_mat_vec_q4_k.slang`
+        // and siblings). All use the same `MulMatVecParams` push-constant
+        // layout via `mul_mat_vec_head.slang`.
+        GgmlType::Q4_K => MmvVariant {
+            name: "mul_mat_vec_q4_k",
+            spv: shaders::MUL_MAT_VEC_Q4_K_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_PACKED16_AND_32,
+        },
+        GgmlType::Q5_K => MmvVariant {
+            name: "mul_mat_vec_q5_k",
+            spv: shaders::MUL_MAT_VEC_Q5_K_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_PACKED16_AND_32,
+        },
+        GgmlType::Q6_K => MmvVariant {
+            name: "mul_mat_vec_q6_k",
+            spv: shaders::MUL_MAT_VEC_Q6_K_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_PACKED16,
         },
         _ => return None,
     };
@@ -333,14 +356,16 @@ fn record_mul_mat_vec(
     }
 
     // Build the bindings array in the same order as `variant.binding_indices`.
-    // The slot meanings (see head file):
-    //   0 = A, 1 = B, 2 = D, 3 = A aliased as packed16, 4 = B aliased as float4
+    // Slot meanings (see `mul_mat_vec_head.slang`):
+    //   0 = A,  3 = A aliased as packed16,  6 = A aliased as packed32
+    //   1 = B,  4 = B aliased as float4,    5 = B aliased as float2 (Q5_K)
+    //   2 = D
     let bindings: Vec<_> = variant
         .binding_indices
         .iter()
         .map(|&slot| match slot {
-            0 | 3 => a.range(),
-            1 | 4 => b.range(),
+            0 | 3 | 6 => a.range(),
+            1 | 4 | 5 => b.range(),
             2 => d.range(),
             other => panic!("unexpected mul_mat_vec binding slot {other}"),
         })

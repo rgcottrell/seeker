@@ -176,6 +176,9 @@ pub fn record_get_rows(
         (GgmlType::BF16, GgmlType::F32) => {
             ("get_rows_bf16", shaders::GET_ROWS_BF16_SPV.as_bytes())
         }
+        (GgmlType::Q6_K, GgmlType::F32) => {
+            ("get_rows_q6_k", shaders::GET_ROWS_Q6_K_DEFAULT_SPV.as_bytes())
+        }
         (GgmlType::I32, GgmlType::I32) => ("get_rows_i32", shaders::GET_ROWS_I32_SPV.as_bytes()),
         (s, d) => return Err(format!("get_rows: unsupported src/dst combo {s:?}/{d:?}").into()),
     };
@@ -193,7 +196,13 @@ pub fn record_get_rows(
 
     let ne00 = src.dims[0] as u32;
     let ne10 = indices_len;
-    let workgroups = [ne00.div_ceil(512), ne10, 1];
+    // get_rows_q6_k uses one workgroup per 256-element block (numthreads=64);
+    // every other variant uses one workgroup per 512-element span (numthreads=512).
+    let workgroups = if src.dtype == GgmlType::Q6_K {
+        [ne00.div_ceil(256), ne10, 1]
+    } else {
+        [ne00.div_ceil(512), ne10, 1]
+    };
 
     let cached = CachedPipeline {
         pipeline,

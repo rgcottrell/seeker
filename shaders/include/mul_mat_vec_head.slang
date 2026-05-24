@@ -69,9 +69,8 @@ struct MulMatVecParams {
 // NUM_ROWS = how many output rows one workgroup produces. Increasing this
 // amortizes the B-vector load across rows (B is fetched once per iter and
 // reused across NUM_ROWS A-row dequants), which dominates decode bandwidth.
-// llama.cpp uses 4–8 depending on dtype; we start at 2 — register pressure
-// goes up linearly and we don't want to overflow Apple's tighter file.
-// NUM_COLS is for multi-prompt batching, kept at 1 for now.
+// llama.cpp uses 4–8 depending on dtype; we use 2 — register pressure goes
+// up linearly and we don't want to overflow Apple's tighter file.
 static const uint NUM_ROWS = 2;
 static const uint NUM_COLS = 1;
 
