@@ -2,11 +2,18 @@
 //!
 //! Hard-fails when required extensions or features are absent — no silent
 //! fallback. The MVP's contract is "Vulkan 1.4 with these caps or bust".
+//!
+//! Debug builds (`cfg(debug_assertions)`) additionally enable the
+//! `VK_LAYER_KHRONOS_validation` layer and a `VK_EXT_debug_utils` messenger
+//! that funnels driver/validation diagnostics into `tracing` under the
+//! `vulkan` target. The layer + extension are best-effort: if either is
+//! missing (e.g. SDK not installed) we log and continue.
 
 use std::error::Error;
 use std::ffi::{c_char, CStr, CString};
 
 use ash::{vk, Entry, Instance};
+use vk::TaggedStructure as _;
 
 const REQUIRED_DEVICE_EXTENSIONS: &[&CStr] = &[
     vk::KHR_16BIT_STORAGE_NAME,
@@ -27,6 +34,8 @@ pub struct Device {
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
     pub portability: bool,
+    #[cfg(debug_assertions)]
+    debug: Option<validation::Messenger>,
 }
 
 impl Device {
@@ -44,6 +53,7 @@ impl Device {
         // on platforms where it's reported (MoltenVK).
         let avail_inst_exts = unsafe { entry.enumerate_instance_extension_properties(None) }?;
         let mut inst_ext_names: Vec<*const c_char> = Vec::new();
+        let inst_layer_names: Vec<*const c_char>;
         let mut inst_flags = vk::InstanceCreateFlags::empty();
         let portability_inst = vk::KHR_PORTABILITY_ENUMERATION_NAME;
         if avail_inst_exts.iter().any(|e| ext_name(&e.extension_name) == portability_inst) {
@@ -51,11 +61,68 @@ impl Device {
             inst_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
         }
 
-        let instance_info = vk::InstanceCreateInfo::default()
+        #[cfg(debug_assertions)]
+        let validation_enabled = {
+            let layer_ok = validation::layer_available(&entry);
+            let ext_ok = avail_inst_exts
+                .iter()
+                .any(|e| ext_name(&e.extension_name) == vk::EXT_DEBUG_UTILS_NAME);
+            let enabled = layer_ok && ext_ok;
+            if enabled {
+                inst_ext_names.push(vk::EXT_DEBUG_UTILS_NAME.as_ptr());
+                inst_layer_names = vec![validation::LAYER.as_ptr()];
+                tracing::info!("Vulkan validation layer + debug_utils enabled (debug build)");
+            } else {
+                inst_layer_names = Vec::new();
+                if !layer_ok {
+                    tracing::warn!(
+                        "VK_LAYER_KHRONOS_validation not available; install the Vulkan SDK \
+                         to get debug-build diagnostics",
+                    );
+                } else {
+                    tracing::warn!(
+                        "VK_EXT_debug_utils not available; skipping debug-build diagnostics",
+                    );
+                }
+            }
+            enabled
+        };
+        #[cfg(not(debug_assertions))]
+        {
+            inst_layer_names = Vec::new();
+        }
+
+        #[allow(unused_mut)] // reassigned via push_next under cfg(debug_assertions)
+        let mut instance_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&inst_ext_names)
+            .enabled_layer_names(&inst_layer_names)
             .flags(inst_flags);
+
+        // `debug_info` must outlive `create_instance` because it's chained
+        // via `push_next` so the validation layer can report errors that
+        // occur during instance creation/destruction itself.
+        #[cfg(debug_assertions)]
+        let mut debug_info = validation::build_create_info();
+        #[cfg(debug_assertions)]
+        if validation_enabled {
+            instance_info = instance_info.push(&mut debug_info);
+        }
+
         let instance = unsafe { entry.create_instance(&instance_info, None) }?;
+
+        #[cfg(debug_assertions)]
+        let debug = if validation_enabled {
+            match validation::Messenger::create(&entry, &instance) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create debug_utils messenger");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let (physical, queue_family, portability) = pick_physical_device(&instance)?;
         let props = unsafe { instance.get_physical_device_properties(physical) };
@@ -96,10 +163,10 @@ impl Device {
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_exts)
-            .push_next(&mut feat_16bit)
-            .push_next(&mut feat_f16)
-            .push_next(&mut feat_subgroup)
-            .push_next(&mut feat_maint4);
+            .push(&mut feat_16bit)
+            .push(&mut feat_f16)
+            .push(&mut feat_subgroup)
+            .push(&mut feat_maint4);
         let device = unsafe { instance.create_device(physical, &device_info, None) }?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
@@ -116,6 +183,8 @@ impl Device {
             mem_props,
             limits,
             portability,
+            #[cfg(debug_assertions)]
+            debug,
         })
     }
 
@@ -135,6 +204,10 @@ impl Drop for Device {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_device(None);
+            #[cfg(debug_assertions)]
+            if let Some(d) = self.debug.take() {
+                d.destroy();
+            }
             self.instance.destroy_instance(None);
         }
     }
@@ -199,4 +272,89 @@ fn missing_extension_message(missing: &[&CStr]) -> CString {
         .collect::<Vec<_>>()
         .join(", ");
     CString::new(s).unwrap_or_default()
+}
+
+#[cfg(debug_assertions)]
+mod validation {
+    use std::ffi::{c_void, CStr};
+
+    use ash::{ext, vk, Entry, Instance, VkResult};
+
+    pub const LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
+
+    pub struct Messenger {
+        loader: ext::debug_utils::Instance,
+        handle: vk::DebugUtilsMessengerEXT,
+    }
+
+    impl Messenger {
+        pub fn create(entry: &Entry, instance: &Instance) -> VkResult<Self> {
+            let loader = ext::debug_utils::Instance::load(entry, instance);
+            let info = build_create_info();
+            let handle = unsafe { loader.create_debug_utils_messenger(&info, None) }?;
+            Ok(Self { loader, handle })
+        }
+
+        pub fn destroy(self) {
+            unsafe {
+                self.loader.destroy_debug_utils_messenger(self.handle, None);
+            }
+        }
+    }
+
+    pub fn layer_available(entry: &Entry) -> bool {
+        match unsafe { entry.enumerate_instance_layer_properties() } {
+            Ok(layers) => layers.iter().any(|l| {
+                let name = unsafe { CStr::from_ptr(l.layer_name.as_ptr()) };
+                name == LAYER
+            }),
+            Err(_) => false,
+        }
+    }
+
+    pub fn build_create_info() -> vk::DebugUtilsMessengerCreateInfoEXT<'static> {
+        vk::DebugUtilsMessengerCreateInfoEXT::default()
+            .message_severity(
+                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
+            )
+            .message_type(
+                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+            )
+            .pfn_user_callback(Some(callback))
+    }
+
+    unsafe extern "system" fn callback(
+        severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+        msg_type: vk::DebugUtilsMessageTypeFlagsEXT,
+        data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+        _user: *mut c_void,
+    ) -> vk::Bool32 {
+        let data = unsafe { &*data };
+        let message = if data.p_message.is_null() {
+            std::borrow::Cow::Borrowed("<no message>")
+        } else {
+            unsafe { CStr::from_ptr(data.p_message) }.to_string_lossy()
+        };
+        let kind = if msg_type.contains(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION) {
+            "validation"
+        } else if msg_type.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE) {
+            "performance"
+        } else {
+            "general"
+        };
+        if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+            tracing::error!(target: "vulkan", kind, "{}", message);
+        } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+            tracing::warn!(target: "vulkan", kind, "{}", message);
+        } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
+            tracing::info!(target: "vulkan", kind, "{}", message);
+        } else {
+            tracing::debug!(target: "vulkan", kind, "{}", message);
+        }
+        vk::FALSE
+    }
 }

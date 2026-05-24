@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ash = "0.38"
+ash = { git = "https://github.com/ash-rs/ash", branch = "master", features = ["provisional"] }
 axum = { version = "0.8", features = ["macros"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
