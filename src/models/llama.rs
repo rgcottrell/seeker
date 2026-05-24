@@ -214,7 +214,14 @@ impl Model for LlamaModel {
             // (reshape_for_rope produces exactly that layout.)
             let k_natural = reshape_for_rope(k_roped, head_dim, p.n_head_kv as u64, l as u64);
             let v_natural = reshape_for_rope(v, head_dim, p.n_head_kv as u64, l as u64);
-            cache_io::record_write(ctx, k_natural, cache.k_layers[layer_idx], position_offset)?;
+            // K and V write to disjoint cache buffers; V's trailing global
+            // barrier covers both before flash_attn reads.
+            cache_io::record_write_nofence(
+                ctx,
+                k_natural,
+                cache.k_layers[layer_idx],
+                position_offset,
+            )?;
             cache_io::record_write(ctx, v_natural, cache.v_layers[layer_idx], position_offset)?;
 
             // Source the K/V views fed to flash_attn:

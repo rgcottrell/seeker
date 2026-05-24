@@ -38,12 +38,36 @@ use super::cast::record_cast;
 /// `cache.v_layers` (full max-seq-len view).
 ///
 /// `position` is the absolute starting position of the new tokens
-/// (= `cache.position` before this call).
+/// (= `cache.position` before this call). Emits a trailing
+/// transfer→all-stages barrier so the cache write is visible before the
+/// next compute pass reads it.
 pub fn record_write(
     ctx: &mut DispatchContext,
     new_kv_f32: TensorView,
     cache_layer: TensorView,
     position: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_write_inner(ctx, new_kv_f32, cache_layer, position, /*fence=*/ true)
+}
+
+/// Same as [`record_write`] but skips the trailing global barrier — use
+/// for the first of a paired K/V write where the second write's trailing
+/// barrier covers both cache buffers ahead of the upcoming flash-attn.
+pub fn record_write_nofence(
+    ctx: &mut DispatchContext,
+    new_kv_f32: TensorView,
+    cache_layer: TensorView,
+    position: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_write_inner(ctx, new_kv_f32, cache_layer, position, /*fence=*/ false)
+}
+
+fn record_write_inner(
+    ctx: &mut DispatchContext,
+    new_kv_f32: TensorView,
+    cache_layer: TensorView,
+    position: u32,
+    fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     let head_dim = new_kv_f32.dims[0];
     let n_head_kv = new_kv_f32.dims[1];
@@ -75,8 +99,10 @@ pub fn record_write(
         },
         copy_size,
     );
-    // Cache write must complete before the upcoming cache read.
-    record_global_barrier(ctx.device, ctx.cmd);
+    if fence {
+        // Cache write must complete before the upcoming cache read.
+        record_global_barrier(ctx.device, ctx.cmd);
+    }
     Ok(())
 }
 
