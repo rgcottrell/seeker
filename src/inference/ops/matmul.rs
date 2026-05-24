@@ -1,12 +1,19 @@
 //! Matrix multiplication, two paths:
 //!
 //! * `mul_mm` — general scalar blocked-GEMM (32×32 tiles, no cooperative
-//!   matrix). Used for prefill (`N > 1`), where there's enough output reuse
-//!   to amortize the shared-memory tile dance.
+//!   matrix). Used for F16 prefill (`N > 1`), where there's enough output
+//!   reuse to amortize the shared-memory tile dance.
 //! * `mul_mat_vec` — vector × matrix kernel optimized for `N = 1`
 //!   (autoregressive decode). One workgroup per output row, 32-thread
 //!   parallel dot-product reduction over K. Without this, decode wastes
 //!   31/32 of each workgroup's compute and runs ~20× slower than expected.
+//!
+//! Dtype dispatch (A's `dtype`): F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1,
+//! Q8_0, IQ4_NL, MXFP4 are wired through `mul_mat_vec.<variant>.spv`. For
+//! N>1 with non-F16 weights, we fall back to issuing one `mul_mat_vec`
+//! dispatch per output column — correct but not bandwidth-optimal for
+//! large prefills. K-quants (Q2_K / Q4_K / Q5_K / Q6_K) and the IQ-family
+//! quants have their own SPV variants compiled but not yet wired here.
 //!
 //! Push constants follow `MulMmParams` and `MulMatVecParams` respectively
 //! (see `shaders/compute/mul_mm.slang` and `shaders/include/mul_mat_vec_head.slang`).
@@ -29,29 +36,137 @@ const MUL_MAT_VEC_PARAMS_BYTES: u32 = 13 * 4;
 /// one output row via a 32-thread dot-product reduction.
 const MUL_MAT_VEC_BLOCK_SIZE: u32 = 32;
 
+/// Per-dtype dispatch info for `mul_mat_vec`. `binding_indices` tracks
+/// which slots in `mul_mat_vec_head.slang` the variant actually declares
+/// (descriptor-set layout must match the SPIR-V's binding decorations
+/// exactly, even when the path through the kernel doesn't read every
+/// alias). Slot 0 → A, 1 → B, 2 → D, 3 → A as packed16 (active when the
+/// quant defines `A_TYPE_PACKED16`), 4 → B as float4 (active when
+/// `B_TYPEV4` is defined — true for every wired variant).
+struct MmvVariant {
+    name: &'static str,
+    spv: &'static [u8],
+    binding_indices: &'static [u32],
+}
+
+const MMV_BINDINGS_NO_PACKED16: &[u32] = &[0, 1, 2, 4];
+const MMV_BINDINGS_PACKED16: &[u32] = &[0, 1, 2, 3, 4];
+
+fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
+    let v = match dtype {
+        GgmlType::F32 => MmvVariant {
+            name: "mul_mat_vec_f32",
+            spv: shaders::MUL_MAT_VEC_F32_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_NO_PACKED16,
+        },
+        GgmlType::F16 => MmvVariant {
+            name: "mul_mat_vec_f16",
+            spv: shaders::MUL_MAT_VEC_F16_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_NO_PACKED16,
+        },
+        GgmlType::BF16 => MmvVariant {
+            name: "mul_mat_vec_bf16",
+            spv: shaders::MUL_MAT_VEC_BF16_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_NO_PACKED16,
+        },
+        GgmlType::Q4_0 => MmvVariant {
+            name: "mul_mat_vec_q4_0",
+            spv: shaders::MUL_MAT_VEC_Q4_0_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_PACKED16,
+        },
+        GgmlType::Q4_1 => MmvVariant {
+            name: "mul_mat_vec_q4_1",
+            spv: shaders::MUL_MAT_VEC_Q4_1_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_PACKED16,
+        },
+        GgmlType::Q5_0 => MmvVariant {
+            name: "mul_mat_vec_q5_0",
+            spv: shaders::MUL_MAT_VEC_Q5_0_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_PACKED16,
+        },
+        GgmlType::Q5_1 => MmvVariant {
+            name: "mul_mat_vec_q5_1",
+            spv: shaders::MUL_MAT_VEC_Q5_1_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_PACKED16,
+        },
+        GgmlType::Q8_0 => MmvVariant {
+            name: "mul_mat_vec_q8_0",
+            spv: shaders::MUL_MAT_VEC_Q8_0_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_PACKED16,
+        },
+        GgmlType::IQ4_NL => MmvVariant {
+            name: "mul_mat_vec_iq4_nl",
+            spv: shaders::MUL_MAT_VEC_IQ4_NL_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_PACKED16,
+        },
+        GgmlType::MXFP4 => MmvVariant {
+            name: "mul_mat_vec_mxfp4",
+            spv: shaders::MUL_MAT_VEC_MXFP4_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_NO_PACKED16,
+        },
+        _ => return None,
+    };
+    Some(v)
+}
+
 /// Record a single matmul: `dst[m, n] = sum_k a[k, m] * b[k, n]`. ggml's
 /// natural layout — A has shape [K, M], B has shape [K, N], D has shape
 /// [M, N]. Inner dim K is the contracting one. Both A and B store K as
 /// `ne[0]` (innermost). Output stride_d = M.
 ///
-/// A is expected to be F16 (weight); B and D are F32 (activations and output).
+/// A may be any wired dtype (see `mmv_variant`); B and D are F32.
 pub fn record(
     ctx: &mut DispatchContext,
     a: TensorView,
     b: TensorView,
     d: TensorView,
 ) -> Result<(), Box<dyn Error>> {
-    debug_assert_eq!(a.dtype, GgmlType::F16, "matmul A must be F16");
     debug_assert_eq!(b.dtype, GgmlType::F32, "matmul B must be F32");
     debug_assert_eq!(d.dtype, GgmlType::F32, "matmul D must be F32");
     debug_assert_eq!(b.dims[0], a.dims[0], "matmul K mismatch");
     debug_assert_eq!(d.dims[0], a.dims[1], "matmul output M mismatch");
     debug_assert_eq!(d.dims[1], b.dims[1], "matmul output N mismatch");
 
-    if b.dims[1] == 1 {
-        record_mul_mat_vec(ctx, a, b, d)
+    let n = b.dims[1];
+    if a.dtype == GgmlType::F16 && n > 1 {
+        return record_mul_mm(ctx, a, b, d);
+    }
+
+    let variant = mmv_variant(a.dtype).ok_or_else(|| {
+        format!(
+            "matmul: weight dtype {:?} not yet wired (shader may exist — see ops/matmul.rs)",
+            a.dtype
+        )
+    })?;
+
+    if n == 1 {
+        record_mul_mat_vec(ctx, &variant, a, b, d)?;
     } else {
-        record_mul_mm(ctx, a, b, d)
+        // Per-column fallback: dispatch one `mul_mat_vec` per output column.
+        // Correct but bandwidth-suboptimal — replace with a dedicated
+        // dtype-specific `mul_mm` once those kernels are wired (or use
+        // cooperative-matrix `mul_mm_cm` when the device exposes it).
+        for col in 0..n {
+            let b_col = slice_col(b, col);
+            let d_col = slice_col(d, col);
+            record_mul_mat_vec(ctx, &variant, a, b_col, d_col)?;
+        }
+    }
+    Ok(())
+}
+
+/// Take column `col` of a `[K, N, …]` tensor as a `[K, 1, …]` view.
+/// Byte_stride is preserved so the underlying buffer offsets stay correct;
+/// only `byte_offset`, `byte_size`, and `dims[1]` change.
+fn slice_col(t: TensorView, col: u64) -> TensorView {
+    let col_bytes = t.byte_stride[1];
+    let mut dims = t.dims;
+    dims[1] = 1;
+    TensorView {
+        byte_offset: t.byte_offset + col * col_bytes,
+        byte_size: col_bytes,
+        dims,
+        ..t
     }
 }
 
@@ -125,20 +240,21 @@ fn record_mul_mm(
     Ok(())
 }
 
-/// Vector-matrix kernel (`mul_mat_vec.slang`, F16 × F32 → F32, N=1).
+/// Vector-matrix kernel (`mul_mat_vec.slang`, A × F32 → F32, N=1).
 /// Dispatches `[M, batch, 1]` workgroups; each WG computes one output row
 /// via 32 threads' dot-product reduction across K.
 ///
-/// Bindings:
-///   0 → data_a              (weight, F16)
+/// Bindings (see `mul_mat_vec_head.slang`):
+///   0 → data_a              (weight, dtype = `a.dtype`)
 ///   1 → data_b              (input vector, F32)
 ///   2 → data_d              (output, F32)
-///   4 → data_b_v4 (= b)     (float4 alias of B; the F16 path's `K_PER_ITER=2`
-///                            doesn't read it, but the head declares it
-///                            unconditionally for the variant macros, so the
-///                            descriptor must be valid).
+///   3 → data_a_packed16     (alias of A for quants with `A_TYPE_PACKED16`;
+///                            same VkBuffer, just a different element type)
+///   4 → data_b_v4           (float4 alias of B; declared by every wired
+///                            variant via `B_TYPEV4=float4`)
 fn record_mul_mat_vec(
     ctx: &mut DispatchContext,
+    variant: &MmvVariant,
     a: TensorView,
     b: TensorView,
     d: TensorView,
@@ -179,33 +295,44 @@ fn record_mul_mat_vec(
         push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
     }
 
-    // Sparse bindings: 0 (data_a), 1 (data_b), 2 (data_d), 4 (data_b_v4).
-    // Binding 3 (data_a_packed16) is unused for the F16 variant.
-    let binding_indices: Vec<u32> = vec![0, 1, 2, 4];
-    let bindings = [a.range(), b.range(), d.range(), b.range()];
+    // Build the bindings array in the same order as `variant.binding_indices`.
+    // The slot meanings (see head file):
+    //   0 = A, 1 = B, 2 = D, 3 = A aliased as packed16, 4 = B aliased as float4
+    let bindings: Vec<_> = variant
+        .binding_indices
+        .iter()
+        .map(|&slot| match slot {
+            0 | 3 => a.range(),
+            1 | 4 => b.range(),
+            2 => d.range(),
+            other => panic!("unexpected mul_mat_vec binding slot {other}"),
+        })
+        .collect();
 
     let key = PipelineKey {
-        name: "mul_mat_vec_f16".to_string(),
-        binding_indices: binding_indices.clone(),
+        name: variant.name.to_string(),
+        binding_indices: variant.binding_indices.to_vec(),
         push_size: MUL_MAT_VEC_PARAMS_BYTES,
         spec_constants: Vec::new(),
     };
     let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx
-            .pipelines
-            .get(ctx.device, key, shaders::MUL_MAT_VEC_F16_SPV.as_bytes())?;
+        let p: &CachedPipeline = ctx.pipelines.get(ctx.device, key, variant.spv)?;
         (p.pipeline, p.layout, p.set_layout)
     };
     let set = ctx.descriptors.allocate_and_write_indexed(
         ctx.device,
         set_layout,
-        &binding_indices,
+        variant.binding_indices,
         &bindings,
     )?;
 
-    // One WG per output row; y dim covers batch (unused here but kept for
-    // shape consistency with the shader's `wg_id.y` batch lookup).
-    let workgroups = [m, num_batches, 1];
+    // Each workgroup produces `NUM_ROWS` output rows (see
+    // `mul_mat_vec_head.slang`). Keep this in sync with the shader's
+    // `static const uint NUM_ROWS = …`. The shader's per-thread bounds
+    // check tolerates an over-dispatch on the last X tile when M is not
+    // divisible by NUM_ROWS, so `div_ceil` is correct.
+    const NUM_ROWS: u32 = 2;
+    let workgroups = [m.div_ceil(NUM_ROWS), num_batches, 1];
     let cached = CachedPipeline { pipeline, layout, set_layout };
     record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);

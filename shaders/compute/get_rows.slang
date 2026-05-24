@@ -1,12 +1,10 @@
 // Ported from llama.cpp ggml-vulkan get_rows.comp, MIT license — see LICENSE.llama-cpp
-//
-// Phase 3: DATA_A_BF16 conversion branch and OPTIMIZATION_ERROR_WORKAROUND
-// are omitted; only the straight cast path is ported.
 
 //@variants
 //  f32:     A_TYPE=float       B_TYPE=int         D_TYPE=float       FLOAT_TYPE=float
 //  f16:     A_TYPE=float16_t   B_TYPE=int         D_TYPE=float16_t   FLOAT_TYPE=float
 //  f16_f32: A_TYPE=float16_t   B_TYPE=int         D_TYPE=float       FLOAT_TYPE=float
+//  bf16:    DATA_A_BF16=1      B_TYPE=int         D_TYPE=float       FLOAT_TYPE=float
 //  i32:     A_TYPE=int         B_TYPE=int         D_TYPE=int         FLOAT_TYPE=int
 //@end-variants
 
@@ -34,7 +32,12 @@ void main(uint3 gl_GlobalInvocationID : SV_DispatchThreadID) {
             const uint a_offset = get_aoffset() + i01 * p.nb01 + i11 * p.nb02 + i12 * p.nb03;
             const uint d_offset = get_doffset() + i10 * p.nb21 + i11 * p.nb22 + i12 * p.nb23;
 
+#if defined(DATA_A_BF16)
+            // bf16 is stored as raw uint16; reinterpret-cast via bf16_to_fp32.
+            data_d[d_offset + i00] = D_TYPE(bf16_to_fp32(uint(data_a[a_offset + i00])));
+#else
             data_d[d_offset + i00] = D_TYPE(FLOAT_TYPE(data_a[a_offset + i00]));
+#endif
 
             gid_y += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
         }

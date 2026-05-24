@@ -66,13 +66,14 @@ struct MulMatVecParams {
 
 [SpecializationConstant] const uint BLOCK_SIZE = 32;
 
-// NUM_ROWS / NUM_COLS are llama.cpp specialization constants too, but we hold
-// them static for the first cut so the groupshared array below can be sized at
-// SPIR-V emit time. Promote to spec constants once the dispatch wants to vary.
-static const uint NUM_ROWS = 1;
+// NUM_ROWS = how many output rows one workgroup produces. Increasing this
+// amortizes the B-vector load across rows (B is fetched once per iter and
+// reused across NUM_ROWS A-row dequants), which dominates decode bandwidth.
+// llama.cpp uses 4–8 depending on dtype; we start at 2 — register pressure
+// goes up linearly and we don't want to overflow Apple's tighter file.
+// NUM_COLS is for multi-prompt batching, kept at 1 for now.
+static const uint NUM_ROWS = 2;
 static const uint NUM_COLS = 1;
-
-groupshared FLOAT_TYPE tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE];
 
 // Per-DATA_A_X dequantize / dequantize4 / get_dm overloads live in dequant_funcs.slang.
 // Including here after the buffer bindings so the helpers can reference data_a /
@@ -96,28 +97,21 @@ void get_offsets(uint3 wg_id, out uint a_offset, out uint b_offset, out uint d_o
     d_offset = batch_idx * p.batch_stride_d;
 }
 
+// Subgroup-reduce result. We require `computeFullSubgroups` and dispatch
+// `numthreads(BLOCK_SIZE = 32, 1, 1)`, which on Apple/Intel/NVIDIA hardware
+// (subgroupSize == 32) means one workgroup == one subgroup and a single
+// `WaveActiveSum` collapses BLOCK_SIZE partial sums with no shared memory
+// and no `GroupMemoryBarrier`. On vendors where subgroupSize differs from
+// 32 the pipeline must request matching size via
+// VK_EXT_subgroup_size_control's required-size (32) for this to remain
+// correct; we already enable the feature in `inference::device`.
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
                    uint d_offset, uint first_row, uint num_rows, uint tid) {
     [unroll] for (uint j = 0; j < NUM_COLS; ++j) {
         [unroll] for (uint n = 0; n < num_rows; ++n) {
-            tmpsh[j][n][tid] = temp[j][n];
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            [unroll] for (uint j = 0; j < NUM_COLS; ++j) {
-                [unroll] for (uint n = 0; n < num_rows; ++n) {
-                    tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
-                }
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    if (tid == 0) {
-        [unroll] for (uint j = 0; j < NUM_COLS; ++j) {
-            [unroll] for (uint n = 0; n < num_rows; ++n) {
-                data_d[j * p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+            const FLOAT_TYPE sum = WaveActiveSum(temp[j][n]);
+            if (tid == 0) {
+                data_d[j * p.batch_stride_d + d_offset + first_row + n] = D_TYPE(sum);
             }
         }
     }

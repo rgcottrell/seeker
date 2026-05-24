@@ -182,11 +182,26 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let mut sampler = Sampler::new(args.sampler_config());
     let mut step_tokens: Vec<u32> = tokens.clone();
     let mut generated: Vec<u32> = Vec::with_capacity(args.max_tokens as usize);
-    for _ in 0..args.max_tokens {
+
+    // Prefill = first forward pass (N = prompt length). Decode = every
+    // subsequent N=1 step. Reporting them separately matches llama.cpp's
+    // `prompt eval` / `eval` timings and is what we want when comparing.
+    let mut prefill_secs: f64 = 0.0;
+    let prefill_tokens = step_tokens.len();
+    let mut decode_secs: f64 = 0.0;
+
+    for step in 0..args.max_tokens {
         let position_offset = cache.position;
+        let t0 = std::time::Instant::now();
         let next_id = engine.forward_sampled(model.weights(), &mut sampler, |ctx| {
             model.record_forward(ctx, &mut cache, &step_tokens, position_offset)
         })?;
+        let elapsed = t0.elapsed().as_secs_f64();
+        if step == 0 {
+            prefill_secs = elapsed;
+        } else {
+            decode_secs += elapsed;
+        }
         generated.push(next_id);
         step_tokens = vec![next_id];
     }
@@ -207,6 +222,17 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     println!("tokens:    {tokens:?}");
     println!("generated: {generated_text}");
     println!("ids:       {generated:?}");
+    let prefill_tps = (prefill_tokens as f64) / prefill_secs.max(1e-9);
+    let decode_steps = args.max_tokens.saturating_sub(1) as f64;
+    let decode_tps = if decode_steps > 0.0 {
+        decode_steps / decode_secs.max(1e-9)
+    } else {
+        0.0
+    };
+    println!(
+        "timing:    prefill {prefill_tokens} tok in {:.3}s ({prefill_tps:.1} tok/s), decode {} tok in {:.3}s ({decode_tps:.1} tok/s)",
+        prefill_secs, decode_steps as u32, decode_secs,
+    );
     Ok(())
 }
 
