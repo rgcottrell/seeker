@@ -79,15 +79,7 @@ fn record_binary_f32(
     dst: TensorView,
 ) -> Result<(), Box<dyn Error>> {
     let key = PipelineKey::dense(name, 3, super::BINARY_PARAMS_BYTES, vec![0]);
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx.pipelines.get(ctx.device, key, spirv)?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write(
-        ctx.device,
-        set_layout,
-        &[a.range(), b.range(), dst.range()],
-    )?;
+    let pipeline = *ctx.pipelines.get(ctx.device, key, spirv)?;
     let push = binary_params_bytes(&a, &b, &dst, 0.0, 0.0, 0);
 
     // Shader: 256 threads × num_iter=2 with `idx += num_threads=256` per
@@ -98,12 +90,14 @@ fn record_binary_f32(
     let nelements: u64 = dst.dims.iter().product();
     let workgroups = [(nelements as u32).div_ceil(256), 1, 1];
 
-    let cached = CachedPipeline {
-        pipeline,
-        layout,
-        set_layout,
-    };
-    record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[a.range(), b.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }
@@ -122,25 +116,18 @@ pub fn record_silu(
     // KY, param1..4 all zero — leave as default.
 
     let key = PipelineKey::dense("silu_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline =
-            ctx.pipelines
-                .get(ctx.device, key, shaders::SILU_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write(
-        ctx.device,
-        set_layout,
-        &[src.range(), dst.range()],
-    )?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SILU_F32_SPV.as_bytes())?;
     let workgroups = [nelements.div_ceil(512), 1, 1];
-
-    let cached = CachedPipeline {
-        pipeline,
-        layout,
-        set_layout,
-    };
-    record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }
@@ -184,15 +171,7 @@ pub fn record_get_rows(
     };
 
     let key = PipelineKey::dense(name, 3, super::BINARY_PARAMS_BYTES, vec![0]);
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx.pipelines.get(ctx.device, key, spirv)?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write(
-        ctx.device,
-        set_layout,
-        &[src.range(), indices, dst.range()],
-    )?;
+    let pipeline = *ctx.pipelines.get(ctx.device, key, spirv)?;
 
     let ne00 = src.dims[0] as u32;
     let ne10 = indices_len;
@@ -204,12 +183,14 @@ pub fn record_get_rows(
         [ne00.div_ceil(512), ne10, 1]
     };
 
-    let cached = CachedPipeline {
-        pipeline,
-        layout,
-        set_layout,
-    };
-    record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[src.range(), indices, dst.range()],
+        &push,
+        workgroups,
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }

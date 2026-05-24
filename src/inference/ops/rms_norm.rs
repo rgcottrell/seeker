@@ -30,18 +30,9 @@ pub fn record(
         super::BINARY_PARAMS_BYTES,
         vec![0, 1], // norepeat=false, do_multiply=true
     );
-    let (pipeline, set_layout) = {
-        let p: &CachedPipeline = ctx
-            .pipelines
-            .get(ctx.device, key, shaders::RMS_NORM_F32_SPV.as_bytes())?;
-        ((p.pipeline, p.layout), p.set_layout)
-    };
-
-    let set = ctx.descriptors.allocate_and_write(
-        ctx.device,
-        set_layout,
-        &[src.range(), weight.range(), dst.range()],
-    )?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::RMS_NORM_F32_SPV.as_bytes())?;
 
     let push = binary_params_bytes(&src, &weight, &dst, eps, 0.0, 0);
     let workgroups = [
@@ -50,12 +41,14 @@ pub fn record(
         src.dims[3].max(1) as u32,
     ];
 
-    let cached = CachedPipeline {
-        pipeline: pipeline.0,
-        layout: pipeline.1,
-        set_layout,
-    };
-    record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[src.range(), weight.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }

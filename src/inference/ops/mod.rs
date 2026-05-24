@@ -12,7 +12,53 @@ pub mod rms_norm;
 pub mod rope;
 pub mod sampler;
 
+use std::error::Error;
+
+use crate::inference::buffer::BufferRange;
+use crate::inference::command::{record_dispatch, record_dispatch_push};
+use crate::inference::context::DispatchContext;
+use crate::inference::pipeline::CachedPipeline;
 use crate::inference::weights::TensorView;
+
+/// Single entry point for "bind buffers + push constants + dispatch".
+/// Branches at runtime on `device.push_descriptor` (core in Vulkan 1.4):
+/// when present, skips the descriptor-pool round-trip entirely via
+/// `vkCmdPushDescriptorSet`; otherwise allocates a set from
+/// `DescriptorAllocator`. Pipeline-layout flags are chosen matchingly in
+/// `pipeline::compile_compute_pipeline`.
+///
+/// `binding_indices[i]` is the descriptor-set slot for `bindings[i]`;
+/// use the *_indexed shape uniformly — passing
+/// `&[0, 1, 2, …, bindings.len() - 1]` covers the dense case.
+pub fn bind_and_dispatch(
+    ctx: &mut DispatchContext,
+    pipeline: &CachedPipeline,
+    binding_indices: &[u32],
+    bindings: &[BufferRange],
+    push: &[u8],
+    workgroups: [u32; 3],
+) -> Result<(), Box<dyn Error>> {
+    if ctx.device.push_descriptor {
+        record_dispatch_push(
+            ctx.device,
+            ctx.cmd,
+            pipeline,
+            binding_indices,
+            bindings,
+            push,
+            workgroups,
+        );
+    } else {
+        let set = ctx.descriptors.allocate_and_write_indexed(
+            ctx.device,
+            pipeline.set_layout,
+            binding_indices,
+            bindings,
+        )?;
+        record_dispatch(ctx.device, ctx.cmd, pipeline, set, push, workgroups);
+    }
+    Ok(())
+}
 
 /// Byte size of `UnaryParams` (in shaders/include/generic_unary_head.slang):
 /// 32 × 4 bytes = 128 bytes.

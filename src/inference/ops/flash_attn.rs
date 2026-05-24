@@ -158,24 +158,16 @@ pub fn record(
         push_size: FA_PUSH_BYTES,
         spec_constants,
     };
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx.pipelines.get(ctx.device, key, variant_spv)?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write_indexed(
-        ctx.device,
-        set_layout,
+    let pipeline = *ctx.pipelines.get(ctx.device, key, variant_spv)?;
+    let workgroups = [n, ne2, ne3];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
         &[0, 1, 2, 3, 5],
         &[q.range(), k.range(), v.range(), mask.range(), out.range()],
+        &push,
+        workgroups,
     )?;
-
-    let workgroups = [n, ne2, ne3];
-    let cached = CachedPipeline {
-        pipeline,
-        layout,
-        set_layout,
-    };
-    record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }

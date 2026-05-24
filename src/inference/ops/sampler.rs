@@ -116,26 +116,17 @@ pub fn record_greedy(
     push[4..8].copy_from_slice(&ky.to_ne_bytes());
 
     let key = PipelineKey::dense("argmax_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline =
-            ctx.pipelines
-                .get(ctx.device, key, shaders::ARGMAX_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write(
-        ctx.device,
-        set_layout,
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::ARGMAX_F32_SPV.as_bytes())?;
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
         &[logits.range(), out],
-    )?;
-
-    record_dispatch(
-        ctx.device,
-        ctx.cmd,
-        &CachedPipeline { pipeline, layout, set_layout },
-        set,
         &push,
         [1, 1, 1],
-    );
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(out)
 }
@@ -270,28 +261,20 @@ fn record_apply_penalties(
         PENALTY_PARAMS_BYTES,
         Vec::new(),
     );
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx.pipelines.get(
-            ctx.device,
-            key,
-            shaders::APPLY_PENALTIES_F32_SPV.as_bytes(),
-        )?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write(
+    let pipeline = *ctx.pipelines.get(
         ctx.device,
-        set_layout,
-        &[logits.range(), pairs_t.range()],
+        key,
+        shaders::APPLY_PENALTIES_F32_SPV.as_bytes(),
     )?;
     let workgroups = [n_pairs.div_ceil(256), 1, 1];
-    record_dispatch(
-        ctx.device,
-        ctx.cmd,
-        &CachedPipeline { pipeline, layout, set_layout },
-        set,
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[logits.range(), pairs_t.range()],
         &push,
         workgroups,
-    );
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }
@@ -348,37 +331,29 @@ fn record_top_k(
         // off (name + binding count + push size), so different (first,
         // last) variants share the pipeline — good.
         let key = PipelineKey::dense("topk_argsort_f32", 4, TOPK_PARAMS_BYTES, Vec::new());
-        let (pipeline, layout, set_layout) = {
-            let p: &CachedPipeline = ctx.pipelines.get(
-                ctx.device,
-                key,
-                shaders::TOPK_ARGSORT_F32_SPV.as_bytes(),
-            )?;
-            (p.pipeline, p.layout, p.set_layout)
-        };
+        let pipeline = *ctx.pipelines.get(
+            ctx.device,
+            key,
+            shaders::TOPK_ARGSORT_F32_SPV.as_bytes(),
+        )?;
         // For the first pass, prev_intermediate isn't initialized — but it's
         // not read in that case (first_pass=1 means the shader reads data_a
         // only). Bind logits to data_s slot too to keep the descriptor valid.
         let s_binding = if is_first { logits.range() } else { prev_intermediate.range() };
-        let set = ctx.descriptors.allocate_and_write(
-            ctx.device,
-            set_layout,
+        let workgroups = [num_wg, 1, 1];
+        super::bind_and_dispatch(
+            ctx,
+            &pipeline,
+            &[0, 1, 2, 3],
             &[
                 logits.range(),
                 final_indices.range(),
                 s_binding,
                 next_intermediate.range(),
             ],
-        )?;
-        let workgroups = [num_wg, 1, 1];
-        record_dispatch(
-            ctx.device,
-            ctx.cmd,
-            &CachedPipeline { pipeline, layout, set_layout },
-            set,
             &push,
             workgroups,
-        );
+        )?;
         record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
 
         if is_last {
@@ -493,26 +468,20 @@ fn record_scale(
 ) -> Result<(), Box<dyn Error>> {
     let push = unary_params_bytes(&src, &dst, alpha, beta);
     let key = PipelineKey::dense("scale_f32", 2, UNARY_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline =
-            ctx.pipelines
-                .get(ctx.device, key, shaders::SCALE_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx
-        .descriptors
-        .allocate_and_write(ctx.device, set_layout, &[src.range(), dst.range()])?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SCALE_F32_SPV.as_bytes())?;
     let nelements: u64 = src.dims.iter().product();
     // scale.slang: 128 threads × num_iter=4 = 512 elements per workgroup.
     let workgroups = [(nelements as u32).div_ceil(512), 1, 1];
-    record_dispatch(
-        ctx.device,
-        ctx.cmd,
-        &CachedPipeline { pipeline, layout, set_layout },
-        set,
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
         &push,
         workgroups,
-    );
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }
@@ -530,26 +499,17 @@ fn record_soft_max(
     // data_d (output). When KY=0 and has_sinks=0 the shader ignores b/c
     // bindings, but Vulkan still requires valid descriptors.
     let key = PipelineKey::dense("soft_max_f32", 4, SOFT_MAX_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline =
-            ctx.pipelines
-                .get(ctx.device, key, shaders::SOFT_MAX_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write(
-        ctx.device,
-        set_layout,
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SOFT_MAX_F32_SPV.as_bytes())?;
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2, 3],
         &[src.range(), src.range(), src.range(), dst.range()],
-    )?;
-    // One workgroup per row; we always have nrows_x = 1.
-    record_dispatch(
-        ctx.device,
-        ctx.cmd,
-        &CachedPipeline { pipeline, layout, set_layout },
-        set,
         &push,
         [1, 1, 1],
-    );
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }
@@ -595,24 +555,17 @@ fn record_cumsum(
     let n_cols: u32 = src.dims[0] as u32;
     let push = sum_rows_params_bytes(n_cols, &src, &dst, 1.0);
     let key = PipelineKey::dense("cumsum_f32", 2, SUM_ROWS_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline =
-            ctx.pipelines
-                .get(ctx.device, key, shaders::CUMSUM_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx
-        .descriptors
-        .allocate_and_write(ctx.device, set_layout, &[src.range(), dst.range()])?;
-    // 1 workgroup per row, we have 1 row.
-    record_dispatch(
-        ctx.device,
-        ctx.cmd,
-        &CachedPipeline { pipeline, layout, set_layout },
-        set,
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::CUMSUM_F32_SPV.as_bytes())?;
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
         &push,
         [1, 1, 1],
-    );
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }
@@ -626,23 +579,17 @@ fn record_sum_rows(
     let n_cols: u32 = src.dims[0] as u32;
     let push = sum_rows_params_bytes(n_cols, &src, &dst, 1.0);
     let key = PipelineKey::dense("sum_rows_f32", 2, SUM_ROWS_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline =
-            ctx.pipelines
-                .get(ctx.device, key, shaders::SUM_ROWS_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx
-        .descriptors
-        .allocate_and_write(ctx.device, set_layout, &[src.range(), dst.range()])?;
-    record_dispatch(
-        ctx.device,
-        ctx.cmd,
-        &CachedPipeline { pipeline, layout, set_layout },
-        set,
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SUM_ROWS_F32_SPV.as_bytes())?;
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
         &push,
         [1, 1, 1],
-    );
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }
@@ -775,25 +722,19 @@ fn record_clamp(
 ) -> Result<(), Box<dyn Error>> {
     let push = unary_params_bytes(&src, &dst, lo, hi);
     let key = PipelineKey::dense("clamp_f32", 2, UNARY_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline =
-            ctx.pipelines
-                .get(ctx.device, key, shaders::CLAMP_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx
-        .descriptors
-        .allocate_and_write(ctx.device, set_layout, &[src.range(), dst.range()])?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::CLAMP_F32_SPV.as_bytes())?;
     let nelements: u64 = src.dims.iter().product();
     let workgroups = [(nelements as u32).div_ceil(512), 1, 1];
-    record_dispatch(
-        ctx.device,
-        ctx.cmd,
-        &CachedPipeline { pipeline, layout, set_layout },
-        set,
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
         &push,
         workgroups,
-    );
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }
@@ -806,26 +747,20 @@ fn record_log(
 ) -> Result<(), Box<dyn Error>> {
     let push = unary_params_bytes(&src, &dst, 0.0, 0.0);
     let key = PipelineKey::dense("log_f32", 2, UNARY_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline =
-            ctx.pipelines
-                .get(ctx.device, key, shaders::LOG_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx
-        .descriptors
-        .allocate_and_write(ctx.device, set_layout, &[src.range(), dst.range()])?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::LOG_F32_SPV.as_bytes())?;
     let nelements: u64 = src.dims.iter().product();
     // log.slang is 512 threads per WG, 1 element per thread.
     let workgroups = [(nelements as u32).div_ceil(512), 1, 1];
-    record_dispatch(
-        ctx.device,
-        ctx.cmd,
-        &CachedPipeline { pipeline, layout, set_layout },
-        set,
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
         &push,
         workgroups,
-    );
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }
@@ -841,24 +776,18 @@ fn record_step(
     push[0..4].copy_from_slice(&(nelements as u32).to_ne_bytes());
     // KY, param1..4 all zero.
     let key = PipelineKey::dense("step_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline =
-            ctx.pipelines
-                .get(ctx.device, key, shaders::STEP_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx
-        .descriptors
-        .allocate_and_write(ctx.device, set_layout, &[src.range(), dst.range()])?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::STEP_F32_SPV.as_bytes())?;
     let workgroups = [(nelements as u32).div_ceil(512), 1, 1];
-    record_dispatch(
-        ctx.device,
-        ctx.cmd,
-        &CachedPipeline { pipeline, layout, set_layout },
-        set,
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
         &push,
         workgroups,
-    );
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }

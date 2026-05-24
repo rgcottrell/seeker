@@ -135,25 +135,18 @@ fn record_inner(
     put_u(&mut push, &mut w, 0);             // d_offset
 
     let key = PipelineKey::dense("rope_norm_f32", 5, ROPE_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx
-            .pipelines
-            .get(ctx.device, key, shaders::ROPE_NORM_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write(
-        ctx.device,
-        set_layout,
-        &[src.range(), positions, dummy, dst.range(), dummy],
-    )?;
-
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::ROPE_NORM_F32_SPV.as_bytes())?;
     let workgroups = [nrows, ne00.div_ceil(512), 1];
-    let cached = CachedPipeline {
-        pipeline,
-        layout,
-        set_layout,
-    };
-    record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2, 3, 4],
+        &[src.range(), positions, dummy, dst.range(), dummy],
+        &push,
+        workgroups,
+    )?;
     if fence {
         record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     }

@@ -51,16 +51,7 @@ pub fn record_cast(
         push_size: UNARY_PARAMS_BYTES,
         spec_constants: Vec::new(),
     };
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx.pipelines.get(ctx.device, key, pick.spirv)?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write_indexed(
-        ctx.device,
-        set_layout,
-        &binding_indices,
-        &bindings,
-    )?;
+    let pipeline = *ctx.pipelines.get(ctx.device, key, pick.spirv)?;
 
     // Workgroup count: each workgroup covers `elements_per_workgroup`
     // elements of work. For plain casts (copy variants) that's
@@ -76,12 +67,14 @@ pub fn record_cast(
         1,
     ];
 
-    let cached = CachedPipeline {
-        pipeline,
-        layout,
-        set_layout,
-    };
-    record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &binding_indices,
+        &bindings,
+        &push,
+        workgroups,
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     Ok(())
 }

@@ -34,6 +34,7 @@ impl PipelineKey {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct CachedPipeline {
     pub pipeline: vk::Pipeline,
     pub layout: vk::PipelineLayout,
@@ -110,8 +111,20 @@ fn build_pipeline(
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         })
         .collect();
-    let set_layout_info =
-        vk::DescriptorSetLayoutCreateInfo::default().bindings(&layout_bindings);
+    // When `push_descriptor` is available (core in Vulkan 1.4), flag the
+    // set layout `PUSH_DESCRIPTOR_BIT_KHR` so the dispatch path can use
+    // `vkCmdPushDescriptorSet` and skip per-dispatch
+    // alloc/update/bind on the descriptor pool. A layout created with
+    // this flag is push-only — sets cannot be allocated from it — so the
+    // dispatch helper must branch on `device.push_descriptor` to match.
+    let set_layout_flags = if device.push_descriptor {
+        vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
+    } else {
+        vk::DescriptorSetLayoutCreateFlags::empty()
+    };
+    let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+        .flags(set_layout_flags)
+        .bindings(&layout_bindings);
     let set_layout =
         unsafe { device.device.create_descriptor_set_layout(&set_layout_info, None) }?;
 

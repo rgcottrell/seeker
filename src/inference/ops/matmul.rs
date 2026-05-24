@@ -273,26 +273,18 @@ fn record_mul_mm(
     }
 
     let key = PipelineKey::dense("mul_mm_f16_f32", 3, MUL_MM_PARAMS_BYTES, Vec::new());
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx
-            .pipelines
-            .get(ctx.device, key, shaders::MUL_MM_F16_F32_SPV.as_bytes())?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-
-    let set = ctx.descriptors.allocate_and_write(
-        ctx.device,
-        set_layout,
-        &[a.range(), b.range(), d.range()],
-    )?;
-
-    let cached = CachedPipeline {
-        pipeline,
-        layout,
-        set_layout,
-    };
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::MUL_MM_F16_F32_SPV.as_bytes())?;
     let workgroups = [m.div_ceil(BM), n.div_ceil(BN), num_batches];
-    record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[a.range(), b.range(), d.range()],
+        &push,
+        workgroups,
+    )?;
     if fence {
         record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     }
@@ -377,16 +369,7 @@ fn record_mul_mat_vec(
         push_size: MUL_MAT_VEC_PARAMS_BYTES,
         spec_constants: Vec::new(),
     };
-    let (pipeline, layout, set_layout) = {
-        let p: &CachedPipeline = ctx.pipelines.get(ctx.device, key, variant.spv)?;
-        (p.pipeline, p.layout, p.set_layout)
-    };
-    let set = ctx.descriptors.allocate_and_write_indexed(
-        ctx.device,
-        set_layout,
-        variant.binding_indices,
-        &bindings,
-    )?;
+    let pipeline = ctx.pipelines.get(ctx.device, key, variant.spv)?.clone();
 
     // Each workgroup produces `NUM_ROWS` output rows (see
     // `mul_mat_vec_head.slang`). Keep this in sync with the shader's
@@ -395,8 +378,14 @@ fn record_mul_mat_vec(
     // divisible by NUM_ROWS, so `div_ceil` is correct.
     const NUM_ROWS: u32 = 2;
     let workgroups = [m.div_ceil(NUM_ROWS), num_batches, 1];
-    let cached = CachedPipeline { pipeline, layout, set_layout };
-    record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        variant.binding_indices,
+        &bindings,
+        &push,
+        workgroups,
+    )?;
     if fence {
         record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
     }
