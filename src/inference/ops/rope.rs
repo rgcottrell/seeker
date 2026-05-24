@@ -43,13 +43,36 @@ impl RopeParams {
 
 /// Record an in-place RoPE on a tensor reshaped to `[head_dim, n_head, L]`.
 /// `positions` is a scratch slot holding `L` `i32`s = [0, 1, …, L-1] (or
-/// whatever absolute position indices apply).
+/// whatever absolute position indices apply). Emits a trailing barrier.
 pub fn record(
     ctx: &mut DispatchContext,
     src: TensorView,
     positions: BufferRange,
     dst: TensorView,
     params: RopeParams,
+) -> Result<(), Box<dyn Error>> {
+    record_inner(ctx, src, positions, dst, params, /*fence=*/ true)
+}
+
+/// Same as [`record`] but skips the trailing barrier — for paired
+/// q-then-k rope calls where one barrier covers both.
+pub fn record_nofence(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    positions: BufferRange,
+    dst: TensorView,
+    params: RopeParams,
+) -> Result<(), Box<dyn Error>> {
+    record_inner(ctx, src, positions, dst, params, /*fence=*/ false)
+}
+
+fn record_inner(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    positions: BufferRange,
+    dst: TensorView,
+    params: RopeParams,
+    fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(src.dtype, GgmlType::F32);
     debug_assert_eq!(dst.dtype, GgmlType::F32);
@@ -131,6 +154,8 @@ pub fn record(
         set_layout,
     };
     record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    }
     Ok(())
 }

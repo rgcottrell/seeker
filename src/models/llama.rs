@@ -188,22 +188,25 @@ impl Model for LlamaModel {
             let x_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             rms_norm::record(ctx, residual, block.attn_norm, x_norm, p.rms_eps)?;
 
-            // Q = wq @ x_norm  → [n_embd, L]
+            // Q/K/V all read the same x_norm and write disjoint outputs, so
+            // they can dispatch back-to-back without inter-barriers — the
+            // wv trailing barrier covers all three for the rope step.
             let q = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
-            matmul::record(ctx, block.wq, x_norm, q)?;
-            // K = wk @ x_norm  → [n_embd_kv, L]
+            matmul::record_nofence(ctx, block.wq, x_norm, q)?;
             let k = ctx.alloc_tensor([n_kv_embd, l as u64, 1, 1], GgmlType::F32)?;
-            matmul::record(ctx, block.wk, x_norm, k)?;
-            // V = wv @ x_norm  → [n_embd_kv, L]
+            matmul::record_nofence(ctx, block.wk, x_norm, k)?;
             let v = ctx.alloc_tensor([n_kv_embd, l as u64, 1, 1], GgmlType::F32)?;
             matmul::record(ctx, block.wv, x_norm, v)?;
 
-            // RoPE on Q and K (separate scratch dst).
+            // RoPE on Q and K (separate scratch dst). The two rope calls
+            // write disjoint tensors and don't depend on each other, so
+            // the q dispatch can skip its barrier — the k trailing barrier
+            // covers both before the cache_write step reads k_roped.
             let q_view = reshape_for_rope(q, head_dim, p.n_head as u64, l as u64);
             let k_view = reshape_for_rope(k, head_dim, p.n_head_kv as u64, l as u64);
             let q_roped = ctx.alloc_tensor(q_view.dims, GgmlType::F32)?;
             let k_roped = ctx.alloc_tensor(k_view.dims, GgmlType::F32)?;
-            rope::record(ctx, q_view, positions_buf, q_roped, rope_params)?;
+            rope::record_nofence(ctx, q_view, positions_buf, q_roped, rope_params)?;
             rope::record(ctx, k_view, positions_buf, k_roped, rope_params)?;
 
             // K, V (post-RoPE for K, raw for V) in natural
@@ -252,10 +255,10 @@ impl Model for LlamaModel {
             let x_norm2 = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             rms_norm::record(ctx, residual, block.ffn_norm, x_norm2, p.rms_eps)?;
 
-            // gate = ffn_gate @ x_norm  → [n_ff, L]
+            // ffn_gate and ffn_up both read x_norm2 and write disjoint
+            // tensors — let the ffn_up trailing barrier cover both.
             let gate = ctx.alloc_tensor([n_ff, l as u64, 1, 1], GgmlType::F32)?;
-            matmul::record(ctx, block.ffn_gate, x_norm2, gate)?;
-            // up = ffn_up @ x_norm  → [n_ff, L]
+            matmul::record_nofence(ctx, block.ffn_gate, x_norm2, gate)?;
             let up = ctx.alloc_tensor([n_ff, l as u64, 1, 1], GgmlType::F32)?;
             matmul::record(ctx, block.ffn_up, x_norm2, up)?;
             // gate = silu(gate)

@@ -114,12 +114,38 @@ fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
 /// [M, N]. Inner dim K is the contracting one. Both A and B store K as
 /// `ne[0]` (innermost). Output stride_d = M.
 ///
-/// A may be any wired dtype (see `mmv_variant`); B and D are F32.
+/// A may be any wired dtype (see `mmv_variant`); B and D are F32. Emits a
+/// trailing compute→compute barrier on the scratch buffer; callers that
+/// dispatch independent matmuls back-to-back (same input, disjoint
+/// outputs — e.g. Q/K/V or ffn_gate/ffn_up) should use [`record_nofence`]
+/// for all but the last and let one barrier cover the group.
 pub fn record(
     ctx: &mut DispatchContext,
     a: TensorView,
     b: TensorView,
     d: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    record_inner(ctx, a, b, d, /*fence=*/ true)
+}
+
+/// Same as [`record`] but skips the trailing barrier. Use only when the
+/// next dispatch you record either reads disjoint memory or is followed
+/// by a real barrier itself; otherwise you'll race the output buffer.
+pub fn record_nofence(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    d: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    record_inner(ctx, a, b, d, /*fence=*/ false)
+}
+
+fn record_inner(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    d: TensorView,
+    fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(b.dtype, GgmlType::F32, "matmul B must be F32");
     debug_assert_eq!(d.dtype, GgmlType::F32, "matmul D must be F32");
@@ -129,7 +155,7 @@ pub fn record(
 
     let n = b.dims[1];
     if a.dtype == GgmlType::F16 && n > 1 {
-        return record_mul_mm(ctx, a, b, d);
+        return record_mul_mm(ctx, a, b, d, fence);
     }
 
     let variant = mmv_variant(a.dtype).ok_or_else(|| {
@@ -140,16 +166,20 @@ pub fn record(
     })?;
 
     if n == 1 {
-        record_mul_mat_vec(ctx, &variant, a, b, d)?;
+        record_mul_mat_vec(ctx, &variant, a, b, d, fence)?;
     } else {
         // Per-column fallback: dispatch one `mul_mat_vec` per output column.
         // Correct but bandwidth-suboptimal — replace with a dedicated
         // dtype-specific `mul_mm` once those kernels are wired (or use
         // cooperative-matrix `mul_mm_cm` when the device exposes it).
+        // Intra-group barriers are unnecessary (each column writes a
+        // disjoint slice of D), so only fence after the last column.
+        let last = n - 1;
         for col in 0..n {
             let b_col = slice_col(b, col);
             let d_col = slice_col(d, col);
-            record_mul_mat_vec(ctx, &variant, a, b_col, d_col)?;
+            let col_fence = fence && col == last;
+            record_mul_mat_vec(ctx, &variant, a, b_col, d_col, col_fence)?;
         }
     }
     Ok(())
@@ -177,6 +207,7 @@ fn record_mul_mm(
     a: TensorView,
     b: TensorView,
     d: TensorView,
+    fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     let k = a.dims[0] as u32;
     let m = a.dims[1] as u32;
@@ -236,7 +267,9 @@ fn record_mul_mm(
     };
     let workgroups = [m.div_ceil(BM), n.div_ceil(BN), num_batches];
     record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    }
     Ok(())
 }
 
@@ -258,6 +291,7 @@ fn record_mul_mat_vec(
     a: TensorView,
     b: TensorView,
     d: TensorView,
+    fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(b.dims[1], 1, "mul_mat_vec requires N=1");
 
@@ -335,7 +369,9 @@ fn record_mul_mat_vec(
     let workgroups = [m.div_ceil(NUM_ROWS), num_batches, 1];
     let cached = CachedPipeline { pipeline, layout, set_layout };
     record_dispatch(ctx.device, ctx.cmd, &cached, set, &push, workgroups);
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    }
     let _ = MUL_MAT_VEC_BLOCK_SIZE; // documented above; not currently used host-side
     Ok(())
 }
