@@ -1,7 +1,18 @@
 //! Vulkan 1.4 instance / physical-device pick / logical device / queue.
 //!
-//! Hard-fails when required extensions or features are absent — no silent
-//! fallback. The MVP's contract is "Vulkan 1.4 with these caps or bust".
+//! Hard-fails when required features are absent — no silent fallback. The
+//! MVP's contract is "Vulkan 1.4 with these features or bust". All four
+//! extensions we used to request explicitly (16-bit storage,
+//! shader_float16_int8, maintenance4, subgroup_size_control) are core in
+//! 1.4 and are now driven through the `PhysicalDeviceVulkanXFeatures`
+//! rollup structs instead.
+//!
+//! Optional 1.4-era usability features (`maintenance5`, `maintenance6`,
+//! `push_descriptor`, `shader_float_controls2`, `shader_expect_assume`,
+//! `shader_subgroup_rotate`/`_clustered`) are probed and enabled when the
+//! driver reports support; availability is exposed on `Device` so call
+//! sites can branch. Cooperative-matrix support (`VK_KHR_cooperative_matrix`
+//! and `VK_NV_cooperative_matrix2`) is treated the same way.
 //!
 //! Debug builds (`cfg(debug_assertions)`) additionally enable the
 //! `VK_LAYER_KHRONOS_validation` layer and a `VK_EXT_debug_utils` messenger
@@ -10,17 +21,12 @@
 //! missing (e.g. SDK not installed) we log and continue.
 
 use std::error::Error;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, CStr};
 
 use ash::{vk, Entry, Instance};
 use vk::TaggedStructure as _;
 
-const REQUIRED_DEVICE_EXTENSIONS: &[&CStr] = &[
-    vk::KHR_16BIT_STORAGE_NAME,
-    vk::KHR_SHADER_FLOAT16_INT8_NAME,
-    vk::KHR_MAINTENANCE4_NAME,
-    vk::EXT_SUBGROUP_SIZE_CONTROL_NAME,
-];
+const REQUIRED_API_VERSION: u32 = vk::make_api_version(0, 1, 4, 0);
 
 /// Vulkan handles needed throughout the inference module. Owns the
 /// `ash::Entry` so the loader stays alive for the device's lifetime.
@@ -33,7 +39,17 @@ pub struct Device {
     pub queue_family: u32,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
+    pub api_version: u32,
     pub portability: bool,
+    pub maintenance5: bool,
+    pub maintenance6: bool,
+    pub push_descriptor: bool,
+    pub shader_float_controls2: bool,
+    pub shader_expect_assume: bool,
+    pub shader_subgroup_rotate: bool,
+    pub shader_subgroup_rotate_clustered: bool,
+    pub coop_matrix: bool,
+    pub coop_matrix2: bool,
     #[cfg(debug_assertions)]
     debug: Option<validation::Messenger>,
 }
@@ -124,7 +140,15 @@ impl Device {
             None
         };
 
-        let (physical, queue_family, portability) = pick_physical_device(&instance)?;
+        let DevicePick {
+            physical,
+            queue_family,
+            api_version,
+            portability,
+            coop_matrix_ext,
+            coop_matrix2_ext,
+        } = pick_physical_device(&instance)?;
+
         let props = unsafe { instance.get_physical_device_properties(physical) };
         let device_name = props
             .device_name_as_c_str()
@@ -132,41 +156,183 @@ impl Device {
             .and_then(|s| s.to_str().ok())
             .unwrap_or("<?>")
             .to_string();
+
+        // Probe feature support via the Vulkan 1.4 rollup structs (plus
+        // coop-matrix structs only when the corresponding extension is
+        // advertised — otherwise the driver may ignore them).
+        let mut q11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut q12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut q13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut q14 = vk::PhysicalDeviceVulkan14Features::default();
+        let mut q_cm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+        let mut q_cm2 = vk::PhysicalDeviceCooperativeMatrix2FeaturesNV::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push(&mut q11)
+            .push(&mut q12)
+            .push(&mut q13)
+            .push(&mut q14);
+        if coop_matrix_ext {
+            features2 = features2.push(&mut q_cm);
+        }
+        if coop_matrix2_ext {
+            features2 = features2.push(&mut q_cm2);
+        }
+        unsafe { instance.get_physical_device_features2(physical, &mut features2) };
+
+        let mut missing: Vec<&'static str> = Vec::new();
+        let mut require = |name: &'static str, supported: vk::Bool32| {
+            if supported != vk::TRUE {
+                missing.push(name);
+            }
+        };
+        require("storage_buffer16_bit_access", q11.storage_buffer16_bit_access);
+        require(
+            "uniform_and_storage_buffer16_bit_access",
+            q11.uniform_and_storage_buffer16_bit_access,
+        );
+        require("shader_float16", q12.shader_float16);
+        require("shader_int8", q12.shader_int8);
+        require("storage_buffer8_bit_access", q12.storage_buffer8_bit_access);
+        require(
+            "uniform_and_storage_buffer8_bit_access",
+            q12.uniform_and_storage_buffer8_bit_access,
+        );
+        require("scalar_block_layout", q12.scalar_block_layout);
+        require("vulkan_memory_model", q12.vulkan_memory_model);
+        require(
+            "vulkan_memory_model_device_scope",
+            q12.vulkan_memory_model_device_scope,
+        );
+        require("timeline_semaphore", q12.timeline_semaphore);
+        require("maintenance4", q13.maintenance4);
+        require("subgroup_size_control", q13.subgroup_size_control);
+        require("compute_full_subgroups", q13.compute_full_subgroups);
+        require("shader_integer_dot_product", q13.shader_integer_dot_product);
+        require("synchronization2", q13.synchronization2);
+        if !missing.is_empty() {
+            return Err(format!(
+                "physical device {} missing required Vulkan 1.4 features: {}",
+                device_name,
+                missing.join(", "),
+            )
+            .into());
+        }
+
+        // Optional features the device may report. For each we record the
+        // bit on `Device` and propagate it into the enable-side struct
+        // below.
+        let maintenance5 = q14.maintenance5 == vk::TRUE;
+        let maintenance6 = q14.maintenance6 == vk::TRUE;
+        let push_descriptor = q14.push_descriptor == vk::TRUE;
+        let shader_float_controls2 = q14.shader_float_controls2 == vk::TRUE;
+        let shader_expect_assume = q14.shader_expect_assume == vk::TRUE;
+        let shader_subgroup_rotate = q14.shader_subgroup_rotate == vk::TRUE;
+        let shader_subgroup_rotate_clustered = q14.shader_subgroup_rotate_clustered == vk::TRUE;
+        let coop_matrix = coop_matrix_ext && q_cm.cooperative_matrix == vk::TRUE;
+        let coop_matrix2 = coop_matrix2_ext && q_cm2.cooperative_matrix_workgroup_scope == vk::TRUE;
+
         tracing::info!(
             device = %device_name,
             queue_family,
+            api_version = format_args!(
+                "{}.{}.{}",
+                vk::api_version_major(api_version),
+                vk::api_version_minor(api_version),
+                vk::api_version_patch(api_version),
+            ),
             portability,
+            maintenance5,
+            maintenance6,
+            push_descriptor,
+            shader_float_controls2,
+            shader_expect_assume,
+            shader_subgroup_rotate,
+            shader_subgroup_rotate_clustered,
+            coop_matrix,
+            coop_matrix2,
             "picked physical device",
         );
+
+        // Enable-side feature structs: only the bits we actually want.
+        let mut feat11 = vk::PhysicalDeviceVulkan11Features::default()
+            .storage_buffer16_bit_access(true)
+            .uniform_and_storage_buffer16_bit_access(true);
+        let mut feat12 = vk::PhysicalDeviceVulkan12Features::default()
+            .shader_float16(true)
+            .shader_int8(true)
+            .storage_buffer8_bit_access(true)
+            .uniform_and_storage_buffer8_bit_access(true)
+            .scalar_block_layout(true)
+            .vulkan_memory_model(true)
+            .vulkan_memory_model_device_scope(true)
+            .timeline_semaphore(true);
+        let mut feat13 = vk::PhysicalDeviceVulkan13Features::default()
+            .maintenance4(true)
+            .subgroup_size_control(true)
+            .compute_full_subgroups(true)
+            .shader_integer_dot_product(true)
+            .synchronization2(true);
+        let mut feat14 = vk::PhysicalDeviceVulkan14Features::default()
+            .maintenance5(maintenance5)
+            .maintenance6(maintenance6)
+            .push_descriptor(push_descriptor)
+            .shader_float_controls2(shader_float_controls2)
+            .shader_expect_assume(shader_expect_assume)
+            .shader_subgroup_rotate(shader_subgroup_rotate)
+            .shader_subgroup_rotate_clustered(shader_subgroup_rotate_clustered);
+        // For cooperative matrix, enable every sub-bit the device reported.
+        // Either struct is only chained in below if its extension is in
+        // the enabled list.
+        let mut feat_cm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
+            .cooperative_matrix(q_cm.cooperative_matrix == vk::TRUE)
+            .cooperative_matrix_robust_buffer_access(
+                q_cm.cooperative_matrix_robust_buffer_access == vk::TRUE,
+            );
+        let mut feat_cm2 = vk::PhysicalDeviceCooperativeMatrix2FeaturesNV::default()
+            .cooperative_matrix_workgroup_scope(
+                q_cm2.cooperative_matrix_workgroup_scope == vk::TRUE,
+            )
+            .cooperative_matrix_flexible_dimensions(
+                q_cm2.cooperative_matrix_flexible_dimensions == vk::TRUE,
+            )
+            .cooperative_matrix_reductions(q_cm2.cooperative_matrix_reductions == vk::TRUE)
+            .cooperative_matrix_conversions(q_cm2.cooperative_matrix_conversions == vk::TRUE)
+            .cooperative_matrix_per_element_operations(
+                q_cm2.cooperative_matrix_per_element_operations == vk::TRUE,
+            )
+            .cooperative_matrix_tensor_addressing(
+                q_cm2.cooperative_matrix_tensor_addressing == vk::TRUE,
+            )
+            .cooperative_matrix_block_loads(q_cm2.cooperative_matrix_block_loads == vk::TRUE);
+
+        let mut device_exts: Vec<*const c_char> = Vec::new();
+        if portability {
+            device_exts.push(vk::KHR_PORTABILITY_SUBSET_NAME.as_ptr());
+        }
+        if coop_matrix {
+            device_exts.push(vk::KHR_COOPERATIVE_MATRIX_NAME.as_ptr());
+        }
+        if coop_matrix2 {
+            device_exts.push(vk::NV_COOPERATIVE_MATRIX2_NAME.as_ptr());
+        }
 
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&[1.0]);
 
-        let mut device_exts: Vec<*const c_char> =
-            REQUIRED_DEVICE_EXTENSIONS.iter().map(|c| c.as_ptr()).collect();
-        if portability {
-            device_exts.push(vk::KHR_PORTABILITY_SUBSET_NAME.as_ptr());
-        }
-
-        let mut feat_16bit = vk::PhysicalDevice16BitStorageFeatures::default()
-            .storage_buffer16_bit_access(true)
-            .uniform_and_storage_buffer16_bit_access(true);
-        let mut feat_f16 = vk::PhysicalDeviceShaderFloat16Int8Features::default()
-            .shader_float16(true);
-        let mut feat_subgroup = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
-            .subgroup_size_control(true)
-            .compute_full_subgroups(true);
-        let mut feat_maint4 = vk::PhysicalDeviceMaintenance4Features::default()
-            .maintenance4(true);
-
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_exts)
-            .push(&mut feat_16bit)
-            .push(&mut feat_f16)
-            .push(&mut feat_subgroup)
-            .push(&mut feat_maint4);
+            .push(&mut feat11)
+            .push(&mut feat12)
+            .push(&mut feat13)
+            .push(&mut feat14);
+        if coop_matrix {
+            device_info = device_info.push(&mut feat_cm);
+        }
+        if coop_matrix2 {
+            device_info = device_info.push(&mut feat_cm2);
+        }
         let device = unsafe { instance.create_device(physical, &device_info, None) }?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
@@ -182,7 +348,17 @@ impl Device {
             queue_family,
             mem_props,
             limits,
+            api_version,
             portability,
+            maintenance5,
+            maintenance6,
+            push_descriptor,
+            shader_float_controls2,
+            shader_expect_assume,
+            shader_subgroup_rotate,
+            shader_subgroup_rotate_clustered,
+            coop_matrix,
+            coop_matrix2,
             #[cfg(debug_assertions)]
             debug,
         })
@@ -217,30 +393,43 @@ fn ext_name(name: &[c_char; 256]) -> &CStr {
     unsafe { CStr::from_ptr(name.as_ptr()) }
 }
 
-fn pick_physical_device(
-    instance: &Instance,
-) -> Result<(vk::PhysicalDevice, u32, bool), Box<dyn Error>> {
+struct DevicePick {
+    physical: vk::PhysicalDevice,
+    queue_family: u32,
+    api_version: u32,
+    portability: bool,
+    coop_matrix_ext: bool,
+    coop_matrix2_ext: bool,
+}
+
+fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error>> {
     let phys = unsafe { instance.enumerate_physical_devices() }?;
     if phys.is_empty() {
         return Err("no Vulkan physical devices found".into());
     }
 
     for p in phys {
-        let avail = unsafe { instance.enumerate_device_extension_properties(p) }?;
-        let avail_names: Vec<&CStr> = avail.iter().map(|e| ext_name(&e.extension_name)).collect();
-        let missing: Vec<&CStr> = REQUIRED_DEVICE_EXTENSIONS
-            .iter()
-            .copied()
-            .filter(|req| !avail_names.iter().any(|n| n == req))
-            .collect();
-        if !missing.is_empty() {
+        let props = unsafe { instance.get_physical_device_properties(p) };
+        if props.api_version < REQUIRED_API_VERSION {
             tracing::debug!(
-                missing = ?missing.iter().map(|s| s.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-                "skipping physical device — missing extensions",
+                api_version = format_args!(
+                    "{}.{}.{}",
+                    vk::api_version_major(props.api_version),
+                    vk::api_version_minor(props.api_version),
+                    vk::api_version_patch(props.api_version),
+                ),
+                "skipping physical device — Vulkan 1.4 required",
             );
             continue;
         }
-        let portability = avail_names.iter().any(|n| *n == vk::KHR_PORTABILITY_SUBSET_NAME);
+
+        let avail = unsafe { instance.enumerate_device_extension_properties(p) }?;
+        let has_ext = |needle: &CStr| {
+            avail.iter().any(|e| ext_name(&e.extension_name) == needle)
+        };
+        let portability = has_ext(vk::KHR_PORTABILITY_SUBSET_NAME);
+        let coop_matrix_ext = has_ext(vk::KHR_COOPERATIVE_MATRIX_NAME);
+        let coop_matrix2_ext = has_ext(vk::NV_COOPERATIVE_MATRIX2_NAME);
 
         let queue_families =
             unsafe { instance.get_physical_device_queue_family_properties(p) };
@@ -249,29 +438,16 @@ fn pick_physical_device(
             .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE));
         let Some(qf) = qf else { continue };
 
-        return Ok((p, qf as u32, portability));
+        return Ok(DevicePick {
+            physical: p,
+            queue_family: qf as u32,
+            api_version: props.api_version,
+            portability,
+            coop_matrix_ext,
+            coop_matrix2_ext,
+        });
     }
-    Err(format!(
-        "no physical device satisfies required extensions: {}",
-        REQUIRED_DEVICE_EXTENSIONS
-            .iter()
-            .map(|e| e.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-    .into())
-}
-
-/// Pre-built CString cache for required extension diagnostics. Currently
-/// unused but kept private so future error paths can reference it.
-#[allow(dead_code)]
-fn missing_extension_message(missing: &[&CStr]) -> CString {
-    let s = missing
-        .iter()
-        .map(|e| e.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(", ");
-    CString::new(s).unwrap_or_default()
+    Err("no Vulkan 1.4 physical device with a compute queue found".into())
 }
 
 #[cfg(debug_assertions)]
