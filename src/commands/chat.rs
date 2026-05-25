@@ -233,18 +233,28 @@ struct ChatSession {
     max_tokens: u32,
 }
 
+/// Timing for one reply, used for the `[ Prompt … | Generation … ]` line.
+/// `prompt_tokens` is the prefill suffix actually fed this turn (after
+/// prefix-reuse), timed by `prefill_secs`; `decode_tokens` is the
+/// autoregressive steps after the first, timed by `decode_secs`.
+struct ReplyStats {
+    prompt_tokens: usize,
+    prefill_secs: f64,
+    decode_tokens: usize,
+    decode_secs: f64,
+}
+
 impl ChatSession {
-    /// Push a user turn, render + tokenize, decode the assistant reply,
-    /// and store the turn. `on_text` fires once per sampled token with the
-    /// newly-emitted byte slice — used by the REPL to stream output as it's
-    /// generated. Returns the full assistant reply (without trailing EOS
-    /// markers) so callers that just want the final string can ignore the
-    /// callback.
+    /// Push a user turn, render + tokenize, decode the assistant reply, and
+    /// store the turn. `on_text` fires once per sampled token with the
+    /// newly-emitted byte slice — the REPL streams output through it. The
+    /// full reply is stored in `self.messages`; the return value carries
+    /// per-turn timing for the stats line.
     fn handle_user_message(
         &mut self,
         text: &str,
         mut on_text: impl FnMut(&str),
-    ) -> Result<String, Box<dyn Error>> {
+    ) -> Result<ReplyStats, Box<dyn Error>> {
         self.messages.push(ChatMessage {
             role: "user".to_string(),
             content: text.to_string(),
@@ -312,6 +322,10 @@ impl ChatSession {
         // multi-byte UTF-8 char or a whitespace-managing prefix, but the
         // running prefix always decodes cleanly with `skip_special_tokens=true`.
         let mut step_tokens = delta;
+        let prompt_tokens = step_tokens.len(); // prefill suffix fed this turn
+        let mut prefill_secs = 0.0f64;
+        let mut decode_secs = 0.0f64;
+        let mut forwards = 0usize;
         let mut assistant_tokens: Vec<u32> = Vec::new();
         let mut printed_len: usize = 0;
         loop {
@@ -322,11 +336,21 @@ impl ChatSession {
             }
             let cache = &mut self.cache;
             let model = &self.model;
+            let t0 = std::time::Instant::now();
             let token = self.engine.forward_sampled(
                 model.weights(),
                 &mut self.sampler,
                 |ctx| model.record_forward(ctx, cache, &step_tokens, cache.position),
             )?;
+            // Forward 0 is the prefill (N = prompt_tokens); the rest are
+            // single-token decode steps. Time them separately, like llama.cpp.
+            let dt = t0.elapsed().as_secs_f64();
+            if forwards == 0 {
+                prefill_secs = dt;
+            } else {
+                decode_secs += dt;
+            }
+            forwards += 1;
             if self.eos_ids.contains(&token) {
                 // Don't emit EOS — but it IS now in the cache (the model
                 // wrote K/V for it). Track that in prior_tokens so the
@@ -371,7 +395,7 @@ impl ChatSession {
 
         self.messages.push(ChatMessage {
             role: "assistant".to_string(),
-            content: reply.clone(),
+            content: reply,
         });
 
         // The cache holds K/V for every token whose forward we *fed* —
@@ -386,7 +410,13 @@ impl ChatSession {
             self.prior_tokens.extend(&assistant_tokens[..n - 1]);
         }
 
-        Ok(reply)
+        Ok(ReplyStats {
+            prompt_tokens,
+            prefill_secs,
+            // The prefill forward emits the first token; the rest are decode.
+            decode_tokens: forwards.saturating_sub(1),
+            decode_secs,
+        })
     }
 
     /// Reset everything that ties to the current conversation; keep the
@@ -571,15 +601,36 @@ fn run_piped(session: &mut ChatSession) -> Result<(), Box<dyn Error>> {
 }
 
 fn emit_reply(session: &mut ChatSession, line: &str) {
-    print!("assistant: ");
+    println!(); // blank line between the input and the reply
     let _ = std::io::stdout().flush();
     let result = session.handle_user_message(line, |delta| {
         print!("{delta}");
         let _ = std::io::stdout().flush();
     });
     match result {
-        Ok(_) => println!(),
-        Err(e) => println!("\n[error: {e}]"),
+        Ok(stats) => {
+            println!(); // terminate the streamed reply line
+            println!(); // blank line between the reply and the stats
+            print_stats(&stats);
+            println!(); // blank line before the next prompt
+        }
+        Err(e) => println!("\n[error: {e}]\n"),
+    }
+}
+
+/// `[ Prompt: X t/s | Generation: Y t/s ]`, dimmed when stdout is a TTY.
+fn print_stats(stats: &ReplyStats) {
+    let prompt_tps = stats.prompt_tokens as f64 / stats.prefill_secs.max(1e-9);
+    let gen_tps = if stats.decode_secs > 0.0 {
+        stats.decode_tokens as f64 / stats.decode_secs
+    } else {
+        0.0
+    };
+    let line = format!("[ Prompt: {prompt_tps:.1} t/s | Generation: {gen_tps:.1} t/s ]");
+    if std::io::stdout().is_terminal() {
+        println!("\x1b[2m{line}\x1b[0m"); // ANSI dim
+    } else {
+        println!("{line}");
     }
 }
 
