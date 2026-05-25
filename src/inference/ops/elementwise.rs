@@ -152,36 +152,69 @@ pub fn record_get_rows(
         element_stride: [1, indices_len as u64, indices_len as u64, indices_len as u64],
         dtype: GgmlType::I32,
     };
-    let push = binary_params_bytes(&src, &indices_view, &dst, 0.0, 0.0, 0);
+    let mut push = binary_params_bytes(&src, &indices_view, &dst, 0.0, 0.0, 0);
 
-    let (name, spirv) = match (src.dtype, dst.dtype) {
-        (GgmlType::F32, GgmlType::F32) => ("get_rows_f32", shaders::GET_ROWS_F32_SPV.as_bytes()),
-        (GgmlType::F16, GgmlType::F16) => ("get_rows_f16", shaders::GET_ROWS_F16_SPV.as_bytes()),
+    // `elems_per_x` = elements covered per workgroup along the X (column)
+    // axis, which sets the dispatch divisor:
+    //   - plain get_rows (`get_rows.slang`): 512 threads × 1 elem  = 512
+    //   - get_rows_quant (`get_rows_quant.slang`): 512 × 2 elems   = 1024
+    //   - get_rows_q6_k (`get_rows_q6_k.slang`): 1 block / WG       = 256
+    // All variants here declare only bindings [0,1,2] (slangc -O3 strips
+    // the unused packed16 alias from the quant kernels' scalar path).
+    let (name, spirv, elems_per_x) = match (src.dtype, dst.dtype) {
+        (GgmlType::F32, GgmlType::F32) => ("get_rows_f32", shaders::GET_ROWS_F32_SPV.as_bytes(), 512),
+        (GgmlType::F16, GgmlType::F16) => ("get_rows_f16", shaders::GET_ROWS_F16_SPV.as_bytes(), 512),
         (GgmlType::F16, GgmlType::F32) => {
-            ("get_rows_f16_f32", shaders::GET_ROWS_F16_F32_SPV.as_bytes())
+            ("get_rows_f16_f32", shaders::GET_ROWS_F16_F32_SPV.as_bytes(), 512)
         }
         (GgmlType::BF16, GgmlType::F32) => {
-            ("get_rows_bf16", shaders::GET_ROWS_BF16_SPV.as_bytes())
+            ("get_rows_bf16", shaders::GET_ROWS_BF16_SPV.as_bytes(), 512)
         }
+        (GgmlType::I32, GgmlType::I32) => ("get_rows_i32", shaders::GET_ROWS_I32_SPV.as_bytes(), 512),
         (GgmlType::Q6_K, GgmlType::F32) => {
-            ("get_rows_q6_k", shaders::GET_ROWS_Q6_K_DEFAULT_SPV.as_bytes())
+            ("get_rows_q6_k", shaders::GET_ROWS_Q6_K_DEFAULT_SPV.as_bytes(), 256)
         }
-        (GgmlType::I32, GgmlType::I32) => ("get_rows_i32", shaders::GET_ROWS_I32_SPV.as_bytes()),
+        (GgmlType::Q4_0, GgmlType::F32) => {
+            ("get_rows_quant_q4_0", shaders::GET_ROWS_QUANT_Q4_0_SPV.as_bytes(), 1024)
+        }
+        (GgmlType::Q4_1, GgmlType::F32) => {
+            ("get_rows_quant_q4_1", shaders::GET_ROWS_QUANT_Q4_1_SPV.as_bytes(), 1024)
+        }
+        (GgmlType::Q5_0, GgmlType::F32) => {
+            ("get_rows_quant_q5_0", shaders::GET_ROWS_QUANT_Q5_0_SPV.as_bytes(), 1024)
+        }
+        (GgmlType::Q5_1, GgmlType::F32) => {
+            ("get_rows_quant_q5_1", shaders::GET_ROWS_QUANT_Q5_1_SPV.as_bytes(), 1024)
+        }
+        (GgmlType::Q8_0, GgmlType::F32) => {
+            ("get_rows_quant_q8_0", shaders::GET_ROWS_QUANT_Q8_0_SPV.as_bytes(), 1024)
+        }
+        (GgmlType::IQ4_NL, GgmlType::F32) => {
+            ("get_rows_quant_iq4_nl", shaders::GET_ROWS_QUANT_IQ4_NL_SPV.as_bytes(), 1024)
+        }
         (s, d) => return Err(format!("get_rows: unsupported src/dst combo {s:?}/{d:?}").into()),
     };
+
+    let ne00 = src.dims[0] as u32;
+    let ne10 = indices_len;
+
+    // `get_rows_quant.slang` indexes `data_a[a_off + i00/QUANT_K]` in *block*
+    // units, so it needs `nb01` = blocks-per-row. `binary_params_bytes`
+    // fills `nb01` from `element_stride[1]`, which for a quant tensor is
+    // `byte_stride[1] / rounded_elem_size` (e.g. Q8_0: (64·34)/2 = 1088) —
+    // not the block count. Patch `nb01` (field index 6, byte offset 24) to
+    // the true blocks-per-row. (`get_rows_q6_k` doesn't need this — it
+    // derives the block index from `ne00/QUANT_K` directly.)
+    if elems_per_x == 1024 {
+        let (block_size, _) = src.dtype.block_layout();
+        let blocks_per_row = ne00 / block_size as u32;
+        push[24..28].copy_from_slice(&blocks_per_row.to_ne_bytes());
+    }
 
     let key = PipelineKey::dense(name, 3, super::BINARY_PARAMS_BYTES, vec![0]);
     let pipeline = *ctx.pipelines.get(ctx.device, key, spirv)?;
 
-    let ne00 = src.dims[0] as u32;
-    let ne10 = indices_len;
-    // get_rows_q6_k uses one workgroup per 256-element block (numthreads=64);
-    // every other variant uses one workgroup per 512-element span (numthreads=512).
-    let workgroups = if src.dtype == GgmlType::Q6_K {
-        [ne00.div_ceil(256), ne10, 1]
-    } else {
-        [ne00.div_ceil(512), ne10, 1]
-    };
+    let workgroups = [ne00.div_ceil(elems_per_x), ne10, 1];
 
     super::bind_and_dispatch(
         ctx,

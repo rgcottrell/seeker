@@ -583,6 +583,18 @@ fn dequant_kquant_row(dtype: GgmlType, raw: &[u8], row: u64, k: usize, out: &mut
                 }
             }
         }
+        GgmlType::Q8_0 => {
+            const BLK: usize = 34; // 2 (d) + 32 (qs i8)
+            let blocks_per_row = k / 32;
+            for blk in 0..blocks_per_row {
+                let base = (row as usize * blocks_per_row + blk) * BLK;
+                let d = f16_bits_to_f32(u16::from_le_bytes([raw[base], raw[base + 1]]));
+                for i in 0..32 {
+                    let q = raw[base + 2 + i] as i8 as f32;
+                    out[blk * 32 + i] = d * q;
+                }
+            }
+        }
         GgmlType::BF16 => {
             let base = row as usize * k * 2;
             for i in 0..k {
