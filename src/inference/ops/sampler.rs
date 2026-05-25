@@ -639,13 +639,18 @@ fn sum_rows_params_bytes(
 /// where dropped entries are `-inf`.
 ///
 /// Composed entirely from existing primitives, matching llama.cpp's
-/// `llama_sampler_top_p_backend_apply`:
+/// `llama_sampler_top_p_apply`:
 ///   probs   = soft_max(sorted)
-///   cdf     = cumsum(probs)
-///   margin  = scale(cdf, α=-1, β=p)            // p - cdf
-///   mask    = step(margin)                     // 1 if cdf ≤ p, else 0
-///   log_m   = log(mask)                        // 0 or -inf
+///   cdf     = cumsum(probs)                     // inclusive
+///   margin  = p - cdf + probs                   // = p - exclusive_cdf
+///   mask    = step(margin)                      // keep while exclusive cdf ≤ p
+///   log_m   = log(mask)                         // 0 or -inf
 ///   kept    = add(sorted, log_m)
+///
+/// Using the *exclusive* cdf keeps the token that first crosses `p`
+/// (llama.cpp's `last_idx = i + 1` once `cum_sum >= p`). Masking on the
+/// inclusive cdf instead would drop that crossing token — slightly too
+/// aggressive vs llama.cpp.
 fn record_top_p(
     ctx: &mut DispatchContext,
     sorted_logits: TensorView,
@@ -657,9 +662,13 @@ fn record_top_p(
     let cdf = ctx.alloc_tensor([k, 1, 1, 1], GgmlType::F32)?;
     record_cumsum(ctx, probs, cdf)?;
     let margin = ctx.alloc_tensor([k, 1, 1, 1], GgmlType::F32)?;
-    record_scale(ctx, cdf, margin, -1.0, p)?;
+    record_scale(ctx, cdf, margin, -1.0, p)?; // p - cdf
+    // + probs → p - (cdf - probs) = p - exclusive_cdf, so the crossing token
+    // (the first with inclusive cdf ≥ p) is kept, matching llama.cpp.
+    let margin_excl = ctx.alloc_tensor([k, 1, 1, 1], GgmlType::F32)?;
+    super::elementwise::record_add(ctx, margin, probs, margin_excl)?;
     let mask = ctx.alloc_tensor([k, 1, 1, 1], GgmlType::F32)?;
-    record_step(ctx, margin, mask)?;
+    record_step(ctx, margin_excl, mask)?;
     let log_mask = ctx.alloc_tensor([k, 1, 1, 1], GgmlType::F32)?;
     record_log(ctx, mask, log_mask)?;
     let kept = ctx.alloc_tensor([k, 1, 1, 1], GgmlType::F32)?;
