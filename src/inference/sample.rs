@@ -27,8 +27,8 @@ use super::buffer::BufferRange;
 use super::context::DispatchContext;
 use super::weights::TensorView;
 
-/// User-facing sampler knobs. Mirrors llama.cpp's `common_params_sampling`
-/// for the subset relevant to Qwen-style models.
+/// User-facing sampler knobs. Mirrors the relevant subset of llama.cpp's
+/// `common_params_sampling`.
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
     /// 0.0 → greedy (skip stochastic chain entirely).
@@ -52,14 +52,15 @@ pub struct SamplerConfig {
 }
 
 impl Default for SamplerConfig {
-    /// Qwen3 recommended defaults.
+    /// llama.cpp's `common_params_sampling` defaults — model-agnostic and
+    /// sensible across families (Llama, Qwen, Mistral, …).
     fn default() -> Self {
         Self {
-            temperature: 0.6,
-            top_k: 20,
+            temperature: 0.8,
+            top_k: 40,
             top_p: 0.95,
-            min_p: 0.0,
-            presence_penalty: 1.5,
+            min_p: 0.05,
+            presence_penalty: 0.0,
             frequency_penalty: 0.0,
             repeat_penalty: 1.0,
             penalty_last_n: 64,

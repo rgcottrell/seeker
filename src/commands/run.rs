@@ -55,20 +55,22 @@ pub struct RunArgs {
     cache_type_v: GgmlType,
 
     // ─── Sampling ───────────────────────────────────────────────────────
-    /// Sampling temperature. 0 → greedy argmax.
+    /// Sampling temperature. Defaults to 0 (greedy) — `run` is a single-shot
+    /// inspection tool, so deterministic argmax is the useful default. Pass
+    /// `--temp 0.8` for llama.cpp-style stochastic sampling.
     #[arg(long = "temp", alias = "temperature", default_value_t = 0.0)]
     temperature: f32,
 
-    /// Top-K filter (0 = disabled, full vocab).
-    #[arg(long = "top-k", default_value_t = 20)]
+    /// Top-K filter (0 = disabled, full vocab). (llama.cpp default: 40)
+    #[arg(long = "top-k", default_value_t = 40)]
     top_k: u32,
 
     /// Top-P (nucleus) filter (1.0 = disabled).
     #[arg(long = "top-p", default_value_t = 0.95)]
     top_p: f32,
 
-    /// Min-P filter (0.0 = disabled).
-    #[arg(long = "min-p", default_value_t = 0.0)]
+    /// Min-P filter (0.0 = disabled). (llama.cpp default: 0.05)
+    #[arg(long = "min-p", default_value_t = 0.05)]
     min_p: f32,
 
     /// Presence penalty (subtract from any repeated-token logit; 0.0 = off).

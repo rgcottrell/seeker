@@ -77,24 +77,24 @@ pub struct ChatArgs {
     cache_type_v: GgmlType,
 
     // ─── Sampling ───────────────────────────────────────────────────────
-    /// Sampling temperature. 0 → greedy argmax.
-    #[arg(long = "temp", alias = "temperature", default_value_t = 0.6)]
+    /// Sampling temperature. 0 → greedy argmax. (llama.cpp default: 0.8)
+    #[arg(long = "temp", alias = "temperature", default_value_t = 0.8)]
     temperature: f32,
 
-    /// Top-K filter (0 = disabled, full vocab).
-    #[arg(long = "top-k", default_value_t = 20)]
+    /// Top-K filter (0 = disabled, full vocab). (llama.cpp default: 40)
+    #[arg(long = "top-k", default_value_t = 40)]
     top_k: u32,
 
     /// Top-P (nucleus) filter (1.0 = disabled).
     #[arg(long = "top-p", default_value_t = 0.95)]
     top_p: f32,
 
-    /// Min-P filter (0.0 = disabled).
-    #[arg(long = "min-p", default_value_t = 0.0)]
+    /// Min-P filter (0.0 = disabled). (llama.cpp default: 0.05)
+    #[arg(long = "min-p", default_value_t = 0.05)]
     min_p: f32,
 
     /// Presence penalty (subtract from any repeated-token logit; 0.0 = off).
-    #[arg(long = "presence-penalty", default_value_t = 1.5)]
+    #[arg(long = "presence-penalty", default_value_t = 0.0)]
     presence_penalty: f32,
 
     /// Frequency penalty (subtract count×p from repeated-token logits; 0.0 = off).
