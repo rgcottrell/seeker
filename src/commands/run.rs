@@ -157,6 +157,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         kquant_matmul_test(&mut engine, model.weights(), &tname)?;
         return Ok(());
     }
+    if std::env::var("SEEKER_INPLACE_BINARY_TEST").is_ok() {
+        inplace_binary_smoke_test(&mut engine, model.weights())?;
+        return Ok(());
+    }
 
     let max_seq_len = args
         .max_tokens
@@ -237,6 +241,60 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         "timing:    prefill {prefill_tokens} tok in {:.3}s ({prefill_tps:.1} tok/s), decode {} tok in {:.3}s ({decode_tps:.1} tok/s)",
         prefill_secs, decode_steps as u32, decode_secs,
     );
+    Ok(())
+}
+
+/// Regression test for in-place elementwise add/mul: `record_add(d, b, d)`
+/// must apply `b` exactly once even though the kernel tiles the buffer in
+/// 512-wide blocks. A previous version dispatched overlapping workgroups and
+/// relied on redundant writes being idempotent — true for a distinct `dst`,
+/// but in-place it double-applied the op nondeterministically (the root cause
+/// of run-to-run nondeterminism in the residual stream). We size N to span
+/// several blocks and deliberately straddle the 512 boundary.
+fn inplace_binary_smoke_test(
+    engine: &mut Engine,
+    weights: &crate::inference::weights::WeightsHandle,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::buffer::BufferRange;
+    use crate::inference::ops::elementwise;
+
+    let n: u64 = 512 * 7 + 137; // straddles block boundaries; not a multiple of 512
+    let a_val = |i: usize| (i as f32) * 0.5 - 3.0;
+    let b_val = |i: usize| ((i % 13) as f32) - 6.0;
+
+    let out = engine.forward(weights, |ctx| -> Result<BufferRange, Box<dyn Error>> {
+        let d = ctx.alloc_tensor([n, 1, 1, 1], GgmlType::F32)?;
+        let b = ctx.alloc_tensor([n, 1, 1, 1], GgmlType::F32)?;
+        let host = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
+        unsafe {
+            let dp = host.add(d.byte_offset as usize) as *mut f32;
+            let bp = host.add(b.byte_offset as usize) as *mut f32;
+            for i in 0..n as usize {
+                std::ptr::write(dp.add(i), a_val(i));
+                std::ptr::write(bp.add(i), b_val(i));
+            }
+        }
+        // In-place: dst aliases src0.
+        elementwise::record_add(ctx, d, b, d)?;
+        Ok(d.range())
+    })?;
+
+    let mut wrong = 0usize;
+    let mut max_err = 0f32;
+    for i in 0..n as usize {
+        let expected = a_val(i) + b_val(i);
+        let err = (out[i] - expected).abs();
+        if err > 1e-4 {
+            wrong += 1;
+            max_err = max_err.max(err);
+        }
+    }
+    println!("in-place add: N={n}, {wrong} wrong elements, max_err={max_err}");
+    if wrong == 0 {
+        println!("  RESULT: PASS (each element written exactly once)");
+    } else {
+        println!("  RESULT: FAIL (in-place op applied a non-unit number of times)");
+    }
     Ok(())
 }
 

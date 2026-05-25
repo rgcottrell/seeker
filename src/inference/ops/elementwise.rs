@@ -82,13 +82,13 @@ fn record_binary_f32(
     let pipeline = *ctx.pipelines.get(ctx.device, key, spirv)?;
     let push = binary_params_bytes(&a, &b, &dst, 0.0, 0.0, 0);
 
-    // Shader: 256 threads × num_iter=2 with `idx += num_threads=256` per
-    // iter. Each workgroup covers 512 indices, but adjacent workgroups
-    // overlap at the 256-boundary, so the effective non-overlapping per-WG
-    // stride is 256. Dispatch ceil(N/256) workgroups to guarantee full
-    // coverage with some redundant writes (idempotent for add/mul).
+    // Shader: 256 threads × num_iter=2, each workgroup owning a UNIQUE 512-wide
+    // block (base = workgroup * 512). Non-overlapping, so every element is
+    // written exactly once — required for in-place ops where dst aliases a
+    // source (e.g. `residual += proj`); overlapping writes would double-apply
+    // the op nondeterministically. Dispatch ceil(N/512) workgroups.
     let nelements: u64 = dst.dims.iter().product();
-    let workgroups = [(nelements as u32).div_ceil(256), 1, 1];
+    let workgroups = [(nelements as u32).div_ceil(512), 1, 1];
 
     super::bind_and_dispatch(
         ctx,

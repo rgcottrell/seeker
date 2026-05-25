@@ -12,8 +12,10 @@ static const uint num_threads = 256;
 
 [shader("compute")]
 [numthreads(num_threads, 1, 1)]
-void main(uint3 gl_GlobalInvocationID : SV_DispatchThreadID) {
-    uint idx = get_idx(gl_GlobalInvocationID);
+void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_GroupThreadID) {
+    // Unique 512-wide block per workgroup — non-overlapping so each element is
+    // written once (safe for in-place dst). Host dispatches ceil(ne/512).
+    uint idx = gl_WorkGroupID.x * 512 + gl_LocalInvocationID.x;
     const uint num_iter = 2;
 
     [unroll] for (uint i = 0; i < num_iter; ++i) {
