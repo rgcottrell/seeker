@@ -42,12 +42,29 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
 
     const uint y_base = out_row * p.nb21 + block_in_row * QUANT_K + 128 * ip + il;
     const uint ql_idx = 64 * ip + il;
-    const uint8_t qh  = data_a[a_block].qh[32 * ip + il];
+    const uint qh = uint(data_a[a_block].qh[32 * ip + il]);
 
     const FLOAT_TYPE d = FLOAT_TYPE(data_a[a_block].d);
 
-    data_d[y_base +  0] = D_TYPE(d * FLOAT_TYPE(data_a[a_block].scales[is + 0] * (int8_t((data_a[a_block].ql[ql_idx +  0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32)));
-    data_d[y_base + 32] = D_TYPE(d * FLOAT_TYPE(data_a[a_block].scales[is + 2] * (int8_t((data_a[a_block].ql[ql_idx + 32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32)));
-    data_d[y_base + 64] = D_TYPE(d * FLOAT_TYPE(data_a[a_block].scales[is + 4] * (int8_t((data_a[a_block].ql[ql_idx +  0] >>  4) | (((qh >> 4) & 3) << 4)) - 32)));
-    data_d[y_base + 96] = D_TYPE(d * FLOAT_TYPE(data_a[a_block].scales[is + 6] * (int8_t((data_a[a_block].ql[ql_idx + 32] >>  4) | (((qh >> 6) & 3) << 4)) - 32)));
+    // Widen to int BEFORE the scale × quant multiply. `scales[]` is i8
+    // (±127) and the centered quant is ±32, so the product reaches ±4000 —
+    // doing it in int8 would overflow. (The mat-vec kernel sidesteps this
+    // by converting both operands to float first.)
+    const int sc0 = int(data_a[a_block].scales[is + 0]);
+    const int sc2 = int(data_a[a_block].scales[is + 2]);
+    const int sc4 = int(data_a[a_block].scales[is + 4]);
+    const int sc6 = int(data_a[a_block].scales[is + 6]);
+
+    const int ql0  = int(data_a[a_block].ql[ql_idx +  0]);
+    const int ql32 = int(data_a[a_block].ql[ql_idx + 32]);
+
+    const int q1 = ((ql0  & 0xF) | (int((qh >> 0) & 3) << 4)) - 32;
+    const int q2 = ((ql32 & 0xF) | (int((qh >> 2) & 3) << 4)) - 32;
+    const int q3 = ((ql0  >>  4) | (int((qh >> 4) & 3) << 4)) - 32;
+    const int q4 = ((ql32 >>  4) | (int((qh >> 6) & 3) << 4)) - 32;
+
+    data_d[y_base +  0] = D_TYPE(d * FLOAT_TYPE(sc0 * q1));
+    data_d[y_base + 32] = D_TYPE(d * FLOAT_TYPE(sc2 * q2));
+    data_d[y_base + 64] = D_TYPE(d * FLOAT_TYPE(sc4 * q3));
+    data_d[y_base + 96] = D_TYPE(d * FLOAT_TYPE(sc6 * q4));
 }

@@ -153,6 +153,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         quant_roundtrip_test(&mut engine, model.weights(), &dt_name)?;
         return Ok(());
     }
+    if let Ok(tname) = std::env::var("SEEKER_KQUANT_MATMUL_TEST") {
+        kquant_matmul_test(&mut engine, model.weights(), &tname)?;
+        return Ok(());
+    }
 
     let max_seq_len = args
         .max_tokens
@@ -416,6 +420,186 @@ fn quant_roundtrip_test(
     println!("  dst last 4:  {:?}", &logits[nel-4..]);
     println!("  max abs err: {max_err}");
     Ok(())
+}
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = if (h >> 15) & 1 == 1 { -1.0f32 } else { 1.0f32 };
+    let exp = (h >> 10) & 0x1F;
+    let mant = (h & 0x3FF) as f32;
+    let val = if exp == 0 {
+        // subnormal (or zero): mant × 2^-24
+        mant * (2.0f32).powi(-24)
+    } else if exp == 0x1F {
+        if mant == 0.0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        // normal: (1 + mant/1024) × 2^(exp-15)
+        (1.0 + mant / 1024.0) * (2.0f32).powi(exp as i32 - 15)
+    };
+    sign * val
+}
+
+/// CPU reference matmul-vec for a K-quant weight, compared against the GPU
+/// `mul_mat_vec_q{4,6}_k` kernel. Picks `blk.0.<name>.weight`, builds a
+/// deterministic input vector, and reports max abs / rel error.
+fn kquant_matmul_test(
+    engine: &mut Engine,
+    weights: &crate::inference::weights::WeightsHandle,
+    tensor_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::ops::matmul;
+
+    let full_name = format!("blk.0.{tensor_name}.weight");
+    let a = *weights
+        .views
+        .get(&full_name)
+        .ok_or_else(|| format!("tensor {full_name} not found"))?;
+    let k = a.dims[0]; // contracting dim
+    let m = a.dims[1]; // output rows
+    println!("kquant matmul test: {full_name} dtype={:?} K={k} M={m}", a.dtype);
+
+    // Raw quant bytes live in the (host-visible) weights region.
+    let host_ptr = weights
+        .region
+        .host_ptr
+        .ok_or("weights region not host-visible")?;
+    let raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            host_ptr.add(a.byte_offset as usize),
+            a.byte_size as usize,
+        )
+    };
+
+    // Deterministic input vector b[i] = sin(i * 0.01) — varied, bounded.
+    let b_host: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01).sin()).collect();
+
+    // GPU matmul.
+    let gpu = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+        let b = ctx.alloc_tensor([k, 1, 1, 1], GgmlType::F32)?;
+        let d = ctx.alloc_tensor([m, 1, 1, 1], GgmlType::F32)?;
+        unsafe {
+            let bp = ctx.scratch.host_ptr.unwrap().add(b.byte_offset as usize) as *mut f32;
+            std::ptr::copy_nonoverlapping(b_host.as_ptr(), bp, b_host.len());
+        }
+        matmul::record(ctx, a, b, d)?;
+        Ok(d.range())
+    })?;
+
+    // CPU reference: dequant each row of A, dot with b.
+    let cpu: Vec<f32> = (0..m)
+        .map(|row| {
+            let mut row_vals = vec![0f32; k as usize];
+            dequant_kquant_row(a.dtype, raw, row, k as usize, &mut row_vals);
+            row_vals.iter().zip(b_host.iter()).map(|(w, x)| w * x).sum()
+        })
+        .collect();
+
+    let mut max_abs = 0f32;
+    let mut worst_row = 0;
+    for (row, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+        let abs = (g - c).abs();
+        if abs > max_abs {
+            max_abs = abs;
+            worst_row = row;
+        }
+    }
+    let bad = (0..m as usize).filter(|&r| (gpu[r] - cpu[r]).abs() > 0.01).count();
+    println!("  gpu[0..4]    = {:?}", &gpu[..4.min(gpu.len())]);
+    println!("  cpu[0..4]    = {:?}", &cpu[..4.min(cpu.len())]);
+    println!("  max abs err  = {max_abs} (worst row {worst_row})");
+    println!("  bad rows     = {bad}/{m} (threshold 0.01)");
+    Ok(())
+}
+
+/// Dequantize one row (`k` elements) of a K-quant tensor stored in `raw`,
+/// into `out`. Mirrors llama.cpp's `dequantize_row_q{4,6}_K`.
+fn dequant_kquant_row(dtype: GgmlType, raw: &[u8], row: u64, k: usize, out: &mut [f32]) {
+    match dtype {
+        GgmlType::Q4_K => {
+            const BLK: usize = 144; // bytes per Q4_K superblock (256 elements)
+            let blocks_per_row = k / 256;
+            for blk in 0..blocks_per_row {
+                let base = (row as usize * blocks_per_row + blk) * BLK;
+                let d = f16_bits_to_f32(u16::from_le_bytes([raw[base], raw[base + 1]]));
+                let dmin = f16_bits_to_f32(u16::from_le_bytes([raw[base + 2], raw[base + 3]]));
+                let scales = &raw[base + 4..base + 16];
+                let qs = &raw[base + 16..base + 144];
+                let get_sc_min = |j: usize| -> (u8, u8) {
+                    if j < 4 {
+                        (scales[j] & 63, scales[j + 4] & 63)
+                    } else {
+                        (
+                            (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4),
+                            (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4),
+                        )
+                    }
+                };
+                let mut y = blk * 256;
+                let mut is = 0usize;
+                for j in (0..256).step_by(64) {
+                    let (sc1, m1) = get_sc_min(is);
+                    let (sc2, m2) = get_sc_min(is + 1);
+                    let d1 = d * sc1 as f32;
+                    let mm1 = dmin * m1 as f32;
+                    let d2 = d * sc2 as f32;
+                    let mm2 = dmin * m2 as f32;
+                    let q = &qs[j / 2..];
+                    for l in 0..32 {
+                        out[y] = d1 * (q[l] & 0xF) as f32 - mm1;
+                        y += 1;
+                    }
+                    for l in 0..32 {
+                        out[y] = d2 * (q[l] >> 4) as f32 - mm2;
+                        y += 1;
+                    }
+                    is += 2;
+                }
+            }
+        }
+        GgmlType::Q6_K => {
+            const BLK: usize = 210;
+            let blocks_per_row = k / 256;
+            for blk in 0..blocks_per_row {
+                let base = (row as usize * blocks_per_row + blk) * BLK;
+                let ql = &raw[base..base + 128];
+                let qh = &raw[base + 128..base + 192];
+                let sc = &raw[base + 192..base + 208]; // i8
+                let d = f16_bits_to_f32(u16::from_le_bytes([raw[base + 208], raw[base + 209]]));
+                for n in 0..2 {
+                    let ql_b = n * 64;
+                    let qh_b = n * 32;
+                    let sc_b = n * 8;
+                    let y_b = blk * 256 + n * 128;
+                    for l in 0..32 {
+                        let is = l / 16;
+                        let q1 = (((ql[ql_b + l] & 0xF) | (((qh[qh_b + l] >> 0) & 3) << 4)) as i8) as i32 - 32;
+                        let q2 = (((ql[ql_b + l + 32] & 0xF) | (((qh[qh_b + l] >> 2) & 3) << 4)) as i8) as i32 - 32;
+                        let q3 = (((ql[ql_b + l] >> 4) | (((qh[qh_b + l] >> 4) & 3) << 4)) as i8) as i32 - 32;
+                        let q4 = (((ql[ql_b + l + 32] >> 4) | (((qh[qh_b + l] >> 6) & 3) << 4)) as i8) as i32 - 32;
+                        out[y_b + l] = d * (sc[sc_b + is] as i8 as f32) * q1 as f32;
+                        out[y_b + l + 32] = d * (sc[sc_b + is + 2] as i8 as f32) * q2 as f32;
+                        out[y_b + l + 64] = d * (sc[sc_b + is + 4] as i8 as f32) * q3 as f32;
+                        out[y_b + l + 96] = d * (sc[sc_b + is + 6] as i8 as f32) * q4 as f32;
+                    }
+                }
+            }
+        }
+        GgmlType::BF16 => {
+            let base = row as usize * k * 2;
+            for i in 0..k {
+                let bits = u16::from_le_bytes([raw[base + i * 2], raw[base + i * 2 + 1]]);
+                // bf16 → f32: high 16 bits of the f32.
+                out[i] = f32::from_bits((bits as u32) << 16);
+            }
+        }
+        GgmlType::F16 => {
+            let base = row as usize * k * 2;
+            for i in 0..k {
+                let bits = u16::from_le_bytes([raw[base + i * 2], raw[base + i * 2 + 1]]);
+                out[i] = f16_bits_to_f32(bits);
+            }
+        }
+        other => panic!("dequant_kquant_row: unsupported dtype {other:?}"),
+    }
 }
 
 fn f32_to_f16_bits(v: f32) -> u16 {

@@ -12,9 +12,9 @@ use std::error::Error;
 
 use crate::gguf::GgmlType;
 use crate::inference::buffer::BufferRange;
-use crate::inference::command::{record_compute_barrier, record_dispatch};
+use crate::inference::command::record_compute_barrier;
 use crate::inference::context::DispatchContext;
-use crate::inference::pipeline::{CachedPipeline, PipelineKey};
+use crate::inference::pipeline::PipelineKey;
 use crate::inference::weights::TensorView;
 use crate::shaders;
 
