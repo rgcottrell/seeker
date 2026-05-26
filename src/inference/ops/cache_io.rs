@@ -62,6 +62,56 @@ pub fn record_write_nofence(
     record_write_inner(ctx, new_kv_f32, cache_layer, position, /*fence=*/ false)
 }
 
+/// Fused KV cache write: a single strided cast directly into the cache
+/// slot at `position`. Replaces the two-step `cast→global_barrier→copy
+/// →global_barrier` chain in [`record_write`] — saves one transfer
+/// command and two global barriers per call. Caller is responsible
+/// for fencing the cache buffer before the downstream compute read
+/// (typically flash_attn).
+pub fn record_write_fused_nofence(
+    ctx: &mut DispatchContext,
+    new_kv_f32: TensorView,
+    cache_layer: TensorView,
+    position: u32,
+) -> Result<(), Box<dyn Error>> {
+    let head_dim = new_kv_f32.dims[0];
+    let n_head_kv = new_kv_f32.dims[1];
+    let l = new_kv_f32.dims[2];
+    let dtype = cache_layer.dtype;
+    let (block_size, type_size) = dtype.block_layout();
+    debug_assert_eq!(block_size, 1, "fused KV write only handles non-block dtypes");
+
+    // Build a TensorView aimed at the cache slot for this batch's
+    // tokens — same shape as `new_kv_f32`, but in the cache's dtype
+    // and offset to the right position. The destination is contiguous
+    // within the cache slab: head_dim innermost, then n_head_kv, then
+    // token; total = l * head_dim * n_head_kv elements.
+    let per_token_bytes_v = per_token_bytes(head_dim, n_head_kv, dtype);
+    let dst_offset_bytes = cache_layer.byte_offset + position as u64 * per_token_bytes_v;
+    let dst_byte_stride: [u64; 4] = [
+        type_size as u64,
+        type_size as u64 * head_dim,
+        type_size as u64 * head_dim * n_head_kv,
+        type_size as u64 * head_dim * n_head_kv * l.max(1),
+    ];
+    let dst_elem_stride: [u64; 4] = [1, head_dim, head_dim * n_head_kv, head_dim * n_head_kv * l.max(1)];
+    let cache_slot = TensorView {
+        buffer: cache_layer.buffer,
+        byte_offset: dst_offset_bytes,
+        byte_size: l * head_dim * n_head_kv * (type_size as u64),
+        dims: [head_dim, n_head_kv, l, 1],
+        byte_stride: dst_byte_stride,
+        element_stride: dst_elem_stride,
+        dtype,
+    };
+    // `record_cast` emits its own trailing compute barrier on the dst
+    // range — that's the right fence (compute → compute) for the
+    // downstream flash_attn read; we still skip the much heavier
+    // pair of `record_global_barrier` calls.
+    record_cast(ctx, new_kv_f32, cache_slot)?;
+    Ok(())
+}
+
 fn record_write_inner(
     ctx: &mut DispatchContext,
     new_kv_f32: TensorView,

@@ -576,13 +576,29 @@ fn attention_block(
     ctx.tap(&format!("Qcur_normed-{layer_idx}"), q_roped)?;
     ctx.tap(&format!("Qcur-{layer_idx}"), q_roped)?;
 
-    // 7a (V only — K already in cache via the fused kernel above). The
-    // V cache write internally emits a global barrier (compute→transfer)
-    // before its memcpy, and a trailing global barrier
-    // (compute|transfer → compute|transfer) after — that covers Q rope
-    // and K rope writes for the downstream flash_attn read; no explicit
-    // Q barrier needed here.
-    cache_io::record_write(ctx, v_view, cache.v_layers[layer_idx as usize], position_offset)?;
+    // 7a (V only — K already in cache via the fused kernel above).
+    // F16 cache fast path: cast V directly into the cache slot — one
+    // compute dispatch, no intermediate scratch + memcpy, no global
+    // barriers. Falls back to the old cast+copy path for non-F16
+    // caches.
+    let v_cache_layer = cache.v_layers[layer_idx as usize];
+    if v_cache_layer.dtype == GgmlType::F16 {
+        cache_io::record_write_fused_nofence(ctx, v_view, v_cache_layer, position_offset)?;
+        // We still need ONE barrier covering (q_roped, K cache slot,
+        // V cache slot) before flash_attn reads. Use a single coalesced
+        // compute barrier — the global barriers from `record_write`
+        // are gone, so this is the only thing fencing the upcoming
+        // attention dispatch.
+        crate::inference::command::record_compute_barrier(
+            ctx.device,
+            ctx.cmd,
+            q_roped.range(),
+        );
+    } else {
+        // Non-F16 cache: the old cast+copy chain still emits its own
+        // trailing global barrier which covers Q rope and K rope.
+        cache_io::record_write(ctx, v_view, v_cache_layer, position_offset)?;
+    }
 
     // 7b. cache read (direct bind for matching K/V dtypes; materialize
     //     otherwise — same logic as the LLaMA path).
