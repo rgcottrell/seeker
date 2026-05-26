@@ -420,6 +420,16 @@ pub fn record_softplus(
     Ok(())
 }
 
+/// As [`record_l2_norm`] but skips the trailing barrier — caller fences.
+pub fn record_l2_norm_nofence(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+    eps: f32,
+) -> Result<(), Box<dyn Error>> {
+    record_l2_norm_inner(ctx, src, dst, eps, /*fence=*/ false)
+}
+
 /// Per-row L2 normalize: `dst[r, c] = src[r, c] / max(sqrt(sum_c src^2), eps)`.
 /// Dispatched with `src.dims[1..]` workgroups, each reducing over
 /// `src.dims[0]` — so passing `src` shape `[head_dim, n_head, L, 1]`
@@ -430,6 +440,16 @@ pub fn record_l2_norm(
     src: TensorView,
     dst: TensorView,
     eps: f32,
+) -> Result<(), Box<dyn Error>> {
+    record_l2_norm_inner(ctx, src, dst, eps, /*fence=*/ true)
+}
+
+fn record_l2_norm_inner(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+    eps: f32,
+    fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(src.dtype, GgmlType::F32);
     debug_assert_eq!(dst.dtype, GgmlType::F32);
@@ -470,7 +490,9 @@ pub fn record_l2_norm(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    }
     Ok(())
 }
 

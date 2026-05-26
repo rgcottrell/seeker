@@ -986,13 +986,19 @@ fn ssm_block(
     let v_view = head_view(v_slice, num_v);
     ctx.tap(&format!("v_conv_predelta-{layer_idx}"), v_view)?;
 
-    // L2-normalize Q and K per (head, token). Output is a fresh
-    // contiguous `[s_v, num_k, L, 1]` tensor.
+    // L2-normalize Q and K per (head, token). The two are independent —
+    // nofence both, then emit one coalesced barrier so they're free to
+    // overlap on the GPU.
     let ssm_norm_eps = 1e-6;
     let q_normed = ctx.alloc_tensor([s_v, num_k, l_u, 1], GgmlType::F32)?;
-    elementwise::record_l2_norm(ctx, q_view, q_normed, ssm_norm_eps)?;
+    elementwise::record_l2_norm_nofence(ctx, q_view, q_normed, ssm_norm_eps)?;
     let k_normed = ctx.alloc_tensor([s_v, num_k, l_u, 1], GgmlType::F32)?;
-    elementwise::record_l2_norm(ctx, k_view, k_normed, ssm_norm_eps)?;
+    elementwise::record_l2_norm_nofence(ctx, k_view, k_normed, ssm_norm_eps)?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[q_normed.range(), k_normed.range()],
+    );
     ctx.tap(&format!("q_conv_predelta-{layer_idx}"), q_normed)?;
     ctx.tap(&format!("k_conv_predelta-{layer_idx}"), k_normed)?;
 
