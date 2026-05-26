@@ -136,39 +136,46 @@ pub fn record_compute_barriers(device: &Device, cmd: vk::CommandBuffer, ranges: 
     // which is a getenv + string-alloc per call — and this function
     // runs hundreds to ~1500 times per decode forward.
     let paranoid = *crate::runtime_flags::BARRIER_PARANOID;
-    let bars: Vec<vk::BufferMemoryBarrier> = if paranoid {
-        // Fall back to a whole-buffer barrier per unique buffer in the set.
+    // Stack-allocated barrier scratch — most calls pass 1–4 ranges
+    // (single barrier, or one coalesced set covering a parallel
+    // dispatch group). Cap at 8.
+    const MAX: usize = 8;
+    let mut bar_buf: [vk::BufferMemoryBarrier; MAX] = [vk::BufferMemoryBarrier::default(); MAX];
+    let n_bars: usize;
+    if paranoid {
+        // Whole-buffer barrier per unique buffer in the set. We still
+        // need a tiny allocation here to dedup (set of buffers); but
+        // paranoid mode is opt-in and not on the perf-critical path.
         let mut buffers: Vec<vk::Buffer> = ranges.iter().map(|r| r.buffer).collect();
         buffers.sort_by_key(|b| b.as_raw());
         buffers.dedup();
-        buffers
-            .into_iter()
-            .map(|buffer| {
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(buffer)
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE)
-            })
-            .collect()
+        debug_assert!(buffers.len() <= MAX, "raise MAX in record_compute_barriers");
+        for (i, buffer) in buffers.iter().take(MAX).enumerate() {
+            bar_buf[i] = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(*buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+        }
+        n_bars = buffers.len();
     } else {
-        ranges
-            .iter()
-            .map(|r| {
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(r.buffer)
-                    .offset(r.offset)
-                    .size(r.size)
-            })
-            .collect()
-    };
+        debug_assert!(ranges.len() <= MAX, "raise MAX in record_compute_barriers");
+        for (i, r) in ranges.iter().take(MAX).enumerate() {
+            bar_buf[i] = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(r.buffer)
+                .offset(r.offset)
+                .size(r.size);
+        }
+        n_bars = ranges.len();
+    }
+    let bars = &bar_buf[..n_bars];
     if bars.is_empty() {
         return;
     }
@@ -179,7 +186,7 @@ pub fn record_compute_barriers(device: &Device, cmd: vk::CommandBuffer, ranges: 
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[],
-            &bars,
+            bars,
             &[],
         );
     }

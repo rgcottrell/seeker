@@ -586,15 +586,13 @@ fn record_mul_mat_vec_with_flags(
         }
     };
     // Spec-const order in `mul_mat_vec_head.slang`: BLOCK_SIZE, NUM_ROWS,
-    // ACCUMULATE. The accumulate flag turns the trailing write into
-    // `data_d[i] += sum` so out-projection matmuls can fold the residual
-    // add into the matmul kernel.
+    // ACCUMULATE. The accumulate flag is purely a spec constant and
+    // doesn't need to disambiguate the name — the spec_constants vec
+    // already makes the pipeline key unique, so we can keep the name
+    // as the static variant string and avoid a per-dispatch
+    // `format!()` allocation.
     let key = PipelineKey {
-        name: if accumulate {
-            format!("{}_acc", variant.name)
-        } else {
-            variant.name.to_string()
-        },
+        name: variant.name.to_string(),
         binding_indices: variant.binding_indices.to_vec(),
         push_size: MUL_MAT_VEC_PARAMS_BYTES,
         spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows, accumulate as u32],
