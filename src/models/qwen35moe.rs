@@ -1271,9 +1271,31 @@ fn moe_ffn(
     rms_norm::record(ctx, residual, post_attn_norm, x_norm, p.rms_eps)?;
     ctx.tap(&format!("attn_post_norm-{layer_idx}"), x_norm)?;
 
-    // Router logits.
+    // Dispatch all four "first-touch" matmuls in parallel — each reads
+    // x_norm and writes a disjoint output. The driver can overlap them
+    // on RDNA. Coalesced barrier covers the entire set.
+    //   - router logits   (gate_inp)        : drives topk_moe
+    //   - shared gate     (ffn_gate_shexp)  : drives shared FFN chain
+    //   - shared up       (ffn_up_shexp)    : drives shared FFN chain
+    //   - shared scalar   (ffn_gate_inp_shexp): drives sigmoid gate
     let gate_logits = ctx.alloc_tensor([n_experts as u64, l_u, 1, 1], GgmlType::F32)?;
-    matmul::record(ctx, w.ffn_gate_inp, x_norm, gate_logits)?;
+    matmul::record_nofence(ctx, w.ffn_gate_inp, x_norm, gate_logits)?;
+    let sgate = ctx.alloc_tensor([shexp_ff, l_u, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, w.ffn_gate_shexp, x_norm, sgate)?;
+    let sup = ctx.alloc_tensor([shexp_ff, l_u, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, w.ffn_up_shexp, x_norm, sup)?;
+    let shared_gate_pre = ctx.alloc_tensor([1, l_u, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, w.ffn_gate_inp_shexp, x_norm, shared_gate_pre)?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[
+            gate_logits.range(),
+            sgate.range(),
+            sup.range(),
+            shared_gate_pre.range(),
+        ],
+    );
     ctx.tap(&format!("ffn_moe_logits-{layer_idx}"), gate_logits)?;
 
     // topk_moe → ids + weights (GPU-only).
@@ -1346,28 +1368,16 @@ fn moe_ffn(
     }
     ctx.tap(&format!("ffn_moe_out-{layer_idx}"), routed)?;
 
-    // Shared expert: standard FFN with `ffn_{gate,up,down}_shexp`.
-    let sgate = ctx.alloc_tensor([shexp_ff, l_u, 1, 1], GgmlType::F32)?;
-    matmul::record_nofence(ctx, w.ffn_gate_shexp, x_norm, sgate)?;
-    let sup = ctx.alloc_tensor([shexp_ff, l_u, 1, 1], GgmlType::F32)?;
-    matmul::record_nofence(ctx, w.ffn_up_shexp, x_norm, sup)?;
-    crate::inference::command::record_compute_barriers(
-        ctx.device,
-        ctx.cmd,
-        &[sgate.range(), sup.range()],
-    );
+    // Shared expert FFN — `sgate` and `sup` were already dispatched in
+    // parallel with the router (see hoist above). Continue the chain
+    // here: swiglu_split fuses silu(sgate)*sup, then down_shexp matmul.
     let sh = ctx.alloc_tensor([shexp_ff, l_u, 1, 1], GgmlType::F32)?;
     elementwise::record_swiglu_split(ctx, sgate, sup, sh)?;
     let shared = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     matmul::record(ctx, w.ffn_down_shexp, sh, shared)?;
 
-    // Shared-expert sigmoid scalar gate per token. Matmul layout is
-    // a=[K=n_embd, M=1] @ b=[K=n_embd, N=L] → d=[M=1, N=L]. Allocating
-    // d as [L, 1] would make `record_inner`'s per-column fallback for
-    // N>1 write past the buffer end (one float per col into a slot
-    // sized for L floats), corrupting downstream tensors.
-    let shared_gate_pre = ctx.alloc_tensor([1, l_u, 1, 1], GgmlType::F32)?;
-    matmul::record(ctx, w.ffn_gate_inp_shexp, x_norm, shared_gate_pre)?;
+    // Shared-expert sigmoid scalar gate per token. `shared_gate_pre` was
+    // dispatched alongside the router above; just apply the sigmoid now.
     let shared_gate_sig = ctx.alloc_tensor([1, l_u, 1, 1], GgmlType::F32)?;
     elementwise::record_sigmoid(ctx, shared_gate_pre, shared_gate_sig)?;
     // Broadcast scalar gate across hidden dim — view it as [1, L] and
