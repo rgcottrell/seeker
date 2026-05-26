@@ -216,6 +216,7 @@ pub fn render(
     add_generation_prompt: bool,
     bos_token: &str,
     eos_token: &str,
+    enable_thinking: bool,
 ) -> Result<String, RenderError> {
     let mut env = Environment::new();
     // Permissive: chat templates frequently use `{% generation %}` blocks,
@@ -239,6 +240,7 @@ pub fn render(
         add_generation_prompt => add_generation_prompt,
         bos_token => bos_token,
         eos_token => eos_token,
+        enable_thinking => enable_thinking,
     })?;
     if std::env::var("SEEKER_CHAT_DEBUG").is_ok() {
         eprintln!("=== rendered chat prompt ===\n{rendered}\n=== end ===");
@@ -261,7 +263,7 @@ mod tests {
             role: "user".to_string(),
             content: "Hello".to_string(),
         }];
-        let out = render(SMOLLM2_TEMPLATE, &messages, true, "<|im_start|>", "<|im_end|>")
+        let out = render(SMOLLM2_TEMPLATE, &messages, true, "<|im_start|>", "<|im_end|>", true)
             .expect("render");
         assert!(out.contains("<|im_start|>system\nYou are a helpful AI assistant"), "missing default system block: {out:?}");
         assert!(out.contains("<|im_start|>user\nHello<|im_end|>"), "missing user turn: {out:?}");
@@ -274,7 +276,7 @@ mod tests {
             ChatMessage { role: "system".into(), content: "Be terse.".into() },
             ChatMessage { role: "user".into(), content: "hi".into() },
         ];
-        let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "")
+        let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "", true)
             .expect("render");
         assert!(out.contains("<|im_start|>system\nBe terse.<|im_end|>"), "{out:?}");
         assert!(!out.contains("You are a helpful AI assistant"), "{out:?}");
@@ -286,7 +288,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
         }];
-        let out = render(SMOLLM2_TEMPLATE, &messages, false, "", "")
+        let out = render(SMOLLM2_TEMPLATE, &messages, false, "", "", true)
             .expect("render");
         assert!(!out.contains("<|im_start|>assistant\n"), "{out:?}");
         assert!(out.ends_with("<|im_start|>user\nhi<|im_end|>\n"), "{out:?}");
@@ -307,14 +309,14 @@ mod tests {
     fn strftime_now_function_is_available_to_templates() {
         // A template gating on `strftime_now is defined` must take the true branch.
         let tmpl = "{% if strftime_now is defined %}{{ strftime_now('%Y') }}{% else %}NONE{% endif %}";
-        let out = render(tmpl, &[], false, "", "").expect("render");
+        let out = render(tmpl, &[], false, "", "", true).expect("render");
         assert_ne!(out, "NONE", "strftime_now should be defined in the env");
         assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");
     }
 
     #[test]
     fn missing_template_string_is_distinguished_from_render_error() {
-        let err = render("", &[], true, "", "").unwrap_or_else(|_| String::new());
+        let err = render("", &[], true, "", "", true).unwrap_or_else(|_| String::new());
         // Empty template just renders an empty string — not an error.
         assert_eq!(err, "");
     }

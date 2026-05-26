@@ -112,6 +112,14 @@ pub struct ChatArgs {
     /// RNG seed for stochastic sampling.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+
+    /// Enable reasoning / "thinking" mode for models that gate it via the
+    /// chat template's `enable_thinking` flag (e.g. Qwen3). Off by default
+    /// — the thinking-mode opener (`<think>\n`) burns generation budget on
+    /// chain-of-thought tokens before the actual answer, which is rarely
+    /// what users want from an interactive REPL.
+    #[arg(long = "think", default_value_t = false)]
+    think: bool,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -194,6 +202,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         chat_template,
         eos_ids,
         max_tokens: args.max_tokens,
+        enable_thinking: args.think,
     };
 
     let history = if args.no_history {
@@ -245,6 +254,9 @@ struct ChatSession {
     /// Tokens that terminate an assistant reply (GGUF `eos_token_id`).
     eos_ids: Vec<u32>,
     max_tokens: u32,
+    /// Threaded into `chat_template::render` so the template can choose
+    /// between the thinking opener and the closed-think shim.
+    enable_thinking: bool,
 }
 
 /// Timing for one reply, used for the `[ Prompt … | Generation … ]` line.
@@ -283,6 +295,7 @@ impl ChatSession {
             /* add_generation_prompt = */ true,
             bos,
             eos,
+            self.enable_thinking,
         )?;
 
         // Tokenize the full conversation. `add_special_tokens=false`: the

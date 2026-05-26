@@ -51,6 +51,7 @@ pub async fn apply_template(
         req.add_generation_prompt.unwrap_or(true),
         state.bos_token().unwrap_or(""),
         state.eos_token().unwrap_or(""),
+        /* enable_thinking = */ true,
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(ApplyTemplateResponse { prompt }))
