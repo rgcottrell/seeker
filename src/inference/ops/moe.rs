@@ -207,11 +207,18 @@ fn record_matvec_kquant_id(
     let ncols = a.dims[0] as u32;
     let n_rows = a.dims[1] as u32;
     let n_tokens = b.dims[1] as u32;
+    // llama.cpp reshapes `cur` to `[n_embd, 1, n_tokens]` before mul_mat_id —
+    // i.e. ne11=1 and the token axis lives in ne12 / the batch index. The
+    // shader's b_offset uses `expert_i0 % ne11`, so ne11 must be 1 for all
+    // 8 active experts in a dispatch to read the SAME token's B vector;
+    // otherwise expert_i0 leaks into the column stride and the per-expert
+    // outputs read scrambled B slabs (manifests as ~24× under-summing in
+    // the gate/up matmul vs llama.cpp on the same prompt).
     let stride_a = ncols;
     let stride_b = ncols;
     let stride_d = n_rows;
     let batch_stride_a = ncols * n_rows;
-    let batch_stride_b = ncols * n_tokens;
+    let batch_stride_b = ncols; // = stride_b * ne11 with ne11=1
     let batch_stride_d = n_rows * n_expert_used;
 
     // Q4_K matvec binds B as both data_b and data_b_v4 (vec4) at slot 4;
@@ -251,7 +258,7 @@ fn record_matvec_kquant_id(
         put_u(&mut push, &mut w, batch_stride_d);
         put_u(&mut push, &mut w, 0); // fusion_flags
         put_u(&mut push, &mut w, n_expert_used); // nei0
-        put_u(&mut push, &mut w, n_tokens); // ne11
+        put_u(&mut push, &mut w, 1); // ne11 = 1 (cur reshaped to [n_embd,1,n_tokens])
         put_u(&mut push, &mut w, expert_i1); // expert_i1 = current token
         put_u(&mut push, &mut w, n_experts); // nbi1 — ids row stride (= n_experts)
 
