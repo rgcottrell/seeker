@@ -7,12 +7,13 @@
 //! Used by `seeker chat`'s REPL between turns and by the `/apply-template`
 //! HTTP endpoint.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use minijinja::value::Value;
-use minijinja::{context, Environment, Error as MjError, ErrorKind, State};
+use minijinja::{Environment, Error as MjError, ErrorKind, State};
 use serde::Serialize;
 
 /// Handle Python-style string methods that real-world chat templates rely
@@ -210,13 +211,19 @@ impl From<minijinja::Error> for RenderError {
 /// tokens (looked up from the GGUF's `tokenizer.ggml.tokens` array). They
 /// may be empty strings if the model has no BOS/EOS — most chat templates
 /// don't reference them and rendering still succeeds.
+///
+/// `extra_context` carries caller-supplied template variables (from
+/// `--chat-template-kwargs`). Its entries are merged in **last**, so a kwarg
+/// key overrides the built-in variable of the same name. This is also the
+/// only way to set template-specific switches like `enable_thinking` — e.g.
+/// `{"enable_thinking": false}`; otherwise the template's own default applies.
 pub fn render(
     template: &str,
     messages: &[ChatMessage],
     add_generation_prompt: bool,
     bos_token: &str,
     eos_token: &str,
-    enable_thinking: bool,
+    extra_context: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String, RenderError> {
     let mut env = Environment::new();
     // Permissive: chat templates frequently use `{% generation %}` blocks,
@@ -235,17 +242,40 @@ pub fn render(
     env.set_unknown_method_callback(unknown_method_callback);
     env.add_template("chat", template)?;
     let tmpl = env.get_template("chat")?;
-    let rendered = tmpl.render(context! {
-        messages => messages,
-        add_generation_prompt => add_generation_prompt,
-        bos_token => bos_token,
-        eos_token => eos_token,
-        enable_thinking => enable_thinking,
-    })?;
+    // Built dynamically (rather than via the compile-time `context!` macro)
+    // so `extra_context` kwargs can be merged in. `Value::from_serialize` is
+    // infallible — serialization errors surface as an invalid value that
+    // only errors if the template actually touches it.
+    let mut ctx: BTreeMap<String, Value> = BTreeMap::new();
+    ctx.insert("messages".into(), Value::from_serialize(messages));
+    ctx.insert(
+        "add_generation_prompt".into(),
+        Value::from(add_generation_prompt),
+    );
+    ctx.insert("bos_token".into(), Value::from(bos_token));
+    ctx.insert("eos_token".into(), Value::from(eos_token));
+    // Merged last: kwargs win on key collision (see doc comment). This is the
+    // only source of switches like `enable_thinking`.
+    for (k, v) in extra_context {
+        ctx.insert(k.clone(), Value::from_serialize(v));
+    }
+    let rendered = tmpl.render(ctx)?;
     if *crate::runtime_flags::CHAT_DEBUG {
         eprintln!("=== rendered chat prompt ===\n{rendered}\n=== end ===");
     }
     Ok(rendered)
+}
+
+/// clap `value_parser` for `--chat-template-kwargs`: parse a JSON **object**
+/// string into the map merged into the template context by [`render`].
+/// Mirrors llama.cpp's `--chat-template-kwargs '{"key":"value",...}'`.
+pub fn parse_template_kwargs(
+    s: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match serde_json::from_str::<serde_json::Value>(s).map_err(|e| format!("invalid JSON: {e}"))? {
+        serde_json::Value::Object(m) => Ok(m),
+        _ => Err("must be a JSON object, e.g. '{\"key1\":\"value1\",\"key2\":\"value2\"}'".into()),
+    }
 }
 
 #[cfg(test)]
@@ -263,8 +293,15 @@ mod tests {
             role: "user".to_string(),
             content: "Hello".to_string(),
         }];
-        let out = render(SMOLLM2_TEMPLATE, &messages, true, "<|im_start|>", "<|im_end|>", true)
-            .expect("render");
+        let out = render(
+            SMOLLM2_TEMPLATE,
+            &messages,
+            true,
+            "<|im_start|>",
+            "<|im_end|>",
+            &serde_json::Map::new(),
+        )
+        .expect("render");
         assert!(out.contains("<|im_start|>system\nYou are a helpful AI assistant"), "missing default system block: {out:?}");
         assert!(out.contains("<|im_start|>user\nHello<|im_end|>"), "missing user turn: {out:?}");
         assert!(out.ends_with("<|im_start|>assistant\n"), "missing assistant opener: {out:?}");
@@ -276,7 +313,7 @@ mod tests {
             ChatMessage { role: "system".into(), content: "Be terse.".into() },
             ChatMessage { role: "user".into(), content: "hi".into() },
         ];
-        let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "", true)
+        let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "", &serde_json::Map::new())
             .expect("render");
         assert!(out.contains("<|im_start|>system\nBe terse.<|im_end|>"), "{out:?}");
         assert!(!out.contains("You are a helpful AI assistant"), "{out:?}");
@@ -288,7 +325,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
         }];
-        let out = render(SMOLLM2_TEMPLATE, &messages, false, "", "", true)
+        let out = render(SMOLLM2_TEMPLATE, &messages, false, "", "", &serde_json::Map::new())
             .expect("render");
         assert!(!out.contains("<|im_start|>assistant\n"), "{out:?}");
         assert!(out.ends_with("<|im_start|>user\nhi<|im_end|>\n"), "{out:?}");
@@ -309,14 +346,15 @@ mod tests {
     fn strftime_now_function_is_available_to_templates() {
         // A template gating on `strftime_now is defined` must take the true branch.
         let tmpl = "{% if strftime_now is defined %}{{ strftime_now('%Y') }}{% else %}NONE{% endif %}";
-        let out = render(tmpl, &[], false, "", "", true).expect("render");
+        let out = render(tmpl, &[], false, "", "", &serde_json::Map::new()).expect("render");
         assert_ne!(out, "NONE", "strftime_now should be defined in the env");
         assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");
     }
 
     #[test]
     fn missing_template_string_is_distinguished_from_render_error() {
-        let err = render("", &[], true, "", "", true).unwrap_or_else(|_| String::new());
+        let err = render("", &[], true, "", "", &serde_json::Map::new())
+            .unwrap_or_else(|_| String::new());
         // Empty template just renders an empty string — not an error.
         assert_eq!(err, "");
     }

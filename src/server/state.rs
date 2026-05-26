@@ -24,6 +24,9 @@ struct Inner {
     /// these as `{{ bos_token }}` / `{{ eos_token }}`.
     bos_token: Option<String>,
     eos_token: Option<String>,
+    /// Extra template-context variables from `serve --chat-template-kwargs`,
+    /// merged into every `/apply-template` render (override built-ins).
+    template_kwargs: serde_json::Map<String, serde_json::Value>,
 }
 
 impl AppState {
@@ -31,12 +34,14 @@ impl AppState {
         chat_template: Option<String>,
         bos_token: Option<String>,
         eos_token: Option<String>,
+        template_kwargs: serde_json::Map<String, serde_json::Value>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 chat_template,
                 bos_token,
                 eos_token,
+                template_kwargs,
             }),
         }
     }
@@ -51,5 +56,9 @@ impl AppState {
 
     pub fn eos_token(&self) -> Option<&str> {
         self.inner.eos_token.as_deref()
+    }
+
+    pub fn template_kwargs(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.inner.template_kwargs
     }
 }

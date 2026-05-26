@@ -30,6 +30,13 @@ pub struct ServeArgs {
     /// handlers stop returning stubs.
     #[arg(short = 'm', long = "model")]
     model: Option<PathBuf>,
+
+    /// Extra key/value pairs merged into the chat-template rendering context
+    /// for `/apply-template`, as a JSON object string, e.g.
+    /// `'{"enable_thinking":false}'`. Keys override the built-in context
+    /// variables. Mirrors llama.cpp's `--chat-template-kwargs`.
+    #[arg(long = "chat-template-kwargs", value_parser = crate::chat_template::parse_template_kwargs)]
+    chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub async fn run(args: ServeArgs) -> Result<(), Box<dyn Error>> {
@@ -41,7 +48,12 @@ pub async fn run(args: ServeArgs) -> Result<(), Box<dyn Error>> {
                 template_present = bundle.chat_template.is_some(),
                 "loaded tokenizer for serve state",
             );
-            AppState::new(bundle.chat_template, bundle.bos_token, bundle.eos_token)
+            AppState::new(
+                bundle.chat_template,
+                bundle.bos_token,
+                bundle.eos_token,
+                args.chat_template_kwargs.clone().unwrap_or_default(),
+            )
         }
         None => AppState::default(),
     };

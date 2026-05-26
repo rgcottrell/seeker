@@ -113,13 +113,14 @@ pub struct ChatArgs {
     #[arg(long, default_value_t = 0)]
     seed: u64,
 
-    /// Enable reasoning / "thinking" mode for models that gate it via the
-    /// chat template's `enable_thinking` flag (e.g. Qwen3). Off by default
-    /// — the thinking-mode opener (`<think>\n`) burns generation budget on
-    /// chain-of-thought tokens before the actual answer, which is rarely
-    /// what users want from an interactive REPL.
-    #[arg(long = "think", default_value_t = false)]
-    think: bool,
+    /// Extra key/value pairs merged into the chat-template rendering context,
+    /// as a JSON object string, e.g. `'{"enable_thinking":false}'`. Keys
+    /// override the built-in context variables. This is how reasoning /
+    /// "thinking" mode is controlled (e.g. Qwen3's `enable_thinking`) — there
+    /// is no dedicated flag; absent a kwarg, the template's own default
+    /// applies. Mirrors llama.cpp's `--chat-template-kwargs`.
+    #[arg(long = "chat-template-kwargs", value_parser = chat_template::parse_template_kwargs)]
+    chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -202,7 +203,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         chat_template,
         eos_ids,
         max_tokens: args.max_tokens,
-        enable_thinking: args.think,
+        template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
     };
 
     let history = if args.no_history {
@@ -254,9 +255,10 @@ struct ChatSession {
     /// Tokens that terminate an assistant reply (GGUF `eos_token_id`).
     eos_ids: Vec<u32>,
     max_tokens: u32,
-    /// Threaded into `chat_template::render` so the template can choose
-    /// between the thinking opener and the closed-think shim.
-    enable_thinking: bool,
+    /// Extra template-context variables from `--chat-template-kwargs`,
+    /// merged into every render (override the built-in variables). Carries
+    /// switches like `enable_thinking` when the user sets them.
+    template_kwargs: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Timing for one reply, used for the `[ Prompt … | Generation … ]` line.
@@ -295,7 +297,7 @@ impl ChatSession {
             /* add_generation_prompt = */ true,
             bos,
             eos,
-            self.enable_thinking,
+            &self.template_kwargs,
         )?;
 
         // Tokenize the full conversation. `add_special_tokens=false`: the
