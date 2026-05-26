@@ -153,12 +153,26 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         max_seq_len: args.ctx_size,
     };
     let dims = model.cache_dims();
-    let cache = engine.allocate_kv_cache(
+    let mut cache = engine.allocate_kv_cache(
         dims.n_layer,
         dims.head_dim,
         dims.n_head_kv,
         cache_config,
     )?;
+    if let Some(ssm) = model.ssm_state_dims() {
+        cache.allocate_ssm_state(
+            &engine.device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
+        tracing::info!(
+            n_ssm_layers = ssm.n_ssm_layers,
+            conv_state_floats = ssm.conv_state_floats,
+            gdn_state_floats = ssm.gdn_state_floats,
+            "ssm state allocated",
+        );
+    }
 
     let sampler = Sampler::new(args.sampler_config());
 

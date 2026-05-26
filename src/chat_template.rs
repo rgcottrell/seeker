@@ -11,8 +11,100 @@ use std::error::Error;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use minijinja::{context, Environment};
+use minijinja::value::Value;
+use minijinja::{context, Environment, Error as MjError, ErrorKind, State};
 use serde::Serialize;
+
+/// Handle Python-style string methods that real-world chat templates rely
+/// on but MiniJinja doesn't ship by default. Qwen3's template uses
+/// `content.startswith(...)`, `content.endswith(...)`, `content.split(...)`,
+/// `content.rstrip(...)`, `content.lstrip(...)`, `content.strip(...)`,
+/// `content.replace(...)`. Registered via
+/// `Environment::set_unknown_method_callback`.
+fn unknown_method_callback(
+    _state: &State,
+    receiver: &Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, MjError> {
+    let s = match receiver.as_str() {
+        Some(s) => s,
+        None => return Err(MjError::from(ErrorKind::UnknownMethod)),
+    };
+    match name {
+        "startswith" => {
+            let prefix = args
+                .get(0)
+                .and_then(|a| a.as_str())
+                .ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, "startswith: expected string arg"))?;
+            Ok(Value::from(s.starts_with(prefix)))
+        }
+        "endswith" => {
+            let suffix = args
+                .get(0)
+                .and_then(|a| a.as_str())
+                .ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, "endswith: expected string arg"))?;
+            Ok(Value::from(s.ends_with(suffix)))
+        }
+        "split" => {
+            // .split(sep) — like Python: splits at every occurrence.
+            // .split() — like Python: splits on whitespace, collapsing runs.
+            let parts: Vec<String> = match args.get(0).and_then(|a| a.as_str()) {
+                Some(sep) if !sep.is_empty() => s.split(sep).map(|p| p.to_string()).collect(),
+                _ => s.split_whitespace().map(|p| p.to_string()).collect(),
+            };
+            Ok(Value::from(parts))
+        }
+        "strip" => Ok(Value::from(strip_str(s, args.get(0), true, true))),
+        "lstrip" => Ok(Value::from(strip_str(s, args.get(0), true, false))),
+        "rstrip" => Ok(Value::from(strip_str(s, args.get(0), false, true))),
+        "replace" => {
+            let old = args
+                .get(0)
+                .and_then(|a| a.as_str())
+                .ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, "replace: expected old"))?;
+            let new = args
+                .get(1)
+                .and_then(|a| a.as_str())
+                .ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, "replace: expected new"))?;
+            Ok(Value::from(s.replace(old, new)))
+        }
+        _ => Err(MjError::from(ErrorKind::UnknownMethod)),
+    }
+}
+
+/// Helper for strip/lstrip/rstrip. When `chars` is None, strip whitespace
+/// (matches Python); otherwise strip any character contained in `chars`.
+fn strip_str(s: &str, chars: Option<&Value>, left: bool, right: bool) -> String {
+    let trim_chars: Option<Vec<char>> = chars
+        .and_then(|v| v.as_str())
+        .map(|c| c.chars().collect());
+    let is_trim = |ch: char| match &trim_chars {
+        Some(set) => set.contains(&ch),
+        None => ch.is_whitespace(),
+    };
+    let mut start = 0;
+    let mut end = s.len();
+    if left {
+        while let Some(c) = s[start..].chars().next() {
+            if is_trim(c) {
+                start += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+    if right {
+        while let Some(c) = s[start..end].chars().rev().next() {
+            if is_trim(c) {
+                end -= c.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+    s[start..end].to_string()
+}
 
 /// Minimal `strftime`-style formatter over the current UTC time. Chat
 /// templates (e.g. Llama-3.x) call `strftime_now("%d %b %Y")` to stamp
@@ -136,6 +228,10 @@ pub fn render(
     // they fall back to a hardcoded 2024 date and the prompt drifts from what
     // llama.cpp feeds the model.
     env.add_function("strftime_now", |fmt: String| strftime_now(&fmt));
+    // Python-style string methods (.startswith, .endswith, .split, .strip,
+    // .lstrip, .rstrip, .replace) that Qwen3 / Llama / DeepSeek chat
+    // templates call directly on strings.
+    env.set_unknown_method_callback(unknown_method_callback);
     env.add_template("chat", template)?;
     let tmpl = env.get_template("chat")?;
     let rendered = tmpl.render(context! {
@@ -144,6 +240,9 @@ pub fn render(
         bos_token => bos_token,
         eos_token => eos_token,
     })?;
+    if std::env::var("SEEKER_CHAT_DEBUG").is_ok() {
+        eprintln!("=== rendered chat prompt ===\n{rendered}\n=== end ===");
+    }
     Ok(rendered)
 }
 
