@@ -528,9 +528,18 @@ fn record_mul_mat_vec(
     // empirically saves ~6% on qwen35moe decode. Other dtypes keep the
     // 2-rows default. Spec-const order is `[BLOCK_SIZE, NUM_ROWS]` per
     // the head's declaration order.
-    let num_rows: u32 = match a.dtype {
-        crate::gguf::GgmlType::Q8_0 => 1,
-        _ => 2,
+    // NUM_ROWS picks the per-WG output-row tile:
+    //   - vocab-sized outputs (lm_head, m ≥ 32k) → 4 (saves dispatch
+    //     overhead vs the 124k-WG default)
+    //   - Q8_0 elsewhere → 1 (matches llama.cpp's rm_stdq on RDNA)
+    //   - everything else → 2 (default)
+    let num_rows: u32 = if m >= 32_768 {
+        4
+    } else {
+        match a.dtype {
+            crate::gguf::GgmlType::Q8_0 => 1,
+            _ => 2,
+        }
     };
     let key = PipelineKey {
         name: variant.name.to_string(),
