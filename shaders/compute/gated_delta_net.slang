@@ -1,10 +1,12 @@
 // Ported from llama.cpp ggml-vulkan gated_delta_net.comp, MIT license — see LICENSE.llama-cpp
 //
 // Gated delta-net attention (Qwen3 / Hyena-style). Each workgroup owns one (head, seq)
-// pair; LANES_PER_COLUMN threads share a single output column and reduce their per-row
-// shards via shared memory. The GLSL source also offers subgroup-add and subgroup-clustered
-// fast paths, but Slang lacks a direct equivalent for fixed-cluster reductions, so we ship
-// only the shmem fallback — same correctness, leaves perf on the table for later.
+// pair; LANES_PER_COLUMN threads share a single output column. With LANES_PER_COLUMN ==
+// SUBGROUP_SIZE == 32 (the only configuration the dispatcher uses), the per-column
+// reduction collapses into one `WaveActiveSum` per lane — replaces five shmem-based
+// XOR-shuffle steps and three `GroupMemoryBarrierWithGroupSync` per step. Twice per
+// token in the inner loop, ×n_tokens, ×4096 workgroups per layer, ×30 layers, so the
+// shmem fallback was costing real time on Strix Halo decode.
 
 //@variants
 //  f32_shmem: FLOAT_TYPE=float
@@ -45,20 +47,12 @@ struct GatedDeltaParams {
 [[vk::binding(5, 0)]] StructuredBuffer<FLOAT_TYPE>   data_state;
 [[vk::binding(6, 0)]] RWStructuredBuffer<FLOAT_TYPE> data_dst;
 
-groupshared FLOAT_TYPE temp[SUBGROUP_SIZE];
-
-FLOAT_TYPE reduce_add_shmem(FLOAT_TYPE partial, uint lane) {
-    temp[lane] = partial;
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (uint s = LANES_PER_COLUMN / 2u; s > 0; s >>= 1u) {
-        const FLOAT_TYPE other = temp[lane ^ s];
-        GroupMemoryBarrierWithGroupSync();
-        temp[lane] += other;
-        GroupMemoryBarrierWithGroupSync();
-    }
-    const FLOAT_TYPE result = temp[lane];
-    GroupMemoryBarrierWithGroupSync();
-    return result;
+// Subgroup-add reduction. Valid because the dispatcher pins
+// `required_subgroup_size = 32` (see ssm.rs) and the only configuration
+// we run is `LANES_PER_COLUMN == SUBGROUP_SIZE == 32`, so one
+// `WaveActiveSum` collapses all 32 per-lane partials across the column.
+FLOAT_TYPE reduce_add(FLOAT_TYPE partial) {
+    return WaveActiveSum(partial);
 }
 
 [shader("compute")]
@@ -118,7 +112,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID) {
         [unroll] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
         }
-        const FLOAT_TYPE kv_col = reduce_add_shmem(kv_shard, lane);
+        const FLOAT_TYPE kv_col = reduce_add(kv_shard);
 
         const FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
 
@@ -127,7 +121,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID) {
             s_shard[r] = g_exp[r] * s_shard[r] + k_reg[r] * delta_col;
             attn_partial += s_shard[r] * q_reg[r];
         }
-        const FLOAT_TYPE attn_col = reduce_add_shmem(attn_partial, lane);
+        const FLOAT_TYPE attn_col = reduce_add(attn_partial);
 
         if (lane == 0) {
             data_dst[attn_off + col] = attn_col * p.scale;
