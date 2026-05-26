@@ -528,16 +528,17 @@ fn attention_block(
     let k_view = reshape_for_rope(k, head_dim_k, n_head_kv, l as u64);
     let v_view = reshape_for_rope(v, head_dim_v, n_head_kv, l as u64);
 
-    // 5. Per-head Q/K RMS norm. `rms_norm::record` uses src.dims[1..] for
-    //    workgroup count and src.dims[0] as the reduction width, which
-    //    matches "one workgroup per (head, token), reduce over head_dim".
-    //    Weight `attn_q_norm` is `[head_dim_k]`; broadcasts across heads.
+    // 5. Per-head Q/K RMS norm. Independent pair — dispatch both nofence
+    //    and emit one coalesced barrier so they can run concurrently.
     let q_normed = ctx.alloc_tensor([head_dim_k, n_head, l as u64, 1], GgmlType::F32)?;
     let k_normed = ctx.alloc_tensor([head_dim_k, n_head_kv, l as u64, 1], GgmlType::F32)?;
-    {
-        rms_norm::record(ctx, q_attn_view, att.attn_q_norm, q_normed, p.rms_eps)?;
-        rms_norm::record(ctx, k_view, att.attn_k_norm, k_normed, p.rms_eps)?;
-    }
+    rms_norm::record_nofence(ctx, q_attn_view, att.attn_q_norm, q_normed, p.rms_eps)?;
+    rms_norm::record_nofence(ctx, k_view, att.attn_k_norm, k_normed, p.rms_eps)?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[q_normed.range(), k_normed.range()],
+    );
     ctx.tap(&format!("Qcur_normed-{layer_idx}"), q_normed)?;
     ctx.tap(&format!("Kcur_normed-{layer_idx}"), k_normed)?;
 

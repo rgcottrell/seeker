@@ -24,6 +24,28 @@ pub fn record(
     dst: TensorView,
     eps: f32,
 ) -> Result<(), Box<dyn Error>> {
+    record_inner(ctx, src, weight, dst, eps, /*fence=*/ true)
+}
+
+/// As [`record`] but skips the trailing barrier — caller fences `dst`.
+pub fn record_nofence(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    weight: TensorView,
+    dst: TensorView,
+    eps: f32,
+) -> Result<(), Box<dyn Error>> {
+    record_inner(ctx, src, weight, dst, eps, /*fence=*/ false)
+}
+
+fn record_inner(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    weight: TensorView,
+    dst: TensorView,
+    eps: f32,
+    fence: bool,
+) -> Result<(), Box<dyn Error>> {
     let key = PipelineKey::dense(
         "rms_norm_f32",
         3,
@@ -49,6 +71,8 @@ pub fn record(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    }
     Ok(())
 }
