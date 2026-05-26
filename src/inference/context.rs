@@ -3,8 +3,22 @@
 //! region, the descriptor pool, and a borrow of the pipeline cache + device.
 
 use std::error::Error;
+use std::sync::atomic::AtomicBool;
 
 use ash::vk;
+
+/// Cache the `SEEKER_QWEN_DIFF_DUMP` env var lookup once per forward
+/// (set by the engine at the start of each forward pass). Without the
+/// cache, every `ctx.tap()` call would syscall — there are ~150 taps
+/// per qwen35moe forward.
+pub static DIFF_DUMP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Refresh the cached DIFF_DUMP flag from the env var. Engine calls this
+/// once at the start of each forward pass.
+pub fn refresh_diff_dump_flag() {
+    let on = std::env::var("SEEKER_QWEN_DIFF_DUMP").is_ok();
+    DIFF_DUMP_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
 use crate::gguf::GgmlType;
 
@@ -72,7 +86,10 @@ impl<'a> DispatchContext<'a> {
     /// range right after the cast so any future writes to that memory
     /// wait for this cast to complete its read.
     pub fn tap(&mut self, name: &str, src: TensorView) -> Result<(), Box<dyn Error>> {
-        if std::env::var("SEEKER_QWEN_DIFF_DUMP").is_err() {
+        // Fast path: check the cached flag set by the engine once per
+        // forward, avoiding a getenv syscall per tap call (there are ~150
+        // taps per forward in the qwen35moe path).
+        if !DIFF_DUMP_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(());
         }
         debug_assert_eq!(src.dtype, GgmlType::F32, "tap only supports F32 tensors");

@@ -239,19 +239,17 @@ fn record_inner(
     // by:
     //   - device.coop_matrix (the KHR extension is enabled and the device
     //     reports CoopMat support)
-    //   - `SEEKER_MM_CM=1` env flag — keep it opt-in until we've verified
-    //     each dtype wave on real hardware
     //   - mmcm_variant for this A dtype is wired
     //   - n >= 32 AND n % 16 == 0 — the CoopMat store writes a full 16-col
     //     fragment per warp; partial-N tiles would overrun the output. M
     //     in the Llama path is always a multiple of 32 (hidden=2048,
     //     n_ff=8192, vocab=128256, n_kv*head_dim=512), so we don't gate on
     //     M alignment yet.
-    if ctx.device.coop_matrix
-        && n >= 32
-        && n % 16 == 0
-        && std::env::var("SEEKER_MM_CM").is_ok_and(|v| v == "1")
-    {
+    //
+    // Verified ~3× prefill win on Llama-1B Q4_K_M and ~1.4× on
+    // qwen35moe Q4_K_XL @ N=320; default-on. `SEEKER_MM_CM=0` opts out.
+    let mm_cm_enabled = std::env::var("SEEKER_MM_CM").map(|v| v != "0").unwrap_or(true);
+    if ctx.device.coop_matrix && n >= 32 && n % 16 == 0 && mm_cm_enabled {
         if let Some(variant) = mmcm_variant(a.dtype) {
             return record_mul_mm_cm(ctx, &variant, a, b, d, fence);
         }

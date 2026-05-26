@@ -397,7 +397,8 @@ impl Model for Qwen35MoeModel {
                         .count();
                     let gdn_state = cache.ssm_gdn_states.get(ssm_layer_idx).copied();
                     let conv_state = cache.ssm_conv_states.get(ssm_layer_idx).copied();
-                    ssm_block(ctx, ssm_w, residual, p, hidden, l, layer_idx as u32, gdn_state, conv_state)?;
+                    let ssm_host_ptr = cache.ssm_region.as_ref().and_then(|r| r.host_ptr);
+                    ssm_block(ctx, ssm_w, residual, p, hidden, l, layer_idx as u32, gdn_state, conv_state, ssm_host_ptr)?;
                 }
                 _ => {
                     // block type currently passthrough'd via the matching
@@ -418,27 +419,29 @@ impl Model for Qwen35MoeModel {
         }
 
         // ─── Epilogue: final norm + lm_head ───
-        let final_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
-        rms_norm::record(ctx, residual, self.weights.output_norm, final_norm, p.rms_eps)?;
+        // Only normalize + project the LAST token's residual: we sample
+        // from the final position only, and full-batch logits would burn
+        // n_vocab × L bytes of scratch (~318MB at L=320 with vocab=248k).
+        // Slicing residual to the last token via a strided TensorView lets
+        // both rms_norm and the lm_head matmul run with L=1.
+        let elem_size = 4u64;
+        let vocab = p.n_vocab as u64;
+        let residual_last = TensorView {
+            buffer: residual.buffer,
+            byte_offset: residual.byte_offset + (l as u64 - 1) * hidden * elem_size,
+            byte_size: hidden * elem_size,
+            dims: [hidden, 1, 1, 1],
+            byte_stride: [elem_size, hidden * elem_size, hidden * elem_size, hidden * elem_size],
+            element_stride: [1, hidden, hidden, hidden],
+            dtype: residual.dtype,
+        };
+        let final_norm = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
+        rms_norm::record(ctx, residual_last, self.weights.output_norm, final_norm, p.rms_eps)?;
         ctx.tap("final_norm", final_norm)?;
 
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
-        let all_logits = ctx.alloc_tensor([p.n_vocab as u64, l as u64, 1, 1], GgmlType::F32)?;
-        matmul::record(ctx, lm_head, final_norm, all_logits)?;
-
-        // Last-token slice.
-        let elem_size = 4u64;
-        let vocab = p.n_vocab as u64;
-        let last_offset = all_logits.byte_offset + (l as u64 - 1) * vocab * elem_size;
-        let last_logits = TensorView {
-            buffer: all_logits.buffer,
-            byte_offset: last_offset,
-            byte_size: vocab * elem_size,
-            dims: [vocab, 1, 1, 1],
-            byte_stride: [elem_size, vocab * elem_size, vocab * elem_size, vocab * elem_size],
-            element_stride: [1, vocab, vocab, vocab],
-            dtype: GgmlType::F32,
-        };
+        let last_logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, lm_head, final_norm, last_logits)?;
 
         cache_io::advance(cache, l);
         Ok(last_logits)
@@ -637,6 +640,7 @@ fn ssm_block(
     layer_idx: u32,
     gdn_state_persistent: Option<crate::inference::buffer::BufferRange>,
     conv_state_persistent: Option<crate::inference::buffer::BufferRange>,
+    ssm_region_host_ptr: Option<*mut u8>,
 ) -> Result<(), Box<dyn Error>> {
     let l_u = l as u64;
     let num_k = p.ssm_groups as u64;          // 16
@@ -650,7 +654,7 @@ fn ssm_block(
     // 1. attn_norm
     let x_norm = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     rms_norm::record(ctx, residual, ssm_w.attn_norm, x_norm, p.rms_eps)?;
-    ctx.tap(&format!("attn_norm-{layer_idx}-a"), x_norm)?;
+    ctx.tap(&format!("attn_norm-{layer_idx}"), x_norm)?;
     if std::env::var("SEEKER_QWEN_ONLY_RMS").is_ok() {
         return Ok(());
     }
@@ -724,10 +728,14 @@ fn ssm_block(
         }
     }
     // Copy persistent conv state into the prefix via a strided cast.
+    // (Note: a host-side memcpy version was attempted but produced
+    // incorrect output — the GPU's preceding cast-write to persistent
+    // wasn't reliably host-visible by the time the next forward's host
+    // read fired, despite HOST_COHERENT. GPU-side cast is the safe path.)
+    let _ = ssm_region_host_ptr;
     if let Some(persistent) = conv_state_persistent {
         let elem_local = 4u64;
         let state_dim_inner = conv_kernel - 1; // 3
-        // Source: persistent, contiguous [(kernel-1) × conv_channels].
         let persistent_src = TensorView {
             buffer: persistent.buffer,
             byte_offset: persistent.offset,
@@ -747,8 +755,6 @@ fn ssm_block(
             ],
             dtype: GgmlType::F32,
         };
-        // Destination: prefix of conv_input. Same dims [(kernel-1) ×
-        // conv_channels] but stride = n_padded between channels.
         let conv_input_prefix = TensorView {
             buffer: conv_input.buffer,
             byte_offset: conv_input.byte_offset,
