@@ -50,6 +50,7 @@ pub fn record_cast(
         binding_indices: binding_indices.clone(),
         push_size: UNARY_PARAMS_BYTES,
         spec_constants: Vec::new(),
+        required_subgroup_size: None,
     };
     let pipeline = *ctx.pipelines.get(ctx.device, key, pick.spirv)?;
 
@@ -75,7 +76,7 @@ pub fn record_cast(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
 

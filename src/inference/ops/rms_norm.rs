@@ -49,6 +49,6 @@ pub fn record(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }

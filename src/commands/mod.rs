@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod chat;
 pub mod detokenize;
 pub mod download;

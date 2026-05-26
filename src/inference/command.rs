@@ -3,6 +3,7 @@
 //! an argument.
 
 use ash::vk;
+use ash::vk::Handle as _;
 
 use super::buffer::BufferRange;
 use super::device::Device;
@@ -106,16 +107,59 @@ pub fn record_dispatch_push(
     }
 }
 
-/// Compute→Compute barrier on the whole scratch buffer.
-pub fn record_compute_barrier(device: &Device, cmd: vk::CommandBuffer, buffer: vk::Buffer) {
-    let bar = vk::BufferMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .buffer(buffer)
-        .offset(0)
-        .size(vk::WHOLE_SIZE);
+/// Compute→Compute barrier on a single buffer range. Replaces the prior
+/// whole-buffer barrier — finer-grained scope lets RADV avoid flushing L2
+/// for unrelated parts of the scratch region, which adds up across the
+/// ~250 barriers a Llama-1B forward pass emits per token.
+///
+/// `SEEKER_BARRIER_PARANOID=1` falls back to a whole-buffer barrier — use
+/// it to A/B-test correctness if a subtle race shows up downstream.
+pub fn record_compute_barrier(device: &Device, cmd: vk::CommandBuffer, range: BufferRange) {
+    record_compute_barriers(device, cmd, std::slice::from_ref(&range))
+}
+
+/// Compute→Compute barrier across several disjoint ranges in one
+/// vkCmdPipelineBarrier call. Use after a batch of nofence dispatches
+/// that wrote disjoint regions (Q/K/V matmuls, FFN gate/up, etc.) to
+/// fence them all at once before downstream reads.
+pub fn record_compute_barriers(device: &Device, cmd: vk::CommandBuffer, ranges: &[BufferRange]) {
+    let paranoid = std::env::var("SEEKER_BARRIER_PARANOID").is_ok();
+    let bars: Vec<vk::BufferMemoryBarrier> = if paranoid {
+        // Fall back to a whole-buffer barrier per unique buffer in the set.
+        let mut buffers: Vec<vk::Buffer> = ranges.iter().map(|r| r.buffer).collect();
+        buffers.sort_by_key(|b| b.as_raw());
+        buffers.dedup();
+        buffers
+            .into_iter()
+            .map(|buffer| {
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(buffer)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)
+            })
+            .collect()
+    } else {
+        ranges
+            .iter()
+            .map(|r| {
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(r.buffer)
+                    .offset(r.offset)
+                    .size(r.size)
+            })
+            .collect()
+    };
+    if bars.is_empty() {
+        return;
+    }
     unsafe {
         device.device.cmd_pipeline_barrier(
             cmd,
@@ -123,7 +167,7 @@ pub fn record_compute_barrier(device: &Device, cmd: vk::CommandBuffer, buffer: v
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[],
-            std::slice::from_ref(&bar),
+            &bars,
             &[],
         );
     }

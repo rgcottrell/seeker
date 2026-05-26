@@ -188,26 +188,34 @@ impl Model for LlamaModel {
             let x_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             rms_norm::record(ctx, residual, block.attn_norm, x_norm, p.rms_eps)?;
 
-            // Q/K/V all read the same x_norm and write disjoint outputs, so
-            // they can dispatch back-to-back without inter-barriers — the
-            // wv trailing barrier covers all three for the rope step.
+            // Q/K/V read the same x_norm and write disjoint outputs — fan
+            // out three dispatches with no inter-barriers, then fence all
+            // three ranges in one vkCmdPipelineBarrier before RoPE reads.
             let q = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             matmul::record_nofence(ctx, block.wq, x_norm, q)?;
             let k = ctx.alloc_tensor([n_kv_embd, l as u64, 1, 1], GgmlType::F32)?;
             matmul::record_nofence(ctx, block.wk, x_norm, k)?;
             let v = ctx.alloc_tensor([n_kv_embd, l as u64, 1, 1], GgmlType::F32)?;
-            matmul::record(ctx, block.wv, x_norm, v)?;
+            matmul::record_nofence(ctx, block.wv, x_norm, v)?;
+            crate::inference::command::record_compute_barriers(
+                ctx.device,
+                ctx.cmd,
+                &[q.range(), k.range(), v.range()],
+            );
 
-            // RoPE on Q and K (separate scratch dst). The two rope calls
-            // write disjoint tensors and don't depend on each other, so
-            // the q dispatch can skip its barrier — the k trailing barrier
-            // covers both before the cache_write step reads k_roped.
+            // RoPE on Q and K (separate scratch dst). Same fan-out
+            // pattern: both nofence, then one combined barrier.
             let q_view = reshape_for_rope(q, head_dim, p.n_head as u64, l as u64);
             let k_view = reshape_for_rope(k, head_dim, p.n_head_kv as u64, l as u64);
             let q_roped = ctx.alloc_tensor(q_view.dims, GgmlType::F32)?;
             let k_roped = ctx.alloc_tensor(k_view.dims, GgmlType::F32)?;
             rope::record_nofence(ctx, q_view, positions_buf, q_roped, rope_params)?;
-            rope::record(ctx, k_view, positions_buf, k_roped, rope_params)?;
+            rope::record_nofence(ctx, k_view, positions_buf, k_roped, rope_params)?;
+            crate::inference::command::record_compute_barriers(
+                ctx.device,
+                ctx.cmd,
+                &[q_roped.range(), k_roped.range()],
+            );
 
             // K, V (post-RoPE for K, raw for V) in natural
             // [head_dim, n_head_kv, L] layout for cache write.
@@ -263,11 +271,16 @@ impl Model for LlamaModel {
             rms_norm::record(ctx, residual, block.ffn_norm, x_norm2, p.rms_eps)?;
 
             // ffn_gate and ffn_up both read x_norm2 and write disjoint
-            // tensors — let the ffn_up trailing barrier cover both.
+            // tensors — fan out, then fence both ranges in one barrier.
             let gate = ctx.alloc_tensor([n_ff, l as u64, 1, 1], GgmlType::F32)?;
             matmul::record_nofence(ctx, block.ffn_gate, x_norm2, gate)?;
             let up = ctx.alloc_tensor([n_ff, l as u64, 1, 1], GgmlType::F32)?;
-            matmul::record(ctx, block.ffn_up, x_norm2, up)?;
+            matmul::record_nofence(ctx, block.ffn_up, x_norm2, up)?;
+            crate::inference::command::record_compute_barriers(
+                ctx.device,
+                ctx.cmd,
+                &[gate.range(), up.range()],
+            );
             // gate = silu(gate)
             let gate_silu = ctx.alloc_tensor([n_ff, l as u64, 1, 1], GgmlType::F32)?;
             elementwise::record_silu(ctx, gate, gate_silu)?;

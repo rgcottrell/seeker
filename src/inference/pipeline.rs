@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::error::Error;
 
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 
 use super::device::Device;
 
@@ -20,6 +21,12 @@ pub struct PipelineKey {
     pub binding_indices: Vec<u32>,
     pub push_size: u32,
     pub spec_constants: Vec<u32>,
+    /// When set, the pipeline is built with
+    /// `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo` so the driver
+    /// can't pick a different wave width. Required by any shader that uses
+    /// `WaveActiveSum` / cooperative matrix / hardcoded `SUBGROUP_SIZE`.
+    /// Skipped (`None`) when the shader is wave-width agnostic.
+    pub required_subgroup_size: Option<u32>,
 }
 
 impl PipelineKey {
@@ -30,7 +37,15 @@ impl PipelineKey {
             binding_indices: (0..n).collect(),
             push_size,
             spec_constants,
+            required_subgroup_size: None,
         }
+    }
+
+    /// Pin the pipeline to a specific subgroup size. Use when the shader
+    /// hardcodes a wave width (e.g. `WaveActiveSum` over 32 lanes).
+    pub fn with_subgroup_size(mut self, size: u32) -> Self {
+        self.required_subgroup_size = Some(size);
+        self
     }
 }
 
@@ -163,6 +178,33 @@ fn build_pipeline(
         .name(entry);
     if !key.spec_constants.is_empty() {
         stage = stage.specialization_info(&spec_info);
+    }
+    // `req_sgs_info` must outlive the pipeline-create call because it's
+    // chained onto `stage.pNext`; declare it at this scope so the lifetime
+    // covers the call below.
+    let mut req_sgs_info: vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'_>;
+    if let Some(size) = key.required_subgroup_size {
+        if !device
+            .required_subgroup_size_stages
+            .contains(vk::ShaderStageFlags::COMPUTE)
+        {
+            return Err(format!(
+                "pipeline {:?} requested requiredSubgroupSize but device does not advertise \
+                 subgroup_size_control on COMPUTE",
+                key.name,
+            )
+            .into());
+        }
+        if size < device.min_subgroup_size || size > device.max_subgroup_size {
+            return Err(format!(
+                "pipeline {:?} requested requiredSubgroupSize={} outside device range [{}, {}]",
+                key.name, size, device.min_subgroup_size, device.max_subgroup_size,
+            )
+            .into());
+        }
+        req_sgs_info =
+            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(size);
+        stage = stage.push(&mut req_sgs_info);
     }
     let pipeline_info = vk::ComputePipelineCreateInfo::default()
         .stage(stage)

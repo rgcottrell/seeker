@@ -64,6 +64,15 @@ pub struct KvCache {
     pub v_layers: Vec<TensorView>,
     /// Number of token positions already written into the cache.
     pub position: u32,
+    /// Optional SSM/Mamba/GDN per-layer recurrent state. Empty for
+    /// pure-attention models; populated alongside K/V for hybrid models
+    /// like qwen35moe. Each entry is a BufferRange covering the layer's
+    /// state region in `ssm_region` (separate buffer to keep KV layout
+    /// untouched). The model writes new state at the end of each forward
+    /// and reads it back at the start of the next forward.
+    pub ssm_region: Option<Region>,
+    pub ssm_conv_states: Vec<crate::inference::buffer::BufferRange>,
+    pub ssm_gdn_states: Vec<crate::inference::buffer::BufferRange>,
 }
 
 impl KvCache {
@@ -127,7 +136,67 @@ impl KvCache {
             k_layers,
             v_layers,
             position: 0,
+            ssm_region: None,
+            ssm_conv_states: Vec::new(),
+            ssm_gdn_states: Vec::new(),
         })
+    }
+
+    /// Allocate persistent SSM-block recurrent state for hybrid models
+    /// like qwen35moe. `n_ssm_layers` is the number of SSM layers (not
+    /// total blocks). Each layer gets a conv state of
+    /// `(conv_kernel - 1) * conv_channels` F32 floats plus a GDN state
+    /// matrix of `state_size^2 * num_v_heads` F32 floats. State is
+    /// zero-initialized via the host pointer.
+    pub fn allocate_ssm_state(
+        &mut self,
+        device: &Device,
+        n_ssm_layers: u32,
+        conv_state_floats: u32,
+        gdn_state_floats: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let conv_bytes = (conv_state_floats as u64) * 4;
+        let gdn_bytes = (gdn_state_floats as u64) * 4;
+        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+        let conv_aligned = align_up(conv_bytes, align);
+        let gdn_aligned = align_up(gdn_bytes, align);
+        let total = (n_ssm_layers as u64) * (conv_aligned + gdn_aligned);
+
+        let region = Region::new(
+            device,
+            total.max(1),
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        // Zero-init: each layer's state must start at zero on the first
+        // forward. Subsequent forwards write new state to these slots.
+        if let Some(host_ptr) = region.host_ptr {
+            unsafe {
+                std::ptr::write_bytes(host_ptr, 0, total as usize);
+            }
+        }
+
+        let mut conv_states = Vec::with_capacity(n_ssm_layers as usize);
+        let mut gdn_states = Vec::with_capacity(n_ssm_layers as usize);
+        let mut cursor = 0u64;
+        for _ in 0..n_ssm_layers {
+            conv_states.push(crate::inference::buffer::BufferRange {
+                buffer: region.buffer,
+                offset: cursor,
+                size: conv_bytes,
+            });
+            cursor += conv_aligned;
+            gdn_states.push(crate::inference::buffer::BufferRange {
+                buffer: region.buffer,
+                offset: cursor,
+                size: gdn_bytes,
+            });
+            cursor += gdn_aligned;
+        }
+        self.ssm_region = Some(region);
+        self.ssm_conv_states = conv_states;
+        self.ssm_gdn_states = gdn_states;
+        Ok(())
     }
 
     /// Reset the position counter to 0. Buffer contents stay (will be
@@ -138,6 +207,9 @@ impl KvCache {
 
     pub fn destroy(&mut self, device: &Device) {
         self.region.destroy(device);
+        if let Some(mut r) = self.ssm_region.take() {
+            r.destroy(device);
+        }
     }
 }
 

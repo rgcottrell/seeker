@@ -150,6 +150,7 @@ fn main() {
                 "-capability", "sm_6_4",
                 "-capability", "cooperative_matrix",
                 "-capability", "cooperative_matrix_2",
+                "-capability", "spvGroupNonUniform",
                 "-O3",
                 "-stage", "compute",
                 "-entry", "main",

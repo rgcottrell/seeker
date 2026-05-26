@@ -31,6 +31,7 @@ const BM: u32 = 32;
 const BN: u32 = 32;
 
 const MUL_MM_PARAMS_BYTES: u32 = 14 * 4;
+const MUL_MM_CM_PARAMS_BYTES: u32 = 14 * 4;
 const MUL_MAT_VEC_PARAMS_BYTES: u32 = 13 * 4;
 /// `numthreads(BLOCK_SIZE, 1, 1)` in `mul_mat_vec.slang`. Each WG produces
 /// one output row via a 32-thread dot-product reduction.
@@ -135,6 +136,58 @@ fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
     Some(v)
 }
 
+/// Cooperative-matrix matmul variant for `mul_mm_cm.slang`. B is always
+/// F32 in our call sites (the model casts the activation side to F32 at
+/// the rms_norm boundary), so we pick the `*_f32` shader variant for
+/// every A dtype.
+struct MmCmVariant {
+    name: &'static str,
+    spv: &'static [u8],
+}
+
+fn mmcm_variant(dtype: GgmlType) -> Option<MmCmVariant> {
+    let v = match dtype {
+        GgmlType::F32 => MmCmVariant {
+            name: "mul_mm_cm_f32",
+            spv: shaders::MUL_MM_CM_F32_SPV.as_bytes(),
+        },
+        GgmlType::F16 => MmCmVariant {
+            name: "mul_mm_cm_f16_f32",
+            spv: shaders::MUL_MM_CM_F16_F32_SPV.as_bytes(),
+        },
+        GgmlType::BF16 => MmCmVariant {
+            name: "mul_mm_cm_bf16",
+            spv: shaders::MUL_MM_CM_BF16_SPV.as_bytes(),
+        },
+        GgmlType::Q4_0 => MmCmVariant {
+            name: "mul_mm_cm_q4_0_f32",
+            spv: shaders::MUL_MM_CM_Q4_0_F32_SPV.as_bytes(),
+        },
+        GgmlType::Q8_0 => MmCmVariant {
+            name: "mul_mm_cm_q8_0_f32",
+            spv: shaders::MUL_MM_CM_Q8_0_F32_SPV.as_bytes(),
+        },
+        GgmlType::Q4_K => MmCmVariant {
+            name: "mul_mm_cm_q4_k_f32",
+            spv: shaders::MUL_MM_CM_Q4_K_F32_SPV.as_bytes(),
+        },
+        GgmlType::Q5_K => MmCmVariant {
+            name: "mul_mm_cm_q5_k_f32",
+            spv: shaders::MUL_MM_CM_Q5_K_F32_SPV.as_bytes(),
+        },
+        GgmlType::Q6_K => MmCmVariant {
+            name: "mul_mm_cm_q6_k_f32",
+            spv: shaders::MUL_MM_CM_Q6_K_F32_SPV.as_bytes(),
+        },
+        GgmlType::MXFP4 => MmCmVariant {
+            name: "mul_mm_cm_mxfp4_f32",
+            spv: shaders::MUL_MM_CM_MXFP4_F32_SPV.as_bytes(),
+        },
+        _ => return None,
+    };
+    Some(v)
+}
+
 /// Record a single matmul: `dst[m, n] = sum_k a[k, m] * b[k, n]`. ggml's
 /// natural layout — A has shape [K, M], B has shape [K, N], D has shape
 /// [M, N]. Inner dim K is the contracting one. Both A and B store K as
@@ -180,6 +233,30 @@ fn record_inner(
     debug_assert_eq!(d.dims[1], b.dims[1], "matmul output N mismatch");
 
     let n = b.dims[1];
+
+    // Cooperative-matrix prefill path (KHR_cooperative_matrix). Pulls in
+    // the `mul_mm_cm.slang` 16×16×16 fp16-acc-fp32 fragment kernel. Gated
+    // by:
+    //   - device.coop_matrix (the KHR extension is enabled and the device
+    //     reports CoopMat support)
+    //   - `SEEKER_MM_CM=1` env flag — keep it opt-in until we've verified
+    //     each dtype wave on real hardware
+    //   - mmcm_variant for this A dtype is wired
+    //   - n >= 32 AND n % 16 == 0 — the CoopMat store writes a full 16-col
+    //     fragment per warp; partial-N tiles would overrun the output. M
+    //     in the Llama path is always a multiple of 32 (hidden=2048,
+    //     n_ff=8192, vocab=128256, n_kv*head_dim=512), so we don't gate on
+    //     M alignment yet.
+    if ctx.device.coop_matrix
+        && n >= 32
+        && n % 16 == 0
+        && std::env::var("SEEKER_MM_CM").is_ok_and(|v| v == "1")
+    {
+        if let Some(variant) = mmcm_variant(a.dtype) {
+            return record_mul_mm_cm(ctx, &variant, a, b, d, fence);
+        }
+    }
+
     if a.dtype == GgmlType::F16 && n > 1 {
         return record_mul_mm(ctx, a, b, d, fence);
     }
@@ -272,7 +349,10 @@ fn record_mul_mm(
         push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
     }
 
-    let key = PipelineKey::dense("mul_mm_f16_f32", 3, MUL_MM_PARAMS_BYTES, Vec::new());
+    // `mul_mm.slang` bakes in `SUBGROUP_SIZE = 32` (mul_mm.slang:29) — pin
+    // the pipeline to wave32.
+    let key = PipelineKey::dense("mul_mm_f16_f32", 3, MUL_MM_PARAMS_BYTES, Vec::new())
+        .with_subgroup_size(32);
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::MUL_MM_F16_F32_SPV.as_bytes())?;
@@ -286,7 +366,83 @@ fn record_mul_mm(
         workgroups,
     )?;
     if fence {
-        record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+        record_compute_barrier(ctx.device, ctx.cmd, d.range());
+    }
+    Ok(())
+}
+
+/// Cooperative-matrix prefill (`mul_mm_cm.slang`, A × F32 → F32, N ≥ 32).
+/// Same push-constant layout and binding layout as `record_mul_mm`. Pinned
+/// to wave32 (the shader hardcodes `SUBGROUP_SIZE = 32` and lays out four
+/// 16×16 CoopMat fragments across a 32×32 output tile assuming 4 wave32s
+/// per workgroup).
+///
+/// Strides are passed in *elements* regardless of A's dtype — for
+/// quantized weights the shader divides by `QUANT_K` to recover the
+/// block-major index (see `mul_mm_cm.slang:167` and similar). M and N are
+/// taken from `a.dims[1]` and `b.dims[1]` directly so this works
+/// uniformly for F16/F32/BF16 and quantized A.
+fn record_mul_mm_cm(
+    ctx: &mut DispatchContext,
+    variant: &MmCmVariant,
+    a: TensorView,
+    b: TensorView,
+    d: TensorView,
+    fence: bool,
+) -> Result<(), Box<dyn Error>> {
+    let k = a.dims[0] as u32;
+    let m = a.dims[1] as u32;
+    let n = b.dims[1] as u32;
+
+    // For the llama path there's no batched matmul: ne02 = ne12 = 1,
+    // num_batches = 1, broadcasts = 1. Keep the wiring simple; bail if a
+    // future model tries to dispatch a real batch through here.
+    if a.dims[2].max(1) != 1
+        || a.dims[3].max(1) != 1
+        || b.dims[2].max(1) != 1
+        || b.dims[3].max(1) != 1
+    {
+        return Err("mul_mm_cm: batched dims > 1 not yet supported in dispatcher".into());
+    }
+
+    // Strides in elements. For quantized A, the shader divides by QUANT_K
+    // on the fly — we pass element counts, not block counts.
+    let stride_a = k;
+    let stride_b = k;
+    let stride_d = m;
+    let batch_stride_a = m * k;
+    let batch_stride_b = n * k;
+    let batch_stride_d = m * n;
+
+    let mut push = [0u8; MUL_MM_CM_PARAMS_BYTES as usize];
+    let fields = [
+        m, n, k,
+        stride_a, stride_b, stride_d,
+        batch_stride_a, batch_stride_b, batch_stride_d,
+        1, // num_batches
+        1, // ne02
+        1, // ne12
+        1, // broadcast2
+        1, // broadcast3
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    let key = PipelineKey::dense(variant.name, 3, MUL_MM_CM_PARAMS_BYTES, Vec::new())
+        .with_subgroup_size(32);
+    let pipeline = *ctx.pipelines.get(ctx.device, key, variant.spv)?;
+    let workgroups = [m.div_ceil(BM), n.div_ceil(BN), 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[a.range(), b.range(), d.range()],
+        &push,
+        workgroups,
+    )?;
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, d.range());
     }
     Ok(())
 }
@@ -363,11 +519,16 @@ fn record_mul_mat_vec(
         })
         .collect();
 
+    // `mul_mat_vec.slang` reduces lane-wise partials with `WaveActiveSum`
+    // assuming `subgroupSize == 32` (mul_mat_vec_head.slang:101-106). Pin
+    // the pipeline to wave32 — required for correctness on any device that
+    // supports both wave32 and wave64 (RDNA, Intel Xe).
     let key = PipelineKey {
         name: variant.name.to_string(),
         binding_indices: variant.binding_indices.to_vec(),
         push_size: MUL_MAT_VEC_PARAMS_BYTES,
         spec_constants: Vec::new(),
+        required_subgroup_size: Some(32),
     };
     let pipeline = ctx.pipelines.get(ctx.device, key, variant.spv)?.clone();
 
@@ -387,7 +548,7 @@ fn record_mul_mat_vec(
         workgroups,
     )?;
     if fence {
-        record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+        record_compute_barrier(ctx.device, ctx.cmd, d.range());
     }
     let _ = MUL_MAT_VEC_BLOCK_SIZE; // documented above; not currently used host-side
     Ok(())

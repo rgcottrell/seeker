@@ -35,6 +35,17 @@ impl TensorView {
             size: self.byte_size,
         }
     }
+
+    /// Buffer range shifted by `offset_bytes` from this view's start.
+    /// Used to address per-token slices inside a multi-token tensor
+    /// without rebuilding the whole TensorView.
+    pub fn range_with_offset(&self, offset_bytes: u64) -> BufferRange {
+        BufferRange {
+            buffer: self.buffer,
+            offset: self.byte_offset + offset_bytes,
+            size: self.byte_size.saturating_sub(offset_bytes),
+        }
+    }
 }
 
 pub struct WeightsHandle {

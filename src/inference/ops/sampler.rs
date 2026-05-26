@@ -127,7 +127,7 @@ pub fn record_greedy(
         &push,
         [1, 1, 1],
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, out);
     Ok(out)
 }
 
@@ -275,7 +275,7 @@ fn record_apply_penalties(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, logits.range());
     Ok(())
 }
 
@@ -354,7 +354,7 @@ fn record_top_k(
             &push,
             workgroups,
         )?;
-        record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+        record_compute_barrier(ctx.device, ctx.cmd, next_intermediate.range());
 
         if is_last {
             break;
@@ -482,7 +482,7 @@ fn record_scale(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
 
@@ -510,7 +510,7 @@ fn record_soft_max(
         &push,
         [1, 1, 1],
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
 
@@ -566,7 +566,7 @@ fn record_cumsum(
         &push,
         [1, 1, 1],
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
 
@@ -590,7 +590,7 @@ fn record_sum_rows(
         &push,
         [1, 1, 1],
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
 
@@ -744,7 +744,7 @@ fn record_clamp(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
 
@@ -770,7 +770,7 @@ fn record_log(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
 
@@ -797,6 +797,6 @@ fn record_step(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }

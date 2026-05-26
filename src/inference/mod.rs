@@ -128,7 +128,7 @@ impl Engine {
                 .begin_command_buffer(self.command_buffer, &begin)?;
         }
 
-        let logits_range = {
+        let (logits_range, taps) = {
             let mut ctx = DispatchContext {
                 device: &self.device,
                 weights,
@@ -136,8 +136,10 @@ impl Engine {
                 pipelines: &mut self.pipelines,
                 descriptors: &self.descriptors,
                 cmd: self.command_buffer,
+                taps: Vec::new(),
             };
-            record(&mut ctx)?
+            let r = record(&mut ctx)?;
+            (r, ctx.taps)
         };
 
         unsafe {
@@ -168,6 +170,26 @@ impl Engine {
         unsafe {
             let src = host_ptr.add(logits_range.offset as usize) as *const f32;
             std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), count);
+        }
+
+        // Print sums for any taps the model recorded. Used for layer-by-layer
+        // diff dumps vs llama.cpp's `cb()` callback. Output is one line per
+        // tap: `TAP <name> n=<count> sum=<value> max_abs=<value>`.
+        for (name, range) in &taps {
+            if range.size % 4 != 0 {
+                eprintln!("TAP {name}: size {} not 4-byte aligned, skipping", range.size);
+                continue;
+            }
+            let n = (range.size / 4) as usize;
+            let mut buf = vec![0f32; n];
+            unsafe {
+                let src = host_ptr.add(range.offset as usize) as *const f32;
+                std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+            }
+            let sum: f32 = buf.iter().sum();
+            let max_abs: f32 = buf.iter().map(|x| x.abs()).fold(0.0, f32::max);
+            let head: Vec<String> = buf.iter().take(5).map(|v| format!("{v:.4}")).collect();
+            println!("TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]", range.offset, head.join(", "));
         }
         Ok(out)
     }
@@ -201,7 +223,7 @@ impl Engine {
                 .begin_command_buffer(self.command_buffer, &begin)?;
         }
 
-        let token_range = {
+        let (token_range, taps) = {
             let mut ctx = DispatchContext {
                 device: &self.device,
                 weights,
@@ -209,9 +231,11 @@ impl Engine {
                 pipelines: &mut self.pipelines,
                 descriptors: &self.descriptors,
                 cmd: self.command_buffer,
+                taps: Vec::new(),
             };
             let logits = record_logits(&mut ctx)?;
-            sampler.record_chain(&mut ctx, logits)?
+            let r = sampler.record_chain(&mut ctx, logits)?;
+            (r, ctx.taps)
         };
 
         unsafe {
@@ -238,6 +262,24 @@ impl Engine {
             let src = host_ptr.add(token_range.offset as usize) as *const u32;
             std::ptr::read(src)
         };
+        // Print tap summaries (same logic as in `forward`). Used for diff
+        // dumps vs llama.cpp's cb() callback.
+        for (name, range) in &taps {
+            if range.size % 4 != 0 {
+                eprintln!("TAP {name}: size {} not 4-byte aligned, skipping", range.size);
+                continue;
+            }
+            let n = (range.size / 4) as usize;
+            let mut buf = vec![0f32; n];
+            unsafe {
+                let src = host_ptr.add(range.offset as usize) as *const f32;
+                std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+            }
+            let sum: f32 = buf.iter().sum();
+            let max_abs: f32 = buf.iter().map(|x| x.abs()).fold(0.0, f32::max);
+            let head: Vec<String> = buf.iter().take(5).map(|v| format!("{v:.4}")).collect();
+            println!("TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]", range.offset, head.join(", "));
+        }
         sampler.accept(token);
         Ok(token)
     }

@@ -2,6 +2,7 @@
 
 //@variants
 //  default: DATA_A_Q4_K=1 B_TYPE=float B_TYPEV4=float4 D_TYPE=float FLOAT_TYPE=float
+//  id:      DATA_A_Q4_K=1 B_TYPE=float B_TYPEV4=float4 D_TYPE=float FLOAT_TYPE=float MUL_MAT_ID=1
 //@end-variants
 
 import glsl;  // gl_WorkGroupSize / gl_NumWorkGroups
@@ -141,7 +142,14 @@ void compute_outputs(uint3 wg_id, uint tid_x, uint first_row, uint num_rows) {
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_GroupThreadID) {
+#ifdef MUL_MAT_ID
+    // Y is `expert_i0 ∈ [0, n_expert_used)` (the routing slot), Z is unused;
+    // M dim is small enough (ff=512 or n_embd=2048 for Qwen MoE) that we
+    // don't need the wgX*wgZ encoding the non-_id path uses to span large M.
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+#else
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+#endif
 
     if (first_row + NUM_ROWS <= p.stride_d) {
         compute_outputs(gl_WorkGroupID, gl_LocalInvocationID.x, first_row, NUM_ROWS);

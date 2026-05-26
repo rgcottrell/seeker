@@ -29,11 +29,31 @@ struct MulMatVecParams {
 
     uint fusion_flags;        // reserved; not consumed in this minimal port
 
+#ifdef MUL_MAT_ID
+    // MUL_MAT_ID branch — replaces the batch-broadcast fields above with the
+    // expert-routing addressing parameters. Mirrors llama.cpp's
+    // `mul_mat_vec_base.glsl`.
+    //
+    //   `nei0` is the leading dim of `data_ids` (= `n_expert_used`).
+    //   `ne11` is the active token count in `data_b` (= `n_tokens` for the
+    //     forward pass; modular arithmetic against it lets multiple
+    //     workgroups share the same input row when `gl_WorkGroupID.y >=
+    //     ne11`).
+    //   `expert_i1` selects which token row we're processing — kept fixed
+    //     at 0 for our N=1 decode path; the host can dispatch sequentially
+    //     across tokens for larger N.
+    //   `nbi1` is the row stride of `data_ids` (= `nei0`).
+    uint nei0;
+    uint ne11;
+    uint expert_i1;
+    uint nbi1;
+#else
     uint base_work_group_y;
     uint ne02;
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+#endif
 };
 
 [[vk::push_constant]] ConstantBuffer<MulMatVecParams> p;
@@ -64,6 +84,15 @@ struct MulMatVecParams {
 
 [[vk::binding(2, 0)]] RWStructuredBuffer<D_TYPE> data_d;
 
+#ifdef MUL_MAT_ID
+// Top-k expert assignment buffer from `topk_moe.slang`. Shape
+// `[n_expert_used, n_tokens]` of `int` (host packs `u32`, shader reads
+// signed for compatibility with llama.cpp's MUL_MAT_ID interface). One
+// expert id per (token, expert-position) pair selects which Q-K weight
+// slab in `data_a` this dispatch reads from.
+[[vk::binding(7, 0)]] StructuredBuffer<int> data_ids;
+#endif
+
 [SpecializationConstant] const uint BLOCK_SIZE = 32;
 
 // NUM_ROWS = how many output rows one workgroup produces. Increasing this
@@ -80,6 +109,16 @@ static const uint NUM_COLS = 1;
 #include "dequant_funcs.slang"
 
 void get_offsets(uint3 wg_id, out uint a_offset, out uint b_offset, out uint d_offset) {
+#ifdef MUL_MAT_ID
+    // `expert_i0 ∈ [0, n_expert_used)` selects which of this token's
+    // experts we're computing. The actual expert *id* (slab index in
+    // `data_a`) comes from the topk_moe output buffer.
+    const uint expert_i0 = wg_id.y;
+    const uint expert_id = uint(data_ids[expert_i0 + p.expert_i1 * p.nbi1]);
+    a_offset = expert_id * (p.batch_stride_a / QUANT_K);
+    b_offset = (expert_i0 % p.ne11) * p.stride_b + p.expert_i1 * p.batch_stride_b;
+    d_offset = expert_i0 * p.stride_d + p.expert_i1 * p.batch_stride_d;
+#else
     const uint batch_idx = wg_id.y + p.base_work_group_y;
 
     uint batch_idx_a = 0;
@@ -94,6 +133,7 @@ void get_offsets(uint3 wg_id, out uint a_offset, out uint b_offset, out uint d_o
     a_offset = batch_idx_a * (p.batch_stride_a / QUANT_K);
     b_offset = batch_idx * p.batch_stride_b;
     d_offset = batch_idx * p.batch_stride_d;
+#endif
 }
 
 // Subgroup-reduce result. We require `computeFullSubgroups` and dispatch

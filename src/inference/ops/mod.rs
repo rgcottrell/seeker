@@ -8,9 +8,12 @@ pub mod cast;
 pub mod elementwise;
 pub mod flash_attn;
 pub mod matmul;
+pub mod moe;
 pub mod rms_norm;
 pub mod rope;
+pub mod rope_multi;
 pub mod sampler;
+pub mod ssm;
 
 use std::error::Error;
 

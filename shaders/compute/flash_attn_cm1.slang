@@ -143,15 +143,21 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         var matS = CoopMat<float, MemoryScope.Subgroup, Br, Bc,
                            CoopMatMatrixUse::MatrixAccumulator>(0.0f);
         [unroll] for (uint kk = 0; kk < HSK; kk += TK) {
-            var matQ = CoopMat<float16_t, MemoryScope.Subgroup, Br, TK,
-                               CoopMatMatrixUse::MatrixA>(float16_t(0));
-            var matK = CoopMat<float16_t, MemoryScope.Subgroup, TK, Bc,
-                               CoopMatMatrixUse::MatrixB>(float16_t(0));
             // Q is row-major (Br × HSK), K is row-major (Bc × HSK); we want K^T,
             // so loading K with ColumnMajor layout from the (Bc × HSK) shmem with
             // stride HSK+4 effectively yields the (HSK × Bc) K^T view.
-            matQ.Load<CoopMatMatrixLayout::RowMajor>(Q_sh, kk, Q_STRIDE);
-            matK.Load<CoopMatMatrixLayout::ColumnMajor>(K_sh, kk, K_STRIDE);
+            //
+            // NOTE: Slang's `CoopMat::Load<>(...)` is a static method that
+            // RETURNS the loaded matrix. The instance-method form
+            // (`var m = CoopMat(...)(0); m.Load(...)`) emits a Load whose
+            // result is silently discarded — verified via SPIR-V disasm
+            // when porting mul_mm_cm.slang.
+            let matQ = CoopMat<float16_t, MemoryScope.Subgroup, Br, TK,
+                               CoopMatMatrixUse::MatrixA>
+                .Load<CoopMatMatrixLayout::RowMajor>(Q_sh, kk, Q_STRIDE);
+            let matK = CoopMat<float16_t, MemoryScope.Subgroup, TK, Bc,
+                               CoopMatMatrixUse::MatrixB>
+                .Load<CoopMatMatrixLayout::ColumnMajor>(K_sh, kk, K_STRIDE);
             matS = coopMatMulAdd<float, false>(matQ, matK, matS);
         }
         matS.Store<CoopMatMatrixLayout::RowMajor>(S_sh, 0, S_STRIDE);
@@ -213,14 +219,21 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // ── 6) Normalize and write back.
+    // ── 6) Normalize and write back into seeker's `[HSV, n_head, L]`
+    // post-permute layout (matches `flash_attn.slang`'s output store,
+    // which is `[hidden, L]` contiguous so the next matmul reads it
+    // directly without an extra permute). NOT llama.cpp's pre-permute
+    // `[HSV, L, n_head]` — the indices of `gr` (= L) and `iq2` (= head)
+    // are swapped from the obvious natural order.
     for (uint i = tid; i < Br * HSV; i += WORKGROUP_SIZE) {
         const uint r = i / HSV;
         const uint d = i % HSV;
         const uint gr = i_row0 + r;
         if (gr >= p.N) { continue; }
         const float inv_L = L_sh[r] == 0.0f ? 0.0f : 1.0f / L_sh[r];
-        const uint o_off = iq3 * p.ne2 * p.ne1 * HSV + iq2 * p.ne1 * HSV + gr * HSV;
+        const uint o_off = iq3 * p.ne2 * p.ne1 * HSV
+                         + gr * p.ne2 * HSV
+                         + iq2 * HSV;
         data_o[o_off + d] = D_TYPE(O_sh[r * HSV + d] * inv_L);
     }
 }

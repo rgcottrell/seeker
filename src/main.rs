@@ -3,6 +3,7 @@ use std::error::Error;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use crate::commands::bench::{self, BenchArgs};
 use crate::commands::chat::{self, ChatArgs};
 use crate::commands::detokenize::{self, DetokenizeArgs};
 use crate::commands::download::{self, DownloadArgs};
@@ -51,6 +52,8 @@ enum Command {
     Chat(ChatArgs),
     /// Run a single forward pass and print the predicted next token.
     Run(RunArgs),
+    /// Benchmark prefill + decode tok/s; optionally dump first-token logits.
+    Bench(BenchArgs),
 }
 
 #[tokio::main]
@@ -71,6 +74,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Serve(args) => serve::run(args).await,
         Command::Chat(args) => chat::run(args).await,
         Command::Run(args) => run_cmd::run(args).await,
+        Command::Bench(args) => bench::run(args).await,
     }
 }
 

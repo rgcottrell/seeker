@@ -920,26 +920,40 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
         GroupMemoryBarrierWithGroupSync();
 
         [unroll] for (uint kk = 0; kk < BK; kk += TK) {
-            var matA = CoopMat<float16_t, MemoryScope.Subgroup, TM, TK,
-                               CoopMatMatrixUse::MatrixA>(float16_t(0));
-            var matB = CoopMat<float16_t, MemoryScope.Subgroup, TK, TN,
-                               CoopMatMatrixUse::MatrixB>(float16_t(0));
-            matA.Load<CoopMatMatrixLayout::RowMajor>(buf_a,
-                                                     warp_r * WM * AS_STRIDE + kk,
-                                                     AS_STRIDE);
-            matB.Load<CoopMatMatrixLayout::ColumnMajor>(buf_b,
-                                                        warp_c * WN * BS_STRIDE + kk,
-                                                        BS_STRIDE);
+            // Slang's `linalg::CoopMat::Load` is a static-method that
+            // RETURNS the loaded matrix; the instance-method form
+            // `someMat.Load(...)` emits an OpCooperativeMatrixLoadKHR
+            // but discards the result. (See `mma-linear-layout-help.slang`
+            // in the Slang stdlib: `MatA.Load<RowMajor, ...>(...)` —
+            // `MatA` is the *type*, not an instance.)
+            let matA = CoopMat<float16_t, MemoryScope.Subgroup, TM, TK,
+                               CoopMatMatrixUse::MatrixA>
+                .Load<CoopMatMatrixLayout::RowMajor>(buf_a,
+                                                    warp_r * WM * AS_STRIDE + kk,
+                                                    AS_STRIDE);
+            let matB = CoopMat<float16_t, MemoryScope.Subgroup, TK, TN,
+                               CoopMatMatrixUse::MatrixB>
+                .Load<CoopMatMatrixLayout::ColumnMajor>(buf_b,
+                                                       warp_c * WN * BS_STRIDE + kk,
+                                                       BS_STRIDE);
             sums = coopMatMulAdd<float, false>(matA, matB, sums);
         }
         GroupMemoryBarrierWithGroupSync();
     }
 
+    // Output is column-major in (m, n) per ggml convention: D[m, n] lives at
+    // element offset `n * stride_d + m` where stride_d = M. The CoopMat
+    // accumulator `sums` is shaped TM × TN with sums[m_local, n_local]
+    // = D[sub_row+m_local, sub_col+n_local]. Store<ColumnMajor> writes
+    // sums[r, c] to `base + r + c * stride`, so we set base to the (sub_row,
+    // sub_col) corner expressed in column-major and stride to stride_d.
+    //
+    // Matches llama.cpp's mul_mm.comp ColumnMajor store (line 404).
     const uint sub_row = row0 + warp_r * WM;
     const uint sub_col = col0 + warp_c * WN;
     if (sub_row < p.M && sub_col < p.N) {
-        sums.Store<CoopMatMatrixLayout::RowMajor>(data_d,
-                                                  d_base + sub_row * p.stride_d + sub_col,
-                                                  p.stride_d);
+        sums.Store<CoopMatMatrixLayout::ColumnMajor>(data_d,
+                                                     d_base + sub_col * p.stride_d + sub_row,
+                                                     p.stride_d);
     }
 }

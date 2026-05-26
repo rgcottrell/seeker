@@ -98,7 +98,7 @@ fn record_binary_f32(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
 
@@ -128,7 +128,123 @@ pub fn record_silu(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// `softplus(x) = log(1 + exp(x))`. Same generic-unary dispatch shape
+/// as `silu` / `sigmoid`. Used by the SSM block to map raw `α` projection
+/// logits to a positive value before the `ssm_a` scaling.
+pub fn record_softplus(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    let nelements: u32 = src.dims.iter().product::<u64>() as u32;
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&nelements.to_ne_bytes());
+    let key = PipelineKey::dense("softplus_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SOFTPLUS_F32_SPV.as_bytes())?;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// Per-row L2 normalize: `dst[r, c] = src[r, c] / max(sqrt(sum_c src^2), eps)`.
+/// Dispatched with `src.dims[1..]` workgroups, each reducing over
+/// `src.dims[0]` — so passing `src` shape `[head_dim, n_head, L, 1]`
+/// gives per-(head, token) L2 normalization (which is what the SSM
+/// block needs for Q and K before gated-delta-net).
+pub fn record_l2_norm(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+    eps: f32,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    let push = super::unary_params_bytes(&src, &dst, eps, 0.0);
+    let key = PipelineKey::dense(
+        "l2_norm_f32",
+        2,
+        super::UNARY_PARAMS_BYTES,
+        Vec::new(),
+    );
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::L2_NORM_F32_SPV.as_bytes())?;
+    // `l2_norm.slang` decodes the row index as a packed
+    // `z*262144 + y*512 + x` value — DIFFERENT convention from `rms_norm`,
+    // which uses (x, y, z) → (row, channel, batch) directly. Pack total
+    // rows (= dim1 × dim2 × dim3) along x, capped at 512 per stripe, with
+    // overflow into y and (z × 262144).
+    let total_rows = (src.dims[1].max(1) * src.dims[2].max(1) * src.dims[3].max(1)) as u32;
+    let wg_z = total_rows / 262144;
+    let wg_after_z = total_rows - wg_z * 262144;
+    let wg_y = wg_after_z.div_ceil(512);
+    let wg_x = (wg_after_z + wg_y.max(1) - 1).min(512);
+    // Simpler when total_rows <= 512: just (total_rows, 1, 1).
+    let workgroups = if total_rows <= 512 {
+        [total_rows, 1, 1]
+    } else if total_rows <= 512 * 512 {
+        [512, total_rows.div_ceil(512), 1]
+    } else {
+        [512, 512, total_rows.div_ceil(262144)]
+    };
+    let _ = (wg_x, wg_y, wg_z);
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// Element-wise sigmoid (`σ(x) = 1 / (1 + exp(-x))`). Same dispatch shape
+/// and push-constant layout as `record_silu` — `sigmoid.slang` is the
+/// same generic-unary template, just a different SPV.
+pub fn record_sigmoid(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+
+    let nelements: u32 = src.dims.iter().product::<u64>() as u32;
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&nelements.to_ne_bytes());
+
+    let key = PipelineKey::dense("sigmoid_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SIGMOID_F32_SPV.as_bytes())?;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
 
@@ -224,6 +340,6 @@ pub fn record_get_rows(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, ctx.scratch.buffer);
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }

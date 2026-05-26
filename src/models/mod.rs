@@ -12,6 +12,7 @@ use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
 
 pub mod llama;
+pub mod qwen35moe;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -30,6 +31,13 @@ pub trait Model: Send + Sync {
     fn vocab_size(&self) -> u32;
     /// Architecture params needed to allocate a KV cache.
     fn cache_dims(&self) -> CacheDims;
+
+    /// Optional per-layer SSM state. Pure-attention models return None.
+    /// Hybrid models (qwen35moe) return Some so the engine allocates a
+    /// persistent state region on the KvCache.
+    fn ssm_state_dims(&self) -> Option<SsmStateDims> {
+        None
+    }
     /// Borrow the model's uploaded weight buffer. Needed by the engine so
     /// it can pass `&WeightsHandle` into the dispatch context.
     fn weights(&self) -> &WeightsHandle;
@@ -56,6 +64,16 @@ pub trait Model: Send + Sync {
     ) -> Result<TensorView, Box<dyn Error>>;
 }
 
+/// Per-layer SSM state dimensions for hybrid (attention + Mamba/GDN)
+/// models. None for pure-attention models. Hooked into KvCache
+/// allocation in `seeker run` via `Model::ssm_state_dims`.
+#[derive(Debug, Clone, Copy)]
+pub struct SsmStateDims {
+    pub n_ssm_layers: u32,
+    pub conv_state_floats: u32,
+    pub gdn_state_floats: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CacheDims {
     pub n_layer: u32,
@@ -75,6 +93,9 @@ pub fn open(
         .ok_or(ModelError::MissingMetadata("general.architecture"))?;
     match arch {
         "llama" => Ok(Box::new(llama::LlamaModel::new(gguf, weights, tokenizer)?)),
+        "qwen35moe" => Ok(Box::new(qwen35moe::Qwen35MoeModel::new(
+            gguf, weights, tokenizer,
+        )?)),
         other => Err(ModelError::Unsupported(other.to_string()).into()),
     }
 }

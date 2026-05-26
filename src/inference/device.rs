@@ -50,6 +50,15 @@ pub struct Device {
     pub shader_subgroup_rotate_clustered: bool,
     pub coop_matrix: bool,
     pub coop_matrix2: bool,
+    /// Smallest subgroup size the driver will assign for compute (also the
+    /// smallest value that can be passed to
+    /// `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`).
+    pub min_subgroup_size: u32,
+    /// Largest subgroup size the driver will assign for compute.
+    pub max_subgroup_size: u32,
+    /// Shader stages on which `requiredSubgroupSize` may be requested. We
+    /// only care about COMPUTE; this is exposed so callers can sanity-check.
+    pub required_subgroup_size_stages: vk::ShaderStageFlags,
     #[cfg(debug_assertions)]
     debug: Option<validation::Messenger>,
 }
@@ -149,13 +158,23 @@ impl Device {
             coop_matrix2_ext,
         } = pick_physical_device(&instance)?;
 
-        let props = unsafe { instance.get_physical_device_properties(physical) };
+        // Pull the legacy 1.0 properties (for `limits`) and the
+        // `subgroup_size_control` properties via the 1.1+ `GetProperties2`
+        // pNext chain so we know what `requiredSubgroupSize` values the
+        // driver will accept on COMPUTE pipelines.
+        let mut props_sgs = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push(&mut props_sgs);
+        unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
+        let props = props2.properties;
         let device_name = props
             .device_name_as_c_str()
             .ok()
             .and_then(|s| s.to_str().ok())
             .unwrap_or("<?>")
             .to_string();
+        let min_subgroup_size = props_sgs.min_subgroup_size;
+        let max_subgroup_size = props_sgs.max_subgroup_size;
+        let required_subgroup_size_stages = props_sgs.required_subgroup_size_stages;
 
         // Probe feature support via the Vulkan 1.4 rollup structs (plus
         // coop-matrix structs only when the corresponding extension is
@@ -266,6 +285,10 @@ impl Device {
             shader_subgroup_rotate_clustered,
             coop_matrix,
             coop_matrix2,
+            min_subgroup_size,
+            max_subgroup_size,
+            required_subgroup_size_compute =
+                required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE),
             "picked physical device",
         );
 
@@ -386,6 +409,9 @@ impl Device {
             shader_subgroup_rotate_clustered,
             coop_matrix,
             coop_matrix2,
+            min_subgroup_size,
+            max_subgroup_size,
+            required_subgroup_size_stages,
             #[cfg(debug_assertions)]
             debug,
         })
