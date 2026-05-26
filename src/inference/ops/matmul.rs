@@ -219,6 +219,26 @@ pub fn record_nofence(
     record_inner(ctx, a, b, d, /*fence=*/ false)
 }
 
+/// `d += a @ b`. Fuses the residual-add that follows out-projection
+/// matmuls in the attention and SSM blocks into the matmul kernel via
+/// the `ACCUMULATE` spec constant on `mul_mat_vec_head.slang`. The
+/// caller passes `d` as the residual buffer (read-modify-write); no
+/// separate `proj` scratch is needed. Only the matvec path supports
+/// this (N=1); panics if used for prefill.
+pub fn record_accumulate(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    d: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(b.dims[1], 1, "matmul accumulate path is matvec-only (N=1)");
+    debug_assert_eq!(d.dtype, GgmlType::F32);
+    let variant = mmv_variant(a.dtype).ok_or_else(|| {
+        format!("matmul accumulate: weight dtype {:?} not yet wired", a.dtype)
+    })?;
+    record_mul_mat_vec_with_flags(ctx, &variant, a, b, d, /*fence=*/ true, /*accumulate=*/ true)
+}
+
 fn record_inner(
     ctx: &mut DispatchContext,
     a: TensorView,
@@ -465,6 +485,18 @@ fn record_mul_mat_vec(
     d: TensorView,
     fence: bool,
 ) -> Result<(), Box<dyn Error>> {
+    record_mul_mat_vec_with_flags(ctx, variant, a, b, d, fence, /*accumulate=*/ false)
+}
+
+fn record_mul_mat_vec_with_flags(
+    ctx: &mut DispatchContext,
+    variant: &MmvVariant,
+    a: TensorView,
+    b: TensorView,
+    d: TensorView,
+    fence: bool,
+    accumulate: bool,
+) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(b.dims[1], 1, "mul_mat_vec requires N=1");
 
     let ncols = a.dims[0] as u32; // K
@@ -541,11 +573,19 @@ fn record_mul_mat_vec(
             _ => 2,
         }
     };
+    // Spec-const order in `mul_mat_vec_head.slang`: BLOCK_SIZE, NUM_ROWS,
+    // ACCUMULATE. The accumulate flag turns the trailing write into
+    // `data_d[i] += sum` so out-projection matmuls can fold the residual
+    // add into the matmul kernel.
     let key = PipelineKey {
-        name: variant.name.to_string(),
+        name: if accumulate {
+            format!("{}_acc", variant.name)
+        } else {
+            variant.name.to_string()
+        },
         binding_indices: variant.binding_indices.to_vec(),
         push_size: MUL_MAT_VEC_PARAMS_BYTES,
-        spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows],
+        spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows, accumulate as u32],
         required_subgroup_size: Some(32),
     };
     let pipeline = ctx.pipelines.get(ctx.device, key, variant.spv)?.clone();

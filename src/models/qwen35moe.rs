@@ -604,11 +604,21 @@ fn attention_block(
     };
     ctx.tap(&format!("attn_gated-{layer_idx}"), attn_gated)?;
 
-    // 9. wo @ attn_gated  →  proj [hidden, L];  residual += proj
-    let proj = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
-    matmul::record(ctx, att.wo, attn_gated, proj)?;
-    ctx.tap(&format!("attn_output-{layer_idx}"), proj)?;
-    elementwise::record_add(ctx, residual, proj, residual)?;
+    // 9. residual += wo @ attn_gated  — fused accumulate. The matvec
+    //    kernel adds its output into the existing residual buffer in
+    //    place via the ACCUMULATE spec constant on
+    //    `mul_mat_vec_head.slang`. Eliminates the `proj` scratch slot,
+    //    one dispatch (record_add), and one barrier per attention layer.
+    //    Decode-only (matvec path); prefill (L>1) falls back to the
+    //    unfused chain because mul_mm doesn't yet implement accumulate.
+    if l == 1 {
+        matmul::record_accumulate(ctx, att.wo, attn_gated, residual)?;
+    } else {
+        let proj = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, att.wo, attn_gated, proj)?;
+        elementwise::record_add(ctx, residual, proj, residual)?;
+    }
+    ctx.tap(&format!("attn_output-{layer_idx}"), residual)?;
     ctx.tap(&format!("attn_residual-{layer_idx}"), residual)?;
 
     Ok(())
@@ -1173,20 +1183,24 @@ fn ssm_block(
 
     ctx.tap(&format!("attn_output_pre_proj-{layer_idx}"), gated_attn)?;
 
-    // ssm_out @ gated_attn → projection contribution [n_embd, L]
+    // ssm_out @ gated_attn — when no debug dump is active, fuse the
+    // residual add into the matvec via the ACCUMULATE spec constant
+    // and skip the `proj` scratch slot entirely. Decode-only (L=1
+    // matvec path).
+    let dump = std::env::var("SEEKER_QWEN_SSM_DUMP").ok();
+    if dump.is_none() && l == 1 {
+        matmul::record_accumulate(ctx, ssm_w.ssm_out, gated_attn, residual)?;
+        ctx.tap(&format!("attn_output-{layer_idx}"), residual)?;
+        ctx.tap(&format!("attn_residual-{layer_idx}"), residual)?;
+        return Ok(());
+    }
+
+    // Slow path (prefill or dump mode): allocate proj, matmul, optional
+    // dump, then a separate residual add.
     let proj = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     matmul::record(ctx, ssm_w.ssm_out, gated_attn, proj)?;
     ctx.tap(&format!("attn_output-{layer_idx}"), proj)?;
 
-    // Diagnostic: SEEKER_QWEN_SSM_DUMP=<stage> redirects the residual
-    // contribution to a specific intermediate value (filling residual
-    // with that tensor's contents via cast, instead of adding `proj`).
-    // The lm_head then operates on the chosen intermediate, so the
-    // dumped logits effectively contain the intermediate's data.
-    //
-    // Valid stages: alpha, beta, qkv, conv, gdn_attn, attn_normed,
-    // gated, proj. Falls through to normal `residual += proj` otherwise.
-    let dump = std::env::var("SEEKER_QWEN_SSM_DUMP").ok();
     if let Some(stage) = dump.as_deref() {
         let src = match stage {
             "alpha" => Some(alpha),

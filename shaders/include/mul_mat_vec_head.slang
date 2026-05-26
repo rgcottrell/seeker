@@ -103,6 +103,12 @@ struct MulMatVecParams {
 [SpecializationConstant] const uint NUM_ROWS = 2;
 static const uint NUM_COLS = 1;
 
+// ACCUMULATE=1 turns the trailing write into `data_d[i] += sum` instead
+// of `data_d[i] = sum`. Used by the attention/SSM out-projections so the
+// residual add can collapse into the matmul (saves a separate elementwise
+// dispatch + barrier per layer).
+[SpecializationConstant] const uint ACCUMULATE = 0;
+
 // Per-DATA_A_X dequantize / dequantize4 / get_dm overloads live in dequant_funcs.slang.
 // Including here after the buffer bindings so the helpers can reference data_a /
 // data_a_packed16 at file scope.
@@ -150,7 +156,12 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
         [unroll] for (uint n = 0; n < num_rows; ++n) {
             const FLOAT_TYPE sum = WaveActiveSum(temp[j][n]);
             if (tid == 0) {
-                data_d[j * p.batch_stride_d + d_offset + first_row + n] = D_TYPE(sum);
+                const uint idx = j * p.batch_stride_d + d_offset + first_row + n;
+                if (ACCUMULATE != 0) {
+                    data_d[idx] = D_TYPE(FLOAT_TYPE(data_d[idx]) + sum);
+                } else {
+                    data_d[idx] = D_TYPE(sum);
+                }
             }
         }
     }

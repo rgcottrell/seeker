@@ -270,14 +270,14 @@ fn record_matvec_kquant_id(
     let b_alias_slot: u32 = if b_alias_v4 { 4 } else { 5 };
     let bindings: Vec<u32> = vec![0, 1, 2, 3, b_alias_slot, 6, 7];
 
-    // NUM_ROWS spec constant on `mul_mat_vec_head.slang` defaults to 2;
-    // we pass it explicitly (alongside BLOCK_SIZE=32) so the shader's
-    // spec-const ordering doesn't drift if more constants are added.
+    // Spec-const order on `mul_mat_vec_head.slang`: BLOCK_SIZE, NUM_ROWS,
+    // ACCUMULATE. MoE matvec_id always writes a fresh dst slice, so
+    // accumulate stays 0.
     let key = PipelineKey {
         name: name.to_string(),
         binding_indices: bindings.clone(),
         push_size: MULMATVEC_ID_PUSH_BYTES,
-        spec_constants: vec![32, 2],
+        spec_constants: vec![32, 2, 0],
         required_subgroup_size: Some(32),
     };
     let pipeline = *ctx.pipelines.get(ctx.device, key, spv)?;
