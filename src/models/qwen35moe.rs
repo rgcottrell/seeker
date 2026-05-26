@@ -1377,44 +1377,44 @@ fn moe_ffn(
     let shared = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     matmul::record(ctx, w.ffn_down_shexp, sh, shared)?;
 
-    // Shared-expert sigmoid scalar gate per token. `shared_gate_pre` was
-    // dispatched alongside the router above; just apply the sigmoid now.
-    let shared_gate_sig = ctx.alloc_tensor([1, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_sigmoid(ctx, shared_gate_pre, shared_gate_sig)?;
-    // Broadcast scalar gate across hidden dim — view it as [1, L] and
-    // rely on the element-wise mul shader's stride handling. The view
-    // dims/strides need to match `shared` for the mul to broadcast
-    // correctly: shape `[hidden, L]` with stride[0]=0 (broadcast) on the
-    // gate side.
-    let shared_gate_broadcast = TensorView {
-        dims: [hidden, l_u, 1, 1],
-        byte_stride: [0, 4, 4 * l_u, 4 * l_u],
-        element_stride: [0, 1, l_u, l_u],
-        byte_size: shared_gate_sig.byte_size,
-        ..shared_gate_sig
-    };
-    let shared_scaled = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_mul(ctx, shared, shared_gate_broadcast, shared_scaled)?;
-
-    // residual += routed + shared_scaled — single fused 3-way add when
-    // both contributions are enabled. The diagnostic bisection flags
-    // fall back to the unfused two-add form so each branch can be
-    // dropped independently.
+    // Final residual update: residual += routed + shared * sigmoid(gate)
+    // — single fused kernel collapsing what used to be four dispatches
+    // (sigmoid, broadcast-mul, two adds). Diagnostic bisection flags
+    // fall back to the unfused form so each branch can be dropped
+    // independently.
     let no_routed = std::env::var("SEEKER_QWEN_NO_ROUTED").is_ok();
     let no_shared = std::env::var("SEEKER_QWEN_NO_SHARED").is_ok();
-    match (no_routed, no_shared) {
-        (false, false) => {
-            elementwise::record_add3(ctx, residual, routed, shared_scaled, residual)?;
-        }
-        (false, true) => {
+    if !no_routed && !no_shared {
+        elementwise::record_moe_residual_fuse(
+            ctx,
+            residual,
+            routed,
+            shared,
+            shared_gate_pre,
+            residual,
+            hidden as u32,
+        )?;
+    } else {
+        // Fallback path retained only for diagnostic flag combinations.
+        let shared_gate_sig = ctx.alloc_tensor([1, l_u, 1, 1], GgmlType::F32)?;
+        elementwise::record_sigmoid(ctx, shared_gate_pre, shared_gate_sig)?;
+        let shared_gate_broadcast = TensorView {
+            dims: [hidden, l_u, 1, 1],
+            byte_stride: [0, 4, 4 * l_u, 4 * l_u],
+            element_stride: [0, 1, l_u, l_u],
+            byte_size: shared_gate_sig.byte_size,
+            ..shared_gate_sig
+        };
+        let shared_scaled = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
+        elementwise::record_mul(ctx, shared, shared_gate_broadcast, shared_scaled)?;
+        if !no_routed {
             elementwise::record_add(ctx, residual, routed, residual)?;
         }
-        (true, false) => {
+        if !no_shared {
             elementwise::record_add(ctx, residual, shared_scaled, residual)?;
         }
-        (true, true) => {}
     }
-    let _ = shared_scaled;
+    let _ = shared;
     let _ = routed;
     ctx.tap(&format!("l_out-{layer_idx}"), residual)?;
 

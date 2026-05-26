@@ -102,6 +102,52 @@ fn record_binary_f32(
     Ok(())
 }
 
+/// Fused MoE residual tail for qwen35moe.
+///
+/// Computes `residual = residual + routed + shared * sigmoid(gate)`
+/// where `gate` is a per-token scalar broadcast across the hidden
+/// dimension. Replaces four sequential dispatches (sigmoid →
+/// broadcast mul → two adds) and the `shared_gate_sig` /
+/// `shared_scaled` scratch buffers. `hidden` is the broadcast period
+/// (= L's stride in `residual`).
+pub fn record_moe_residual_fuse(
+    ctx: &mut DispatchContext,
+    residual_in: TensorView,
+    routed: TensorView,
+    shared: TensorView,
+    gate: TensorView,
+    residual_out: TensorView,
+    hidden: u32,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(residual_in.dtype, GgmlType::F32);
+    debug_assert_eq!(routed.dtype, GgmlType::F32);
+    debug_assert_eq!(shared.dtype, GgmlType::F32);
+    debug_assert_eq!(gate.dtype, GgmlType::F32);
+    debug_assert_eq!(residual_out.dtype, GgmlType::F32);
+    debug_assert_eq!(residual_in.dims, residual_out.dims);
+
+    let nelements: u32 = residual_in.dims.iter().product::<u64>() as u32;
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&nelements.to_ne_bytes());
+    push[4..8].copy_from_slice(&hidden.to_ne_bytes()); // KY = broadcast period
+
+    let key = PipelineKey::dense("moe_residual_fuse_f32", 5, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::MOE_RESIDUAL_FUSE_F32_SPV.as_bytes())?;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2, 3, 4],
+        &[residual_in.range(), routed.range(), shared.range(), gate.range(), residual_out.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, residual_out.range());
+    Ok(())
+}
+
 /// Fused 3-way element-wise add: `dst = a + b + c`. Used by qwen35moe's
 /// MoE FFN to collapse the two sequential residual updates
 /// (`residual += routed`; `residual += shared_scaled`) into one dispatch.
