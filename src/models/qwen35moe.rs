@@ -528,30 +528,31 @@ fn attention_block(
     let k_view = reshape_for_rope(k, head_dim_k, n_head_kv, l as u64);
     let v_view = reshape_for_rope(v, head_dim_v, n_head_kv, l as u64);
 
-    // 5. Per-head Q/K RMS norm. Independent pair — dispatch both nofence
-    //    and emit one coalesced barrier so they can run concurrently.
-    let q_normed = ctx.alloc_tensor([head_dim_k, n_head, l as u64, 1], GgmlType::F32)?;
-    let k_normed = ctx.alloc_tensor([head_dim_k, n_head_kv, l as u64, 1], GgmlType::F32)?;
-    rms_norm::record_nofence(ctx, q_attn_view, att.attn_q_norm, q_normed, p.rms_eps)?;
-    rms_norm::record_nofence(ctx, k_view, att.attn_k_norm, k_normed, p.rms_eps)?;
-    crate::inference::command::record_compute_barriers(
-        ctx.device,
-        ctx.cmd,
-        &[q_normed.range(), k_normed.range()],
-    );
-    ctx.tap(&format!("Qcur_normed-{layer_idx}"), q_normed)?;
-    ctx.tap(&format!("Kcur_normed-{layer_idx}"), k_normed)?;
-
-    // 6. M-RoPE on Q and K.
+    // 5+6. Per-head Q/K RMS norm fused with M-RoPE. The old chain was
+    //      rms_norm → barrier → rope (×2 for Q and K); the fused kernel
+    //      does the sum-of-squares reduction, weight multiply, and pair
+    //      rotation in a single workgroup per (head, token), eliminating
+    //      the `q_normed` / `k_normed` scratch buffers and one barrier
+    //      per Q/K chain. 10 attention layers × 4 saved dispatches/barriers
+    //      = 40 ops/decode.
     let q_roped = ctx.alloc_tensor([head_dim_k, n_head, l as u64, 1], GgmlType::F32)?;
-    rope_multi::record_nofence(ctx, q_normed, positions_buf, q_roped, rope_params)?;
     let k_roped = ctx.alloc_tensor([head_dim_k, n_head_kv, l as u64, 1], GgmlType::F32)?;
-    rope_multi::record_nofence(ctx, k_normed, positions_buf, k_roped, rope_params)?;
+    rope_multi::record_rms_norm_rope_nofence(
+        ctx, q_attn_view, positions_buf, att.attn_q_norm, q_roped, rope_params, p.rms_eps,
+    )?;
+    rope_multi::record_rms_norm_rope_nofence(
+        ctx, k_view, positions_buf, att.attn_k_norm, k_roped, rope_params, p.rms_eps,
+    )?;
     crate::inference::command::record_compute_barriers(
         ctx.device,
         ctx.cmd,
         &[q_roped.range(), k_roped.range()],
     );
+    // Diff-dump diagnostics: the intermediate `*_normed` no longer exists;
+    // these taps now read the post-rope output directly. The downstream
+    // `Qcur` / `Kcur` taps remain unchanged.
+    ctx.tap(&format!("Qcur_normed-{layer_idx}"), q_roped)?;
+    ctx.tap(&format!("Kcur_normed-{layer_idx}"), k_roped)?;
     ctx.tap(&format!("Qcur-{layer_idx}"), q_roped)?;
     ctx.tap(&format!("Kcur-{layer_idx}"), k_roped)?;
 
