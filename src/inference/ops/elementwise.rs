@@ -302,6 +302,31 @@ pub fn record_ssm_alpha_fuse(
     dst: TensorView,
     num_v: u32,
 ) -> Result<(), Box<dyn Error>> {
+    record_ssm_alpha_fuse_inner(ctx, alpha_pre, bias, ssm_a, dst, num_v, /*fence=*/ true)
+}
+
+/// As [`record_ssm_alpha_fuse`] but skips the trailing barrier — caller is
+/// responsible for fencing `dst` before any downstream read.
+pub fn record_ssm_alpha_fuse_nofence(
+    ctx: &mut DispatchContext,
+    alpha_pre: TensorView,
+    bias: TensorView,
+    ssm_a: TensorView,
+    dst: TensorView,
+    num_v: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_ssm_alpha_fuse_inner(ctx, alpha_pre, bias, ssm_a, dst, num_v, /*fence=*/ false)
+}
+
+fn record_ssm_alpha_fuse_inner(
+    ctx: &mut DispatchContext,
+    alpha_pre: TensorView,
+    bias: TensorView,
+    ssm_a: TensorView,
+    dst: TensorView,
+    num_v: u32,
+    fence: bool,
+) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(alpha_pre.dtype, GgmlType::F32);
     debug_assert_eq!(bias.dtype, GgmlType::F32);
     debug_assert_eq!(ssm_a.dtype, GgmlType::F32);
@@ -329,7 +354,9 @@ pub fn record_ssm_alpha_fuse(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    }
     Ok(())
 }
 
@@ -450,6 +477,33 @@ pub fn record_l2_norm(
 /// Element-wise sigmoid (`σ(x) = 1 / (1 + exp(-x))`). Same dispatch shape
 /// and push-constant layout as `record_silu` — `sigmoid.slang` is the
 /// same generic-unary template, just a different SPV.
+/// As [`record_sigmoid`] but skips the trailing barrier — caller fences `dst`.
+pub fn record_sigmoid_nofence(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    let nelements: u32 = src.dims.iter().product::<u64>() as u32;
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&nelements.to_ne_bytes());
+    let key = PipelineKey::dense("sigmoid_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SIGMOID_F32_SPV.as_bytes())?;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    Ok(())
+}
+
 pub fn record_sigmoid(
     ctx: &mut DispatchContext,
     src: TensorView,

@@ -47,6 +47,45 @@ pub fn record_ssm_conv(
     kernel_size: u32,
     fuse_silu: bool,
 ) -> Result<(), Box<dyn Error>> {
+    record_ssm_conv_inner(
+        ctx, src, kernel, dst, n_channels, n_padded_tokens, n_tokens, n_seqs, kernel_size,
+        fuse_silu, /*fence=*/ true,
+    )
+}
+
+/// As [`record_ssm_conv`] but skips the trailing barrier — caller fences
+/// `dst` before any downstream read.
+pub fn record_ssm_conv_nofence(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    kernel: TensorView,
+    dst: TensorView,
+    n_channels: u32,
+    n_padded_tokens: u32,
+    n_tokens: u32,
+    n_seqs: u32,
+    kernel_size: u32,
+    fuse_silu: bool,
+) -> Result<(), Box<dyn Error>> {
+    record_ssm_conv_inner(
+        ctx, src, kernel, dst, n_channels, n_padded_tokens, n_tokens, n_seqs, kernel_size,
+        fuse_silu, /*fence=*/ false,
+    )
+}
+
+fn record_ssm_conv_inner(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    kernel: TensorView,
+    dst: TensorView,
+    n_channels: u32,
+    n_padded_tokens: u32,
+    n_tokens: u32,
+    n_seqs: u32,
+    kernel_size: u32,
+    fuse_silu: bool,
+    fence: bool,
+) -> Result<(), Box<dyn Error>> {
     let mut push = [0u8; SSM_CONV_PUSH_BYTES as usize];
     let mut w = 0;
     fn put_u(out: &mut [u8], w: &mut usize, v: u32) {
@@ -102,7 +141,9 @@ pub fn record_ssm_conv(
         &push,
         workgroups,
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    }
     Ok(())
 }
 

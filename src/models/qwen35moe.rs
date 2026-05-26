@@ -685,15 +685,19 @@ fn ssm_block(
     ctx.tap(&format!("alpha_pre-{layer_idx}"), alpha_pre)?;
 
     // 4a. beta = sigmoid(beta_pre)
+    // 4a/4b: sigmoid(beta_pre) and the fused alpha pipeline are
+    // independent — same inputs (matmul outputs), disjoint outputs
+    // (beta vs alpha). Dispatch both nofence so the GPU is free to
+    // overlap them with each other (and with the conv1d below, which
+    // is also independent until gated_delta_net reads its output);
+    // emit one coalesced barrier covering (beta, alpha, conv_out) just
+    // before the L2 norms further down.
     let beta = ctx.alloc_tensor([num_v, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_sigmoid(ctx, beta_pre, beta)?;
+    elementwise::record_sigmoid_nofence(ctx, beta_pre, beta)?;
     ctx.tap(&format!("beta_sigmoid-{layer_idx}"), beta)?;
 
-    // 4b. alpha = softplus(alpha_pre + ssm_dt_bias) * ssm_a — single
-    // fused dispatch (was add + softplus + mul). ssm_dt_bias and ssm_a
-    // are shape `[num_v]` and broadcast along the L axis.
     let alpha = ctx.alloc_tensor([num_v, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_ssm_alpha_fuse(
+    elementwise::record_ssm_alpha_fuse_nofence(
         ctx,
         alpha_pre,
         ssm_w.ssm_dt_bias,
@@ -879,7 +883,9 @@ fn ssm_block(
         // n*M + m, i.e. m (channel) innermost. Just memcpy.
         cast::record_cast(ctx, qkv, conv_out)?;
     } else {
-        ssm::record_ssm_conv(
+        // Nofence — coalesced barrier below covers conv_out alongside
+        // beta and alpha.
+        ssm::record_ssm_conv_nofence(
             ctx,
             conv_input,
             ssm_w.ssm_conv1d,
@@ -892,6 +898,15 @@ fn ssm_block(
             /* fuse_silu = */ true,
         )?;
     }
+    // Coalesced barrier on (beta, alpha, conv_out): the three branches
+    // are independent on the GPU and the driver is now free to overlap
+    // them. None of the subsequent dispatches read any of these
+    // buffers before this barrier point.
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[beta.range(), alpha.range(), conv_out.range()],
+    );
 
     // 5b. SiLU is fused into the conv1d kernel above (FUSE_SILU=1), so
     // `conv_out` already holds `silu(raw_conv_output)`. Diagnostic taps
