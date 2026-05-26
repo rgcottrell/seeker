@@ -1132,22 +1132,24 @@ fn ssm_block(
 
     ctx.tap(&format!("gdn_attn_raw-{layer_idx}"), gdn_attn)?;
 
-    // ssm_norm: per-head RMS norm on gdn_attn — `[s_v, num_v, L, 1]`
-    // with weight `[s_v]`.
-    let attn_normed = ctx.alloc_tensor([s_v, num_v, l_u, 1], GgmlType::F32)?;
-    rms_norm::record(ctx, gdn_attn, ssm_w.ssm_norm, attn_normed, p.rms_eps)?;
-    ctx.tap(&format!("ssm_norm_out-{layer_idx}"), attn_normed)?;
-
-    // gated_attn = attn_normed * silu(z) — fuse into one swiglu dispatch.
-    let attn_normed_flat = TensorView {
-        dims: [value_dim, l_u, 1, 1],
-        byte_size: attn_normed.byte_size,
-        byte_stride: [elem, value_dim * elem, value_dim * l_u * elem, value_dim * l_u * elem],
-        element_stride: [1, value_dim, value_dim * l_u, value_dim * l_u],
-        ..attn_normed
-    };
+    // Fused: gated_attn = (rms_norm(gdn_attn) * ssm_norm) * silu(z).
+    // Was rms_norm → swiglu_split (two dispatches); now one kernel writes
+    // gated_attn directly. The `ssm_norm_out` tap is kept for parity with
+    // diff-dump runs but now points at `gated_attn` rather than the
+    // intermediate normed buffer.
     let gated_attn = ctx.alloc_tensor([value_dim, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_swiglu_split(ctx, z, attn_normed_flat, gated_attn)?;
+    elementwise::record_ssm_norm_gate(
+        ctx,
+        gdn_attn,
+        ssm_w.ssm_norm,
+        z,
+        gated_attn,
+        s_v as u32,
+        num_v as u32,
+        l_u as u32,
+        p.rms_eps,
+    )?;
+    ctx.tap(&format!("ssm_norm_out-{layer_idx}"), gated_attn)?;
 
     ctx.tap(&format!("attn_output_pre_proj-{layer_idx}"), gated_attn)?;
 

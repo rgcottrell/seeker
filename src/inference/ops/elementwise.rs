@@ -184,6 +184,58 @@ pub fn record_swiglu_split(
     Ok(())
 }
 
+/// Fused SSM post-GDN normalize + silu(z) gate. Combines
+/// `rms_norm(gdn_attn, ssm_norm) * silu(z) → gated_attn` into a single
+/// dispatch — saves the intermediate `attn_normed` allocation, the
+/// rms_norm dispatch, and one barrier per SSM layer. Dispatches one
+/// workgroup per `(head, token)` pair.
+pub fn record_ssm_norm_gate(
+    ctx: &mut DispatchContext,
+    gdn_attn: TensorView,
+    ssm_norm: TensorView,
+    z: TensorView,
+    dst: TensorView,
+    s_v: u32,
+    num_v: u32,
+    l: u32,
+    eps: f32,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(gdn_attn.dtype, GgmlType::F32);
+    debug_assert_eq!(ssm_norm.dtype, GgmlType::F32);
+    debug_assert_eq!(z.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+
+    const SSM_NORM_GATE_PUSH_BYTES: u32 = 5 * 4;
+    let mut push = [0u8; SSM_NORM_GATE_PUSH_BYTES as usize];
+    let value_dim = s_v * num_v;
+    let fields: [u32; 5] = [
+        s_v,
+        num_v,
+        value_dim,
+        l,
+        eps.to_bits(), // float reinterpret
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    let key = PipelineKey::dense("ssm_norm_gate_f32", 4, SSM_NORM_GATE_PUSH_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SSM_NORM_GATE_F32_SPV.as_bytes())?;
+    let workgroups = [num_v, l, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2, 3],
+        &[gdn_attn.range(), ssm_norm.range(), z.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
 /// Fused SSM alpha pipeline: `alpha = softplus(alpha_pre + bias) * ssm_a`,
 /// with `bias` and `ssm_a` shape `[num_v]` broadcasting along the L
 /// dimension of `alpha_pre`. Replaces three sequential dispatches in
