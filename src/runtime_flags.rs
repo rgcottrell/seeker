@@ -94,3 +94,8 @@ pub static MM_SPLIT_K: LazyLock<Option<u32>> = LazyLock::new(|| env_u32("SEEKER_
 /// `SEEKER_CHAT_DEBUG=1` — print the rendered chat prompt to stderr.
 /// Not hot-path but cache anyway for consistency.
 pub static CHAT_DEBUG: LazyLock<bool> = LazyLock::new(|| env_is_set("SEEKER_CHAT_DEBUG"));
+
+/// `SEEKER_PROFILE_FORWARD=1` — print a per-token `PROF forward:` line
+/// showing CPU-side recording time, GPU compute (wait_for_fences)
+/// time, and host readback. Use to triage host vs GPU overhead.
+pub static PROFILE_FORWARD: LazyLock<bool> = LazyLock::new(|| env_is_set("SEEKER_PROFILE_FORWARD"));

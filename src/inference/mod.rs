@@ -209,6 +209,8 @@ impl Engine {
     where
         F: FnOnce(&mut DispatchContext) -> Result<weights::TensorView, Box<dyn Error>>,
     {
+        let prof = *crate::runtime_flags::PROFILE_FORWARD;
+        let t0 = if prof { Some(std::time::Instant::now()) } else { None };
         self.scratch.reset();
         self.descriptors.reset(&self.device)?;
 
@@ -237,6 +239,7 @@ impl Engine {
             let r = sampler.record_chain(&mut ctx, logits)?;
             (r, ctx.taps)
         };
+        let t_record = t0.map(|t| t.elapsed());
 
         unsafe {
             self.device.device.end_command_buffer(self.command_buffer)?;
@@ -250,6 +253,7 @@ impl Engine {
                 .device
                 .wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
+        let t_wait = t0.map(|t| t.elapsed());
 
         if token_range.size < 4 {
             return Err(format!("sampler output too small: {} bytes", token_range.size).into());
@@ -281,6 +285,16 @@ impl Engine {
             println!("TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]", range.offset, head.join(", "));
         }
         sampler.accept(token);
+        if let (Some(rec), Some(wait)) = (t_record, t_wait) {
+            let total = t0.unwrap().elapsed();
+            eprintln!(
+                "PROF forward: record={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
+                rec.as_secs_f64() * 1000.0,
+                (wait - rec).as_secs_f64() * 1000.0,
+                (total - wait).as_secs_f64() * 1000.0,
+                total.as_secs_f64() * 1000.0,
+            );
+        }
         Ok(token)
     }
 
