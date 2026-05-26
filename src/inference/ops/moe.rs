@@ -134,10 +134,14 @@ pub fn record_topk_moe(
         &push,
         workgroups,
     )?;
-    // Range-aware barrier covers both outputs — downstream matvec_id reads
-    // ids; the swiglu/down later reads weights.
-    record_compute_barrier(ctx.device, ctx.cmd, ids_out);
-    record_compute_barrier(ctx.device, ctx.cmd, weights_out);
+    // One coalesced barrier covering both outputs — downstream matvec_id
+    // reads ids; the swiglu/moe_down later reads weights. Emit in a
+    // single vkCmdPipelineBarrier instead of two separate ones.
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[ids_out, weights_out],
+    );
     Ok(())
 }
 

@@ -1396,17 +1396,23 @@ fn moe_ffn(
     let shared_scaled = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     elementwise::record_mul(ctx, shared, shared_gate_broadcast, shared_scaled)?;
 
-    // residual += routed (+ shared_scaled)
-    // SEEKER_QWEN_NO_SHARED=1 disables the shared-expert add — bisects
-    // between the broadcast/sigmoid gate path and the routed-experts path.
-    // SEEKER_QWEN_NO_ROUTED=1 disables the routed-expert add — bisects
-    // the other direction; combined with NO_SHARED it makes moe_ffn a
-    // no-op so the forward becomes "embed → final_norm → lm_head".
-    if std::env::var("SEEKER_QWEN_NO_ROUTED").is_err() {
-        elementwise::record_add(ctx, residual, routed, residual)?;
-    }
-    if std::env::var("SEEKER_QWEN_NO_SHARED").is_err() {
-        elementwise::record_add(ctx, residual, shared_scaled, residual)?;
+    // residual += routed + shared_scaled — single fused 3-way add when
+    // both contributions are enabled. The diagnostic bisection flags
+    // fall back to the unfused two-add form so each branch can be
+    // dropped independently.
+    let no_routed = std::env::var("SEEKER_QWEN_NO_ROUTED").is_ok();
+    let no_shared = std::env::var("SEEKER_QWEN_NO_SHARED").is_ok();
+    match (no_routed, no_shared) {
+        (false, false) => {
+            elementwise::record_add3(ctx, residual, routed, shared_scaled, residual)?;
+        }
+        (false, true) => {
+            elementwise::record_add(ctx, residual, routed, residual)?;
+        }
+        (true, false) => {
+            elementwise::record_add(ctx, residual, shared_scaled, residual)?;
+        }
+        (true, true) => {}
     }
     let _ = shared_scaled;
     let _ = routed;

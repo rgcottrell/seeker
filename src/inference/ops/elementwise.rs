@@ -102,6 +102,46 @@ fn record_binary_f32(
     Ok(())
 }
 
+/// Fused 3-way element-wise add: `dst = a + b + c`. Used by qwen35moe's
+/// MoE FFN to collapse the two sequential residual updates
+/// (`residual += routed`; `residual += shared_scaled`) into one dispatch.
+/// Same workgroup decomposition as the binary add/mul ops.
+pub fn record_add3(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    c: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(a.dtype, GgmlType::F32);
+    debug_assert_eq!(b.dtype, GgmlType::F32);
+    debug_assert_eq!(c.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    debug_assert_eq!(a.dims, dst.dims);
+    debug_assert_eq!(b.dims, dst.dims);
+    debug_assert_eq!(c.dims, dst.dims);
+
+    let nelements: u32 = a.dims.iter().product::<u64>() as u32;
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&nelements.to_ne_bytes());
+
+    let key = PipelineKey::dense("add3_f32", 4, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::ADD3_F32_SPV.as_bytes())?;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2, 3],
+        &[a.range(), b.range(), c.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
 /// Fused `silu(a) * b → dst` ("split-mode" swiglu). a, b, dst must share
 /// the same F32 contiguous layout. Saves two dispatches (silu + mul) and
 /// one barrier vs the unfused path — the FFN gate path of every MoE expert
