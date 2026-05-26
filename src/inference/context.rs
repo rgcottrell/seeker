@@ -26,6 +26,12 @@ pub struct DispatchContext<'a> {
     /// The engine reads these back after submit, alongside the main logits.
     /// Used for layer-by-layer diff dumps vs llama.cpp's `cb()` callback.
     pub taps: Vec<(String, BufferRange)>,
+    /// Bumped by every `bind_and_dispatch` and barrier-emitting helper —
+    /// when `SEEKER_PROFILE_FORWARD=1` is set, `forward_sampled` prints
+    /// this alongside its timing breakdown to give a per-token count
+    /// of `vkCmdDispatch` and `vkCmdPipelineBarrier` calls.
+    pub n_dispatches: u32,
+    pub n_barriers: u32,
 }
 
 impl<'a> DispatchContext<'a> {

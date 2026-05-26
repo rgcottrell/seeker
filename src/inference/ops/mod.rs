@@ -60,8 +60,10 @@ pub fn bind_and_dispatch(
         )?;
         record_dispatch(ctx.device, ctx.cmd, pipeline, set, push, workgroups);
     }
+    ctx.n_dispatches += 1;
     Ok(())
 }
+
 
 /// Byte size of `UnaryParams` (in shaders/include/generic_unary_head.slang):
 /// 32 × 4 bytes = 128 bytes.

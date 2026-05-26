@@ -130,7 +130,17 @@ pub fn record_compute_barrier(device: &Device, cmd: vk::CommandBuffer, range: Bu
 /// vkCmdPipelineBarrier call. Use after a batch of nofence dispatches
 /// that wrote disjoint regions (Q/K/V matmuls, FFN gate/up, etc.) to
 /// fence them all at once before downstream reads.
+// Thread-local counters for the SEEKER_PROFILE_FORWARD=1 breakdown.
+// Reset by `forward_sampled` before the dispatch graph is recorded;
+// bumped by each barrier-emitting path here. Out of the hot path
+// when profiling is off (no atomic / no shared state).
+std::thread_local! {
+    pub static BARRIER_COMPUTE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    pub static BARRIER_GLOBAL_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 pub fn record_compute_barriers(device: &Device, cmd: vk::CommandBuffer, ranges: &[BufferRange]) {
+    BARRIER_COMPUTE_COUNT.with(|c| c.set(c.get() + 1));
     // Cached at first access; LazyLock keeps subsequent reads to a
     // single atomic-pointer load. This used to be `std::env::var(…)`,
     // which is a getenv + string-alloc per call — and this function
@@ -196,6 +206,7 @@ pub fn record_compute_barriers(device: &Device, cmd: vk::CommandBuffer, ranges: 
 /// to every buffer. Used between dispatches that share data through
 /// `vkCmdCopyBuffer` (e.g. KV cache write / read).
 pub fn record_global_barrier(device: &Device, cmd: vk::CommandBuffer) {
+    BARRIER_GLOBAL_COUNT.with(|c| c.set(c.get() + 1));
     let bar = vk::MemoryBarrier::default()
         .src_access_mask(
             vk::AccessFlags::SHADER_WRITE

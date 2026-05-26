@@ -137,6 +137,8 @@ impl Engine {
                 descriptors: &self.descriptors,
                 cmd: self.command_buffer,
                 taps: Vec::new(),
+                n_dispatches: 0,
+                n_barriers: 0,
             };
             let r = record(&mut ctx)?;
             (r, ctx.taps)
@@ -211,6 +213,10 @@ impl Engine {
     {
         let prof = *crate::runtime_flags::PROFILE_FORWARD;
         let t0 = if prof { Some(std::time::Instant::now()) } else { None };
+        if prof {
+            crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.set(0));
+            crate::inference::command::BARRIER_GLOBAL_COUNT.with(|c| c.set(0));
+        }
         self.scratch.reset();
         self.descriptors.reset(&self.device)?;
 
@@ -225,7 +231,7 @@ impl Engine {
                 .begin_command_buffer(self.command_buffer, &begin)?;
         }
 
-        let (token_range, taps) = {
+        let (token_range, taps, n_dispatches) = {
             let mut ctx = DispatchContext {
                 device: &self.device,
                 weights,
@@ -234,10 +240,12 @@ impl Engine {
                 descriptors: &self.descriptors,
                 cmd: self.command_buffer,
                 taps: Vec::new(),
+                n_dispatches: 0,
+                n_barriers: 0,
             };
             let logits = record_logits(&mut ctx)?;
             let r = sampler.record_chain(&mut ctx, logits)?;
-            (r, ctx.taps)
+            (r, ctx.taps, ctx.n_dispatches)
         };
         let t_record = t0.map(|t| t.elapsed());
 
@@ -287,8 +295,10 @@ impl Engine {
         sampler.accept(token);
         if let (Some(rec), Some(wait)) = (t_record, t_wait) {
             let total = t0.unwrap().elapsed();
+            let bc = crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.get());
+            let bg = crate::inference::command::BARRIER_GLOBAL_COUNT.with(|c| c.get());
             eprintln!(
-                "PROF forward: record={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
+                "PROF forward: dispatches={n_dispatches} barriers=(compute={bc} global={bg}) record={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
                 rec.as_secs_f64() * 1000.0,
                 (wait - rec).as_secs_f64() * 1000.0,
                 (total - wait).as_secs_f64() * 1000.0,
