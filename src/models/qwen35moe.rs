@@ -692,19 +692,19 @@ fn ssm_block(
     elementwise::record_sigmoid(ctx, beta_pre, beta)?;
     ctx.tap(&format!("beta_sigmoid-{layer_idx}"), beta)?;
 
-    // 4b. alpha_pre += ssm_dt_bias (broadcast on dim 1 if L>1; ssm_dt_bias
-    //     has dims [num_v, 1, 1, 1]). The generic binary shader handles
-    //     broadcast via fastmod against the smaller src1 element count.
-    let alpha_biased = ctx.alloc_tensor([num_v, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_add(ctx, alpha_pre, ssm_w.ssm_dt_bias, alpha_biased)?;
-    // softplus(alpha_biased) — into the same buffer in-place is OK because
-    // softplus is a unary in-place-safe op.
-    let alpha_pos = ctx.alloc_tensor([num_v, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_softplus(ctx, alpha_biased, alpha_pos)?;
-    ctx.tap(&format!("a_softplus-{layer_idx}"), alpha_pos)?;
-    // alpha = alpha_pos * ssm_a (broadcast). ssm_a is [num_v] F32.
+    // 4b. alpha = softplus(alpha_pre + ssm_dt_bias) * ssm_a — single
+    // fused dispatch (was add + softplus + mul). ssm_dt_bias and ssm_a
+    // are shape `[num_v]` and broadcast along the L axis.
     let alpha = ctx.alloc_tensor([num_v, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_mul(ctx, alpha_pos, ssm_w.ssm_a, alpha)?;
+    elementwise::record_ssm_alpha_fuse(
+        ctx,
+        alpha_pre,
+        ssm_w.ssm_dt_bias,
+        ssm_w.ssm_a,
+        alpha,
+        num_v as u32,
+    )?;
+    ctx.tap(&format!("a_softplus-{layer_idx}"), alpha)?;
     ctx.tap(&format!("gate-{layer_idx}"), alpha)?;
 
     // 5. ssm_conv1d on qkv.

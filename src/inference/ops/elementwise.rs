@@ -184,6 +184,49 @@ pub fn record_swiglu_split(
     Ok(())
 }
 
+/// Fused SSM alpha pipeline: `alpha = softplus(alpha_pre + bias) * ssm_a`,
+/// with `bias` and `ssm_a` shape `[num_v]` broadcasting along the L
+/// dimension of `alpha_pre`. Replaces three sequential dispatches in
+/// `ssm_block`; everything F32. KY is the broadcast period (`num_v`).
+pub fn record_ssm_alpha_fuse(
+    ctx: &mut DispatchContext,
+    alpha_pre: TensorView,
+    bias: TensorView,
+    ssm_a: TensorView,
+    dst: TensorView,
+    num_v: u32,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(alpha_pre.dtype, GgmlType::F32);
+    debug_assert_eq!(bias.dtype, GgmlType::F32);
+    debug_assert_eq!(ssm_a.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+
+    let n_elements: u64 = alpha_pre.dims.iter().product();
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&(n_elements as u32).to_ne_bytes());
+    push[4..8].copy_from_slice(&num_v.to_ne_bytes()); // KY
+
+    let key = PipelineKey::dense("ssm_alpha_fuse_f32", 4, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SSM_ALPHA_FUSE_F32_SPV.as_bytes())?;
+    let total_wgs = (n_elements as u32).div_ceil(512);
+    let max_x: u32 = 65535;
+    let wg_x = total_wgs.min(max_x);
+    let wg_y = total_wgs.div_ceil(max_x);
+    let workgroups = [wg_x, wg_y, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2, 3],
+        &[alpha_pre.range(), bias.range(), ssm_a.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
 pub fn record_silu(
     ctx: &mut DispatchContext,
     src: TensorView,
