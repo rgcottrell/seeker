@@ -343,18 +343,25 @@ impl ChatSession {
 
         // Prefill + decode in one loop. forward_sampled records the model
         // forward then the sampler chain, returning the next token id.
-        // After each non-EOS token we cumulative-decode and emit the
-        // newly-completed byte slice. Cumulative-decode is the only
-        // reliable pattern: a single BPE token may be a fragment of a
-        // multi-byte UTF-8 char or a whitespace-managing prefix, but the
-        // running prefix always decodes cleanly with `skip_special_tokens=true`.
+        // After each non-EOS token we step a `DecodeStream` and emit any
+        // newly-completed UTF-8 chars. The streaming decoder is the right
+        // tool here: when a multi-byte char (emoji, CJK) is split across
+        // two BPE byte tokens, a bulk `decode` of the running prefix
+        // substitutes `\u{fffd}` for the in-flight bytes and then
+        // *retcons* it into the real char when the completing token
+        // arrives — naive byte-length diffing slices into the middle of
+        // that real char and panics.
         let mut step_tokens = delta;
         let prompt_tokens = step_tokens.len(); // prefill suffix fed this turn
         let mut prefill_secs = 0.0f64;
         let mut decode_secs = 0.0f64;
         let mut forwards = 0usize;
         let mut assistant_tokens: Vec<u32> = Vec::new();
-        let mut printed_len: usize = 0;
+        let mut stream = self
+            .model
+            .tokenizer()
+            .tokenizer
+            .decode_stream(/* skip_special_tokens = */ true);
         loop {
             if (self.cache.position as usize + step_tokens.len() + 1) as u32
                 > self.cache.config.max_seq_len
@@ -387,21 +394,13 @@ impl ChatSession {
             }
             assistant_tokens.push(token);
 
-            // Stream the new bytes. `decode` errors are rare (the tokenizer
-            // should always succeed on its own outputs); on the off-chance
-            // we hit one, skip the emit and try again next iteration —
-            // whatever bytes were withheld will reappear in the cumulative
-            // decode once the run is decodable.
-            if let Ok(text) = self
-                .model
-                .tokenizer()
-                .tokenizer
-                .decode(&assistant_tokens, /* skip_special_tokens = */ true)
-            {
-                if text.len() > printed_len {
-                    on_text(&text[printed_len..]);
-                    printed_len = text.len();
-                }
+            // Stream emit: `step` buffers partial UTF-8 internally and
+            // returns `Some(piece)` only once one or more complete chars
+            // are ready. Errors are rare (the tokenizer succeeds on its
+            // own outputs); on the off-chance we hit one, skip the emit
+            // — the next step's output will catch up.
+            if let Ok(Some(piece)) = stream.step(token) {
+                on_text(&piece);
             }
 
             if assistant_tokens.len() as u32 >= self.max_tokens {
