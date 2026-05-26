@@ -100,7 +100,7 @@ struct MulMatVecParams {
 // reused across NUM_ROWS A-row dequants), which dominates decode bandwidth.
 // llama.cpp uses 4–8 depending on dtype; we use 2 — register pressure goes
 // up linearly and we don't want to overflow Apple's tighter file.
-static const uint NUM_ROWS = 2;
+[SpecializationConstant] const uint NUM_ROWS = 2;
 static const uint NUM_COLS = 1;
 
 // Per-DATA_A_X dequantize / dequantize4 / get_dm overloads live in dequant_funcs.slang.

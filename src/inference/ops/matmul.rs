@@ -521,22 +521,27 @@ fn record_mul_mat_vec(
     // assuming `subgroupSize == 32` (mul_mat_vec_head.slang:101-106). Pin
     // the pipeline to wave32 — required for correctness on any device that
     // supports both wave32 and wave64 (RDNA, Intel Xe).
+    //
+    // `NUM_ROWS` is a spec constant on the shared `mul_mat_vec_head.slang`
+    // (default 2). For Q8_0 the optimal tile on RDNA is 1 row per
+    // workgroup — matching llama.cpp's `rm_stdq` table for that dtype;
+    // empirically saves ~6% on qwen35moe decode. Other dtypes keep the
+    // 2-rows default. Spec-const order is `[BLOCK_SIZE, NUM_ROWS]` per
+    // the head's declaration order.
+    let num_rows: u32 = match a.dtype {
+        crate::gguf::GgmlType::Q8_0 => 1,
+        _ => 2,
+    };
     let key = PipelineKey {
         name: variant.name.to_string(),
         binding_indices: variant.binding_indices.to_vec(),
         push_size: MUL_MAT_VEC_PARAMS_BYTES,
-        spec_constants: Vec::new(),
+        spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows],
         required_subgroup_size: Some(32),
     };
     let pipeline = ctx.pipelines.get(ctx.device, key, variant.spv)?.clone();
 
-    // Each workgroup produces `NUM_ROWS` output rows (see
-    // `mul_mat_vec_head.slang`). Keep this in sync with the shader's
-    // `static const uint NUM_ROWS = …`. The shader's per-thread bounds
-    // check tolerates an over-dispatch on the last X tile when M is not
-    // divisible by NUM_ROWS, so `div_ceil` is correct.
-    const NUM_ROWS: u32 = 2;
-    let workgroups = [m.div_ceil(NUM_ROWS), num_batches, 1];
+    let workgroups = [m.div_ceil(num_rows), num_batches, 1];
     super::bind_and_dispatch(
         ctx,
         &pipeline,
