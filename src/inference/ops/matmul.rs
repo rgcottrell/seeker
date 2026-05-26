@@ -287,6 +287,18 @@ fn record_inner(
     })?;
 
     if n == 1 {
+        // Split-K opt-in for huge-M Q8_0 matvecs (lm_head — 248k × 2048).
+        // The single-pass kernel already issues vocab/NUM_ROWS workgroups
+        // which saturates RDNA's CU count; split-K trades a reduce pass
+        // for fewer iterations per WG, occasionally helping when the
+        // per-WG work is large enough to bottleneck on memory issue rate.
+        // Gate on `SEEKER_MM_SPLIT_K=<n>` for now (no auto-pick); 0
+        // disables. Only Q8_0 (the lm_head dtype) is wired.
+        if a.dtype == GgmlType::Q8_0 {
+            if let Some(split_k) = pick_mm_split_k(a.dims[0] as u32, a.dims[1] as u32) {
+                return record_mul_mat_vec_split_k(ctx, &variant, a, b, d, split_k, fence);
+            }
+        }
         record_mul_mat_vec(ctx, &variant, a, b, d, fence)?;
     } else {
         // Per-column fallback: dispatch one `mul_mat_vec` per output column.
@@ -603,5 +615,143 @@ fn record_mul_mat_vec_with_flags(
         record_compute_barrier(ctx.device, ctx.cmd, d.range());
     }
     let _ = MUL_MAT_VEC_BLOCK_SIZE; // documented above; not currently used host-side
+    Ok(())
+}
+
+/// Heuristic: opt into split-K for the lm_head matvec specifically.
+/// `ncols` = K (hidden dim), `nrows` = M (vocab). Returns the split factor
+/// to use, or None for the single-pass path.
+///
+/// `SEEKER_MM_SPLIT_K=<n>` forces a value (0 = disable). Otherwise enable
+/// for huge-M matvecs where the per-WG K work is large enough to bottleneck
+/// on memory issue rate; threshold tuned for STRIX_HALO's 40 CUs.
+fn pick_mm_split_k(ncols: u32, nrows: u32) -> Option<u32> {
+    if let Ok(v) = std::env::var("SEEKER_MM_SPLIT_K") {
+        return match v.parse::<u32>().ok()? {
+            0 | 1 => None,
+            n => Some(n),
+        };
+    }
+    // Auto-enable only for the lm_head-shaped case: vocab-scale rows and
+    // K divisible by `4 * K_PER_ITER * BLOCK_SIZE = 1024` so 4-way split-K
+    // partitions cleanly. Skip when rows are small enough that the
+    // single-pass kernel already issues plenty of workgroups.
+    if nrows >= 32_768 && ncols % 1024 == 0 {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+/// Split-K mul_mat_vec — multiple workgroups cooperate on each output row.
+/// Each WG writes one partial value per (row, split_idx) to a `[M, SPLIT_K]`
+/// scratch buffer; a follow-up reduce shader sums the SPLIT_K partials
+/// into the final `[M]` output. Used by the lm_head matvec on STRIX_HALO.
+fn record_mul_mat_vec_split_k(
+    ctx: &mut DispatchContext,
+    variant: &MmvVariant,
+    a: TensorView,
+    b: TensorView,
+    d: TensorView,
+    split_k: u32,
+    fence: bool,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(b.dims[1], 1, "split-K matvec requires N=1");
+    debug_assert_eq!(a.dtype, GgmlType::Q8_0, "split-K matvec wired for Q8_0 only");
+
+    let ncols = a.dims[0] as u32;
+    let m = a.dims[1] as u32;
+    let num_rows: u32 = match a.dtype {
+        crate::gguf::GgmlType::Q8_0 => 1,
+        _ => 2,
+    };
+
+    // Partials buffer: [M, SPLIT_K] F32, laid out split-major per row so
+    // the reduce kernel sweeps with unit stride.
+    let partials_bytes = (m as u64) * (split_k as u64) * 4;
+    let partials = ctx.alloc_scratch(partials_bytes)?;
+
+    // Build the split-K push constants — share the existing matvec layout
+    // (the shader reuses `mul_mat_vec_head.slang`). `stride_d` carries M
+    // (rows in this split-K dispatch's output slice); other fields are
+    // single-batch defaults.
+    let mut push = [0u8; MUL_MAT_VEC_PARAMS_BYTES as usize];
+    let fields = [
+        ncols, ncols, ncols, m, // ncols, stride_a, stride_b, stride_d
+        ncols * m, ncols, m,    // batch_stride_a, _b, _d (single batch)
+        0, 0, 1, 1, 1, 1,       // fusion_flags, base_work_group_y, ne02..broadcast3
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    // Pipeline: `mul_mat_vec_split_k.slang` Q8_0 variant. Spec-const order
+    // matches the head + the new SPLIT_K: [BLOCK_SIZE, NUM_ROWS,
+    // ACCUMULATE, SPLIT_K]. Accumulate stays 0 (partials are fresh).
+    let key = PipelineKey {
+        name: "mul_mat_vec_split_k_q8_0".to_string(),
+        binding_indices: variant.binding_indices.to_vec(),
+        push_size: MUL_MAT_VEC_PARAMS_BYTES,
+        spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows, 0, split_k],
+        required_subgroup_size: Some(32),
+    };
+    let pipeline = ctx
+        .pipelines
+        .get(ctx.device, key, shaders::MUL_MAT_VEC_SPLIT_K_Q8_0_SPV.as_bytes())?
+        .clone();
+
+    // Dispatch: (M / NUM_ROWS, SPLIT_K, 1).
+    let workgroups = [m.div_ceil(num_rows), split_k, 1];
+
+    // The split-K shader writes into `partials` via the data_d binding.
+    // We slice the regular `MmvVariant` bindings list and swap slot 2's
+    // buffer for the partials buffer (slot 0 = A, 1 = B, 2 = D=partials,
+    // 3 = A packed16, 4 = B vec4).
+    let bindings: Vec<_> = variant
+        .binding_indices
+        .iter()
+        .map(|&slot| match slot {
+            0 | 3 | 6 => a.range(),
+            1 | 4 | 5 => b.range(),
+            2 => partials,
+            other => panic!("unexpected split-K binding slot {other}"),
+        })
+        .collect();
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        variant.binding_indices,
+        &bindings,
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, partials);
+
+    // Reduce: sum SPLIT_K partials per row into `d`.
+    let reduce_key = PipelineKey::dense(
+        "mul_mat_vec_split_k_reduce_f32",
+        2,
+        8, // generic_head: KX + KY
+        vec![split_k],
+    );
+    let reduce_pipeline = *ctx.pipelines.get(
+        ctx.device,
+        reduce_key,
+        shaders::MUL_MAT_VEC_SPLIT_K_REDUCE_F32_SPV.as_bytes(),
+    )?;
+    let mut reduce_push = [0u8; 8];
+    reduce_push[0..4].copy_from_slice(&m.to_ne_bytes()); // KX = M
+    let reduce_workgroups = [m.div_ceil(512), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &reduce_pipeline,
+        &[0, 1],
+        &[partials, d.range()],
+        &reduce_push,
+        reduce_workgroups,
+    )?;
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, d.range());
+    }
     Ok(())
 }
