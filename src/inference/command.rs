@@ -67,18 +67,26 @@ pub fn record_dispatch_push(
     workgroups: [u32; 3],
 ) {
     debug_assert_eq!(binding_indices.len(), bindings.len());
-    let infos: Vec<vk::DescriptorBufferInfo> =
-        bindings.iter().map(|b| b.descriptor_info()).collect();
-    let writes: Vec<vk::WriteDescriptorSet<'_>> = binding_indices
-        .iter()
-        .zip(infos.iter())
-        .map(|(&binding, info)| {
-            vk::WriteDescriptorSet::default()
-                .dst_binding(binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(info))
-        })
-        .collect();
+    // Stack-allocated scratch arrays — every dispatch was Vec-allocating
+    // two short collections (DescriptorBufferInfo + WriteDescriptorSet)
+    // and freeing them right after. 1500 dispatches/forward × 2 small
+    // heap allocs added up. Cap at 8 bindings (max wired in any shader,
+    // e.g. mul_mat_vec_q4_k_id at slot 7); panics on overflow.
+    const MAX: usize = 8;
+    debug_assert!(bindings.len() <= MAX, "raise MAX in record_dispatch_push");
+    let mut infos: [vk::DescriptorBufferInfo; MAX] = [vk::DescriptorBufferInfo::default(); MAX];
+    let mut writes: [vk::WriteDescriptorSet<'_>; MAX] = [vk::WriteDescriptorSet::default(); MAX];
+    let n = bindings.len();
+    for i in 0..n {
+        infos[i] = bindings[i].descriptor_info();
+    }
+    for i in 0..n {
+        writes[i] = vk::WriteDescriptorSet::default()
+            .dst_binding(binding_indices[i])
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&infos[i]));
+    }
+    let writes = &writes[..n];
     unsafe {
         device.device.cmd_bind_pipeline(
             cmd,
@@ -90,7 +98,7 @@ pub fn record_dispatch_push(
             vk::PipelineBindPoint::COMPUTE,
             pipeline.layout,
             0,
-            &writes,
+            writes,
         );
         if !push.is_empty() {
             device.device.cmd_push_constants(
