@@ -153,8 +153,17 @@ impl Model for LlamaModel {
 
         // Mask is always F32 regardless of cache dtype (the shader's
         // `data_m` binding is F32 across every variant since `e41661f`).
-        let mask = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
-        write_causal_mask(ctx, mask, l, position_offset, GgmlType::F32)?;
+        // Single-token decode (l == 1) needs no mask: the one query sits at
+        // the newest position, so every KV slot is causally visible (the
+        // whole row is 0). Skip the O(total_len) host-side mask build per
+        // step — flash_attn runs that case with MASK_ENABLE=0.
+        let mask = if l > 1 {
+            let m = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
+            write_causal_mask(ctx, m, l, position_offset, GgmlType::F32)?;
+            Some(m)
+        } else {
+            None
+        };
 
         // ---- embedding lookup ----
         // Residual is one persistent slot, reused across layers via in-place
@@ -258,6 +267,8 @@ impl Model for LlamaModel {
             // attn_out = flash_attn(Q, K, V, mask) → [hidden, L]
             let attn_out = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             flash_attn::record(ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params)?;
+            // (mask is Option<TensorView>: Some for prefill chunks, None for
+            // single-token decode — see the prologue.)
 
             // proj = wo @ attn_out → [hidden, L]
             let proj = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;

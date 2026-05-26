@@ -314,8 +314,16 @@ impl Model for Qwen35MoeModel {
         }
         write_u32(ctx, positions_buf, &positions)?;
 
-        let mask = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
-        write_causal_mask(ctx, mask, l, position_offset)?;
+        // Single-token decode (l == 1) needs no mask: every KV slot is
+        // causally visible, so flash_attn runs with MASK_ENABLE=0 and we skip
+        // the O(total_len) host-side mask build per step. See llama.rs.
+        let mask = if l > 1 {
+            let m = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
+            write_causal_mask(ctx, m, l, position_offset)?;
+            Some(m)
+        } else {
+            None
+        };
 
         let residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
         elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, l, residual)?;
@@ -470,7 +478,7 @@ fn attention_block(
     att: &AttentionBlockWeights,
     cache: &mut KvCache,
     residual: TensorView,
-    mask: TensorView,
+    mask: Option<TensorView>,
     positions_buf: crate::inference::buffer::BufferRange,
     rope_params: rope_multi::RopeMultiParams,
     fa_params: flash_attn::FlashAttnParams,

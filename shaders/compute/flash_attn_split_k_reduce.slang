@@ -107,6 +107,9 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         const float FLT_MAX_ = asfloat(0x7F7FFFFFu);
         O = clamp(O, -FLT_MAX_, FLT_MAX_);
 
-        data_d[(i3 * p.ne2 + i2) * p.ne1 * D + D * n + d] = O;
+        // seeker layout: [HSV, n_head, L] (matches flash_attn.slang's single-
+        // pass write), so the wo matmul reads attn_out directly. (llama.cpp's
+        // original wrote [HSV, L, n_head] here.)
+        data_d[i3 * p.ne2 * p.ne1 * D + n * p.ne2 * D + i2 * D + d] = O;
     }
 }

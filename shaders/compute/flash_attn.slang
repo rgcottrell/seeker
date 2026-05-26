@@ -121,6 +121,11 @@ struct FaParams {
 
 // Mask is always F32 across every variant.
 [[vk::binding(3, 0)]] StructuredBuffer<float>      data_m;
+// Split-K partials (binding 4): written when p.k_num > 1 — unnormalized O
+// plus per-row running (L, M) — for flash_attn_split_k_reduce to merge.
+// Declared unconditionally so the descriptor-set layout is identical on
+// both the single-pass and split-K paths.
+[[vk::binding(4, 0)]] RWStructuredBuffer<float>    data_o_split;
 [[vk::binding(5, 0)]] RWStructuredBuffer<D_TYPE>   data_o;
 
 // Shared Q row (already premultiplied by scale).
@@ -240,7 +245,11 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
 
     const uint tid    = gl_LocalInvocationID.x;
     const uint i_row  = gl_WorkGroupID.x;
-    const uint iq2    = gl_WorkGroupID.y;
+    // grid.y packs (head, split): head = y / k_num, split = y % k_num.
+    // With k_num == 1 this collapses to head = y, split = 0 — identical to
+    // the pre-split-K dispatch.
+    const uint iq2    = gl_WorkGroupID.y / p.k_num;
+    const uint split  = gl_WorkGroupID.y % p.k_num;
     const uint iq3    = gl_WorkGroupID.z;
 
     if (i_row >= p.N) { return; }
@@ -271,8 +280,14 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                      + (iq2 % p.nem2) * p.nem1 * p.KV
                      + i_row * p.KV;
 
-    const uint num_blocks = (p.KV + Bc - 1) / Bc;
-    for (uint j = 0; j < num_blocks; ++j) {
+    const uint num_blocks  = (p.KV + Bc - 1) / Bc;
+    // This workgroup handles only its split's slice of the KV blocks.
+    // k_num == 1 ⇒ split_kv == num_blocks ⇒ [0, num_blocks): full range.
+    // A split past the end (block_start >= num_blocks) runs zero iterations
+    // and leaves Mf=-1e30, Lf=0 — the combine kernel weights it to ~0.
+    const uint block_start = split * p.split_kv;
+    const uint block_end   = min(block_start + p.split_kv, num_blocks);
+    for (uint j = block_start; j < block_end; ++j) {
         const uint kv_base = j * Bc;
 
         // 1) S[c] = dot(Q, K[kv_base+c])
@@ -320,13 +335,36 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // 4) Final normalize + write back to [HSV, n_head, L] post-permute layout.
-    const float inv_L = Lf == 0.0f ? 0.0f : 1.0f / Lf;
-    const uint o_off = iq3 * p.ne2 * p.ne1 * HSV
-                     + i_row * p.ne2 * HSV
-                     + iq2 * HSV;
-    [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
-        const uint d_global = d * WORKGROUP_SIZE + tid;
-        data_o[o_off + d_global] = D_TYPE(Of[d] * inv_L);
+    if (p.k_num <= 1u) {
+        // 4) Single pass: normalize + write final, [HSV, n_head, L] layout.
+        const float inv_L = Lf == 0.0f ? 0.0f : 1.0f / Lf;
+        const uint o_off = iq3 * p.ne2 * p.ne1 * HSV
+                         + i_row * p.ne2 * HSV
+                         + iq2 * HSV;
+        [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
+            const uint d_global = d * WORKGROUP_SIZE + tid;
+            data_o[o_off + d_global] = D_TYPE(Of[d] * inv_L);
+        }
+    } else {
+        // 4') Split-K: write this split's UNNORMALIZED O partial plus its
+        // running (L, M) into the layout flash_attn_split_k_reduce decodes:
+        //   O:   HSV*ne1*(split + k_num*(iq2 + ne2*iq3)) + HSV*i_row + d
+        //   L/M: base + ne1*2*(k_num*(iq2 + ne2*iq3)) + i_row + split*ne1*2
+        //        with base = HSV*ne1*ne2*ne3*k_num and M at +ne1 past L.
+        // (L and M are identical across the workgroup's 32 threads, so only
+        // tid==0 writes them.)
+        const uint o_base = HSV * p.ne1 * (split + p.k_num * (iq2 + p.ne2 * iq3))
+                          + HSV * i_row;
+        [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
+            const uint d_global = d * WORKGROUP_SIZE + tid;
+            data_o_split[o_base + d_global] = Of[d];
+        }
+        if (tid == 0u) {
+            const uint lm_base = HSV * p.ne1 * p.ne2 * p.ne3 * p.k_num
+                               + p.ne1 * 2u * (p.k_num * (iq2 + p.ne2 * iq3))
+                               + i_row + split * (p.ne1 * 2u);
+            data_o_split[lm_base]         = Lf;
+            data_o_split[lm_base + p.ne1] = Mf;
+        }
     }
 }
