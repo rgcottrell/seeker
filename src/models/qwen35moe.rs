@@ -1140,11 +1140,7 @@ fn ssm_block(
     rms_norm::record(ctx, gdn_attn, ssm_w.ssm_norm, attn_normed, p.rms_eps)?;
     ctx.tap(&format!("ssm_norm_out-{layer_idx}"), attn_normed)?;
 
-    // silu(z) — apply elementwise, then multiply attn_normed by silu(z).
-    let z_silu = ctx.alloc_tensor([value_dim, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_silu(ctx, z, z_silu)?;
-    ctx.tap(&format!("z_silu-{layer_idx}"), z_silu)?;
-    // Reshape attn_normed flat: [value_dim=s_v*num_v, L] for the mul.
+    // gated_attn = attn_normed * silu(z) — fuse into one swiglu dispatch.
     let attn_normed_flat = TensorView {
         dims: [value_dim, l_u, 1, 1],
         byte_size: attn_normed.byte_size,
@@ -1153,7 +1149,7 @@ fn ssm_block(
         ..attn_normed
     };
     let gated_attn = ctx.alloc_tensor([value_dim, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_mul(ctx, attn_normed_flat, z_silu, gated_attn)?;
+    elementwise::record_swiglu_split(ctx, z, attn_normed_flat, gated_attn)?;
 
     ctx.tap(&format!("attn_output_pre_proj-{layer_idx}"), gated_attn)?;
 
@@ -1298,11 +1294,9 @@ fn moe_ffn(
 
     ctx.tap(&format!("ffn_moe_gate-{layer_idx}"), gate)?;
     ctx.tap(&format!("ffn_moe_up-{layer_idx}"), up)?;
-    // SwiGLU: silu(gate) * up. Element-wise — shape matches.
-    let gate_silu = ctx.alloc_tensor([ff, n_used as u64, l_u, 1], GgmlType::F32)?;
-    elementwise::record_silu(ctx, gate, gate_silu)?;
+    // SwiGLU: silu(gate) * up — single fused dispatch.
     let ffn_h = ctx.alloc_tensor([ff, n_used as u64, l_u, 1], GgmlType::F32)?;
-    elementwise::record_mul(ctx, gate_silu, up, ffn_h)?;
+    elementwise::record_swiglu_split(ctx, gate, up, ffn_h)?;
     ctx.tap(&format!("ffn_moe_swiglu-{layer_idx}"), ffn_h)?;
 
     // Fused routing-weighted down. The Q4_K_XL checkpoint mixes Q5_K
@@ -1334,10 +1328,8 @@ fn moe_ffn(
         ctx.cmd,
         &[sgate.range(), sup.range()],
     );
-    let sgate_silu = ctx.alloc_tensor([shexp_ff, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_silu(ctx, sgate, sgate_silu)?;
     let sh = ctx.alloc_tensor([shexp_ff, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_mul(ctx, sgate_silu, sup, sh)?;
+    elementwise::record_swiglu_split(ctx, sgate, sup, sh)?;
     let shared = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     matmul::record(ctx, w.ffn_down_shexp, sh, shared)?;
 

@@ -102,6 +102,88 @@ fn record_binary_f32(
     Ok(())
 }
 
+/// Fused `silu(a) * b → dst` ("split-mode" swiglu). a, b, dst must share
+/// the same F32 contiguous layout. Saves two dispatches (silu + mul) and
+/// one barrier vs the unfused path — the FFN gate path of every MoE expert
+/// and the SSM `output * silu(z)` step both fit this shape.
+///
+/// Push-constants are `GluParams` from `shaders/include/glu_head.slang`
+/// (16 × 4 bytes); `nb*` are in **element** units (not bytes) — see
+/// `glu_main.slang`. For contiguous tensors that means `nb01 = ne00`,
+/// `nb02 = ne00 * ne01`, etc., and the same for the dst side.
+pub fn record_swiglu_split(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(a.dtype, GgmlType::F32);
+    debug_assert_eq!(b.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    debug_assert_eq!(a.dims, b.dims);
+    debug_assert_eq!(a.dims, dst.dims);
+
+    let ne00 = a.dims[0] as u32;
+    let ne01 = a.dims[1] as u32;
+    let ne02 = a.dims[2] as u32;
+    let n_elements: u64 = a.dims.iter().product();
+
+    let nb01 = ne00;
+    let nb02 = ne00 * ne01;
+    let nb03 = ne00 * ne01 * ne02;
+
+    const SWIGLU_PARAMS_BYTES: u32 = 16 * 4;
+    let mut push = [0u8; SWIGLU_PARAMS_BYTES as usize];
+    let fields: [u32; 16] = [
+        n_elements as u32, // N
+        ne00,              // ne00 (src col count)
+        ne00,              // ne20 (dst col count — same shape)
+        2,                 // mode = 2 (split)
+        0,                 // alpha (unused)
+        0,                 // limit (unused)
+        nb01,
+        nb02,
+        nb03,
+        ne01,
+        ne02,
+        nb01, // nb11 = same as nb01 (dst contiguous, same shape)
+        nb02,
+        nb03,
+        ne01,
+        ne02,
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+    }
+    // `alpha`/`limit` are floats — the shader reads them through the same
+    // 16-byte aligned struct; the zero u32 bit-pattern is 0.0f32, so the
+    // u32 write above already encodes `alpha = 0.0`, `limit = 0.0`.
+
+    let key = PipelineKey::dense("swiglu_f32", 3, SWIGLU_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SWIGLU_F32_SPV.as_bytes())?;
+    // Shader: 512 threads/WG; flat index uses
+    // `z * 262144 + y * 512 + x`, so dispatch ceil(N/512) on X up to the
+    // 65535 hardware limit and spill into Y for larger N. Even at
+    // L=1 decode every MoE expert FFN tile is far below that limit.
+    let total_wgs = (n_elements as u32).div_ceil(512);
+    let max_x: u32 = 65535;
+    let wg_x = total_wgs.min(max_x);
+    let wg_y = total_wgs.div_ceil(max_x);
+    let workgroups = [wg_x, wg_y, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[a.range(), b.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
 pub fn record_silu(
     ctx: &mut DispatchContext,
     src: TensorView,
