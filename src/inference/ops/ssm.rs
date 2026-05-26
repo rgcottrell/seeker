@@ -45,6 +45,7 @@ pub fn record_ssm_conv(
     n_tokens: u32,
     n_seqs: u32,
     kernel_size: u32,
+    fuse_silu: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut push = [0u8; SSM_CONV_PUSH_BYTES as usize];
     let mut w = 0;
@@ -81,11 +82,13 @@ pub fn record_ssm_conv(
     put_u(&mut push, &mut w, n_tokens);
     put_u(&mut push, &mut w, n_seqs);
 
+    // Spec-const ordering: BLOCK_SIZE, TOKENS_PER_WG, FUSE_SILU
+    // (declared in this order in shaders/compute/ssm_conv.slang).
     let key = PipelineKey::dense(
-        "ssm_conv_f32",
+        if fuse_silu { "ssm_conv_f32_silu" } else { "ssm_conv_f32" },
         3,
         SSM_CONV_PUSH_BYTES,
-        Vec::new(),
+        vec![32, 16, fuse_silu as u32],
     );
     let pipeline = *ctx
         .pipelines

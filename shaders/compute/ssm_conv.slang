@@ -10,6 +10,10 @@
 
 [SpecializationConstant] const uint BLOCK_SIZE    = 32;
 [SpecializationConstant] const uint TOKENS_PER_WG = 16;
+// 1 → apply `silu(x) = x / (1 + exp(-x))` to the output in place,
+// saving the trailing element-wise dispatch in qwen35moe's SSM block.
+// 0 → keep the unfused contract (smoke test / future callers).
+[SpecializationConstant] const uint FUSE_SILU      = 0;
 
 [[vk::binding(0, 0)]] StructuredBuffer<float>    src0;
 [[vk::binding(1, 0)]] StructuredBuffer<float>    src1;
@@ -51,5 +55,9 @@ void main(uint3 gl_GlobalInvocationID : SV_DispatchThreadID,
     }
 
     const uint dst_idx = i3 * (p.dst_nb2 / 4u) + i2 * (p.dst_nb1 / 4u) + i1;
-    dst[dst_idx] = sum;
+    if (FUSE_SILU != 0) {
+        dst[dst_idx] = sum / (1.0f + exp(-sum));
+    } else {
+        dst[dst_idx] = sum;
+    }
 }

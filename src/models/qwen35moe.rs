@@ -892,18 +892,16 @@ fn ssm_block(
             l as u32,
             1,
             conv_kernel as u32,
+            /* fuse_silu = */ true,
         )?;
     }
 
-    // 5b. SiLU on conv output. llama.cpp's qwen35moe.cpp:423 applies
-    // `ggml_silu(conv_output)` before slicing Q/K/V. Missing this was
-    // the dominant SSM math bug — without it the GDN inputs are
-    // mis-scaled by the conv's raw output magnitude.
+    // 5b. SiLU is fused into the conv1d kernel above (FUSE_SILU=1), so
+    // `conv_out` already holds `silu(raw_conv_output)`. Diagnostic taps
+    // expect the post-silu values too, which is fine — both names point
+    // at the same buffer when fused.
     ctx.tap(&format!("conv_output_raw-{layer_idx}"), conv_out)?;
-    let conv_silu = ctx.alloc_tensor([conv_channels, l_u, 1, 1], GgmlType::F32)?;
-    elementwise::record_silu(ctx, conv_out, conv_silu)?;
-    ctx.tap(&format!("conv_output_silu-{layer_idx}"), conv_silu)?;
-    let conv_out = conv_silu; // shadow — downstream slicing reads conv_silu
+    ctx.tap(&format!("conv_output_silu-{layer_idx}"), conv_out)?;
 
     // 6. Slice Q, K, V out of conv_out. Layout is `[L, conv_channels]`
     //    (token innermost). The channel axis spans `[key_dim, key_dim,

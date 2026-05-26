@@ -472,6 +472,7 @@ fn ssm_conv_smoke_test(
                 l as u32,
                 1,
                 conv_kernel as u32,
+                /* fuse_silu = */ false,
             )?;
             Ok(conv_out.range())
         },
