@@ -528,37 +528,58 @@ fn attention_block(
     let k_view = reshape_for_rope(k, head_dim_k, n_head_kv, l as u64);
     let v_view = reshape_for_rope(v, head_dim_v, n_head_kv, l as u64);
 
-    // 5+6. Per-head Q/K RMS norm fused with M-RoPE. The old chain was
-    //      rms_norm → barrier → rope (×2 for Q and K); the fused kernel
-    //      does the sum-of-squares reduction, weight multiply, and pair
-    //      rotation in a single workgroup per (head, token), eliminating
-    //      the `q_normed` / `k_normed` scratch buffers and one barrier
-    //      per Q/K chain. 10 attention layers × 4 saved dispatches/barriers
-    //      = 40 ops/decode.
+    // 5+6+7a. Per-head Q/K RMS norm + M-RoPE fused. For Q the result
+    //         lands in an F32 scratch slot (flash_attn reads it
+    //         directly). For K, when the cache is F16, the fused
+    //         kernel writes the rotated K directly into the cache
+    //         buffer at the right position offset — eliminating the
+    //         `k_roped` scratch, the cast F32→F16 dispatch, the
+    //         transfer copy, and one global barrier per attention
+    //         layer.
     let q_roped = ctx.alloc_tensor([head_dim_k, n_head, l as u64, 1], GgmlType::F32)?;
-    let k_roped = ctx.alloc_tensor([head_dim_k, n_head_kv, l as u64, 1], GgmlType::F32)?;
     rope_multi::record_rms_norm_rope_nofence(
         ctx, q_attn_view, positions_buf, att.attn_q_norm, q_roped, rope_params, p.rms_eps,
     )?;
-    rope_multi::record_rms_norm_rope_nofence(
-        ctx, k_view, positions_buf, att.attn_k_norm, k_roped, rope_params, p.rms_eps,
-    )?;
-    crate::inference::command::record_compute_barriers(
-        ctx.device,
-        ctx.cmd,
-        &[q_roped.range(), k_roped.range()],
-    );
-    // Diff-dump diagnostics: the intermediate `*_normed` no longer exists;
-    // these taps now read the post-rope output directly. The downstream
-    // `Qcur` / `Kcur` taps remain unchanged.
+    let k_cache_layer = cache.k_layers[layer_idx as usize];
+    let cache_max_seq_len = cache.config.max_seq_len;
+    let k_cache_fused = k_cache_layer.dtype == GgmlType::F16;
+    if k_cache_fused {
+        rope_multi::record_rms_norm_rope_to_cache_f16_nofence(
+            ctx,
+            k_view,
+            positions_buf,
+            att.attn_k_norm,
+            k_cache_layer,
+            rope_params,
+            p.rms_eps,
+            position_offset,
+            cache_max_seq_len,
+        )?;
+    } else {
+        // Fallback for non-F16 caches: separate rope into a scratch
+        // buffer, then go through the regular cache_io::record_write
+        // (cast + copy) below.
+        let k_roped_fb = ctx.alloc_tensor([head_dim_k, n_head_kv, l as u64, 1], GgmlType::F32)?;
+        rope_multi::record_rms_norm_rope_nofence(
+            ctx, k_view, positions_buf, att.attn_k_norm, k_roped_fb, rope_params, p.rms_eps,
+        )?;
+        crate::inference::command::record_compute_barrier(ctx.device, ctx.cmd, k_roped_fb.range());
+        cache_io::record_write_nofence(ctx, k_roped_fb, k_cache_layer, position_offset)?;
+    }
+    // Diff-dump diagnostics — the `Kcur*` taps used to point at the
+    // F32 `k_roped` scratch. With cache-fused K that intermediate
+    // doesn't exist; the rotated values live as F16 inside the cache
+    // buffer. Tap only the Q side; downstream `attn_pregate` / etc.
+    // still expose end-to-end values.
     ctx.tap(&format!("Qcur_normed-{layer_idx}"), q_roped)?;
-    ctx.tap(&format!("Kcur_normed-{layer_idx}"), k_roped)?;
     ctx.tap(&format!("Qcur-{layer_idx}"), q_roped)?;
-    ctx.tap(&format!("Kcur-{layer_idx}"), k_roped)?;
 
-    // 7a. cache write K, V. The cache expects `[head_dim, n_head_kv, L]`
-    //     natural layout; that's exactly what `k_roped` / `v_view` have.
-    cache_io::record_write_nofence(ctx, k_roped, cache.k_layers[layer_idx as usize], position_offset)?;
+    // 7a (V only — K already in cache via the fused kernel above). The
+    // V cache write internally emits a global barrier (compute→transfer)
+    // before its memcpy, and a trailing global barrier
+    // (compute|transfer → compute|transfer) after — that covers Q rope
+    // and K rope writes for the downstream flash_attn read; no explicit
+    // Q barrier needed here.
     cache_io::record_write(ctx, v_view, cache.v_layers[layer_idx as usize], position_offset)?;
 
     // 7b. cache read (direct bind for matching K/V dtypes; materialize

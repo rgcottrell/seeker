@@ -18,7 +18,8 @@
 // (or pass-through) value to dst.
 
 //@variants
-//  f32: A_TYPE=float       D_TYPE=float       FLOAT_TYPE=float
+//  f32:    A_TYPE=float       D_TYPE=float       FLOAT_TYPE=float
+//  to_f16: A_TYPE=float       D_TYPE=float16_t   FLOAT_TYPE=float
 //@end-variants
 
 #include "types.slang"
