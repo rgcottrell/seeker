@@ -50,6 +50,10 @@ pub struct Device {
     pub shader_subgroup_rotate_clustered: bool,
     pub coop_matrix: bool,
     pub coop_matrix2: bool,
+    /// Compute-unit count (AMD `activeComputeUnitCount`), used to size
+    /// flash-attention split-K the way llama.cpp does. 0 when the device
+    /// doesn't advertise `VK_AMD_shader_core_properties2`.
+    pub shader_core_count: u32,
     /// Smallest subgroup size the driver will assign for compute (also the
     /// smallest value that can be passed to
     /// `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`).
@@ -156,6 +160,7 @@ impl Device {
             portability,
             coop_matrix_ext,
             coop_matrix2_ext,
+            shader_core_props2_ext,
         } = pick_physical_device(&instance)?;
 
         // Pull the legacy 1.0 properties (for `limits`) and the
@@ -163,9 +168,21 @@ impl Device {
         // pNext chain so we know what `requiredSubgroupSize` values the
         // driver will accept on COMPUTE pipelines.
         let mut props_sgs = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        // `activeComputeUnitCount` (AMD) — only chained when the extension is
+        // advertised, since the driver fills it only if it recognizes the
+        // struct. Queried as a physical-device property (no enable needed).
+        let mut props_score = vk::PhysicalDeviceShaderCoreProperties2AMD::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default().push(&mut props_sgs);
+        if shader_core_props2_ext {
+            props2 = props2.push(&mut props_score);
+        }
         unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
         let props = props2.properties;
+        let shader_core_count = if shader_core_props2_ext {
+            props_score.active_compute_unit_count
+        } else {
+            0
+        };
         let device_name = props
             .device_name_as_c_str()
             .ok()
@@ -285,6 +302,7 @@ impl Device {
             shader_subgroup_rotate_clustered,
             coop_matrix,
             coop_matrix2,
+            shader_core_count,
             min_subgroup_size,
             max_subgroup_size,
             required_subgroup_size_compute =
@@ -409,6 +427,7 @@ impl Device {
             shader_subgroup_rotate_clustered,
             coop_matrix,
             coop_matrix2,
+            shader_core_count,
             min_subgroup_size,
             max_subgroup_size,
             required_subgroup_size_stages,
@@ -453,6 +472,7 @@ struct DevicePick {
     portability: bool,
     coop_matrix_ext: bool,
     coop_matrix2_ext: bool,
+    shader_core_props2_ext: bool,
 }
 
 fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error>> {
@@ -483,6 +503,7 @@ fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error
         let portability = has_ext(vk::KHR_PORTABILITY_SUBSET_NAME);
         let coop_matrix_ext = has_ext(vk::KHR_COOPERATIVE_MATRIX_NAME);
         let coop_matrix2_ext = has_ext(vk::NV_COOPERATIVE_MATRIX2_NAME);
+        let shader_core_props2_ext = has_ext(vk::AMD_SHADER_CORE_PROPERTIES2_NAME);
 
         let queue_families =
             unsafe { instance.get_physical_device_queue_family_properties(p) };
@@ -498,6 +519,7 @@ fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error
             portability,
             coop_matrix_ext,
             coop_matrix2_ext,
+            shader_core_props2_ext,
         });
     }
     Err("no Vulkan 1.4 physical device with a compute queue found".into())

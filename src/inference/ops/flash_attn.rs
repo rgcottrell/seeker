@@ -26,14 +26,13 @@ const FA_PUSH_BYTES: u32 = 32 * 4;
 /// Combine-pass push (`FaSplitKParams`): D, ne1, ne2, ne3, k_num, sinks.
 const FA_SPLIT_K_PUSH_BYTES: u32 = 6 * 4;
 
-/// KV block width — must match the `Bc` spec constant in flash_attn.slang.
+/// KV block width — must match the `Bc` spec constant in flash_attn.slang,
+/// and the alignment llama.cpp snaps split-K KV chunks to.
 const FA_BC: u32 = 32;
 
-// Split-K decode heuristic (see `pick_k_num`).
-const FA_SPLIT_N_THRESHOLD: u32 = 1; // only split single-token decode
-const FA_SPLIT_OCCUPANCY_TARGET: u32 = 256; // aim for ~this many workgroups
-const FA_SPLIT_MIN_BLOCKS_PER_SPLIT: u32 = 4;
-const FA_SPLIT_MAX_K_NUM: u32 = 16;
+/// Placeholder compute-unit count when the device doesn't advertise one,
+/// matching llama.cpp's flash-attention fallback.
+const FA_SPLIT_CORE_COUNT_FALLBACK: u32 = 16;
 
 #[derive(Clone, Copy)]
 pub struct FlashAttnParams {
@@ -150,11 +149,9 @@ pub fn record(
     let nb22 = v.element_stride[2] as u32;
     let nb23 = v.element_stride[3] as u32;
 
-    // ---- split-K decode heuristic ----
-    let num_blocks = kv.div_ceil(FA_BC);
+    // ---- split-K decode heuristic (replicates llama.cpp) ----
     let base_wgs = n * ne2 * ne3;
-    let k_num = pick_k_num(n, base_wgs, num_blocks);
-    let blocks_per_split = num_blocks.div_ceil(k_num);
+    let (k_num, blocks_per_split) = pick_k_num(ctx.device.shader_core_count, base_wgs, kv);
 
     // Pack push.
     let mut push = [0u8; FA_PUSH_BYTES as usize];
@@ -278,33 +275,62 @@ pub fn record(
     Ok(())
 }
 
-/// Pick the KV-split factor for the main flash-attn dispatch.
+/// Pick the KV-split factor `(k_num, blocks_per_split)` for the main
+/// flash-attn dispatch, replicating llama.cpp's heuristic
+/// (`ggml_vk_flash_attn` in ggml-vulkan.cpp).
 ///
-/// Returns 1 (the original single-workgroup-per-head path) except for
-/// single-token decode (`n <= FA_SPLIT_N_THRESHOLD`) over a KV cache long
-/// enough that splitting keeps each workgroup busy. Decode otherwise launches
-/// only `n_head` workgroups, each serially walking the whole cache — that
-/// starves the GPU and makes per-token latency grow with context length.
+/// llama.cpp aims for ~`2 × shader_core_count` total workgroups, then snaps
+/// each split to a `Bc`-aligned KV chunk and re-derives the split count.
+/// `base_wgs` is our no-split workgroup count (`n * n_head * batch`). Because
+/// our kernel launches one workgroup per *full* query head (no GQA grouping),
+/// `base_wgs` already equals llama.cpp's grouped total occupancy, so dividing
+/// the target by it reproduces the same total workgroup count. (We omit
+/// llama.cpp's Intel-Alchemist `×2` multiplier — irrelevant on this path.)
 ///
 /// `SEEKER_FA_SPLIT=0` disables splitting; `SEEKER_FA_SPLIT_KNUM=<n>` pins it.
-fn pick_k_num(n: u32, base_wgs: u32, num_blocks: u32) -> u32 {
+fn pick_k_num(shader_core_count: u32, base_wgs: u32, kv: u32) -> (u32, u32) {
+    let num_blocks = kv.div_ceil(FA_BC).max(1);
     if std::env::var("SEEKER_FA_SPLIT").is_ok_and(|v| v == "0") {
-        return 1;
+        return (1, num_blocks);
     }
     if let Ok(v) = std::env::var("SEEKER_FA_SPLIT_KNUM") {
         if let Ok(k) = v.parse::<u32>() {
-            return k.clamp(1, num_blocks.max(1));
+            let k = k.clamp(1, num_blocks);
+            return (k, num_blocks.div_ceil(k));
         }
     }
-    if n > FA_SPLIT_N_THRESHOLD || base_wgs >= FA_SPLIT_OCCUPANCY_TARGET {
-        return 1;
+
+    // Placeholder core count when the device doesn't report one; target is
+    // 2× that, the same as llama.cpp.
+    let core_count = if shader_core_count != 0 {
+        shader_core_count
+    } else {
+        FA_SPLIT_CORE_COUNT_FALLBACK
+    };
+    let target = core_count * 2;
+
+    let mut split_k = 1u32;
+    if base_wgs < target {
+        split_k = target / base_wgs.max(1);
     }
-    if num_blocks < 2 * FA_SPLIT_MIN_BLOCKS_PER_SPLIT {
-        return 1;
+    if split_k <= 1 {
+        return (1, num_blocks);
     }
-    let want = FA_SPLIT_OCCUPANCY_TARGET.div_ceil(base_wgs.max(1));
-    let by_blocks = num_blocks / FA_SPLIT_MIN_BLOCKS_PER_SPLIT;
-    want.min(by_blocks).min(FA_SPLIT_MAX_K_NUM).max(1)
+
+    // Snap KV into `split_k` chunks rounded up to a multiple of Bc, then
+    // re-derive split_k from the chunk size (matches llama.cpp's
+    // `ROUNDUP_POW2(KV/split_k, alignment)` + `CEIL_DIV(KV, split_kv)`). This
+    // self-corrects to never request more splits than there are blocks.
+    let split_kv = roundup_mult((kv / split_k).max(1), FA_BC);
+    let split_k = kv.div_ceil(split_kv);
+    let blocks_per_split = split_kv / FA_BC; // exact: split_kv is a multiple of Bc
+    (split_k, blocks_per_split)
+}
+
+/// Round `m` up to a multiple of `n` (n a power of two) — llama.cpp's
+/// `ROUNDUP_POW2`.
+fn roundup_mult(m: u32, n: u32) -> u32 {
+    (m + n - 1) & !(n - 1)
 }
 
 /// Merge `k_num` per-split (O, L, M) partials into the final attention output
