@@ -268,7 +268,7 @@ fn record_inner(
     //
     // Verified ~3× prefill win on Llama-1B Q4_K_M and ~1.4× on
     // qwen35moe Q4_K_XL @ N=320; default-on. `SEEKER_MM_CM=0` opts out.
-    let mm_cm_enabled = std::env::var("SEEKER_MM_CM").map(|v| v != "0").unwrap_or(true);
+    let mm_cm_enabled = !*crate::runtime_flags::MM_CM_DISABLED;
     if ctx.device.coop_matrix && n >= 32 && n % 16 == 0 && mm_cm_enabled {
         if let Some(variant) = mmcm_variant(a.dtype) {
             return record_mul_mm_cm(ctx, &variant, a, b, d, fence);
@@ -626,8 +626,8 @@ fn record_mul_mat_vec_with_flags(
 /// for huge-M matvecs where the per-WG K work is large enough to bottleneck
 /// on memory issue rate; threshold tuned for STRIX_HALO's 40 CUs.
 fn pick_mm_split_k(ncols: u32, nrows: u32) -> Option<u32> {
-    if let Ok(v) = std::env::var("SEEKER_MM_SPLIT_K") {
-        return match v.parse::<u32>().ok()? {
+    if let Some(v) = *crate::runtime_flags::MM_SPLIT_K {
+        return match v {
             0 | 1 => None,
             n => Some(n),
         };

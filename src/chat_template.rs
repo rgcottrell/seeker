@@ -242,7 +242,7 @@ pub fn render(
         eos_token => eos_token,
         enable_thinking => enable_thinking,
     })?;
-    if std::env::var("SEEKER_CHAT_DEBUG").is_ok() {
+    if *crate::runtime_flags::CHAT_DEBUG {
         eprintln!("=== rendered chat prompt ===\n{rendered}\n=== end ===");
     }
     Ok(rendered)

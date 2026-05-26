@@ -116,7 +116,6 @@ impl Engine {
     {
         self.scratch.reset();
         self.descriptors.reset(&self.device)?;
-        crate::inference::context::refresh_diff_dump_flag();
 
         unsafe {
             self.device
@@ -212,7 +211,6 @@ impl Engine {
     {
         self.scratch.reset();
         self.descriptors.reset(&self.device)?;
-        crate::inference::context::refresh_diff_dump_flag();
 
         unsafe {
             self.device

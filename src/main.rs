@@ -17,6 +17,8 @@ mod commands;
 #[allow(dead_code)]
 mod gguf;
 #[allow(dead_code)]
+mod runtime_flags;
+#[allow(dead_code)]
 mod inference;
 #[allow(dead_code)]
 mod models;

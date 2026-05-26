@@ -123,7 +123,11 @@ pub fn record_compute_barrier(device: &Device, cmd: vk::CommandBuffer, range: Bu
 /// that wrote disjoint regions (Q/K/V matmuls, FFN gate/up, etc.) to
 /// fence them all at once before downstream reads.
 pub fn record_compute_barriers(device: &Device, cmd: vk::CommandBuffer, ranges: &[BufferRange]) {
-    let paranoid = std::env::var("SEEKER_BARRIER_PARANOID").is_ok();
+    // Cached at first access; LazyLock keeps subsequent reads to a
+    // single atomic-pointer load. This used to be `std::env::var(…)`,
+    // which is a getenv + string-alloc per call — and this function
+    // runs hundreds to ~1500 times per decode forward.
+    let paranoid = *crate::runtime_flags::BARRIER_PARANOID;
     let bars: Vec<vk::BufferMemoryBarrier> = if paranoid {
         // Fall back to a whole-buffer barrier per unique buffer in the set.
         let mut buffers: Vec<vk::Buffer> = ranges.iter().map(|r| r.buffer).collect();

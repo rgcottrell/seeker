@@ -343,19 +343,23 @@ impl Model for Qwen35MoeModel {
         let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
 
         // ─── Per-layer loop ───
-        // SEEKER_QWEN_MAX_LAYERS=N caps the loop at the first N layers —
-        // helpful for bisecting the layer index at which a numeric issue
-        // first appears.
-        let max_layers = std::env::var("SEEKER_QWEN_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        // All diagnostic toggles are LazyLock-cached `SEEKER_*` env
+        // vars (see `runtime_flags`) — read once at first access and
+        // free thereafter. The previous `std::env::var(…)` calls were
+        // running on every layer iteration (40× per forward) and
+        // showed up as 0.1–0.3 ms of decode overhead.
+        let max_layers = crate::runtime_flags::QWEN_MAX_LAYERS
+            .map(|n| n as usize)
             .unwrap_or(self.weights.blocks.len());
         // When diff-dumping intermediates, each layer's taps must remain in
         // their own scratch slots until the GPU has executed all dispatches
         // and the host reads them back. Restoring scratch between layers
         // makes subsequent layers overwrite the tap data at the same byte
         // offsets — making every per-layer tap report the same value.
-        let dump_mode = std::env::var("SEEKER_QWEN_DIFF_DUMP").is_ok();
+        let dump_mode = *crate::runtime_flags::QWEN_DIFF_DUMP;
+        let skip_attn = *crate::runtime_flags::QWEN_NO_ATTN;
+        let skip_ssm = *crate::runtime_flags::QWEN_NO_SSM;
+        let skip_moe = *crate::runtime_flags::QWEN_NO_MOE;
         for (layer_idx, block) in self.weights.blocks.iter().take(max_layers).enumerate() {
             if !dump_mode {
                 ctx.scratch_restore(layer_checkpoint);
@@ -365,8 +369,6 @@ impl Model for Qwen35MoeModel {
             //   SEEKER_QWEN_NO_ATTN=1 → skip only the 10 attention layers
             //   SEEKER_QWEN_NO_SSM=1  → skip only the 30 SSM layers
             // Used to bisect which block type contributes a bug.
-            let skip_attn = std::env::var("SEEKER_QWEN_NO_ATTN").is_ok();
-            let skip_ssm = std::env::var("SEEKER_QWEN_NO_SSM").is_ok();
             match block {
                 BlockWeights::Attention(att) if !skip_attn => {
                     attention_block(
@@ -418,7 +420,7 @@ impl Model for Qwen35MoeModel {
             // SEEKER_QWEN_NO_MOE=1 skips the FFN entirely — leaves residual
             // unchanged. Used to isolate whether the MoE-FFN accumulation
             // chain (and not the prologue / epilogue) is the source of bugs.
-            if std::env::var("SEEKER_QWEN_NO_MOE").is_err() {
+            if !skip_moe {
                 moe_ffn(ctx, block.moe(), block.post_attn_norm(), residual, p, hidden, l, layer_idx as u32)?;
             }
         }
@@ -693,7 +695,7 @@ fn ssm_block(
     let x_norm = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     rms_norm::record(ctx, residual, ssm_w.attn_norm, x_norm, p.rms_eps)?;
     ctx.tap(&format!("attn_norm-{layer_idx}"), x_norm)?;
-    if std::env::var("SEEKER_QWEN_ONLY_RMS").is_ok() {
+    if *crate::runtime_flags::QWEN_ONLY_RMS {
         return Ok(());
     }
 
@@ -910,7 +912,7 @@ fn ssm_block(
     // SEEKER_QWEN_NO_CONV=1 bypasses ssm_conv1d (uses raw qkv directly as
     // conv_out, treating the conv as identity). Helps isolate stride
     // bugs in the conv path from bugs in the downstream GDN math.
-    if std::env::var("SEEKER_QWEN_NO_CONV").is_ok() {
+    if *crate::runtime_flags::QWEN_NO_CONV {
         // qkv has the same memory layout as conv_out should (channel-inner,
         // token-outer) — `matmul::record` produces D[m, n] at offset
         // n*M + m, i.e. m (channel) innermost. Just memcpy.
@@ -1074,9 +1076,13 @@ fn ssm_block(
     // downstream ssm_norm + silu(z) gating amplifies the discrepancy enough
     // that residual diverges from llama by orders of magnitude after the
     // first few SSM layers. SEEKER_QWEN_GDN_SCALE=one bypasses for testing.
-    let gdn_scale = match std::env::var("SEEKER_QWEN_GDN_SCALE").as_deref() {
-        Ok("one") => 1.0,
-        _ => 1.0 / (s_v as f32).sqrt(),
+    // `SEEKER_QWEN_GDN_SCALE=one` overrides — cached once at startup,
+    // so this is a single LazyLock load per SSM block instead of the
+    // previous `std::env::var(…)` per call.
+    let gdn_scale = if *crate::runtime_flags::QWEN_GDN_SCALE_ONE {
+        1.0
+    } else {
+        1.0 / (s_v as f32).sqrt()
     };
     let q_strides = ssm::GdnStrides {
         s1: s_v as u32,          // head stride within Q (= s_v)
@@ -1208,7 +1214,7 @@ fn ssm_block(
     // residual add into the matvec via the ACCUMULATE spec constant
     // and skip the `proj` scratch slot entirely. Decode-only (L=1
     // matvec path).
-    let dump = std::env::var("SEEKER_QWEN_SSM_DUMP").ok();
+    let dump = crate::runtime_flags::QWEN_SSM_DUMP.as_deref();
     if dump.is_none() && l == 1 {
         matmul::record_accumulate(ctx, ssm_w.ssm_out, gated_attn, residual)?;
         ctx.tap(&format!("attn_output-{layer_idx}"), residual)?;
@@ -1222,7 +1228,7 @@ fn ssm_block(
     matmul::record(ctx, ssm_w.ssm_out, gated_attn, proj)?;
     ctx.tap(&format!("attn_output-{layer_idx}"), proj)?;
 
-    if let Some(stage) = dump.as_deref() {
+    if let Some(stage) = dump {
         let src = match stage {
             "alpha" => Some(alpha),
             "beta" => Some(beta),
@@ -1417,8 +1423,8 @@ fn moe_ffn(
     // (sigmoid, broadcast-mul, two adds). Diagnostic bisection flags
     // fall back to the unfused form so each branch can be dropped
     // independently.
-    let no_routed = std::env::var("SEEKER_QWEN_NO_ROUTED").is_ok();
-    let no_shared = std::env::var("SEEKER_QWEN_NO_SHARED").is_ok();
+    let no_routed = *crate::runtime_flags::QWEN_NO_ROUTED;
+    let no_shared = *crate::runtime_flags::QWEN_NO_SHARED;
     if !no_routed && !no_shared {
         elementwise::record_moe_residual_fuse(
             ctx,
