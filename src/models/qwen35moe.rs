@@ -582,25 +582,22 @@ fn attention_block(
     flash_attn::record(ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params)?;
     ctx.tap(&format!("attn_pregate-{layer_idx}"), attn_out)?;
 
-    // 8. Sigmoid-gate the attention output by q_gate.
-    //    `sigmoid.slang` reads sequential memory (no stride support), so we
-    //    first materialize the strided q_gate view into a contiguous slot
-    //    via a F32→F32 cast (which IS stride-aware).
+    // 8. Sigmoid-gate the attention output by q_gate, fused as one
+    //    `sigmoid(q_gate) * attn_out` dispatch via `sigmoid_mul.slang`.
+    //    The kernel reads a flat buffer so we still materialize the
+    //    strided q_gate view into a contiguous slot via F32→F32 cast.
     let attn_gated = {
         let q_gate_contig = ctx.alloc_tensor([head_dim_k, n_head, l as u64, 1], GgmlType::F32)?;
         cast::record_cast(ctx, q_gate_view, q_gate_contig)?;
-        let q_gate_sig = ctx.alloc_tensor([head_dim_k, n_head, l as u64, 1], GgmlType::F32)?;
-        elementwise::record_sigmoid(ctx, q_gate_contig, q_gate_sig)?;
-        ctx.tap(&format!("gate_sigmoid-{layer_idx}"), q_gate_sig)?;
-        let attn_gated = ctx.alloc_tensor([hidden_v, l as u64, 1, 1], GgmlType::F32)?;
         let q_gate_flat = TensorView {
             dims: [hidden_v, l as u64, 1, 1],
-            byte_size: q_gate_sig.byte_size,
+            byte_size: q_gate_contig.byte_size,
             byte_stride: [4, 4 * hidden_v, 4 * hidden_v * (l as u64), 4 * hidden_v * (l as u64)],
             element_stride: [1, hidden_v, hidden_v * (l as u64), hidden_v * (l as u64)],
-            ..q_gate_sig
+            ..q_gate_contig
         };
-        elementwise::record_mul(ctx, attn_out, q_gate_flat, attn_gated)?;
+        let attn_gated = ctx.alloc_tensor([hidden_v, l as u64, 1, 1], GgmlType::F32)?;
+        elementwise::record_sigmoid_mul_split(ctx, q_gate_flat, attn_out, attn_gated)?;
         attn_gated
     };
     ctx.tap(&format!("attn_gated-{layer_idx}"), attn_gated)?;

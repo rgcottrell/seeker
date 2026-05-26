@@ -163,10 +163,66 @@ pub fn record_swiglu_split(
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::SWIGLU_F32_SPV.as_bytes())?;
-    // Shader: 512 threads/WG; flat index uses
-    // `z * 262144 + y * 512 + x`, so dispatch ceil(N/512) on X up to the
-    // 65535 hardware limit and spill into Y for larger N. Even at
-    // L=1 decode every MoE expert FFN tile is far below that limit.
+    record_glu_dispatch(ctx, pipeline, &push, n_elements, &[a.range(), b.range(), dst.range()])?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// Fused `sigmoid(a) * b → dst` ("split-mode" sigmoid_mul) — same dispatch
+/// shape as `record_swiglu_split` but using the `sigmoid_mul.slang`
+/// kernel. The attention block's q-gate `sigmoid(q_gate) * attn_out`
+/// chain fits this exactly.
+pub fn record_sigmoid_mul_split(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(a.dtype, GgmlType::F32);
+    debug_assert_eq!(b.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    debug_assert_eq!(a.dims, b.dims);
+    debug_assert_eq!(a.dims, dst.dims);
+
+    let ne00 = a.dims[0] as u32;
+    let ne01 = a.dims[1] as u32;
+    let ne02 = a.dims[2] as u32;
+    let n_elements: u64 = a.dims.iter().product();
+
+    let nb01 = ne00;
+    let nb02 = ne00 * ne01;
+    let nb03 = ne00 * ne01 * ne02;
+
+    const SIGMOID_MUL_PARAMS_BYTES: u32 = 16 * 4;
+    let mut push = [0u8; SIGMOID_MUL_PARAMS_BYTES as usize];
+    let fields: [u32; 16] = [
+        n_elements as u32, ne00, ne00, 2, 0, 0,
+        nb01, nb02, nb03, ne01, ne02,
+        nb01, nb02, nb03, ne01, ne02,
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    let key = PipelineKey::dense("sigmoid_mul_f32", 3, SIGMOID_MUL_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SIGMOID_MUL_F32_SPV.as_bytes())?;
+    record_glu_dispatch(ctx, pipeline, &push, n_elements, &[a.range(), b.range(), dst.range()])?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// Dispatch helper for the `glu_main.slang` family. The shader uses 512
+/// threads/WG and packs the flat index as `z * 262144 + y * 512 + x`, so
+/// dispatch ceil(N/512) on X up to the 65535 hw limit and spill into Y.
+fn record_glu_dispatch(
+    ctx: &mut DispatchContext,
+    pipeline: crate::inference::pipeline::CachedPipeline,
+    push: &[u8],
+    n_elements: u64,
+    bindings: &[crate::inference::buffer::BufferRange],
+) -> Result<(), Box<dyn Error>> {
     let total_wgs = (n_elements as u32).div_ceil(512);
     let max_x: u32 = 65535;
     let wg_x = total_wgs.min(max_x);
@@ -176,12 +232,10 @@ pub fn record_swiglu_split(
         ctx,
         &pipeline,
         &[0, 1, 2],
-        &[a.range(), b.range(), dst.range()],
-        &push,
+        bindings,
+        push,
         workgroups,
-    )?;
-    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
-    Ok(())
+    )
 }
 
 /// Fused SSM post-GDN normalize + silu(z) gate. Combines
