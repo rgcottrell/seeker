@@ -170,6 +170,25 @@ pub fn record_matvec_q4k_id(
         "mul_mat_vec_q4_k_id",
         shaders::MUL_MAT_VEC_Q4_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ true,
+        /* fence= */ true,
+    )
+}
+
+/// As [`record_matvec_q4k_id`] but skips the trailing barrier — caller fences.
+pub fn record_matvec_q4k_id_nofence(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    ids: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_matvec_kquant_id(
+        ctx, a, b, ids, dst, n_expert_used,
+        "mul_mat_vec_q4_k_id",
+        shaders::MUL_MAT_VEC_Q4_K_ID_SPV.as_bytes(),
+        /* b_alias_v4= */ true,
+        /* fence= */ false,
     )
 }
 
@@ -190,6 +209,25 @@ pub fn record_matvec_q5k_id(
         "mul_mat_vec_q5_k_id",
         shaders::MUL_MAT_VEC_Q5_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ false, // Q5_K matvec uses B_TYPEV2 (binding 5)
+        /* fence= */ true,
+    )
+}
+
+/// As [`record_matvec_q5k_id`] but skips the trailing barrier — caller fences.
+pub fn record_matvec_q5k_id_nofence(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    ids: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_matvec_kquant_id(
+        ctx, a, b, ids, dst, n_expert_used,
+        "mul_mat_vec_q5_k_id",
+        shaders::MUL_MAT_VEC_Q5_K_ID_SPV.as_bytes(),
+        /* b_alias_v4= */ false,
+        /* fence= */ false,
     )
 }
 
@@ -203,6 +241,7 @@ fn record_matvec_kquant_id(
     name: &'static str,
     spv: &[u8],
     b_alias_v4: bool,
+    fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     let ncols = a.dims[0] as u32;
     let n_rows = a.dims[1] as u32;
@@ -282,7 +321,9 @@ fn record_matvec_kquant_id(
             workgroups,
         )?;
     }
-    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    }
     Ok(())
 }
 

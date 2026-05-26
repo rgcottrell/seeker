@@ -1306,10 +1306,19 @@ fn moe_ffn(
     // llama.cpp's MUL_MAT_ID dispatch at ggml-vulkan.cpp:9020). For L=1
     // (decode) it's a single dispatch; for L>1 (prefill) it's L
     // sequential dispatches with per-token expert_i1 push constants.
+    // gate_exps and up_exps matvec_ids are independent (read same x_norm /
+    // same ids, write disjoint outputs). Dispatch both nofence so the
+    // driver can overlap them, then emit one coalesced barrier before the
+    // swiglu_split below reads them.
     let gate = ctx.alloc_tensor([ff, n_used as u64, l_u, 1], GgmlType::F32)?;
-    dispatch_matvec_id(ctx, w.ffn_gate_exps, x_norm, ids, gate, n_used)?;
+    dispatch_matvec_id_nofence(ctx, w.ffn_gate_exps, x_norm, ids, gate, n_used)?;
     let up = ctx.alloc_tensor([ff, n_used as u64, l_u, 1], GgmlType::F32)?;
-    dispatch_matvec_id(ctx, w.ffn_up_exps, x_norm, ids, up, n_used)?;
+    dispatch_matvec_id_nofence(ctx, w.ffn_up_exps, x_norm, ids, up, n_used)?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[gate.range(), up.range()],
+    );
 
     ctx.tap(&format!("ffn_moe_gate-{layer_idx}"), gate)?;
     ctx.tap(&format!("ffn_moe_up-{layer_idx}"), up)?;
@@ -1608,6 +1617,22 @@ fn dispatch_matvec_id(
     match a.dtype {
         GgmlType::Q4_K => moe::record_matvec_q4k_id(ctx, a, b, ids, dst, n_expert_used),
         GgmlType::Q5_K => moe::record_matvec_q5k_id(ctx, a, b, ids, dst, n_expert_used),
+        other => Err(format!("matvec_id: expert weight dtype {other:?} not yet wired").into()),
+    }
+}
+
+/// As [`dispatch_matvec_id`] but skips the trailing barrier — caller fences.
+fn dispatch_matvec_id_nofence(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    ids: crate::inference::buffer::BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+) -> Result<(), Box<dyn Error>> {
+    match a.dtype {
+        GgmlType::Q4_K => moe::record_matvec_q4k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
+        GgmlType::Q5_K => moe::record_matvec_q5k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
         other => Err(format!("matvec_id: expert weight dtype {other:?} not yet wired").into()),
     }
 }
