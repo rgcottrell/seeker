@@ -25,7 +25,9 @@ use crate::inference::buffer::BufferRange;
 use crate::inference::command::{record_copy, record_global_barrier};
 use crate::inference::context::DispatchContext;
 use crate::inference::kv_cache::KvCache;
+use crate::inference::pipeline::PipelineKey;
 use crate::inference::weights::TensorView;
+use crate::shaders;
 
 use super::cast::record_cast;
 
@@ -109,6 +111,64 @@ pub fn record_write_fused_nofence(
     // downstream flash_attn read; we still skip the much heavier
     // pair of `record_global_barrier` calls.
     record_cast(ctx, new_kv_f32, cache_slot)?;
+    Ok(())
+}
+
+/// Replay-safe variant of [`record_write_fused_nofence`] for F16 V
+/// caches. Binds the *full* `cache_layer` and writes at
+/// `DecodeDyn::v_cache_d_offset` — the cmdbuf doesn't bake the
+/// position offset into the descriptor binding, so a single recorded
+/// dispatch serves any decode token in the cache.
+///
+/// The caller is responsible for writing `position * head_dim_v *
+/// n_head_kv` to `DecodeDyn::v_cache_d_offset` before submit (the
+/// model does this on the fresh-record path, the engine does it on
+/// the replay path).
+pub fn record_v_cache_write_f16_nofence(
+    ctx: &mut DispatchContext,
+    new_kv_f32: TensorView,
+    cache_layer: TensorView,
+    position: u32,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(new_kv_f32.dtype, GgmlType::F32);
+    debug_assert_eq!(cache_layer.dtype, GgmlType::F16);
+    let head_dim = new_kv_f32.dims[0];
+    let n_head_kv = new_kv_f32.dims[1];
+    let l = new_kv_f32.dims[2];
+    let n_elements = (head_dim * n_head_kv * l) as u32;
+
+    // Populate DecodeDyn::v_cache_d_offset. On the replay path the
+    // engine re-stamps this between submits; we still need to write it
+    // on the fresh-record path so the recorded dispatch can find the
+    // right slot at submit time.
+    let v_offset = position * head_dim as u32 * n_head_kv as u32;
+    crate::inference::decode_dyn::write_field_ctx(
+        ctx,
+        ctx.decode_dyn,
+        crate::inference::decode_dyn::OFFSET_V_CACHE_D_OFFSET,
+        v_offset,
+    )?;
+
+    let mut push = [0u8; 4];
+    push[0..4].copy_from_slice(&n_elements.to_ne_bytes());
+
+    let key = PipelineKey::dense("v_cache_write_f16_f32", 3, 4, vec![256u32]);
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::V_CACHE_WRITE_F16_F32_SPV.as_bytes())?;
+    let dyn_range = ctx.decode_dyn;
+    let workgroups = [n_elements.div_ceil(256), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[new_kv_f32.range(), cache_layer.range(), dyn_range],
+        &push,
+        workgroups,
+    )?;
+    // Caller is responsible for fencing the cache buffer before the
+    // downstream flash_attn read (paired with the K-cache write in the
+    // attention block).
     Ok(())
 }
 

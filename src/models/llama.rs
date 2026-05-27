@@ -266,7 +266,7 @@ impl Model for LlamaModel {
 
             // attn_out = flash_attn(Q, K, V, mask) → [hidden, L]
             let attn_out = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
-            flash_attn::record(ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params)?;
+            flash_attn::record(ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params, total_len)?;
             // (mask is Option<TensorView>: Some for prefill chunks, None for
             // single-token decode — see the prologue.)
 

@@ -35,7 +35,11 @@ pub struct DecodeDyn {
     pub uniform_rng: f32,
     /// Count of valid `(token_id, count)` pairs in the penalty buffer.
     pub penalty_count: u32,
-    pub _pad0: u32,
+    /// Element offset in the V-cache buffer where the new tokens land
+    /// (= `position_offset * head_dim_v * n_head_kv`). Read by the
+    /// dyn-offset V-cache write shader so the cmdbuf binds the *full*
+    /// cache layer instead of a position-baked slice.
+    pub v_cache_d_offset: u32,
     pub _pad1: u32,
 }
 
@@ -111,6 +115,7 @@ pub const OFFSET_BLOCKS_PER_SPLIT: usize = 8;
 pub const OFFSET_ROPE_D_OFFSET: usize = 12;
 pub const OFFSET_UNIFORM_RNG: usize = 16;
 pub const OFFSET_PENALTY_COUNT: usize = 20;
+pub const OFFSET_V_CACHE_D_OFFSET: usize = 24;
 
 /// Snapshot of the scratch offsets and small constants captured during
 /// the first decode recording. Lets the host re-populate the same slots
@@ -142,6 +147,9 @@ pub struct ModelReplayConstants {
     /// `head_dim_k * n_head_kv` — multiplied by `position_offset` to
     /// get the K-cache write offset (rope_d_offset).
     pub rope_d_offset_per_position: u32,
+    /// `head_dim_v * n_head_kv` — multiplied by `position_offset` to
+    /// get the V-cache write offset (v_cache_d_offset).
+    pub v_cache_d_offset_per_position: u32,
     /// Number of position axes in the M-RoPE positions buffer
     /// (typically 4 for qwen35moe).
     pub mrope_axes: u32,

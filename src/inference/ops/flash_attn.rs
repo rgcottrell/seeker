@@ -88,6 +88,11 @@ pub fn record(
     mask: Option<TensorView>,
     out: TensorView,
     params: FlashAttnParams,
+    // Actual KV length to iterate over. The caller passes this
+    // explicitly instead of using `k.dims[1]` because the direct-cache
+    // fast path binds the full cache layer (so `k.dims[1] = max_seq_len`)
+    // and the shader bounds its iteration by `DecodeDyn::kv_len`.
+    kv_actual: u32,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(q.dtype, GgmlType::F32);
     debug_assert_eq!(out.dtype, GgmlType::F32);
@@ -117,7 +122,7 @@ pub fn record(
         && std::env::var("SEEKER_FA_CM").is_ok_and(|v| v == "1")
     {
         if let Some(m) = mask {
-            return record_cm1(ctx, q, k, v, m, out, params);
+            return record_cm1(ctx, q, k, v, m, out, params, kv_actual);
         }
     }
 
@@ -143,7 +148,10 @@ pub fn record(
     };
 
     let n = q.dims[1] as u32; // L (rows of Q per head)
-    let kv = k.dims[1] as u32;
+    // kv_actual is the caller-provided KV length to iterate over.
+    // k.dims[1] may be max_seq_len (direct-cache fast path) — the
+    // shader uses DecodeDyn::kv_len to bound its loops.
+    let kv = kv_actual;
     let ne1 = n; // output rows per head
     let ne2 = q.dims[2] as u32; // n_head
     let ne3 = q.dims[3].max(1) as u32; // batch
@@ -490,6 +498,7 @@ fn record_cm1(
     mask: TensorView,
     out: TensorView,
     params: FlashAttnParams,
+    kv_actual: u32,
 ) -> Result<(), Box<dyn Error>> {
     // Cast F32 mask → F16 in scratch. Mask layout is preserved (only the
     // element dtype changes), so dims/strides flow through unchanged via
@@ -498,7 +507,7 @@ fn record_cm1(
     crate::inference::ops::cast::record_cast(ctx, mask, mask_f16)?;
 
     let n = q.dims[1] as u32;
-    let kv = k.dims[1] as u32;
+    let kv = kv_actual;
     let ne1 = n;
     let ne2 = q.dims[2] as u32;
     let ne3 = q.dims[3].max(1) as u32;

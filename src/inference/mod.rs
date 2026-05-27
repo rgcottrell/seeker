@@ -329,21 +329,14 @@ impl Engine {
             None
         };
         let want_config_hash = sampler.config().graph_hash();
-        // Replay path is opt-in via `SEEKER_DECODE_REPLAY=1` until two
-        // remaining cache-binding issues are fixed:
-        //   1. V-cache write (`cache_io::record_write_fused_nofence`)
-        //      bakes `position * per_token_bytes` into the descriptor
-        //      binding offset. Each replay submit writes V to the
-        //      *recorded* position, corrupting the actual slot.
-        //   2. `slice_cache_prefix` bounds the cache-read binding to
-        //      `total_len_at_record * per_token_bytes`. Later replays
-        //      read past that size; behavior depends on
-        //      robustBufferAccess.
-        // With the flag off the path is exercised as a no-op
-        // (decode_cache fills but is never consulted), so any future
-        // fix can land incrementally without disrupting the default.
+        // `SEEKER_DECODE_REPLAY=0` forces the legacy record-each-token
+        // path — diagnostic only. Default is replay-on; the cached
+        // decode cmdbuf saves the ~2.5 ms/token CPU recording cost.
+        let allow_replay = std::env::var("SEEKER_DECODE_REPLAY")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let can_replay = is_decode
-            && std::env::var("SEEKER_DECODE_REPLAY").is_ok_and(|v| v != "0")
+            && allow_replay
             && self.decode_cache.as_ref().is_some_and(|c| {
                 c.sampler_config_hash == want_config_hash
                     && Some((c.k_num, c.blocks_per_split)) == want_grid
@@ -414,6 +407,13 @@ impl Engine {
             plan.decode_dyn_offset,
             decode_dyn::OFFSET_ROPE_D_OFFSET,
             rope_d_offset,
+        );
+        let v_cache_d_offset = position_offset * mc.v_cache_d_offset_per_position;
+        decode_dyn::write_field(
+            host_ptr,
+            plan.decode_dyn_offset,
+            decode_dyn::OFFSET_V_CACHE_D_OFFSET,
+            v_cache_d_offset,
         );
 
         model.refresh_replay_inputs(host_ptr, &plan, tokens, position_offset)?;

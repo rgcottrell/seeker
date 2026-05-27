@@ -266,6 +266,7 @@ impl Model for Qwen35MoeModel {
     fn replay_constants(&self) -> Option<crate::inference::decode_dyn::ModelReplayConstants> {
         Some(crate::inference::decode_dyn::ModelReplayConstants {
             rope_d_offset_per_position: self.params.head_dim_k * self.params.n_head_kv,
+            v_cache_d_offset_per_position: self.params.head_dim_v * self.params.n_head_kv,
             mrope_axes: 4,
         })
     }
@@ -649,18 +650,15 @@ fn attention_block(
     ctx.tap(&format!("Qcur-{layer_idx}"), q_roped)?;
 
     // 7a (V only — K already in cache via the fused kernel above).
-    // F16 cache fast path: cast V directly into the cache slot — one
-    // compute dispatch, no intermediate scratch + memcpy, no global
-    // barriers. Falls back to the old cast+copy path for non-F16
-    // caches.
+    // F16 cache fast path: dyn-offset write into the cache via
+    // `v_cache_write_f16` so the descriptor binding doesn't bake the
+    // position offset (required for the persistent-decode-cmdbuf
+    // replay path).
     let v_cache_layer = cache.v_layers[layer_idx as usize];
     if v_cache_layer.dtype == GgmlType::F16 {
-        cache_io::record_write_fused_nofence(ctx, v_view, v_cache_layer, position_offset)?;
-        // We still need ONE barrier covering (q_roped, K cache slot,
-        // V cache slot) before flash_attn reads. Use a single coalesced
-        // compute barrier — the global barriers from `record_write`
-        // are gone, so this is the only thing fencing the upcoming
-        // attention dispatch.
+        cache_io::record_v_cache_write_f16_nofence(ctx, v_view, v_cache_layer, position_offset)?;
+        // ONE barrier covering (q_roped, K cache slot, V cache slot)
+        // before flash_attn reads.
         crate::inference::command::record_compute_barrier(
             ctx.device,
             ctx.cmd,
@@ -669,15 +667,22 @@ fn attention_block(
     } else {
         // Non-F16 cache: the old cast+copy chain still emits its own
         // trailing global barrier which covers Q rope and K rope.
+        // (Replay path is not supported on this branch — V write
+        // bakes position into cmd_copy_buffer.)
         cache_io::record_write(ctx, v_view, v_cache_layer, position_offset)?;
     }
 
-    // 7b. cache read (direct bind for matching K/V dtypes; materialize
-    //     otherwise — same logic as the LLaMA path).
+    // 7b. cache read — bind the *full* cache layers (no
+    // `slice_cache_prefix`). Strides are `total_len`-independent at
+    // `iq3 = 0` (`nb11 = head_dim * n_head_kv`, `nb12 = head_dim`); the
+    // shader bounds reads by `DecodeDyn::kv_len` so OOB into the
+    // unwritten max-seq-len tail never happens. For non-F16 caches
+    // (materialize path) we still slice to `total_len` — those callers
+    // don't use replay.
     let (k_src, v_src) = if cache_direct {
         (
-            slice_cache_prefix(cache.k_layers[layer_idx as usize], kv_len_u),
-            slice_cache_prefix(cache.v_layers[layer_idx as usize], kv_len_u),
+            cache.k_layers[layer_idx as usize],
+            cache.v_layers[layer_idx as usize],
         )
     } else {
         (
@@ -687,12 +692,21 @@ fn attention_block(
     };
 
     // 7c. flash_attn — permute Q to [hd_k, L, n_head], K/V to
-    //     [hd_kv, kv_len, n_head_kv]. Output is `[hidden_v, L]`.
+    //     [hd_kv, kv_len_for_strides, n_head_kv]. For the direct-cache
+    //     fast path the permute uses max_seq_len so the strides match
+    //     the actual cache layout; the shader bounds its iteration by
+    //     `DecodeDyn::kv_len` via the `kv_actual` arg here, which feeds
+    //     `pick_k_num` and the dyn write.
+    let kv_for_perm = if cache_direct {
+        cache.k_layers[layer_idx as usize].dims[2]
+    } else {
+        kv_len_u
+    };
     let q_perm = permute_to_attn(q_roped, head_dim_k, l as u64, n_head);
-    let k_perm = permute_to_attn(k_src, head_dim_k, kv_len_u, n_head_kv);
-    let v_perm = permute_to_attn(v_src, head_dim_v, kv_len_u, n_head_kv);
+    let k_perm = permute_to_attn(k_src, head_dim_k, kv_for_perm, n_head_kv);
+    let v_perm = permute_to_attn(v_src, head_dim_v, kv_for_perm, n_head_kv);
     let attn_out = ctx.alloc_tensor([hidden_v, l as u64, 1, 1], GgmlType::F32)?;
-    flash_attn::record(ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params)?;
+    flash_attn::record(ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params, total_len)?;
     ctx.tap(&format!("attn_pregate-{layer_idx}"), attn_out)?;
 
     // 8. Sigmoid-gate the attention output by q_gate, fused as one
@@ -1906,18 +1920,6 @@ fn permute_to_attn(t: TensorView, head_dim: u64, l: u64, n_heads: u64) -> Tensor
             head_dim * n_heads * l,
         ],
         dtype: t.dtype,
-    }
-}
-
-/// Restrict a cache-layer view to the first `total_len` token slots.
-fn slice_cache_prefix(layer: TensorView, total_len: u64) -> TensorView {
-    let mut dims = layer.dims;
-    dims[2] = total_len;
-    let byte_size = layer.byte_stride[2] * total_len;
-    TensorView {
-        dims,
-        byte_size,
-        ..layer
     }
 }
 
