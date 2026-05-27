@@ -14,7 +14,7 @@
 #include "types.slang"
 
 struct PenaltyParams {
-    uint  n_pairs;
+    uint  _n_pairs_unused;   // historical slot; live count reads from DecodeDyn
     float repeat_p;
     float freq_p;
     float presence_p;
@@ -25,11 +25,17 @@ struct PenaltyParams {
 [[vk::binding(0, 0)]] RWStructuredBuffer<A_TYPE> data_logits;
 [[vk::binding(1, 0)]] StructuredBuffer<int2>     data_pairs;
 
+// Per-forward dynamic params. `penalty_count` varies per decode token
+// (recent-token ring grows then plateaus); reading it from DecodeDyn
+// keeps the recorded cmdbuf replay-stable.
+#include "decode_dyn.slang"
+[[vk::binding(2, 0)]] StructuredBuffer<DecodeDyn> data_dyn;
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void main(uint3 gl_GlobalInvocationID : SV_DispatchThreadID) {
     const uint i = gl_GlobalInvocationID.x;
-    if (i >= p.n_pairs) { return; }
+    if (i >= data_dyn[0].penalty_count) { return; }
 
     const int2 pair = data_pairs[i];
     const uint token_id = uint(pair.x);

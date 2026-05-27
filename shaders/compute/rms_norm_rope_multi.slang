@@ -18,8 +18,8 @@
 // (or pass-through) value to dst.
 
 //@variants
-//  f32:    A_TYPE=float       D_TYPE=float       FLOAT_TYPE=float
-//  to_f16: A_TYPE=float       D_TYPE=float16_t   FLOAT_TYPE=float
+//  f32:    A_TYPE=float       D_TYPE=float       FLOAT_TYPE=float        USE_DYN_OFFSET=0
+//  to_f16: A_TYPE=float       D_TYPE=float16_t   FLOAT_TYPE=float        USE_DYN_OFFSET=1
 //@end-variants
 
 #include "types.slang"
@@ -37,6 +37,15 @@ struct rms_norm_rope_params {
 [[vk::binding(2, 0)]] StructuredBuffer<float>      data_ff;     // unused when has_ff=0
 [[vk::binding(3, 0)]] RWStructuredBuffer<D_TYPE>   data_d;
 [[vk::binding(4, 0)]] StructuredBuffer<A_TYPE>     data_w;      // norm weight, shape [head_dim]
+#if USE_DYN_OFFSET
+// Per-forward dynamic params — see src/inference/decode_dyn.rs. The
+// `to_f16` variant writes directly into the F16 KV cache at a position
+// offset that changes every decode token; reading it from a host-written
+// buffer (rather than push constants) lets the recorded decode command
+// buffer be replayed across tokens.
+#include "decode_dyn.slang"
+[[vk::binding(5, 0)]] StructuredBuffer<DecodeDyn>  data_dyn;
+#endif
 
 [[vk::push_constant]] ConstantBuffer<rms_norm_rope_params> pc;
 
@@ -53,7 +62,12 @@ void main(uint3 gl_WorkGroupID : SV_GroupID,
     const uint i3  = gl_WorkGroupID.z;   // seq index
 
     const uint a_row = pc.rope.a_offset + i3 * pc.rope.nb03 + i2 * pc.rope.nb02 + i1 * pc.rope.nb01;
-    const uint d_row = pc.rope.d_offset + i3 * pc.rope.nb13 + i2 * pc.rope.nb12 + i1 * pc.rope.nb11;
+#if USE_DYN_OFFSET
+    const uint d_offset = data_dyn[0].rope_d_offset;
+#else
+    const uint d_offset = pc.rope.d_offset;
+#endif
+    const uint d_row = d_offset + i3 * pc.rope.nb13 + i2 * pc.rope.nb12 + i1 * pc.rope.nb11;
 
     // Phase 1: load value and contribute partial sum-of-squares.
     float x = 0.0f;

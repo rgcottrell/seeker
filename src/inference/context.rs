@@ -22,6 +22,13 @@ pub struct DispatchContext<'a> {
     pub pipelines: &'a mut PipelineCache,
     pub descriptors: &'a DescriptorAllocator,
     pub cmd: vk::CommandBuffer,
+    /// Per-forward dynamic-params slot. Reserved at the top of every
+    /// forward (always the first scratch alloc, so the offset is stable
+    /// across calls — required for the persistent-decode-cmdbuf
+    /// optimization, where the recorded cmdbuf binds this range and
+    /// subsequent replays only host-write new values into the slot).
+    /// Holds [`super::decode_dyn::DecodeDyn`].
+    pub decode_dyn: BufferRange,
     /// Optional list of `(name, range)` snapshots the model can push to.
     /// The engine reads these back after submit, alongside the main logits.
     /// Used for layer-by-layer diff dumps vs llama.cpp's `cb()` callback.

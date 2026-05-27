@@ -26,6 +26,12 @@ struct FaSplitKParams {
 [[vk::binding(1, 0)]] StructuredBuffer<float>   data_s;
 [[vk::binding(2, 0)]] RWStructuredBuffer<float> data_d;
 
+// Per-forward dynamic params — see src/inference/decode_dyn.rs. The
+// reduce kernel reads `k_num` (number of partials to merge) from this
+// instead of the push struct so the recorded cmdbuf is replay-stable.
+#include "decode_dyn.slang"
+[[vk::binding(3, 0)]] StructuredBuffer<DecodeDyn> data_dyn;
+
 groupshared float tmpsh[BLOCK_SIZE];
 
 [shader("compute")]
@@ -37,10 +43,11 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     const uint i3  = gl_WorkGroupID.z / p.ne2;
 
     const uint D     = p.D;
-    const uint k_num = p.k_num;
+    // k_num varies per decode token — read from DecodeDyn rather than push.
+    const uint k_num = data_dyn[0].k_num;
 
-    const uint l_offset = D * p.ne1 * p.ne2 * p.ne3 * k_num + p.ne1 * 2u * (p.k_num * (i2 + p.ne2 * i3)) + n;
-    const uint m_offset = D * p.ne1 * p.ne2 * p.ne3 * k_num + p.ne1 * 2u * (p.k_num * (i2 + p.ne2 * i3)) + p.ne1 + n;
+    const uint l_offset = D * p.ne1 * p.ne2 * p.ne3 * k_num + p.ne1 * 2u * (k_num * (i2 + p.ne2 * i3)) + n;
+    const uint m_offset = D * p.ne1 * p.ne2 * p.ne3 * k_num + p.ne1 * 2u * (k_num * (i2 + p.ne2 * i3)) + p.ne1 + n;
     const uint lm_stride = p.ne1 * 2u;
 
     float m_max = -1.0f / 0.0f;
@@ -95,7 +102,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     if (d < D) {
         float O = 0.0f;
         [unroll] for (uint k = 0; k < k_num; ++k) {
-            const uint o_offset = D * p.ne1 * (k + p.k_num * (i2 + p.ne2 * i3)) + D * n + d;
+            const uint o_offset = D * p.ne1 * (k + k_num * (i2 + p.ne2 * i3)) + D * n + d;
             const float m = data_a[m_offset + k * lm_stride];
             O += exp(m - m_max) * data_a[o_offset];
         }

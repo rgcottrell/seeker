@@ -128,6 +128,12 @@ struct FaParams {
 [[vk::binding(4, 0)]] RWStructuredBuffer<float>    data_o_split;
 [[vk::binding(5, 0)]] RWStructuredBuffer<D_TYPE>   data_o;
 
+// Per-forward dynamic params (kv_len, k_num, blocks_per_split). These
+// change every decode token; host-writes the buffer between submits
+// when the recorded cmdbuf is replayed. See src/inference/decode_dyn.rs.
+#include "decode_dyn.slang"
+[[vk::binding(6, 0)]] StructuredBuffer<DecodeDyn>  data_dyn;
+
 // Shared Q row (already premultiplied by scale).
 groupshared float Q_sh[HSK];
 // Per-block S values and probabilities.
@@ -245,11 +251,18 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
 
     const uint tid    = gl_LocalInvocationID.x;
     const uint i_row  = gl_WorkGroupID.x;
+    // Per-forward dynamic params (kv_len, k_num, blocks_per_split)
+    // override the corresponding push fields. The push struct still
+    // carries the fields for binary compat with the dispatcher but the
+    // values are stale at decode-replay time — read from `data_dyn`.
+    const uint p_KV       = data_dyn[0].kv_len;
+    const uint p_k_num    = data_dyn[0].k_num;
+    const uint p_split_kv = data_dyn[0].blocks_per_split;
     // grid.y packs (head, split): head = y / k_num, split = y % k_num.
     // With k_num == 1 this collapses to head = y, split = 0 — identical to
     // the pre-split-K dispatch.
-    const uint iq2    = gl_WorkGroupID.y / p.k_num;
-    const uint split  = gl_WorkGroupID.y % p.k_num;
+    const uint iq2    = gl_WorkGroupID.y / p_k_num;
+    const uint split  = gl_WorkGroupID.y % p_k_num;
     const uint iq3    = gl_WorkGroupID.z;
 
     if (i_row >= p.N) { return; }
@@ -276,17 +289,17 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     float Lf = 0.0f;
     float Mf = -1.0e30f;
 
-    const uint m_off = (iq3 % p.nem3) * p.nem2 * p.nem1 * p.KV
-                     + (iq2 % p.nem2) * p.nem1 * p.KV
-                     + i_row * p.KV;
+    const uint m_off = (iq3 % p.nem3) * p.nem2 * p.nem1 * p_KV
+                     + (iq2 % p.nem2) * p.nem1 * p_KV
+                     + i_row * p_KV;
 
-    const uint num_blocks  = (p.KV + Bc - 1) / Bc;
+    const uint num_blocks  = (p_KV + Bc - 1) / Bc;
     // This workgroup handles only its split's slice of the KV blocks.
     // k_num == 1 ⇒ split_kv == num_blocks ⇒ [0, num_blocks): full range.
     // A split past the end (block_start >= num_blocks) runs zero iterations
     // and leaves Mf=-1e30, Lf=0 — the combine kernel weights it to ~0.
-    const uint block_start = split * p.split_kv;
-    const uint block_end   = min(block_start + p.split_kv, num_blocks);
+    const uint block_start = split * p_split_kv;
+    const uint block_end   = min(block_start + p_split_kv, num_blocks);
     for (uint j = block_start; j < block_end; ++j) {
         const uint kv_base = j * Bc;
 
@@ -294,7 +307,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         for (uint c0 = 0; c0 < Bc; c0 += WORKGROUP_SIZE) {
             const uint c = c0 + tid;
             float s = 0.0f;
-            if (c < Bc && kv_base + c < p.KV) {
+            if (c < Bc && kv_base + c < p_KV) {
                 const uint k_off = iq3 * p.nb13 + ik2 * p.nb12 + (kv_base + c) * p.nb11;
                 [unroll] for (uint d = 0; d < HSK; ++d) {
                     s += Q_sh[d] * read_k_element(k_off + d);
@@ -322,7 +335,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
             Of[d] *= m_scale;
         }
         [unroll] for (uint c = 0; c < Bc; ++c) {
-            if (kv_base + c >= p.KV) { break; }
+            if (kv_base + c >= p_KV) { break; }
             const float p_c = exp(S_sh[c] - M_new);
             Lf += p_c;
             const uint v_off = iq3 * p.nb23 + iv2 * p.nb22 + (kv_base + c) * p.nb21;
@@ -335,7 +348,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         GroupMemoryBarrierWithGroupSync();
     }
 
-    if (p.k_num <= 1u) {
+    if (p_k_num <= 1u) {
         // 4) Single pass: normalize + write final, [HSV, n_head, L] layout.
         const float inv_L = Lf == 0.0f ? 0.0f : 1.0f / Lf;
         const uint o_off = iq3 * p.ne2 * p.ne1 * HSV
@@ -353,15 +366,15 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         //        with base = HSV*ne1*ne2*ne3*k_num and M at +ne1 past L.
         // (L and M are identical across the workgroup's 32 threads, so only
         // tid==0 writes them.)
-        const uint o_base = HSV * p.ne1 * (split + p.k_num * (iq2 + p.ne2 * iq3))
+        const uint o_base = HSV * p.ne1 * (split + p_k_num * (iq2 + p.ne2 * iq3))
                           + HSV * i_row;
         [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
             const uint d_global = d * WORKGROUP_SIZE + tid;
             data_o_split[o_base + d_global] = Of[d];
         }
         if (tid == 0u) {
-            const uint lm_base = HSV * p.ne1 * p.ne2 * p.ne3 * p.k_num
-                               + p.ne1 * 2u * (p.k_num * (iq2 + p.ne2 * iq3))
+            const uint lm_base = HSV * p.ne1 * p.ne2 * p.ne3 * p_k_num
+                               + p.ne1 * 2u * (p_k_num * (iq2 + p.ne2 * iq3))
                                + i_row + split * (p.ne1 * 2u);
             data_o_split[lm_base]         = Lf;
             data_o_split[lm_base + p.ne1] = Mf;

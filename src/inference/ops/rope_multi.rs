@@ -123,7 +123,19 @@ pub fn record_rms_norm_rope_to_cache_f16_nofence(
     let cache_nb11 = head_dim;
     let cache_nb12 = head_dim * n_head_kv;
     let cache_nb13 = head_dim * n_head_kv * max_seq_len;
+    // d_offset is now sourced from the DecodeDyn buffer (binding 5) so
+    // the recorded cmdbuf can be replayed across decode tokens with
+    // only a host-side write to `DecodeDyn::rope_d_offset`. Compute it
+    // here and write into the dyn slot; the value packed into the push
+    // struct below is left at 0 and ignored by the shader (see
+    // `USE_DYN_OFFSET` in rms_norm_rope_multi.slang).
     let d_offset = position * head_dim * n_head_kv;
+    crate::inference::decode_dyn::write_field(
+        ctx,
+        ctx.decode_dyn,
+        12, /* offset of `rope_d_offset` in DecodeDyn */
+        d_offset,
+    )?;
 
     const PUSH_BYTES: u32 = ROPE_PARAMS_BYTES + 4;
     let mut push = [0u8; PUSH_BYTES as usize];
@@ -168,13 +180,15 @@ pub fn record_rms_norm_rope_to_cache_f16_nofence(
     put_u(&mut push, &mut w, cache_nb12);
     put_u(&mut push, &mut w, cache_nb13);
     put_u(&mut push, &mut w, 0); // a_offset
-    put_u(&mut push, &mut w, d_offset);
+    // Ignored by the shader on the to_f16 variant — see USE_DYN_OFFSET.
+    put_u(&mut push, &mut w, 0); // d_offset (sourced from DecodeDyn now)
     put_f(&mut push, &mut w, eps);
+    let _ = d_offset; // value already lives in DecodeDyn
     debug_assert_eq!(w, PUSH_BYTES as usize);
 
     let key = PipelineKey::dense(
         "rms_norm_rope_multi_to_f16",
-        5,
+        6,
         PUSH_BYTES,
         vec![ne00],
     );
@@ -184,11 +198,12 @@ pub fn record_rms_norm_rope_to_cache_f16_nofence(
     let workgroups = [ne01, ne02, src.dims[3].max(1) as u32];
 
     let dummy = positions;
+    let dyn_range = ctx.decode_dyn;
     super::bind_and_dispatch(
         ctx,
         &pipeline,
-        &[0, 1, 2, 3, 4],
-        &[src.range(), positions, dummy, cache_layer.range(), weight.range()],
+        &[0, 1, 2, 3, 4, 5],
+        &[src.range(), positions, dummy, cache_layer.range(), weight.range(), dyn_range],
         &push,
         workgroups,
     )?;

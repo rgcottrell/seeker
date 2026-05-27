@@ -152,6 +152,13 @@ pub fn record(
     // ---- split-K decode heuristic (replicates llama.cpp) ----
     let base_wgs = n * ne2 * ne3;
     let (k_num, blocks_per_split) = pick_k_num(ctx.device.shader_core_count, base_wgs, kv);
+    // Mirror kv/k_num/blocks_per_split into the per-forward DecodeDyn
+    // slot. The shader reads them from there so the recorded cmdbuf
+    // is replay-stable (host overwrites these fields between submits
+    // when the persistent-decode-cmdbuf path activates).
+    crate::inference::decode_dyn::write_field(ctx, ctx.decode_dyn, 0, kv)?;
+    crate::inference::decode_dyn::write_field(ctx, ctx.decode_dyn, 4, k_num)?;
+    crate::inference::decode_dyn::write_field(ctx, ctx.decode_dyn, 8, blocks_per_split)?;
 
     // Pack push.
     let mut push = [0u8; FA_PUSH_BYTES as usize];
@@ -210,7 +217,7 @@ pub fn record(
     // exactly one subgroup (rather than half a wave64).
     let key = PipelineKey {
         name: variant_name.to_string(),
-        binding_indices: vec![0, 1, 2, 3, 4, 5],
+        binding_indices: vec![0, 1, 2, 3, 4, 5, 6],
         push_size: FA_PUSH_BYTES,
         spec_constants,
         required_subgroup_size: Some(32),
@@ -221,6 +228,7 @@ pub fn record(
     // the shader guards every read on the spec constant, so bind any live
     // storage buffer (q) as a harmless stand-in.
     let mask_range = mask.map(|m| m.range()).unwrap_or_else(|| q.range());
+    let dyn_range = ctx.decode_dyn;
 
     if k_num <= 1 {
         // Single pass: writes the final normalized output to data_o
@@ -230,7 +238,7 @@ pub fn record(
         super::bind_and_dispatch(
             ctx,
             &pipeline,
-            &[0, 1, 2, 3, 4, 5],
+            &[0, 1, 2, 3, 4, 5, 6],
             &[
                 q.range(),
                 k.range(),
@@ -238,6 +246,7 @@ pub fn record(
                 mask_range,
                 out.range(),
                 out.range(),
+                dyn_range,
             ],
             &push,
             workgroups,
@@ -257,7 +266,7 @@ pub fn record(
         super::bind_and_dispatch(
             ctx,
             &pipeline,
-            &[0, 1, 2, 3, 4, 5],
+            &[0, 1, 2, 3, 4, 5, 6],
             &[
                 q.range(),
                 k.range(),
@@ -265,6 +274,7 @@ pub fn record(
                 mask_range,
                 partials.range(),
                 out.range(), // data_o unused on the split path
+                dyn_range,
             ],
             &push,
             workgroups,
@@ -361,7 +371,7 @@ fn record_split_k_combine(
 
     let key = PipelineKey {
         name: "flash_attn_split_k_reduce_f32".to_string(),
-        binding_indices: vec![0, 1, 2],
+        binding_indices: vec![0, 1, 2, 3],
         push_size: FA_SPLIT_K_PUSH_BYTES,
         spec_constants: vec![32], // BLOCK_SIZE
         required_subgroup_size: None,
@@ -371,13 +381,14 @@ fn record_split_k_combine(
         key,
         shaders::FLASH_ATTN_SPLIT_K_REDUCE_F32_SPV.as_bytes(),
     )?;
-    // data_a = partials, data_s = sinks (unused → dummy `out`), data_d = out.
+    // data_a = partials, data_s = sinks (unused → dummy `out`), data_d = out, data_dyn = DecodeDyn.
     let workgroups = [ne1, head_dim_v.div_ceil(32), ne2 * ne3];
+    let dyn_range = ctx.decode_dyn;
     super::bind_and_dispatch(
         ctx,
         &pipeline,
-        &[0, 1, 2],
-        &[partials.range(), out.range(), out.range()],
+        &[0, 1, 2, 3],
+        &[partials.range(), out.range(), out.range(), dyn_range],
         &push,
         workgroups,
     )?;

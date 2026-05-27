@@ -45,12 +45,16 @@ pub fn record_chain(
     uniform: f32,
 ) -> Result<BufferRange, Box<dyn Error>> {
     // Penalties run first because the repetition penalty's multiply/divide
-    // is sign-conditional on the *raw* logit.
-    if config.any_penalty() && !penalty_pairs.is_empty() {
+    // is sign-conditional on the *raw* logit. Always record the dispatch
+    // when the config has any penalty term — the kernel sources its valid
+    // pair count from DecodeDyn at submit time, so the cmdbuf is
+    // replay-stable even when the recent-token ring is empty.
+    if config.any_penalty() {
         record_apply_penalties(
             ctx,
             logits,
             penalty_pairs,
+            config.penalty_last_n,
             config.repeat_penalty,
             config.frequency_penalty,
             config.presence_penalty,
@@ -138,7 +142,9 @@ fn record_sample_categorical(
     assert!(k > 0 && k <= 256, "fused categorical requires 0 < k ≤ 256, got {k}");
 
     // Push constants — must match the `CatParams` struct in
-    // `sample_categorical.slang`: u32 k + four f32s.
+    // `sample_categorical.slang`: u32 k + four f32s (top_p/min_p/temp/
+    // _uniform_unused). The uniform draw migrated to DecodeDyn for
+    // decode-replay; the historical slot stays for binary layout compat.
     const PUSH_BYTES: u32 = 5 * 4;
     let mut push = [0u8; PUSH_BYTES as usize];
     push[0..4].copy_from_slice(&k.to_ne_bytes());
@@ -146,7 +152,15 @@ fn record_sample_categorical(
     push[8..12].copy_from_slice(&top_p.to_ne_bytes());
     let log_min_p = if min_p > 0.0 { min_p.ln() } else { f32::NEG_INFINITY };
     push[12..16].copy_from_slice(&log_min_p.to_ne_bytes());
-    push[16..20].copy_from_slice(&uniform.to_ne_bytes());
+    // Field 4 (uniform) is now sourced from DecodeDyn; leave the push slot at 0.
+
+    // Mirror the host-drawn uniform into the per-forward DecodeDyn slot.
+    crate::inference::decode_dyn::write_field(
+        ctx,
+        ctx.decode_dyn,
+        crate::inference::decode_dyn::OFFSET_UNIFORM_RNG,
+        uniform,
+    )?;
 
     // Spec constants — fold off any filter that would be a no-op so
     // the shader skips its barriers and shared-mem reductions.
@@ -158,7 +172,7 @@ fn record_sample_categorical(
     let out = ctx.alloc_scratch(4)?;
     let key = PipelineKey::dense(
         "sample_categorical_f32",
-        3,
+        4,
         PUSH_BYTES,
         // Order in the shader: BLOCK_SIZE, TOP_P_ON, MIN_P_ON, TEMP_ON.
         vec![block_size, top_p_on, min_p_on, temp_on],
@@ -166,11 +180,12 @@ fn record_sample_categorical(
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::SAMPLE_CATEGORICAL_F32_SPV.as_bytes())?;
+    let dyn_range = ctx.decode_dyn;
     super::bind_and_dispatch(
         ctx,
         &pipeline,
-        &[0, 1, 2],
-        &[sorted_logits.range(), candidates.range(), out],
+        &[0, 1, 2, 3],
+        &[sorted_logits.range(), candidates.range(), out, dyn_range],
         &push,
         [1, 1, 1],
     )?;
@@ -332,48 +347,65 @@ fn record_categorical(
 /// `pairs` is the deduplicated `(token_id, count)` list from the sampler's
 /// recent-token ring; the host uploads it into a scratch SSBO.
 ///
-/// The shader does one thread per pair, so we dispatch
-/// `ceil(n_pairs / 256)` workgroups.
+/// Scratch is sized for the worst case (`penalty_last_n` pairs) and the
+/// dispatch grid is fixed accordingly, so the recorded cmdbuf is
+/// replay-stable. The shader reads the live pair count from DecodeDyn
+/// and bails out per-thread when `i >= penalty_count`, so unused slots
+/// are skipped at submit time.
 fn record_apply_penalties(
     ctx: &mut DispatchContext,
     logits: TensorView,
     pairs: &[(u32, u32)],
+    penalty_last_n: usize,
     repeat_p: f32,
     freq_p: f32,
     presence_p: f32,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(logits.dtype, GgmlType::F32);
+    let max_pairs = penalty_last_n.max(1) as u32;
     let n_pairs = pairs.len() as u32;
-    if n_pairs == 0 {
-        return Ok(());
-    }
+    debug_assert!(n_pairs <= max_pairs, "penalty_pairs exceeds penalty_last_n");
 
-    // Pack the (token_id, count) pairs into a scratch SSBO. Each pair is
-    // two u32s back-to-back, matching the shader's `StructuredBuffer<int2>`.
-    let pairs_t = ctx.alloc_tensor([2 * n_pairs as u64, 1, 1, 1], GgmlType::I32)?;
+    // Pack the (token_id, count) pairs into a fixed-size scratch SSBO of
+    // capacity `max_pairs` pairs. Each pair is two u32s. Unused trailing
+    // slots are zeroed so a future shader read past `penalty_count` (the
+    // shader doesn't, but defensive) is harmless.
+    let pairs_t = ctx.alloc_tensor([2 * max_pairs as u64, 1, 1, 1], GgmlType::I32)?;
     let host_ptr = ctx
         .scratch
         .host_ptr
         .ok_or("scratch not host-visible — penalties need pair upload")?;
-    // SAFETY: `pairs_t` has byte_size = 2 * n_pairs * 4 = 8 * n_pairs bytes,
-    // which is exactly the size of the flattened pair list.
     unsafe {
         let dst = host_ptr.add(pairs_t.byte_offset as usize) as *mut u32;
         for (i, &(tid, count)) in pairs.iter().enumerate() {
             std::ptr::write(dst.add(2 * i), tid);
             std::ptr::write(dst.add(2 * i + 1), count);
         }
+        // Zero out the unused tail so stale data from prior calls isn't
+        // visible if the shader ever reads past penalty_count (it shouldn't).
+        for i in n_pairs as usize..max_pairs as usize {
+            std::ptr::write(dst.add(2 * i), 0u32);
+            std::ptr::write(dst.add(2 * i + 1), 0u32);
+        }
     }
 
+    // Live pair count goes through DecodeDyn so cmdbuf is replay-stable.
+    crate::inference::decode_dyn::write_field(
+        ctx,
+        ctx.decode_dyn,
+        crate::inference::decode_dyn::OFFSET_PENALTY_COUNT,
+        n_pairs,
+    )?;
+
     let mut push = [0u8; PENALTY_PARAMS_BYTES as usize];
-    push[0..4].copy_from_slice(&n_pairs.to_ne_bytes());
+    // Field 0 (n_pairs) is now sourced from DecodeDyn; leave at 0.
     push[4..8].copy_from_slice(&repeat_p.to_ne_bytes());
     push[8..12].copy_from_slice(&freq_p.to_ne_bytes());
     push[12..16].copy_from_slice(&presence_p.to_ne_bytes());
 
     let key = PipelineKey::dense(
         "apply_penalties_f32",
-        2,
+        3,
         PENALTY_PARAMS_BYTES,
         Vec::new(),
     );
@@ -382,12 +414,13 @@ fn record_apply_penalties(
         key,
         shaders::APPLY_PENALTIES_F32_SPV.as_bytes(),
     )?;
-    let workgroups = [n_pairs.div_ceil(256), 1, 1];
+    let workgroups = [max_pairs.div_ceil(256), 1, 1];
+    let dyn_range = ctx.decode_dyn;
     super::bind_and_dispatch(
         ctx,
         &pipeline,
-        &[0, 1],
-        &[logits.range(), pairs_t.range()],
+        &[0, 1, 2],
+        &[logits.range(), pairs_t.range(), dyn_range],
         &push,
         workgroups,
     )?;

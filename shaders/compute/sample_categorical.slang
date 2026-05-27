@@ -33,7 +33,7 @@ struct CatParams {
     float inv_temp;          // 1 / temperature
     float top_p;             // 1.0 → keep all
     float log_min_p;         // ln(min_p); 0.0 host-side disables via spec const
-    float uniform;           // RNG draw ∈ [0, 1)
+    float _uniform_unused;   // historical slot; live value reads from DecodeDyn
 };
 
 [[vk::push_constant]] ConstantBuffer<CatParams> p;
@@ -41,6 +41,12 @@ struct CatParams {
 [[vk::binding(0, 0)]] StructuredBuffer<float> data_logits;     // [K], sorted DESC
 [[vk::binding(1, 0)]] StructuredBuffer<int>   data_candidates; // [K], token ids
 [[vk::binding(2, 0)]] RWStructuredBuffer<int> data_out;        // [1], picked token id
+
+// Per-forward dynamic params. The RNG uniform draw changes every
+// decode token; reading it here lets the recorded cmdbuf replay with
+// only a host-side write to DecodeDyn::uniform_rng between submits.
+#include "decode_dyn.slang"
+[[vk::binding(3, 0)]] StructuredBuffer<DecodeDyn> data_dyn;
 
 groupshared float scan[BLOCK_SIZE]; // reused for prefix-scan (Hillis-Steele)
 groupshared float red[BLOCK_SIZE];  // reused for sum reductions
@@ -139,7 +145,7 @@ void main(uint3 gl_LocalInvocationID : SV_GroupThreadID) {
 
     // Inverse-CDF: find the smallest tid where `incl > target`, with
     // `excl <= target` confirming it's the bucket that owns `target`.
-    const float target = p.uniform * sum_kept;
+    const float target = data_dyn[0].uniform_rng * sum_kept;
     if (active && kept && my_incl > target && my_excl <= target) {
         data_out[0] = data_candidates[tid];
     }

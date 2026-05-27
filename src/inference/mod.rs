@@ -9,6 +9,7 @@
 pub mod buffer;
 pub mod command;
 pub mod context;
+pub mod decode_dyn;
 pub mod descriptor;
 pub mod device;
 pub mod kv_cache;
@@ -128,6 +129,19 @@ impl Engine {
         self.scratch.reset();
         self.descriptors.reset(&self.device)?;
 
+        // Reserve the DecodeDyn slot before the model records anything else
+        // so its offset is stable (= first alloc after reset). Bindings into
+        // this slot must remain valid across replays when the
+        // persistent-decode-cmdbuf path lands.
+        let decode_dyn_range = {
+            let off = self.scratch.alloc(decode_dyn::DecodeDyn::SIZE)?;
+            BufferRange {
+                buffer: self.scratch.buffer,
+                offset: off,
+                size: decode_dyn::DecodeDyn::SIZE,
+            }
+        };
+
         unsafe {
             self.device
                 .device
@@ -152,6 +166,7 @@ impl Engine {
                 taps: Vec::new(),
                 n_dispatches: 0,
                 n_barriers: 0,
+                decode_dyn: decode_dyn_range,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
@@ -247,6 +262,17 @@ impl Engine {
         self.scratch.reset();
         self.descriptors.reset(&self.device)?;
 
+        // Reserve the DecodeDyn slot before the model/sampler record anything
+        // else — see comment in `forward` above.
+        let decode_dyn_range = {
+            let off = self.scratch.alloc(decode_dyn::DecodeDyn::SIZE)?;
+            BufferRange {
+                buffer: self.scratch.buffer,
+                offset: off,
+                size: decode_dyn::DecodeDyn::SIZE,
+            }
+        };
+
         unsafe {
             self.device
                 .device
@@ -271,6 +297,7 @@ impl Engine {
                 taps: Vec::new(),
                 n_dispatches: 0,
                 n_barriers: 0,
+                decode_dyn: decode_dyn_range,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
