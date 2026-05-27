@@ -130,7 +130,7 @@ pub fn record_rms_norm_rope_to_cache_f16_nofence(
     // struct below is left at 0 and ignored by the shader (see
     // `USE_DYN_OFFSET` in rms_norm_rope_multi.slang).
     let d_offset = position * head_dim * n_head_kv;
-    crate::inference::decode_dyn::write_field(
+    crate::inference::decode_dyn::write_field_ctx(
         ctx,
         ctx.decode_dyn,
         12, /* offset of `rope_d_offset` in DecodeDyn */

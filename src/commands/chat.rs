@@ -454,10 +454,13 @@ impl ChatSession {
             let cache = &mut self.cache;
             let model = &self.model;
             let t0 = std::time::Instant::now();
+            let position = cache.position;
             let token = self.engine.forward_sampled(
-                model.weights(),
+                &**model,
+                cache,
+                &step_tokens,
+                position,
                 &mut self.sampler,
-                |ctx| model.record_forward(ctx, cache, &step_tokens, cache.position),
             )?;
             // Forward 0 is the prefill (N = prompt_tokens); the rest are
             // single-token decode steps. Time them separately, like llama.cpp.

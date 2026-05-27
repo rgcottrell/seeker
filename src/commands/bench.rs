@@ -183,9 +183,7 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         );
         next
     } else {
-        engine.forward_sampled(model.weights(), &mut sampler, |ctx| {
-            model.record_forward(ctx, &mut cache, &prompt_tokens, position_offset)
-        })?
+        engine.forward_sampled(&*model, &mut cache, &prompt_tokens, position_offset, &mut sampler)?
     };
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
@@ -193,9 +191,7 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
     let mut cur = next_id;
     for _ in 0..args.warmup {
         let position_offset = cache.position;
-        cur = engine.forward_sampled(model.weights(), &mut sampler, |ctx| {
-            model.record_forward(ctx, &mut cache, &[cur], position_offset)
-        })?;
+        cur = engine.forward_sampled(&*model, &mut cache, &[cur], position_offset, &mut sampler)?;
     }
 
     // ── Timed decode ────────────────────────────────────────────────────
@@ -203,9 +199,7 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
     for _ in 0..args.decode_tokens {
         let position_offset = cache.position;
         let t0 = Instant::now();
-        cur = engine.forward_sampled(model.weights(), &mut sampler, |ctx| {
-            model.record_forward(ctx, &mut cache, &[cur], position_offset)
-        })?;
+        cur = engine.forward_sampled(&*model, &mut cache, &[cur], position_offset, &mut sampler)?;
         per_token_ns.push(t0.elapsed().as_nanos());
     }
 

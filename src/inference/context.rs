@@ -29,6 +29,13 @@ pub struct DispatchContext<'a> {
     /// subsequent replays only host-write new values into the slot).
     /// Holds [`super::decode_dyn::DecodeDyn`].
     pub decode_dyn: BufferRange,
+    /// Offsets captured during the first decode recording so the host
+    /// can re-populate the same slots between subsequent submits of
+    /// the cached decode command buffer. Model fills `token_buf` and
+    /// `positions_buf`; sampler fills `sampler_output` and (if
+    /// penalties recorded) `penalty_pairs`. None during prefill or
+    /// when the recording isn't going to be cached.
+    pub replay_plan: Option<super::decode_dyn::ReplayPlan>,
     /// Optional list of `(name, range)` snapshots the model can push to.
     /// The engine reads these back after submit, alongside the main logits.
     /// Used for layer-by-layer diff dumps vs llama.cpp's `cb()` callback.

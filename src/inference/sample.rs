@@ -19,12 +19,14 @@
 
 use std::collections::VecDeque;
 use std::error::Error;
+use std::hash::{Hash, Hasher};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use super::buffer::BufferRange;
 use super::context::DispatchContext;
+use super::decode_dyn;
 use super::weights::TensorView;
 
 /// User-facing sampler knobs. Mirrors the relevant subset of llama.cpp's
@@ -80,6 +82,27 @@ impl SamplerConfig {
         self.repeat_penalty != 1.0
             || self.frequency_penalty != 0.0
             || self.presence_penalty != 0.0
+    }
+
+    /// Hash of every config field that affects the recorded GPU graph
+    /// shape or spec constants. Used by the persistent-decode-cmdbuf
+    /// path to invalidate the cached recording when the caller changes
+    /// sampler knobs mid-session. RNG seed and the recent-token window
+    /// are deliberately excluded — they affect only the values fed
+    /// into the dispatched graph, not the graph itself.
+    pub fn graph_hash(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        // Cast floats to bit patterns so NaN compares structurally and
+        // we don't have to bound `Hash` on `SamplerConfig`.
+        self.temperature.to_bits().hash(&mut h);
+        self.top_k.hash(&mut h);
+        self.top_p.to_bits().hash(&mut h);
+        self.min_p.to_bits().hash(&mut h);
+        self.repeat_penalty.to_bits().hash(&mut h);
+        self.frequency_penalty.to_bits().hash(&mut h);
+        self.presence_penalty.to_bits().hash(&mut h);
+        self.penalty_last_n.hash(&mut h);
+        h.finish()
     }
 }
 
@@ -144,6 +167,64 @@ impl Sampler {
     pub fn draw_uniform(&mut self) -> f32 {
         use rand::Rng;
         self.rng.r#gen::<f32>()
+    }
+
+    /// Host-side refresh of the sampler-owned scratch slots between
+    /// submits of a cached decode command buffer. Pairs with
+    /// [`Model::refresh_replay_inputs`] (the model handles its own
+    /// token/positions buffers); this writes the RNG uniform and the
+    /// `(token_id, count)` penalty pairs + count into the slots whose
+    /// offsets were captured during the recording pass.
+    ///
+    /// Mutates the sampler RNG state — call exactly once per replay.
+    pub fn refresh_replay_inputs(
+        &mut self,
+        host_ptr: *mut u8,
+        plan: &decode_dyn::ReplayPlan,
+    ) -> Result<(), Box<dyn Error>> {
+        // Uniform draw goes into the DecodeDyn slot. Greedy paths use 0
+        // (sample_categorical isn't recorded in that case anyway).
+        let uniform = if self.config.is_greedy() {
+            0.0
+        } else {
+            self.draw_uniform()
+        };
+        decode_dyn::write_field(
+            host_ptr,
+            plan.decode_dyn_offset,
+            decode_dyn::OFFSET_UNIFORM_RNG,
+            uniform,
+        );
+
+        // Penalty pairs (when the chain recorded apply_penalties).
+        if let Some((pairs_off, max_pairs)) = plan.penalty_pairs {
+            let pairs = self.penalty_pairs();
+            if pairs.len() as u32 > max_pairs {
+                return Err(format!(
+                    "penalty_pairs {} exceeds recorded max {max_pairs}",
+                    pairs.len()
+                )
+                .into());
+            }
+            unsafe {
+                let dst = host_ptr.add(pairs_off as usize) as *mut u32;
+                for (i, &(tid, count)) in pairs.iter().enumerate() {
+                    std::ptr::write(dst.add(2 * i), tid);
+                    std::ptr::write(dst.add(2 * i + 1), count);
+                }
+                for i in pairs.len()..max_pairs as usize {
+                    std::ptr::write(dst.add(2 * i), 0u32);
+                    std::ptr::write(dst.add(2 * i + 1), 0u32);
+                }
+            }
+            decode_dyn::write_field(
+                host_ptr,
+                plan.decode_dyn_offset,
+                decode_dyn::OFFSET_PENALTY_COUNT,
+                pairs.len() as u32,
+            );
+        }
+        Ok(())
     }
 
     /// Record the sampler chain into the command buffer. Returns a

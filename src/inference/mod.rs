@@ -43,12 +43,44 @@ pub struct Engine {
     pub scratch: Region,
     pub command_pool: vk::CommandPool,
     pub command_buffer: vk::CommandBuffer,
+    /// Secondary command buffer used to cache the decode forward graph
+    /// for replay. Cleared on prefill / sampler-config change / k_num
+    /// boundary; once populated, subsequent decode tokens host-update
+    /// the input scratch slots and resubmit this cmdbuf without
+    /// re-recording.
+    pub decode_command_buffer: vk::CommandBuffer,
     pub fence: vk::Fence,
     /// Per-block GPU-timestamp recorder. Only present in builds with
     /// the `profile_gpu` feature; non-profiling builds skip this field
     /// entirely (no query-pool allocation, no host readback path).
     #[cfg(feature = "profile_gpu")]
     pub profile: profile::ProfileRecorder,
+    /// Current cached decode recording. `None` when invalid (after
+    /// prefill, sampler-config change, or k_num boundary crossing).
+    pub decode_cache: Option<DecodeCache>,
+    /// Scratch cursor immediately after the decode recording finishes.
+    /// While `decode_cache` is `Some`, subsequent decode replays skip
+    /// `scratch.reset()` so the bindings captured in
+    /// `decode_command_buffer` stay valid. Prefill bumps the cache and
+    /// resumes the normal reset-each-call behavior.
+    pub decode_scratch_cursor: u64,
+}
+
+/// State captured by the first decode recording so subsequent replays
+/// know which scratch slots to refresh and when to invalidate.
+#[derive(Debug, Clone)]
+pub struct DecodeCache {
+    /// `Sampler::config().graph_hash()` at recording time.
+    pub sampler_config_hash: u64,
+    /// `Model::decode_shape_key(kv, shader_core_count)` at recording time.
+    pub shape_key: u64,
+    /// Captured `kv_len` / `k_num` / `blocks_per_split` so we can re-
+    /// stamp DecodeDyn between replays without re-running the heuristic.
+    pub kv_len: u32,
+    pub k_num: u32,
+    pub blocks_per_split: u32,
+    pub plan: decode_dyn::ReplayPlan,
+    pub model_constants: decode_dyn::ModelReplayConstants,
 }
 
 impl Engine {
@@ -78,8 +110,10 @@ impl Engine {
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command_buffer = unsafe { device.device.allocate_command_buffers(&alloc_info) }?[0];
+            .command_buffer_count(2);
+        let cmd_bufs = unsafe { device.device.allocate_command_buffers(&alloc_info) }?;
+        let command_buffer = cmd_bufs[0];
+        let decode_command_buffer = cmd_bufs[1];
 
         let fence_info = vk::FenceCreateInfo::default();
         let fence = unsafe { device.device.create_fence(&fence_info, None) }?;
@@ -94,9 +128,12 @@ impl Engine {
             scratch,
             command_pool,
             command_buffer,
+            decode_command_buffer,
             fence,
             #[cfg(feature = "profile_gpu")]
             profile,
+            decode_cache: None,
+            decode_scratch_cursor: 0,
         })
     }
 
@@ -170,6 +207,7 @@ impl Engine {
                 n_dispatches: 0,
                 n_barriers: 0,
                 decode_dyn: decode_dyn_range,
+                replay_plan: None,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
@@ -241,32 +279,218 @@ impl Engine {
         Ok(out)
     }
 
-    /// Run a forward pass and sample a token, all on the GPU. The closure
-    /// records the model forward and returns the logits `TensorView`; the
-    /// `sampler` then appends its chain into the same command buffer. After
-    /// submit/wait the engine reads back exactly 4 bytes — the sampled token
-    /// id — instead of pulling the full logits buffer to host. The sampler's
-    /// recent-token window is updated automatically via `accept`.
-    pub fn forward_sampled<F>(
+    /// Run a forward pass and sample a token, all on the GPU.
+    ///
+    /// Three execution paths, picked from `tokens.len()` and the
+    /// validity of the cached decode recording:
+    ///
+    /// 1. **Prefill (L > 1)**: scratch reset, fresh record on the main
+    ///    cmdbuf, single submit. Invalidates any cached decode
+    ///    recording (graph shape differs).
+    /// 2. **Decode-record (L = 1, cache stale)**: scratch reset, fresh
+    ///    record on the decode cmdbuf, captures the input-slot offsets
+    ///    + flash_attn grid params into `decode_cache`, submit.
+    /// 3. **Decode-replay (L = 1, cache valid)**: skip scratch reset,
+    ///    skip recording, host-update the input slots (decode_dyn,
+    ///    token_buf, positions_buf, penalty pairs) at the captured
+    ///    offsets, resubmit the cached cmdbuf. Drops the ~2.4 ms of
+    ///    per-token CPU recording cost.
+    ///
+    /// The cache is invalidated whenever the sampler's
+    /// `SamplerConfig::graph_hash()` changes or the model's
+    /// `decode_grid(kv, …)` returns a different `(k_num, blocks_per_split)`
+    /// than the one recorded (the wg count is baked into the cmdbuf via
+    /// `cmd_update_buffer`).
+    pub fn forward_sampled(
         &mut self,
-        weights: &WeightsHandle,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        position_offset: u32,
         sampler: &mut sample::Sampler,
-        record_logits: F,
-    ) -> Result<u32, Box<dyn Error>>
-    where
-        F: FnOnce(&mut DispatchContext) -> Result<weights::TensorView, Box<dyn Error>>,
-    {
+    ) -> Result<u32, Box<dyn Error>> {
         let prof = *crate::runtime_flags::PROFILE_FORWARD;
         let t0 = if prof { Some(std::time::Instant::now()) } else { None };
         if prof {
             crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.set(0));
             crate::inference::command::BARRIER_GLOBAL_COUNT.with(|c| c.set(0));
         }
+
+        let l = tokens.len() as u32;
+        if l == 0 {
+            return Err("forward_sampled called with empty token list".into());
+        }
+        let is_decode = l == 1;
+        let kv_after = position_offset + l;
+        let core_count = self.device.shader_core_count;
+        let want_grid = if is_decode {
+            model.decode_grid(kv_after, core_count)
+        } else {
+            None
+        };
+        let want_config_hash = sampler.config().graph_hash();
+        // Replay path is opt-in via `SEEKER_DECODE_REPLAY=1` until two
+        // remaining cache-binding issues are fixed:
+        //   1. V-cache write (`cache_io::record_write_fused_nofence`)
+        //      bakes `position * per_token_bytes` into the descriptor
+        //      binding offset. Each replay submit writes V to the
+        //      *recorded* position, corrupting the actual slot.
+        //   2. `slice_cache_prefix` bounds the cache-read binding to
+        //      `total_len_at_record * per_token_bytes`. Later replays
+        //      read past that size; behavior depends on
+        //      robustBufferAccess.
+        // With the flag off the path is exercised as a no-op
+        // (decode_cache fills but is never consulted), so any future
+        // fix can land incrementally without disrupting the default.
+        let can_replay = is_decode
+            && std::env::var("SEEKER_DECODE_REPLAY").is_ok_and(|v| v != "0")
+            && self.decode_cache.as_ref().is_some_and(|c| {
+                c.sampler_config_hash == want_config_hash
+                    && Some((c.k_num, c.blocks_per_split)) == want_grid
+            });
+
+        if can_replay {
+            return self.forward_sampled_replay(
+                model,
+                cache,
+                tokens,
+                position_offset,
+                sampler,
+                t0,
+                kv_after,
+            );
+        }
+        self.forward_sampled_record(
+            model,
+            cache,
+            tokens,
+            position_offset,
+            sampler,
+            t0,
+            is_decode,
+            want_grid,
+            want_config_hash,
+        )
+    }
+
+    fn forward_sampled_replay(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        position_offset: u32,
+        sampler: &mut sample::Sampler,
+        t0: Option<std::time::Instant>,
+        kv_after: u32,
+    ) -> Result<u32, Box<dyn Error>> {
+        let host_ptr = self
+            .scratch
+            .host_ptr
+            .ok_or("scratch region not host-visible — replay requires mapped memory")?;
+        let cache_state = self
+            .decode_cache
+            .as_ref()
+            .expect("forward_sampled_replay called without a cached recording");
+        let plan = cache_state.plan.clone();
+        let mc = cache_state.model_constants;
+        let kv_len = kv_after;
+        let k_num = cache_state.k_num;
+        let blocks_per_split = cache_state.blocks_per_split;
+
+        // Update DecodeDyn fields owned by the engine. The sampler
+        // refresh below covers uniform_rng + penalty_count; the model
+        // doesn't touch decode_dyn directly during replay.
+        decode_dyn::write_field(host_ptr, plan.decode_dyn_offset, decode_dyn::OFFSET_KV_LEN, kv_len);
+        decode_dyn::write_field(host_ptr, plan.decode_dyn_offset, decode_dyn::OFFSET_K_NUM, k_num);
+        decode_dyn::write_field(
+            host_ptr,
+            plan.decode_dyn_offset,
+            decode_dyn::OFFSET_BLOCKS_PER_SPLIT,
+            blocks_per_split,
+        );
+        let rope_d_offset = position_offset * mc.rope_d_offset_per_position;
+        decode_dyn::write_field(
+            host_ptr,
+            plan.decode_dyn_offset,
+            decode_dyn::OFFSET_ROPE_D_OFFSET,
+            rope_d_offset,
+        );
+
+        model.refresh_replay_inputs(host_ptr, &plan, tokens, position_offset)?;
+        sampler.refresh_replay_inputs(host_ptr, &plan)?;
+
+        let t_record = t0.map(|t| t.elapsed());
+
+        unsafe {
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.decode_command_buffer));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        let t_wait = t0.map(|t| t.elapsed());
+        #[cfg(feature = "profile_gpu")]
+        self.profile.readback_and_print(&self.device);
+
+        let sampler_output_offset = plan
+            .sampler_output_offset
+            .ok_or("replay plan missing sampler_output_offset")?;
+        let token = unsafe {
+            let src = host_ptr.add(sampler_output_offset as usize) as *const u32;
+            std::ptr::read(src)
+        };
+
+        crate::inference::ops::cache_io::advance(cache, tokens.len() as u32);
+        sampler.accept(token);
+
+        if let (Some(rec), Some(wait)) = (t_record, t_wait) {
+            let total = t0.unwrap().elapsed();
+            let bc = crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.get());
+            let bg = crate::inference::command::BARRIER_GLOBAL_COUNT.with(|c| c.get());
+            eprintln!(
+                "PROF forward[replay]: barriers=(compute={bc} global={bg}) record={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
+                rec.as_secs_f64() * 1000.0,
+                (wait - rec).as_secs_f64() * 1000.0,
+                (total - wait).as_secs_f64() * 1000.0,
+                total.as_secs_f64() * 1000.0,
+            );
+        }
+        Ok(token)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_sampled_record(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        position_offset: u32,
+        sampler: &mut sample::Sampler,
+        t0: Option<std::time::Instant>,
+        is_decode: bool,
+        want_grid: Option<(u32, u32)>,
+        want_config_hash: u64,
+    ) -> Result<u32, Box<dyn Error>> {
+        // Want to cache the decode recording? Only if the model opts
+        // in (replay_constants() returns Some) AND the sampler chain's
+        // graph is stable across replays (no L>1 mask alloc).
+        let cache_recording = is_decode && model.replay_constants().is_some();
+        let cmd = if cache_recording {
+            self.decode_command_buffer
+        } else {
+            self.command_buffer
+        };
+
+        // Either path resets everything: a stale `decode_cache` would
+        // bind to scratch ranges we're about to recycle.
+        self.decode_cache = None;
         self.scratch.reset();
         self.descriptors.reset(&self.device)?;
 
-        // Reserve the DecodeDyn slot before the model/sampler record anything
-        // else — see comment in `forward` above.
         let decode_dyn_range = {
             let off = self.scratch.alloc(decode_dyn::DecodeDyn::SIZE)?;
             BufferRange {
@@ -279,52 +503,51 @@ impl Engine {
         unsafe {
             self.device
                 .device
-                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device
-                .device
-                .begin_command_buffer(self.command_buffer, &begin)?;
+            self.device.device.begin_command_buffer(cmd, &begin)?;
         }
         #[cfg(feature = "profile_gpu")]
-        self.profile.reset(&self.device, self.command_buffer);
+        self.profile.reset(&self.device, cmd);
 
-        let (token_range, taps, n_dispatches) = {
+        let replay_plan_init = if cache_recording {
+            Some(decode_dyn::ReplayPlan {
+                decode_dyn_offset: decode_dyn_range.offset,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
+        let (token_range, taps, n_dispatches, captured_plan) = {
             let mut ctx = DispatchContext {
                 device: &self.device,
-                weights,
+                weights: model.weights(),
                 scratch: &mut self.scratch,
                 pipelines: &mut self.pipelines,
                 descriptors: &self.descriptors,
-                cmd: self.command_buffer,
+                cmd,
                 taps: Vec::new(),
                 n_dispatches: 0,
                 n_barriers: 0,
                 decode_dyn: decode_dyn_range,
+                replay_plan: replay_plan_init,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
-            let logits = record_logits(&mut ctx)?;
+            let logits = model.record_forward(&mut ctx, cache, tokens, position_offset)?;
             let r = sampler.record_chain(&mut ctx, logits)?;
-            (r, ctx.taps, ctx.n_dispatches)
+            (r, ctx.taps, ctx.n_dispatches, ctx.replay_plan)
         };
-        // Emit a closing timestamp so the last region (Sampler) gets
-        // a duration in the readback pair-walk. Any BlockClass works
-        // for the trailing mark — the host walker assigns durations to
-        // `marks[i]`, never to the final entry.
         #[cfg(feature = "profile_gpu")]
-        self.profile.mark(
-            &self.device,
-            self.command_buffer,
-            profile::BlockClass::Sampler,
-        );
+        self.profile.mark(&self.device, cmd, profile::BlockClass::Sampler);
         let t_record = t0.map(|t| t.elapsed());
 
         unsafe {
-            self.device.device.end_command_buffer(self.command_buffer)?;
+            self.device.device.end_command_buffer(cmd)?;
             self.device.device.reset_fences(&[self.fence])?;
-            let submit = vk::SubmitInfo::default()
-                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
             self.device
                 .device
                 .queue_submit(self.device.queue, &[submit], self.fence)?;
@@ -347,8 +570,6 @@ impl Engine {
             let src = host_ptr.add(token_range.offset as usize) as *const u32;
             std::ptr::read(src)
         };
-        // Print tap summaries (same logic as in `forward`). Used for diff
-        // dumps vs llama.cpp's cb() callback.
         for (name, range) in &taps {
             if range.size % 4 != 0 {
                 eprintln!("TAP {name}: size {} not 4-byte aligned, skipping", range.size);
@@ -366,6 +587,31 @@ impl Engine {
             println!("TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]", range.offset, head.join(", "));
         }
         sampler.accept(token);
+
+        // Stash the recording so subsequent matching decodes can replay.
+        if cache_recording {
+            if let (Some((k_num, blocks_per_split)), Some(mc), Some(plan)) =
+                (want_grid, model.replay_constants(), captured_plan)
+            {
+                if plan.token_buf_offset.is_some()
+                    && plan.positions_buf_offset.is_some()
+                    && plan.sampler_output_offset.is_some()
+                {
+                    let kv_after = position_offset + tokens.len() as u32;
+                    self.decode_cache = Some(DecodeCache {
+                        sampler_config_hash: want_config_hash,
+                        shape_key: 0,
+                        kv_len: kv_after,
+                        k_num,
+                        blocks_per_split,
+                        plan,
+                        model_constants: mc,
+                    });
+                    self.decode_scratch_cursor = self.scratch.cursor;
+                }
+            }
+        }
+
         if let (Some(rec), Some(wait)) = (t_record, t_wait) {
             let total = t0.unwrap().elapsed();
             let bc = crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.get());

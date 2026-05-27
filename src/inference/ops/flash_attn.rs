@@ -41,7 +41,22 @@ const FA_SPLIT_CORE_COUNT_FALLBACK: u32 = 16;
 /// where the host changes only the indirect-dispatch wg count between
 /// submits. On qwen35moe Strix Halo decode the heuristic naturally
 /// saturates at ~8 (target=80 / base_wgs=10); 16 leaves headroom.
-const FA_MAX_K_NUM: u32 = 16;
+pub const FA_MAX_K_NUM: u32 = 16;
+
+/// Same heuristic as `pick_k_num`, clamped to `FA_MAX_K_NUM`. Used by
+/// the Engine to decide whether a cached decode cmdbuf can be replayed
+/// for the current `kv` — the wg count is baked into the cmdbuf via
+/// `cmd_update_buffer`, so we have to re-record when the heuristic
+/// would now pick a different value.
+pub fn pick_k_num_clamped(shader_core_count: u32, base_wgs: u32, kv: u32) -> (u32, u32) {
+    let (k, bps) = pick_k_num(shader_core_count, base_wgs, kv);
+    if k <= FA_MAX_K_NUM {
+        (k, bps)
+    } else {
+        let num_blocks = kv.div_ceil(FA_BC).max(1);
+        (FA_MAX_K_NUM, num_blocks.div_ceil(FA_MAX_K_NUM))
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct FlashAttnParams {
@@ -158,28 +173,17 @@ pub fn record(
     let nb22 = v.element_stride[2] as u32;
     let nb23 = v.element_stride[3] as u32;
 
-    // ---- split-K decode heuristic (replicates llama.cpp) ----
+    // ---- split-K decode heuristic (replicates llama.cpp, clamped to FA_MAX_K_NUM) ----
     let base_wgs = n * ne2 * ne3;
-    let (k_num_raw, blocks_per_split_raw) =
-        pick_k_num(ctx.device.shader_core_count, base_wgs, kv);
-    // Clamp to FA_MAX_K_NUM so the partials buffer can be sized once at
-    // the upper bound and the cmdbuf bindings stay constant across
-    // decode tokens. We re-derive `blocks_per_split` after clamping so
-    // the splits still cover the full KV.
-    let (k_num, blocks_per_split) = if k_num_raw <= FA_MAX_K_NUM {
-        (k_num_raw, blocks_per_split_raw)
-    } else {
-        let num_blocks = kv.div_ceil(FA_BC).max(1);
-        let bps = num_blocks.div_ceil(FA_MAX_K_NUM);
-        (FA_MAX_K_NUM, bps)
-    };
+    let (k_num, blocks_per_split) =
+        pick_k_num_clamped(ctx.device.shader_core_count, base_wgs, kv);
     // Mirror kv/k_num/blocks_per_split into the per-forward DecodeDyn
     // slot. The shader reads them from there so the recorded cmdbuf
     // is replay-stable (host overwrites these fields between submits
     // when the persistent-decode-cmdbuf path activates).
-    crate::inference::decode_dyn::write_field(ctx, ctx.decode_dyn, 0, kv)?;
-    crate::inference::decode_dyn::write_field(ctx, ctx.decode_dyn, 4, k_num)?;
-    crate::inference::decode_dyn::write_field(ctx, ctx.decode_dyn, 8, blocks_per_split)?;
+    crate::inference::decode_dyn::write_field_ctx(ctx, ctx.decode_dyn, 0, kv)?;
+    crate::inference::decode_dyn::write_field_ctx(ctx, ctx.decode_dyn, 4, k_num)?;
+    crate::inference::decode_dyn::write_field_ctx(ctx, ctx.decode_dyn, 8, blocks_per_split)?;
 
     // Pack push.
     let mut push = [0u8; FA_PUSH_BYTES as usize];
@@ -368,7 +372,7 @@ pub fn record(
 /// llama.cpp's Intel-Alchemist `×2` multiplier — irrelevant on this path.)
 ///
 /// `SEEKER_FA_SPLIT=0` disables splitting; `SEEKER_FA_SPLIT_KNUM=<n>` pins it.
-fn pick_k_num(shader_core_count: u32, base_wgs: u32, kv: u32) -> (u32, u32) {
+pub fn pick_k_num(shader_core_count: u32, base_wgs: u32, kv: u32) -> (u32, u32) {
     let num_blocks = kv.div_ceil(FA_BC).max(1);
     if std::env::var("SEEKER_FA_SPLIT").is_ok_and(|v| v == "0") {
         return (1, num_blocks);

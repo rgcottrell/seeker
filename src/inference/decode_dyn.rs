@@ -68,32 +68,81 @@ pub fn write(
     Ok(())
 }
 
-/// Host-write a single field of an already-allocated `DecodeDyn` slot
-/// (cheaper than re-writing the whole struct when only one value
-/// changed, e.g. the sampler updating `uniform_rng` after the model
-/// finished setting the cache-related fields).
-pub fn write_field<T: Copy>(
+/// Host-write a single field of an already-allocated `DecodeDyn` slot.
+/// Two-argument shape used during recording when the dispatch context
+/// owns the scratch region. The bare-pointer overload below
+/// ([`write_field`] free function) is used by the replay path which
+/// has already resolved the mapped pointer.
+pub fn write_field_ctx<T: Copy>(
     ctx: &DispatchContext,
     range: BufferRange,
     field_offset: usize,
     value: T,
 ) -> Result<(), Box<dyn Error>> {
-    debug_assert!(field_offset + std::mem::size_of::<T>() <= DecodeDyn::SIZE as usize);
     let host_ptr = ctx
         .scratch
         .host_ptr
         .ok_or("scratch not host-visible — DecodeDyn requires mapped memory")?;
-    unsafe {
-        let dst = host_ptr.add(range.offset as usize + field_offset) as *mut T;
-        std::ptr::write(dst, value);
-    }
+    write_field(host_ptr, range.offset, field_offset, value);
     Ok(())
 }
 
-/// Byte offset of `uniform_rng` within `DecodeDyn`. Used for partial
-/// writes from the sampler after the model code has already populated
-/// the cache-related fields.
-pub const OFFSET_UNIFORM_RNG: usize = 16;
+/// Host-write a single field of an already-allocated `DecodeDyn` slot.
+/// Used by the replay path which has already resolved the mapped
+/// pointer once at the top of the call.
+pub fn write_field<T: Copy>(
+    host_ptr: *mut u8,
+    range_offset: u64,
+    field_offset: usize,
+    value: T,
+) {
+    debug_assert!(field_offset + std::mem::size_of::<T>() <= DecodeDyn::SIZE as usize);
+    unsafe {
+        let dst = host_ptr.add(range_offset as usize + field_offset) as *mut T;
+        std::ptr::write(dst, value);
+    }
+}
 
-/// Byte offset of `penalty_count`.
+/// Byte offsets of each field within `DecodeDyn`. Used by the replay
+/// path to host-write individual fields between submits.
+pub const OFFSET_KV_LEN: usize = 0;
+pub const OFFSET_K_NUM: usize = 4;
+pub const OFFSET_BLOCKS_PER_SPLIT: usize = 8;
+pub const OFFSET_ROPE_D_OFFSET: usize = 12;
+pub const OFFSET_UNIFORM_RNG: usize = 16;
 pub const OFFSET_PENALTY_COUNT: usize = 20;
+
+/// Snapshot of the scratch offsets and small constants captured during
+/// the first decode recording. Lets the host re-populate the same slots
+/// (token_buf, positions_buf, decode_dyn, penalty pairs) between
+/// subsequent submits of the cached decode command buffer.
+///
+/// Created by `Engine::forward_sampled` with `decode_dyn_offset` set
+/// and the rest of the fields `None`. The model fills `token_buf_offset`
+/// and `positions_buf_offset` at the top of its `record_forward`; the
+/// sampler fills `sampler_output_offset` (always) and `penalty_pairs`
+/// (if the chain recorded penalties). After recording, the Engine
+/// validates that every required field is populated.
+#[derive(Debug, Clone, Default)]
+pub struct ReplayPlan {
+    pub decode_dyn_offset: u64,
+    pub token_buf_offset: Option<u64>,
+    pub positions_buf_offset: Option<u64>,
+    pub sampler_output_offset: Option<u64>,
+    /// `(offset, max_pairs)` for the penalty-pairs scratch slot. None
+    /// if the sampler config has no penalties (apply_penalties wasn't
+    /// recorded).
+    pub penalty_pairs: Option<(u64, u32)>,
+}
+
+/// Per-model constants the host needs to drive the replay path.
+/// Returned by `Model::replay_constants`.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelReplayConstants {
+    /// `head_dim_k * n_head_kv` — multiplied by `position_offset` to
+    /// get the K-cache write offset (rope_d_offset).
+    pub rope_d_offset_per_position: u32,
+    /// Number of position axes in the M-RoPE positions buffer
+    /// (typically 4 for qwen35moe).
+    pub mrope_axes: u32,
+}

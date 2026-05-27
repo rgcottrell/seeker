@@ -155,7 +155,7 @@ fn record_sample_categorical(
     // Field 4 (uniform) is now sourced from DecodeDyn; leave the push slot at 0.
 
     // Mirror the host-drawn uniform into the per-forward DecodeDyn slot.
-    crate::inference::decode_dyn::write_field(
+    crate::inference::decode_dyn::write_field_ctx(
         ctx,
         ctx.decode_dyn,
         crate::inference::decode_dyn::OFFSET_UNIFORM_RNG,
@@ -170,6 +170,9 @@ fn record_sample_categorical(
     let block_size: u32 = 256;
 
     let out = ctx.alloc_scratch(4)?;
+    if let Some(plan) = ctx.replay_plan.as_mut() {
+        plan.sampler_output_offset = Some(out.offset);
+    }
     let key = PipelineKey::dense(
         "sample_categorical_f32",
         4,
@@ -223,6 +226,9 @@ pub fn record_greedy(
     // pairs. The reduce pass reinterprets the second slot as `asfloat`.
     let partials = ctx.alloc_scratch((num_wg as u64) * 2 * 4)?;
     let out = ctx.alloc_scratch(4)?;
+    if let Some(plan) = ctx.replay_plan.as_mut() {
+        plan.sampler_output_offset = Some(out.offset);
+    }
 
     // Pass 1: block-level argmax over the logits.
     let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
@@ -371,6 +377,9 @@ fn record_apply_penalties(
     // slots are zeroed so a future shader read past `penalty_count` (the
     // shader doesn't, but defensive) is harmless.
     let pairs_t = ctx.alloc_tensor([2 * max_pairs as u64, 1, 1, 1], GgmlType::I32)?;
+    if let Some(plan) = ctx.replay_plan.as_mut() {
+        plan.penalty_pairs = Some((pairs_t.byte_offset, max_pairs));
+    }
     let host_ptr = ctx
         .scratch
         .host_ptr
@@ -390,7 +399,7 @@ fn record_apply_penalties(
     }
 
     // Live pair count goes through DecodeDyn so cmdbuf is replay-stable.
-    crate::inference::decode_dyn::write_field(
+    crate::inference::decode_dyn::write_field_ctx(
         ctx,
         ctx.decode_dyn,
         crate::inference::decode_dyn::OFFSET_PENALTY_COUNT,

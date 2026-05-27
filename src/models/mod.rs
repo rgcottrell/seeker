@@ -44,6 +44,40 @@ pub trait Model: Send + Sync {
     /// Borrow the model's tokenizer (for prompt encoding / sampled-token
     /// decoding by callers).
     fn tokenizer(&self) -> &TokenizerBundle;
+
+    /// Per-model constants the engine needs to drive the
+    /// persistent-decode-cmdbuf replay path. Returns `None` when the
+    /// model doesn't support replay yet (default).
+    fn replay_constants(&self) -> Option<crate::inference::decode_dyn::ModelReplayConstants> {
+        None
+    }
+
+    /// The (k_num, blocks_per_split) the model would feed into
+    /// flash_attn for the upcoming decode call. Engine uses this both
+    /// to decide whether a cached decode cmdbuf can be replayed (it
+    /// compares against the captured pair) and to re-stamp DecodeDyn
+    /// on the replay path. None means the model doesn't support replay
+    /// (default).
+    fn decode_grid(&self, _kv: u32, _shader_core_count: u32) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Refresh the host-side scratch slots a cached decode cmdbuf reads
+    /// from before each replay submit. Mirrors the work that
+    /// `record_forward` would have done on a fresh-record path —
+    /// writing the new input token, the M-RoPE position values, etc. —
+    /// without re-recording any GPU dispatches. Default returns an
+    /// error so non-replay-capable models can't be silently mis-driven.
+    fn refresh_replay_inputs(
+        &self,
+        _host_ptr: *mut u8,
+        _plan: &crate::inference::decode_dyn::ReplayPlan,
+        _tokens: &[u32],
+        _position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        Err("model does not support decode replay".into())
+    }
+
     /// Record a forward pass into `ctx`'s command buffer.
     ///
     /// `tokens` are the new tokens being added at absolute positions

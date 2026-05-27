@@ -263,6 +263,61 @@ impl Model for Qwen35MoeModel {
         &self.tokenizer
     }
 
+    fn replay_constants(&self) -> Option<crate::inference::decode_dyn::ModelReplayConstants> {
+        Some(crate::inference::decode_dyn::ModelReplayConstants {
+            rope_d_offset_per_position: self.params.head_dim_k * self.params.n_head_kv,
+            mrope_axes: 4,
+        })
+    }
+
+    fn decode_grid(&self, kv: u32, shader_core_count: u32) -> Option<(u32, u32)> {
+        // L=1 for decode → base_wgs = n_head (= ne2 of the FA dispatch).
+        // The cached cmdbuf bakes the flash_attn split-K wg count via
+        // cmd_update_buffer, so the (k_num, blocks_per_split) pair is
+        // the canonical "graph shape" the Engine compares against.
+        let base_wgs = self.params.n_head;
+        Some(crate::inference::ops::flash_attn::pick_k_num_clamped(
+            shader_core_count,
+            base_wgs,
+            kv,
+        ))
+    }
+
+    fn refresh_replay_inputs(
+        &self,
+        host_ptr: *mut u8,
+        plan: &crate::inference::decode_dyn::ReplayPlan,
+        tokens: &[u32],
+        position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let token_off = plan
+            .token_buf_offset
+            .ok_or("replay plan missing token_buf_offset")?;
+        let pos_off = plan
+            .positions_buf_offset
+            .ok_or("replay plan missing positions_buf_offset")?;
+        // SAFETY: host_ptr is the mapped pointer of the host-coherent
+        // scratch region; both offsets were captured during the
+        // recording pass into that same region.
+        unsafe {
+            let tok_dst = host_ptr.add(token_off as usize) as *mut u32;
+            for (i, &t) in tokens.iter().enumerate() {
+                std::ptr::write(tok_dst.add(i), t);
+            }
+            // M-RoPE positions: 4 axes × L tokens. Each axis gets the
+            // same linear sequence (text-only inference — see
+            // `record_forward` for the same layout at record time).
+            let l = tokens.len();
+            let pos_dst = host_ptr.add(pos_off as usize) as *mut u32;
+            for axis in 0..4usize {
+                for i in 0..l {
+                    std::ptr::write(pos_dst.add(axis * l + i), position_offset + i as u32);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn record_forward(
         &self,
         ctx: &mut DispatchContext,
@@ -313,6 +368,14 @@ impl Model for Qwen35MoeModel {
             }
         }
         write_u32(ctx, positions_buf, &positions)?;
+
+        // Snapshot the replay-input offsets so the persistent-decode-cmdbuf
+        // path can re-write these slots between submits via
+        // `refresh_replay_inputs`.
+        if let Some(plan) = ctx.replay_plan.as_mut() {
+            plan.token_buf_offset = Some(token_buf.offset);
+            plan.positions_buf_offset = Some(positions_buf.offset);
+        }
 
         // Single-token decode (l == 1) needs no mask: every KV slot is
         // causally visible, so flash_attn runs with MASK_ENABLE=0 and we skip

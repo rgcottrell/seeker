@@ -264,9 +264,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     for step in 0..args.max_tokens {
         let position_offset = cache.position;
         let t0 = std::time::Instant::now();
-        let next_id = engine.forward_sampled(model.weights(), &mut sampler, |ctx| {
-            model.record_forward(ctx, &mut cache, &step_tokens, position_offset)
-        })?;
+        let next_id = engine.forward_sampled(&*model, &mut cache, &step_tokens, position_offset, &mut sampler)?;
         let elapsed = t0.elapsed().as_secs_f64();
         if step == 0 {
             prefill_secs = elapsed;
