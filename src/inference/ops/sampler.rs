@@ -97,34 +97,69 @@ pub fn record_chain(
     record_categorical(ctx, temped, candidates, uniform)
 }
 
-/// Wrap `argmax.slang` for a single-row argmax over the vocab. Output is a
-/// 4-byte slot holding the picked token id as `i32` (reinterpret as `u32`
-/// on the host — valid token ids are non-negative).
+/// Two-pass parallel argmax over a single row of vocab-sized logits.
+///
+/// Pass 1 (`argmax_block_f32`): each WG of 256 threads handles 1024
+/// elements (4 per thread), shared-mem-reduces to a single `(idx,
+/// value)` pair, writes one int2 to the partials buffer.
+/// Pass 2 (`argmax_reduce_f32`): one WG reduces the ~243 partials into
+/// the final int token id.
+///
+/// This replaces the old single-WG / 32-thread `argmax.slang`, which
+/// strided 7,750 elements per lane on one CU — ~1 ms of decode time
+/// burned on the slowest part of the sampler chain. The two-pass
+/// version saturates all 40 CUs in pass 1; total cost is in the tens
+/// of microseconds.
 pub fn record_greedy(
     ctx: &mut DispatchContext,
     logits: TensorView,
 ) -> Result<BufferRange, Box<dyn Error>> {
     debug_assert_eq!(logits.dtype, GgmlType::F32);
 
-    let kx: u32 = logits.dims[0] as u32;
-    let ky: u32 = 1;
+    const BLOCK_SIZE: u32 = 256;
+    const ELEMS_PER_THREAD: u32 = 4;
+    const ELEMS_PER_WG: u32 = BLOCK_SIZE * ELEMS_PER_THREAD; // 1024
 
+    let kx: u32 = logits.dims[0] as u32;
+    let num_wg = kx.div_ceil(ELEMS_PER_WG);
+
+    // Partials buffer: `[num_wg, 2]` ints = `(global_index, asint(value))`
+    // pairs. The reduce pass reinterprets the second slot as `asfloat`.
+    let partials = ctx.alloc_scratch((num_wg as u64) * 2 * 4)?;
     let out = ctx.alloc_scratch(4)?;
 
+    // Pass 1: block-level argmax over the logits.
     let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
     push[0..4].copy_from_slice(&kx.to_ne_bytes());
-    push[4..8].copy_from_slice(&ky.to_ne_bytes());
-
-    let key = PipelineKey::dense("argmax_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    push[4..8].copy_from_slice(&1u32.to_ne_bytes()); // KY (unused)
+    let key = PipelineKey::dense("argmax_block_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
     let pipeline = *ctx
         .pipelines
-        .get(ctx.device, key, shaders::ARGMAX_F32_SPV.as_bytes())?;
+        .get(ctx.device, key, shaders::ARGMAX_BLOCK_F32_SPV.as_bytes())?;
     super::bind_and_dispatch(
         ctx,
         &pipeline,
         &[0, 1],
-        &[logits.range(), out],
+        &[logits.range(), partials],
         &push,
+        [num_wg, 1, 1],
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, partials);
+
+    // Pass 2: reduce the per-WG partials into the final token id.
+    let mut reduce_push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    reduce_push[0..4].copy_from_slice(&num_wg.to_ne_bytes()); // KX = N partials
+    reduce_push[4..8].copy_from_slice(&1u32.to_ne_bytes());
+    let reduce_key = PipelineKey::dense("argmax_reduce_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    let reduce_pipeline = *ctx
+        .pipelines
+        .get(ctx.device, reduce_key, shaders::ARGMAX_REDUCE_F32_SPV.as_bytes())?;
+    super::bind_and_dispatch(
+        ctx,
+        &reduce_pipeline,
+        &[0, 1],
+        &[partials, out],
+        &reduce_push,
         [1, 1, 1],
     )?;
     record_compute_barrier(ctx.device, ctx.cmd, out);
