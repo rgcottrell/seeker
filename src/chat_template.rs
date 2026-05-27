@@ -180,10 +180,38 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// A single conversation turn. Mirrors the OpenAI-flavored shape that real
 /// chat templates iterate over. `tool_calls` / multi-modal content are out
 /// of scope here — add them when the first model that needs them lands.
+///
+/// `reasoning_content` holds a thinking/reasoning model's chain-of-thought
+/// separately from the final `content`. Reasoning templates (e.g. Qwen3)
+/// read `message.reasoning_content` directly and decide per-turn whether to
+/// re-include it. It's omitted from serialization when `None`, so messages
+/// without reasoning render exactly as a plain `{role, content}`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+impl ChatMessage {
+    /// A user turn (never carries reasoning).
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: content.into(),
+            reasoning_content: None,
+        }
+    }
+
+    /// An assistant turn, optionally with its reasoning split out.
+    pub fn assistant(content: impl Into<String>, reasoning_content: Option<String>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+            reasoning_content,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -289,10 +317,7 @@ mod tests {
 
     #[test]
     fn smollm2_template_injects_default_system_and_assistant_opener() {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hello".to_string(),
-        }];
+        let messages = vec![ChatMessage::user("Hello")];
         let out = render(
             SMOLLM2_TEMPLATE,
             &messages,
@@ -310,8 +335,12 @@ mod tests {
     #[test]
     fn explicit_system_message_skips_default() {
         let messages = vec![
-            ChatMessage { role: "system".into(), content: "Be terse.".into() },
-            ChatMessage { role: "user".into(), content: "hi".into() },
+            ChatMessage {
+                role: "system".into(),
+                content: "Be terse.".into(),
+                reasoning_content: None,
+            },
+            ChatMessage::user("hi"),
         ];
         let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "", &serde_json::Map::new())
             .expect("render");
@@ -321,10 +350,7 @@ mod tests {
 
     #[test]
     fn add_generation_prompt_false_omits_assistant_opener() {
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: "hi".into(),
-        }];
+        let messages = vec![ChatMessage::user("hi")];
         let out = render(SMOLLM2_TEMPLATE, &messages, false, "", "", &serde_json::Map::new())
             .expect("render");
         assert!(!out.contains("<|im_start|>assistant\n"), "{out:?}");

@@ -72,9 +72,16 @@ fn convert_messages(raw: &[serde_json::Value]) -> Result<Vec<ChatMessage>, Strin
                 .get("content")
                 .and_then(|c| c.as_str())
                 .ok_or_else(|| "message `content` must be a plain string for now".to_string())?;
+            // Accept an optional `reasoning_content` (OpenAI/DeepSeek-style)
+            // so reasoning templates can re-render prior thinking when asked.
+            let reasoning_content = v
+                .get("reasoning_content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
             Ok(ChatMessage {
                 role: role.to_string(),
                 content: content.to_string(),
+                reasoning_content,
             })
         })
         .collect()

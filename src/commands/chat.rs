@@ -4,6 +4,7 @@
 //! `--hf-*` or `-m/--model PATH`). KV cache persists across turns; the
 //! sampler's RNG / recent-token state survives `/clear`.
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
@@ -11,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::highlight::{CmdKind, Highlighter};
+use rustyline::{Completer, Editor, Helper, Hinter, Validator};
 
 use crate::chat_template::{self, ChatMessage};
 use crate::commands::download::{resolve_hf, HfResolveArgs};
@@ -193,6 +195,11 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         eos_ids.push(id);
     }
 
+    // Reasoning-model think markers, if present (single special tokens for
+    // Qwen3-style models). Used to split reasoning from the final answer.
+    let think_open_id = model.tokenizer().tokenizer.token_to_id("<think>");
+    let think_close_id = model.tokenizer().tokenizer.token_to_id("</think>");
+
     let mut session = ChatSession {
         engine,
         model,
@@ -202,6 +209,8 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         prior_tokens: Vec::new(),
         chat_template,
         eos_ids,
+        think_open_id,
+        think_close_id,
         max_tokens: args.max_tokens,
         template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
     };
@@ -254,6 +263,12 @@ struct ChatSession {
     chat_template: String,
     /// Tokens that terminate an assistant reply (GGUF `eos_token_id`).
     eos_ids: Vec<u32>,
+    /// `<think>` / `</think>` token ids, when the model has them. Used to
+    /// split a reply's reasoning from its final answer (for coloring and for
+    /// storing `reasoning_content` separately). `None` for non-reasoning
+    /// models, in which case the whole reply is treated as the final answer.
+    think_open_id: Option<u32>,
+    think_close_id: Option<u32>,
     max_tokens: u32,
     /// Extra template-context variables from `--chat-template-kwargs`,
     /// merged into every render (override the built-in variables). Carries
@@ -272,6 +287,70 @@ struct ReplyStats {
     decode_secs: f64,
 }
 
+/// Which part of a streamed reply a piece belongs to — drives its color.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Segment {
+    Thinking,
+    Final,
+}
+
+// ANSI styling, brightness-separated so it reads for any color vision: user
+// input is bold (bright) cyan, reasoning is dim/faint, the final answer is the
+// terminal's normal default. User input is colored via the rustyline
+// highlighter (`ChatHelper`); the streamed reply uses these directly.
+const C_USER: &str = "\x1b[1;36m"; // bold cyan
+const C_THINK: &str = "\x1b[2m"; // dim / faint
+const C_RESET: &str = "\x1b[0m";
+
+/// Color is emitted only to a real terminal, and suppressed when `NO_COLOR`
+/// is set (see https://no-color.org).
+fn color_enabled() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// True when the rendered prompt left a `<think>` block open (the assistant
+/// opener starts inside thinking), so the model's first generated tokens are
+/// reasoning even though the opening tag isn't part of the stream.
+fn prompt_opens_think(rendered: &str) -> bool {
+    match (rendered.rfind("<think>"), rendered.rfind("</think>")) {
+        (Some(open), Some(close)) => open > close,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// rustyline line-editor helper: colors the prompt and the text being typed
+/// in the user color. Completion / hints / validation are the default no-ops.
+#[derive(Completer, Helper, Hinter, Validator)]
+struct ChatHelper;
+
+impl Highlighter for ChatHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if line.is_empty() || !color_enabled() {
+            Cow::Borrowed(line)
+        } else {
+            Cow::Owned(format!("{C_USER}{line}{C_RESET}"))
+        }
+    }
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        if color_enabled() {
+            Cow::Owned(format!("{C_USER}{prompt}{C_RESET}"))
+        } else {
+            Cow::Borrowed(prompt)
+        }
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
+        // Re-highlight on every edit so the whole input line stays colored.
+        color_enabled()
+    }
+}
+
 impl ChatSession {
     /// Push a user turn, render + tokenize, decode the assistant reply, and
     /// store the turn. `on_text` fires once per sampled token with the
@@ -281,12 +360,9 @@ impl ChatSession {
     fn handle_user_message(
         &mut self,
         text: &str,
-        mut on_text: impl FnMut(&str),
+        mut on_text: impl FnMut(&str, Segment),
     ) -> Result<ReplyStats, Box<dyn Error>> {
-        self.messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: text.to_string(),
-        });
+        self.messages.push(ChatMessage::user(text));
 
         let bundle = self.model.tokenizer();
         let bos = bundle.bos_token.as_deref().unwrap_or("");
@@ -359,6 +435,11 @@ impl ChatSession {
         let mut decode_secs = 0.0f64;
         let mut forwards = 0usize;
         let mut assistant_tokens: Vec<u32> = Vec::new();
+        // Reasoning state: the prompt's assistant opener may already be inside
+        // a `<think>` block (Qwen3 with thinking on), so seed from it; flips
+        // are then driven by the think token ids below.
+        let mut in_think = prompt_opens_think(&rendered);
+        let mut think_close_at: Option<usize> = None;
         let mut stream = self
             .model
             .tokenizer()
@@ -396,13 +477,32 @@ impl ChatSession {
             }
             assistant_tokens.push(token);
 
+            // Token-level think transitions detected by id (the boundary is
+            // only reliable here, not in the decoded text). The marker tokens
+            // belong to the reasoning region, so a piece is dimmed if we were
+            // in think before this token OR still are after it — that keeps a
+            // visible `</think>` dimmed with the reasoning rather than the
+            // answer.
+            let was_in_think = in_think;
+            if Some(token) == self.think_open_id {
+                in_think = true;
+            } else if Some(token) == self.think_close_id {
+                in_think = false;
+                think_close_at = Some(assistant_tokens.len() - 1);
+            }
+            let seg = if was_in_think || in_think {
+                Segment::Thinking
+            } else {
+                Segment::Final
+            };
+
             // Stream emit: `step` buffers partial UTF-8 internally and
             // returns `Some(piece)` only once one or more complete chars
             // are ready. Errors are rare (the tokenizer succeeds on its
             // own outputs); on the off-chance we hit one, skip the emit
             // — the next step's output will catch up.
             if let Ok(Some(piece)) = stream.step(token) {
-                on_text(&piece);
+                on_text(&piece, seg);
             }
 
             if assistant_tokens.len() as u32 >= self.max_tokens {
@@ -411,20 +511,33 @@ impl ChatSession {
             step_tokens = vec![token];
         }
 
-        // Final reply — same decode used for streaming, but we want the
-        // canonical string for storage. (When EOS was sampled the per-loop
-        // emit skipped it, so this matches what the user saw.)
-        let reply = self
-            .model
-            .tokenizer()
-            .tokenizer
-            .decode(&assistant_tokens, /* skip_special_tokens = */ true)
-            .map_err(|e| format!("decode failed: {e}"))?;
+        // Split the reply into final answer + reasoning at the `</think>`
+        // token (when one was emitted). `decode` with skip_special_tokens
+        // drops the think markers and EOS from each half. Storing reasoning
+        // in its own field lets reasoning templates (Qwen3) decide per-turn
+        // whether to re-include it — by default they drop it from older turns
+        // (override with `--chat-template-kwargs '{"preserve_thinking":true}'`).
+        let tok = &self.model.tokenizer().tokenizer;
+        let decode = |ids: &[u32]| {
+            tok.decode(ids, /* skip_special_tokens = */ true)
+                .map_err(|e| format!("decode failed: {e}"))
+        };
+        let (content, reasoning_content) = match think_close_at {
+            Some(c) => {
+                let reasoning = decode(&assistant_tokens[..c])?;
+                let answer = decode(&assistant_tokens[c + 1..])?;
+                let reasoning = reasoning.trim();
+                let r = (!reasoning.is_empty()).then(|| reasoning.to_string());
+                (answer, r)
+            }
+            // No closed think block (non-reasoning model, thinking disabled, or
+            // the budget ran out mid-thought): keep the whole reply as the
+            // answer so nothing is lost.
+            None => (decode(&assistant_tokens)?, None),
+        };
 
-        self.messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: reply,
-        });
+        self.messages
+            .push(ChatMessage::assistant(content, reasoning_content));
 
         // The cache holds K/V for every token whose forward we *fed* —
         // that's the rendered prompt plus all but the most-recently
@@ -567,7 +680,8 @@ fn run_interactive(
     path: &Path,
     history: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut editor = DefaultEditor::new()?;
+    let mut editor = Editor::new()?;
+    editor.set_helper(Some(ChatHelper));
     if let Some(p) = history {
         if let Err(e) = editor.load_history(p) {
             tracing::debug!(path = %p.display(), error = %e, "history load");
@@ -631,8 +745,14 @@ fn run_piped(session: &mut ChatSession) -> Result<(), Box<dyn Error>> {
 fn emit_reply(session: &mut ChatSession, line: &str) {
     println!(); // blank line between the input and the reply
     let _ = std::io::stdout().flush();
-    let result = session.handle_user_message(line, |delta| {
-        print!("{delta}");
+    let color = color_enabled();
+    let result = session.handle_user_message(line, |delta, seg| {
+        // Reasoning is dimmed; the final answer uses the normal default color.
+        if color && seg == Segment::Thinking {
+            print!("{C_THINK}{delta}{C_RESET}");
+        } else {
+            print!("{delta}");
+        }
         let _ = std::io::stdout().flush();
     });
     match result {
@@ -678,5 +798,22 @@ fn handle_read(session: &mut ChatSession, path: &str) {
             emit_reply(session, trimmed);
         }
         Err(e) => println!("/read failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_opens_think;
+
+    #[test]
+    fn prompt_opens_think_detects_open_block() {
+        // Qwen3 thinking-on: assistant opener ends with an unclosed `<think>`.
+        assert!(prompt_opens_think("<|im_start|>assistant\n<think>\n"));
+        // Open then closed again (thinking disabled → empty block) is closed.
+        assert!(!prompt_opens_think("<think>\n\n</think>\n\n"));
+        // A prior closed turn followed by a new open block is open.
+        assert!(prompt_opens_think("<think>\na\n</think>\nb<|im_start|>assistant\n<think>\n"));
+        // No think markers at all (e.g. Llama) → closed.
+        assert!(!prompt_opens_think("<|im_start|>assistant\n"));
     }
 }
