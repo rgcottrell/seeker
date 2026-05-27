@@ -51,6 +51,66 @@ pub fn record_dispatch(
     }
 }
 
+/// Push-descriptor variant of [`record_dispatch_indirect`]: bindings
+/// inline, dispatch grid read from a buffer at submit time via
+/// `vkCmdDispatchIndirect`. Used by ops whose grid dimension depends on
+/// a per-token value (flash_attn split-K count) so the recorded cmdbuf
+/// stays replay-stable — host updates the 12-byte (wg_x, wg_y, wg_z)
+/// slot before each replay.
+pub fn record_dispatch_indirect(
+    device: &Device,
+    cmd: vk::CommandBuffer,
+    pipeline: &CachedPipeline,
+    binding_indices: &[u32],
+    bindings: &[crate::inference::buffer::BufferRange],
+    push: &[u8],
+    indirect: BufferRange,
+) {
+    debug_assert_eq!(binding_indices.len(), bindings.len());
+    debug_assert!(indirect.size >= 12, "indirect dispatch slot must hold 3×u32");
+    const MAX: usize = 8;
+    debug_assert!(bindings.len() <= MAX, "raise MAX in record_dispatch_indirect");
+    let mut infos: [vk::DescriptorBufferInfo; MAX] = [vk::DescriptorBufferInfo::default(); MAX];
+    let mut writes: [vk::WriteDescriptorSet<'_>; MAX] = [vk::WriteDescriptorSet::default(); MAX];
+    let n = bindings.len();
+    for i in 0..n {
+        infos[i] = bindings[i].descriptor_info();
+    }
+    for i in 0..n {
+        writes[i] = vk::WriteDescriptorSet::default()
+            .dst_binding(binding_indices[i])
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&infos[i]));
+    }
+    let writes = &writes[..n];
+    unsafe {
+        device.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            pipeline.pipeline,
+        );
+        device.device.cmd_push_descriptor_set(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            pipeline.layout,
+            0,
+            writes,
+        );
+        if !push.is_empty() {
+            device.device.cmd_push_constants(
+                cmd,
+                pipeline.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push,
+            );
+        }
+        device
+            .device
+            .cmd_dispatch_indirect(cmd, indirect.buffer, indirect.offset);
+    }
+}
+
 /// Push-descriptor dispatch path (Vulkan 1.4 core). Builds the
 /// descriptor writes inline and emits `vkCmdPushDescriptorSet` instead
 /// of allocating a set from the pool — saves one

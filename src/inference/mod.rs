@@ -60,10 +60,13 @@ impl Engine {
         // Scratch is host-visible + device-local. On Apple Silicon (unified
         // memory) this maps trivially; on discrete GPUs with BAR/ReBAR this
         // also works. If neither is available we'd need a staging path.
+        // INDIRECT_BUFFER lets us point `vkCmdDispatchIndirect` at slots
+        // inside scratch (flash_attn split-K grid lives here so the
+        // recorded cmdbuf is replay-stable).
         let scratch = Region::new(
             &device,
             scratch_bytes,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 

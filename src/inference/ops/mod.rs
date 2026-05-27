@@ -18,7 +18,7 @@ pub mod ssm;
 use std::error::Error;
 
 use crate::inference::buffer::BufferRange;
-use crate::inference::command::{record_dispatch, record_dispatch_push};
+use crate::inference::command::{record_dispatch, record_dispatch_indirect, record_dispatch_push};
 use crate::inference::context::DispatchContext;
 use crate::inference::pipeline::CachedPipeline;
 use crate::inference::weights::TensorView;
@@ -60,6 +60,37 @@ pub fn bind_and_dispatch(
         )?;
         record_dispatch(ctx.device, ctx.cmd, pipeline, set, push, workgroups);
     }
+    ctx.n_dispatches += 1;
+    Ok(())
+}
+
+/// Indirect-dispatch variant of [`bind_and_dispatch`]. The workgroup
+/// count is read from `indirect` (a `BufferRange` holding three packed
+/// `u32`s) at submit time, so the dispatch grid can vary per token
+/// without re-recording the cmdbuf. Push-descriptor only — the
+/// descriptor-pool fallback path doesn't need this yet.
+pub fn bind_and_dispatch_indirect(
+    ctx: &mut DispatchContext,
+    pipeline: &CachedPipeline,
+    binding_indices: &[u32],
+    bindings: &[BufferRange],
+    push: &[u8],
+    indirect: BufferRange,
+) -> Result<(), Box<dyn Error>> {
+    if !ctx.device.push_descriptor {
+        return Err(
+            "bind_and_dispatch_indirect requires push_descriptor; Vulkan 1.4 path only".into(),
+        );
+    }
+    record_dispatch_indirect(
+        ctx.device,
+        ctx.cmd,
+        pipeline,
+        binding_indices,
+        bindings,
+        push,
+        indirect,
+    );
     ctx.n_dispatches += 1;
     Ok(())
 }
