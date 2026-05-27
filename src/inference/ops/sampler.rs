@@ -73,6 +73,29 @@ pub fn record_chain(
         (logits, None)
     };
 
+    // Fast path: when top_k actually shrunk the candidate set to a
+    // small `k ≤ FUSED_K_CAP`, fold top_p / min_p / temperature scale
+    // / softmax / cumsum / sample into one workgroup
+    // (`sample_categorical.slang`). Replaces ~12 dispatches with a
+    // single one for the common chat config (top_k=40).
+    const FUSED_K_CAP: u64 = 256;
+    let k_actual = kept_logits.dims[0];
+    if let Some(cand) = candidates {
+        if k_actual <= FUSED_K_CAP {
+            return record_sample_categorical(
+                ctx,
+                kept_logits,
+                cand,
+                config.top_p,
+                config.min_p,
+                config.temperature,
+                uniform,
+            );
+        }
+    }
+
+    // Fallback (top_k disabled, or K > FUSED_K_CAP — neither happens
+    // on the default qwen35moe chat config).
     let kept_logits = if config.top_p < 1.0 && config.top_p > 0.0 {
         record_top_p(ctx, kept_logits, config.top_p)?
     } else {
@@ -95,6 +118,64 @@ pub fn record_chain(
     };
 
     record_categorical(ctx, temped, candidates, uniform)
+}
+
+/// Fused stochastic finalizer: takes sorted top-K logits +
+/// candidates and applies top_p / min_p / temperature / softmax /
+/// inverse-CDF sample in one workgroup. Replaces ~12 dispatches.
+fn record_sample_categorical(
+    ctx: &mut DispatchContext,
+    sorted_logits: TensorView,
+    candidates: TensorView,
+    top_p: f32,
+    min_p: f32,
+    temperature: f32,
+    uniform: f32,
+) -> Result<BufferRange, Box<dyn Error>> {
+    debug_assert_eq!(sorted_logits.dtype, GgmlType::F32);
+    debug_assert_eq!(candidates.dtype, GgmlType::I32);
+    let k: u32 = sorted_logits.dims[0] as u32;
+    assert!(k > 0 && k <= 256, "fused categorical requires 0 < k ≤ 256, got {k}");
+
+    // Push constants — must match the `CatParams` struct in
+    // `sample_categorical.slang`: u32 k + four f32s.
+    const PUSH_BYTES: u32 = 5 * 4;
+    let mut push = [0u8; PUSH_BYTES as usize];
+    push[0..4].copy_from_slice(&k.to_ne_bytes());
+    push[4..8].copy_from_slice(&(1.0f32 / temperature.max(1e-9)).to_ne_bytes());
+    push[8..12].copy_from_slice(&top_p.to_ne_bytes());
+    let log_min_p = if min_p > 0.0 { min_p.ln() } else { f32::NEG_INFINITY };
+    push[12..16].copy_from_slice(&log_min_p.to_ne_bytes());
+    push[16..20].copy_from_slice(&uniform.to_ne_bytes());
+
+    // Spec constants — fold off any filter that would be a no-op so
+    // the shader skips its barriers and shared-mem reductions.
+    let top_p_on = (top_p < 1.0 && top_p > 0.0) as u32;
+    let min_p_on = (min_p > 0.0) as u32;
+    let temp_on = ((temperature - 1.0).abs() > 1e-9) as u32;
+    let block_size: u32 = 256;
+
+    let out = ctx.alloc_scratch(4)?;
+    let key = PipelineKey::dense(
+        "sample_categorical_f32",
+        3,
+        PUSH_BYTES,
+        // Order in the shader: BLOCK_SIZE, TOP_P_ON, MIN_P_ON, TEMP_ON.
+        vec![block_size, top_p_on, min_p_on, temp_on],
+    );
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SAMPLE_CATEGORICAL_F32_SPV.as_bytes())?;
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[sorted_logits.range(), candidates.range(), out],
+        &push,
+        [1, 1, 1],
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, out);
+    Ok(out)
 }
 
 /// Two-pass parallel argmax over a single row of vocab-sized logits.
