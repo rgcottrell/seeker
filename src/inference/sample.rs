@@ -157,6 +157,11 @@ impl Sampler {
         ctx: &mut DispatchContext,
         logits: TensorView,
     ) -> Result<BufferRange, Box<dyn Error>> {
+        // Boundary marker — everything emitted from here until the
+        // next `mark(…)` (or end of forward) is attributed to
+        // BlockClass::Sampler. The final `forward_sampled` mark closes
+        // it implicitly via the pair-walk on host readback.
+        ctx.mark(super::profile::BlockClass::Sampler);
         let pairs = self.penalty_pairs();
         let uniform = if self.config.is_greedy() {
             0.0

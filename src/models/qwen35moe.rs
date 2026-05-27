@@ -328,6 +328,10 @@ impl Model for Qwen35MoeModel {
         let residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
         elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, l, residual)?;
         ctx.tap("input_embed", residual)?;
+        // Boundary marker: everything emitted from here until the
+        // next `mark(…)` is attributed to BlockClass::Embed. No-op
+        // unless the `profile_gpu` Cargo feature is set.
+        ctx.mark(crate::inference::profile::BlockClass::Embed);
 
         let layer_checkpoint = ctx.scratch_checkpoint();
 
@@ -371,6 +375,7 @@ impl Model for Qwen35MoeModel {
             // Used to bisect which block type contributes a bug.
             match block {
                 BlockWeights::Attention(att) if !skip_attn => {
+                    ctx.mark(crate::inference::profile::BlockClass::Attn);
                     attention_block(
                         ctx,
                         att,
@@ -399,6 +404,7 @@ impl Model for Qwen35MoeModel {
                     )?;
                 }
                 BlockWeights::Ssm(ssm_w) if !skip_ssm => {
+                    ctx.mark(crate::inference::profile::BlockClass::Ssm);
                     // Map block index to SSM-layer index (counting only SSM
                     // blocks). cache.ssm_gdn_states is indexed in SSM-layer
                     // order, not block order.
@@ -421,6 +427,7 @@ impl Model for Qwen35MoeModel {
             // unchanged. Used to isolate whether the MoE-FFN accumulation
             // chain (and not the prologue / epilogue) is the source of bugs.
             if !skip_moe {
+                ctx.mark(crate::inference::profile::BlockClass::MoE);
                 moe_ffn(ctx, block.moe(), block.post_attn_norm(), residual, p, hidden, l, layer_idx as u32)?;
             }
         }
@@ -445,10 +452,12 @@ impl Model for Qwen35MoeModel {
             element_stride: [1, hidden, hidden, hidden],
             dtype: residual.dtype,
         };
+        ctx.mark(crate::inference::profile::BlockClass::Epilogue);
         let final_norm = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
         rms_norm::record(ctx, residual_last, self.weights.output_norm, final_norm, p.rms_eps)?;
         ctx.tap("final_norm", final_norm)?;
 
+        ctx.mark(crate::inference::profile::BlockClass::LmHead);
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
         let last_logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
         matmul::record(ctx, lm_head, final_norm, last_logits)?;

@@ -32,6 +32,35 @@ pub struct DispatchContext<'a> {
     /// of `vkCmdDispatch` and `vkCmdPipelineBarrier` calls.
     pub n_dispatches: u32,
     pub n_barriers: u32,
+    /// GPU-timestamp recorder for per-block profiling. Present only
+    /// when the `profile_gpu` Cargo feature is enabled; in default
+    /// builds the field doesn't exist and the [`mark`] method
+    /// (defined below) is an `#[inline(always)]` no-op so call sites
+    /// emit no instructions.
+    ///
+    /// [`mark`]: DispatchContext::mark
+    #[cfg(feature = "profile_gpu")]
+    pub profile: Option<&'a mut super::profile::ProfileRecorder>,
+}
+
+impl<'a> DispatchContext<'a> {
+    /// Boundary marker — call once at the start of each high-level
+    /// block (attention/SSM/MoE/lm_head/etc.). The next `mark` closes
+    /// the previous region; consecutive timestamps form the
+    /// duration-per-class summary printed at end of forward.
+    ///
+    /// With the `profile_gpu` feature OFF (default), this is an
+    /// inlined empty function — every call site elides to nothing.
+    #[cfg(feature = "profile_gpu")]
+    pub fn mark(&mut self, kind: super::profile::BlockClass) {
+        if let Some(p) = self.profile.as_deref_mut() {
+            p.mark(self.device, self.cmd, kind);
+        }
+    }
+
+    #[cfg(not(feature = "profile_gpu"))]
+    #[inline(always)]
+    pub fn mark(&mut self, _kind: super::profile::BlockClass) {}
 }
 
 impl<'a> DispatchContext<'a> {

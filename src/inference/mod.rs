@@ -15,6 +15,7 @@ pub mod kv_cache;
 pub mod memory;
 pub mod ops;
 pub mod pipeline;
+pub mod profile;
 pub mod sample;
 pub mod weights;
 
@@ -42,6 +43,11 @@ pub struct Engine {
     pub command_pool: vk::CommandPool,
     pub command_buffer: vk::CommandBuffer,
     pub fence: vk::Fence,
+    /// Per-block GPU-timestamp recorder. Only present in builds with
+    /// the `profile_gpu` feature; non-profiling builds skip this field
+    /// entirely (no query-pool allocation, no host readback path).
+    #[cfg(feature = "profile_gpu")]
+    pub profile: profile::ProfileRecorder,
 }
 
 impl Engine {
@@ -74,6 +80,9 @@ impl Engine {
         let fence_info = vk::FenceCreateInfo::default();
         let fence = unsafe { device.device.create_fence(&fence_info, None) }?;
 
+        #[cfg(feature = "profile_gpu")]
+        let profile = profile::ProfileRecorder::new(&device)?;
+
         Ok(Self {
             device,
             pipelines,
@@ -82,6 +91,8 @@ impl Engine {
             command_pool,
             command_buffer,
             fence,
+            #[cfg(feature = "profile_gpu")]
+            profile,
         })
     }
 
@@ -127,6 +138,8 @@ impl Engine {
                 .device
                 .begin_command_buffer(self.command_buffer, &begin)?;
         }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.reset(&self.device, self.command_buffer);
 
         let (logits_range, taps) = {
             let mut ctx = DispatchContext {
@@ -139,10 +152,22 @@ impl Engine {
                 taps: Vec::new(),
                 n_dispatches: 0,
                 n_barriers: 0,
+                #[cfg(feature = "profile_gpu")]
+                profile: Some(&mut self.profile),
             };
             let r = record(&mut ctx)?;
             (r, ctx.taps)
         };
+        // Closing timestamp — the last marked region (typically LmHead
+        // for the bulk `forward` path, since `sampler.record_chain`
+        // isn't called here) needs a trailing `t[i+1]` so its duration
+        // shows up in the readback pair-walk.
+        #[cfg(feature = "profile_gpu")]
+        self.profile.mark(
+            &self.device,
+            self.command_buffer,
+            profile::BlockClass::Epilogue,
+        );
 
         unsafe {
             self.device.device.end_command_buffer(self.command_buffer)?;
@@ -156,6 +181,8 @@ impl Engine {
                 .device
                 .wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.readback_and_print(&self.device);
 
         // Read logits back from scratch's host pointer.
         let host_ptr = self
@@ -230,6 +257,8 @@ impl Engine {
                 .device
                 .begin_command_buffer(self.command_buffer, &begin)?;
         }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.reset(&self.device, self.command_buffer);
 
         let (token_range, taps, n_dispatches) = {
             let mut ctx = DispatchContext {
@@ -242,11 +271,23 @@ impl Engine {
                 taps: Vec::new(),
                 n_dispatches: 0,
                 n_barriers: 0,
+                #[cfg(feature = "profile_gpu")]
+                profile: Some(&mut self.profile),
             };
             let logits = record_logits(&mut ctx)?;
             let r = sampler.record_chain(&mut ctx, logits)?;
             (r, ctx.taps, ctx.n_dispatches)
         };
+        // Emit a closing timestamp so the last region (Sampler) gets
+        // a duration in the readback pair-walk. Any BlockClass works
+        // for the trailing mark — the host walker assigns durations to
+        // `marks[i]`, never to the final entry.
+        #[cfg(feature = "profile_gpu")]
+        self.profile.mark(
+            &self.device,
+            self.command_buffer,
+            profile::BlockClass::Sampler,
+        );
         let t_record = t0.map(|t| t.elapsed());
 
         unsafe {
@@ -262,6 +303,8 @@ impl Engine {
                 .wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
         let t_wait = t0.map(|t| t.elapsed());
+        #[cfg(feature = "profile_gpu")]
+        self.profile.readback_and_print(&self.device);
 
         if token_range.size < 4 {
             return Err(format!("sampler output too small: {} bytes", token_range.size).into());

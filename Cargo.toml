@@ -24,3 +24,13 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Per-block GPU timestamp profiling via vkCmdWriteTimestamp. When OFF
+# (the default), every `DispatchContext::mark(…)` call site compiles
+# to nothing and the `ProfileRecorder` infrastructure isn't built.
+# When ON, each forward writes ~80 timestamps into a query pool, reads
+# them back after fence wait, and prints a `PROF blocks: …` summary
+# line aggregated by `BlockClass` — adds ~80 µs of GPU overhead per
+# token (~0.4 % of decode), well below bench noise.
+profile_gpu = []
