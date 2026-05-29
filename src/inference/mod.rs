@@ -836,8 +836,12 @@ impl Engine {
         let mut h: Vec<f32> = h_last.to_vec();
         let mut tok = last_token;
         for k in 0..n as u32 {
+            // Absolute MTP position: draft 0 is at position-1 (consuming the
+            // last committed hidden + token), so it attends over the full
+            // seeded/committed MTP KV [0, position-1).
+            let mtp_pos = (position + k).saturating_sub(1);
             let outs = self.run_spec_record(weights, |ctx| {
-                let d = model.record_mtp_draft(ctx, cache, &h, tok, k)?;
+                let d = model.record_mtp_draft(ctx, cache, &h, tok, mtp_pos)?;
                 Ok(vec![d.draft_token, d.block_out.range()])
             })?;
             // outs[0] is the 4-byte u32 token id read back as f32 bits.
@@ -951,11 +955,12 @@ impl Engine {
     }
 
     /// Run [`Model::record_forward_full`] and read back the logits plus the
-    /// last-position pre-`output_norm` hidden state. With `full_logits=false`
+    /// per-position pre-`output_norm` hidden states. With `full_logits=false`
     /// the returned logits is just the final position's vocab row
-    /// (`[vocab]`); otherwise all `L` rows concatenated (`[vocab*L]`).
-    /// `h_last` is `[n_embd]`. Used to seed MTP speculative decoding from a
-    /// prefill (or any) forward. Advances `cache.position` by `tokens.len()`.
+    /// (`[vocab]`); otherwise all `L` rows concatenated (`[vocab*L]`). The
+    /// second return is the full residual `[n_embd*L]` (position-major); the
+    /// caller slices the last column for `h_last` and the prefix for the MTP
+    /// seed. Advances `cache.position` by `tokens.len()`.
     pub fn forward_full_readback(
         &mut self,
         model: &dyn crate::models::Model,
@@ -965,16 +970,33 @@ impl Engine {
         full_logits: bool,
     ) -> Result<(Vec<f32>, Vec<f32>), Box<dyn Error>> {
         let weights = model.weights();
-        let l = tokens.len();
         let outs = self.run_spec_record(weights, |ctx| {
             let o = model.record_forward_full(ctx, cache, tokens, position, full_logits, false)?;
             Ok(vec![o.logits.range(), o.residual.range()])
         })?;
         let logits = outs[0].clone();
-        let residual = &outs[1];
-        let hidden = residual.len() / l.max(1);
-        let h_last = residual[(l - 1) * hidden..l * hidden].to_vec();
-        Ok((logits, h_last))
+        let residual = outs[1].clone();
+        Ok((logits, residual))
+    }
+
+    /// Populate the MTP draft head's KV cache for `tokens.len()` positions
+    /// from the given main-model hidden states (see
+    /// [`Model::record_mtp_seed`]). Used to seed the head from the prompt
+    /// after prefill so drafting attends to real prior context.
+    pub fn run_mtp_seed(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        hiddens: &[f32],
+        tokens: &[u32],
+        position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let weights = model.weights();
+        self.run_spec_record(weights, |ctx| {
+            model.record_mtp_seed(ctx, cache, hiddens, tokens, position_offset)?;
+            Ok(vec![])
+        })?;
+        Ok(())
     }
 
     /// Write u32 data into a scratch slot (e.g. token ids for get_rows).

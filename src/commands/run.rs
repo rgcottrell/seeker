@@ -290,8 +290,19 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         // Prefill via the hidden-exposing forward; sample the first token on
         // the host (the spec path samples on host throughout).
         let t0 = std::time::Instant::now();
-        let (logits, mut h_last) =
+        let (logits, residual) =
             engine.forward_full_readback(&*model, &mut cache, &tokens, 0, /*full_logits=*/ false)?;
+        let prompt_len = tokens.len();
+        let hsz = residual.len() / prompt_len;
+        let mut h_last = residual[(prompt_len - 1) * hsz..prompt_len * hsz].to_vec();
+        // Seed the MTP draft head's KV from the prompt's main hidden states so
+        // the first draft attends to real prior context (raises acceptance).
+        // MTP-KV[i] (i in [0, prompt_len-1)) uses h_i + embed(t_{i+1}).
+        if prompt_len >= 2 {
+            let seed_hiddens = &residual[0..(prompt_len - 1) * hsz];
+            let seed_tokens = &tokens[1..prompt_len];
+            engine.run_mtp_seed(&*model, &mut cache, seed_hiddens, seed_tokens, 0)?;
+        }
         prefill_secs = t0.elapsed().as_secs_f64();
         let first = sampler.sample_one(&logits);
         sampler.accept(first);

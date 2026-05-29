@@ -142,6 +142,24 @@ pub trait Model: Send + Sync {
         Err("model does not support record_ssm_finalize (MTP spec decode)".into())
     }
 
+    /// Populate the MTP draft head's KV cache for positions
+    /// `[position_offset, position_offset + tokens.len())` from the main
+    /// model's hidden states (`hiddens`, `[n_embd, L]` row-major by
+    /// position) and the corresponding next-token ids (`tokens[i]` =
+    /// `t_{position_offset+i+1}`). Runs the NextN block's KV projections
+    /// only (no MoE / output head). Used to seed the draft head from the
+    /// prompt after prefill so drafting attends to real prior context.
+    fn record_mtp_seed(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _hiddens: &[f32],
+        _tokens: &[u32],
+        _position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        Err("model does not support record_mtp_seed (MTP spec decode)".into())
+    }
+
     /// Record one autoregressive MTP draft step (`L=1`). Given the last
     /// hidden state `h_last` (`[n_embd]`, host-uploaded) and the previously
     /// accepted/drafted token `prev_token`, runs the NextN head and returns

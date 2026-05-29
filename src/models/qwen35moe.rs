@@ -387,15 +387,26 @@ impl Model for Qwen35MoeModel {
         self.ssm_finalize_impl(ctx, cache, accept_len)
     }
 
+    fn record_mtp_seed(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        hiddens: &[f32],
+        tokens: &[u32],
+        position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.mtp_seed_impl(ctx, cache, hiddens, tokens, position_offset)
+    }
+
     fn record_mtp_draft(
         &self,
         ctx: &mut DispatchContext,
         cache: &mut KvCache,
         h_last: &[f32],
         prev_token: u32,
-        rel_pos: u32,
+        position: u32,
     ) -> Result<crate::models::MtpDraftOut, Box<dyn Error>> {
-        self.mtp_draft_impl(ctx, cache, h_last, prev_token, rel_pos)
+        self.mtp_draft_impl(ctx, cache, h_last, prev_token, position)
     }
 }
 
@@ -649,11 +660,11 @@ impl Qwen35MoeModel {
     /// `logits = output · shared_head_norm(block_out)`. The block output
     /// (`block_out`) is the recurrence hidden for the next draft step.
     ///
-    /// The MTP attention uses its own KV slot (index `n_main`) at
-    /// `rel_pos` — ephemeral per speculative step: `rel_pos` runs 0..N so
-    /// each step starts a fresh draft-window context (the prior committed
-    /// context reaches the head via `h_last`, the main model's hidden
-    /// state). This is an approximation that only affects acceptance rate;
+    /// The MTP attention uses its own persistent KV slot (index `n_main`)
+    /// at absolute `position`, so it attends to the full prior context
+    /// [0, position) — seeded from the prompt's main hidden states
+    /// ([`mtp_seed_impl`]) and extended by prior steps' drafts — plus the
+    /// current draft token. Draft-window quality only affects acceptance;
     /// verification keeps the emitted tokens lossless regardless.
     #[allow(clippy::too_many_arguments)]
     fn mtp_draft_impl(
@@ -662,7 +673,7 @@ impl Qwen35MoeModel {
         cache: &mut KvCache,
         h_last: &[f32],
         prev_token: u32,
-        rel_pos: u32,
+        position: u32,
     ) -> Result<crate::models::MtpDraftOut, Box<dyn Error>> {
         let p = &self.params;
         let mtp = self
@@ -724,9 +735,9 @@ impl Qwen35MoeModel {
         let residual = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
         matmul::record(ctx, mtp.eh_proj, combined, residual)?;
 
-        // M-RoPE positions for this single token (4 axes, all = rel_pos).
+        // M-RoPE positions for this single token (4 axes, all = absolute position).
         let positions_buf = ctx.alloc_scratch(4 * 4)?;
-        write_u32(ctx, positions_buf, &[rel_pos; 4])?;
+        write_u32(ctx, positions_buf, &[position; 4])?;
 
         let rope_params =
             rope_multi::RopeMultiParams::qwen_default(p.rope_dim, p.rope_freq_base, p.rope_sections);
@@ -738,7 +749,10 @@ impl Qwen35MoeModel {
             scale,
         };
         let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
-        let total_len = rel_pos + 1;
+        // Persistent MTP KV: the draft at absolute `position` attends to the
+        // full prior context [0, position) (seeded from the prompt's main
+        // hidden states + prior steps' drafts) plus itself.
+        let total_len = position + 1;
 
         attention_block(
             ctx,
@@ -750,7 +764,7 @@ impl Qwen35MoeModel {
             rope_params,
             fa_params,
             mtp_layer,
-            /*position_offset=*/ rel_pos,
+            /*position_offset=*/ position,
             total_len,
             total_len as u64,
             /*l=*/ 1,
@@ -782,6 +796,144 @@ impl Qwen35MoeModel {
             draft_token,
             block_out: residual,
         })
+    }
+
+    /// Populate the MTP draft head's KV (slot `n_main`) for `L` positions
+    /// `[position_offset, position_offset+L)` from the main model's hidden
+    /// states + next-token ids — the batched (`L>1`) form of the NextN
+    /// prologue + attention, run for its K/V side effect only (no MoE / no
+    /// output head). Used to seed/extend the draft head's context so
+    /// drafting attends to the real prior sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_seed_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        hiddens: &[f32],
+        tokens: &[u32],
+        position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let p = &self.params;
+        let mtp = self
+            .weights
+            .mtp
+            .as_ref()
+            .ok_or("mtp_seed called but MTP weights are not loaded")?;
+        let l = tokens.len() as u32;
+        if l == 0 {
+            return Ok(());
+        }
+        let hidden = p.n_embd as u64;
+        let head_dim_k = p.head_dim_k as u64;
+        let head_dim_v = p.head_dim_v as u64;
+        let n_head = p.n_head as u64;
+        let n_head_kv = p.n_head_kv as u64;
+        let n_embd_kv = p.n_embd_k_gqa() as u64;
+        let n_embd_vv = p.n_embd_v_gqa() as u64;
+        let wq_out = p.wq_out() as u64;
+        let hidden_v = head_dim_v * n_head;
+        let mtp_layer = p.n_main;
+        let l_u = l as u64;
+        if hiddens.len() as u64 != hidden * l_u {
+            return Err(format!(
+                "mtp_seed: hiddens len {} != n_embd*L {}",
+                hiddens.len(),
+                hidden * l_u
+            )
+            .into());
+        }
+
+        // Upload hiddens [n_embd, L] and embed the next tokens.
+        let h_tensor = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
+        write_f32(ctx, h_tensor.range(), hiddens)?;
+        let tok_buf = ctx.alloc_scratch(l_u * 4)?;
+        write_u32(ctx, tok_buf, tokens)?;
+        let emb = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, tok_buf, l, emb)?;
+
+        // combined[:, i] = concat(enorm(emb_i), hnorm(h_i)) — per-position,
+        // embedding first. combined is [2*n_embd, L]; the two halves are
+        // strided views (gap of 2*n_embd between columns).
+        let combined = ctx.alloc_tensor([2 * hidden, l_u, 1, 1], GgmlType::F32)?;
+        let half = |off_elems: u64| -> TensorView {
+            TensorView {
+                buffer: combined.buffer,
+                byte_offset: combined.byte_offset + off_elems * 4,
+                byte_size: combined.byte_size - off_elems * 4,
+                dims: [hidden, l_u, 1, 1],
+                byte_stride: [4, 2 * hidden * 4, 2 * hidden * l_u * 4, 2 * hidden * l_u * 4],
+                element_stride: [1, 2 * hidden, 2 * hidden * l_u, 2 * hidden * l_u],
+                dtype: GgmlType::F32,
+            }
+        };
+        rms_norm::record(ctx, emb, mtp.enorm, half(0), p.rms_eps)?;
+        rms_norm::record(ctx, h_tensor, mtp.hnorm, half(hidden), p.rms_eps)?;
+        crate::inference::command::record_compute_barrier(ctx.device, ctx.cmd, combined.range());
+
+        let residual = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, mtp.eh_proj, combined, residual)?;
+
+        // M-RoPE positions (4 axes × L) + causal mask for the batched attn.
+        let positions_buf = ctx.alloc_scratch(4 * l_u * 4)?;
+        let mut positions: Vec<u32> = Vec::with_capacity(4 * l as usize);
+        for _axis in 0..4 {
+            for pos in position_offset..position_offset + l {
+                positions.push(pos);
+            }
+        }
+        write_u32(ctx, positions_buf, &positions)?;
+
+        let total_len = position_offset + l;
+        let kv_len_u = total_len as u64;
+        let mask = if l > 1 {
+            let m = ctx.alloc_tensor([kv_len_u, l_u, 1, 1], GgmlType::F32)?;
+            write_causal_mask(ctx, m, l, position_offset)?;
+            Some(m)
+        } else {
+            None
+        };
+
+        let rope_params =
+            rope_multi::RopeMultiParams::qwen_default(p.rope_dim, p.rope_freq_base, p.rope_sections);
+        let scale = 1.0 / (head_dim_k as f32).sqrt();
+        let fa_params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim_k as u32,
+            head_dim_v: head_dim_v as u32,
+            gqa_ratio: (p.n_head / p.n_head_kv).max(1),
+            scale,
+        };
+        let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
+
+        // Attention block writes K/V into the MTP slot for these positions.
+        // Its attention output is discarded — we only want the KV side effect,
+        // so MoE + output head are skipped.
+        attention_block(
+            ctx,
+            &mtp.body,
+            cache,
+            residual,
+            mask,
+            positions_buf,
+            rope_params,
+            fa_params,
+            mtp_layer,
+            position_offset,
+            total_len,
+            kv_len_u,
+            l,
+            p,
+            head_dim_k,
+            head_dim_v,
+            n_head,
+            n_head_kv,
+            n_embd_kv,
+            n_embd_vv,
+            wq_out,
+            hidden,
+            hidden_v,
+            cache_direct,
+        )?;
+        Ok(())
     }
 
     /// Commit per-position SSM snapshots from a checkpoint verify into the
