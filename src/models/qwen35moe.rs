@@ -411,12 +411,12 @@ impl Model for Qwen35MoeModel {
         let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
 
         // ─── Per-layer loop ───
-        // All diagnostic toggles are LazyLock-cached `SEEKER_*` env
-        // vars (see `runtime_flags`) — read once at first access and
-        // free thereafter. The previous `std::env::var(…)` calls were
-        // running on every layer iteration (40× per forward) and
-        // showed up as 0.1–0.3 ms of decode overhead.
-        let max_layers = crate::runtime_flags::QWEN_MAX_LAYERS
+        // All diagnostic toggles are behind the `gpu_debug` feature (see
+        // `runtime_flags`): each accessor reads its `SEEKER_*` env var once
+        // (cached) when the feature is on, and constant-folds to
+        // `false`/`None` when it's off so every branch below is eliminated
+        // from production builds — no per-layer instrumentation at all.
+        let max_layers = crate::runtime_flags::qwen_max_layers()
             .map(|n| n as usize)
             .unwrap_or(self.weights.blocks.len());
         // When diff-dumping intermediates, each layer's taps must remain in
@@ -424,10 +424,10 @@ impl Model for Qwen35MoeModel {
         // and the host reads them back. Restoring scratch between layers
         // makes subsequent layers overwrite the tap data at the same byte
         // offsets — making every per-layer tap report the same value.
-        let dump_mode = *crate::runtime_flags::QWEN_DIFF_DUMP;
-        let skip_attn = *crate::runtime_flags::QWEN_NO_ATTN;
-        let skip_ssm = *crate::runtime_flags::QWEN_NO_SSM;
-        let skip_moe = *crate::runtime_flags::QWEN_NO_MOE;
+        let dump_mode = crate::runtime_flags::qwen_diff_dump();
+        let skip_attn = crate::runtime_flags::qwen_no_attn();
+        let skip_ssm = crate::runtime_flags::qwen_no_ssm();
+        let skip_moe = crate::runtime_flags::qwen_no_moe();
         for (layer_idx, block) in self.weights.blocks.iter().take(max_layers).enumerate() {
             if !dump_mode {
                 ctx.scratch_restore(layer_checkpoint);
@@ -797,7 +797,7 @@ fn ssm_block(
     let x_norm = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     rms_norm::record(ctx, residual, ssm_w.attn_norm, x_norm, p.rms_eps)?;
     ctx.tap(&format!("attn_norm-{layer_idx}"), x_norm)?;
-    if *crate::runtime_flags::QWEN_ONLY_RMS {
+    if crate::runtime_flags::qwen_only_rms() {
         return Ok(());
     }
 
@@ -1014,7 +1014,7 @@ fn ssm_block(
     // SEEKER_QWEN_NO_CONV=1 bypasses ssm_conv1d (uses raw qkv directly as
     // conv_out, treating the conv as identity). Helps isolate stride
     // bugs in the conv path from bugs in the downstream GDN math.
-    if *crate::runtime_flags::QWEN_NO_CONV {
+    if crate::runtime_flags::qwen_no_conv() {
         // qkv has the same memory layout as conv_out should (channel-inner,
         // token-outer) — `matmul::record` produces D[m, n] at offset
         // n*M + m, i.e. m (channel) innermost. Just memcpy.
@@ -1177,11 +1177,10 @@ fn ssm_block(
     // Without this scale, GDN output is sqrt(S_v) too large, and the
     // downstream ssm_norm + silu(z) gating amplifies the discrepancy enough
     // that residual diverges from llama by orders of magnitude after the
-    // first few SSM layers. SEEKER_QWEN_GDN_SCALE=one bypasses for testing.
-    // `SEEKER_QWEN_GDN_SCALE=one` overrides — cached once at startup,
-    // so this is a single LazyLock load per SSM block instead of the
-    // previous `std::env::var(…)` per call.
-    let gdn_scale = if *crate::runtime_flags::QWEN_GDN_SCALE_ONE {
+    // first few SSM layers. `SEEKER_QWEN_GDN_SCALE=one` (gpu_debug only)
+    // bypasses for testing; `qwen_gdn_scale_one()` constant-folds to
+    // `false` in production builds so this resolves to the real scale.
+    let gdn_scale = if crate::runtime_flags::qwen_gdn_scale_one() {
         1.0
     } else {
         1.0 / (s_v as f32).sqrt()
@@ -1316,7 +1315,7 @@ fn ssm_block(
     // residual add into the matvec via the ACCUMULATE spec constant
     // and skip the `proj` scratch slot entirely. Decode-only (L=1
     // matvec path).
-    let dump = crate::runtime_flags::QWEN_SSM_DUMP.as_deref();
+    let dump = crate::runtime_flags::qwen_ssm_dump();
     if dump.is_none() && l == 1 {
         matmul::record_accumulate(ctx, ssm_w.ssm_out, gated_attn, residual)?;
         ctx.tap(&format!("attn_output-{layer_idx}"), residual)?;
@@ -1525,8 +1524,8 @@ fn moe_ffn(
     // (sigmoid, broadcast-mul, two adds). Diagnostic bisection flags
     // fall back to the unfused form so each branch can be dropped
     // independently.
-    let no_routed = *crate::runtime_flags::QWEN_NO_ROUTED;
-    let no_shared = *crate::runtime_flags::QWEN_NO_SHARED;
+    let no_routed = crate::runtime_flags::qwen_no_routed();
+    let no_shared = crate::runtime_flags::qwen_no_shared();
     if !no_routed && !no_shared {
         elementwise::record_moe_residual_fuse(
             ctx,

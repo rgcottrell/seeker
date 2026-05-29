@@ -138,74 +138,81 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
 
     let model = crate::models::open(&gguf, weights, bundle)?;
 
-    // DEBUG: isolated matmul test with hardcoded 2x2 input.
-    if std::env::var("SEEKER_MATMUL_TEST").is_ok() {
-        matmul_smoke_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_RMSNORM_TEST").is_ok() {
-        rms_norm_smoke_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_GETROWS_TEST").is_ok() {
-        get_rows_smoke_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if let Ok(dt_name) = std::env::var("SEEKER_QUANT_TEST") {
-        quant_roundtrip_test(&mut engine, model.weights(), &dt_name)?;
-        return Ok(());
-    }
-    if let Ok(tname) = std::env::var("SEEKER_KQUANT_MATMUL_TEST") {
-        kquant_matmul_test(&mut engine, model.weights(), &tname)?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_INPLACE_BINARY_TEST").is_ok() {
-        inplace_binary_smoke_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_MM_CM_SMOKE").is_ok() {
-        mm_cm_smoke_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_MOE_TEST").is_ok() {
-        moe_smoke_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if let Ok(stage) = std::env::var("SEEKER_MOE_DIAG") {
-        moe_diag_test(&mut engine, model.weights(), &stage)?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_SSM_CONV_TEST").is_ok() {
-        ssm_conv_smoke_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_L2_NORM_TEST").is_ok() {
-        l2_norm_smoke_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_GDN_TEST").is_ok() {
-        gdn_smoke_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_WQ_DUMP").is_ok() {
-        wq_dump_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_NORM_WEIGHTS_DUMP").is_ok() {
-        norm_weights_dump(model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_EMBED_NORM_DUMP").is_ok() {
-        embed_norm_dump(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_TAP_SANITY").is_ok() {
-        tap_sanity_test(&mut engine, model.weights())?;
-        return Ok(());
-    }
-    if std::env::var("SEEKER_RMS_TEST").is_ok() {
-        rms_norm_qwen_smoke(&mut engine, model.weights())?;
-        return Ok(());
+    // Op smoke-test harnesses — model bring-up scaffolding, gated behind
+    // the `gpu_debug` feature. In production builds this whole dispatch
+    // block (and the test functions below) compiles out, so `seeker run`
+    // does no `SEEKER_*_TEST` env probing at startup and the binary
+    // carries none of the test code.
+    #[cfg(feature = "gpu_debug")]
+    {
+        if std::env::var("SEEKER_MATMUL_TEST").is_ok() {
+            matmul_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_RMSNORM_TEST").is_ok() {
+            rms_norm_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_GETROWS_TEST").is_ok() {
+            get_rows_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if let Ok(dt_name) = std::env::var("SEEKER_QUANT_TEST") {
+            quant_roundtrip_test(&mut engine, model.weights(), &dt_name)?;
+            return Ok(());
+        }
+        if let Ok(tname) = std::env::var("SEEKER_KQUANT_MATMUL_TEST") {
+            kquant_matmul_test(&mut engine, model.weights(), &tname)?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_INPLACE_BINARY_TEST").is_ok() {
+            inplace_binary_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_MM_CM_SMOKE").is_ok() {
+            mm_cm_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_MOE_TEST").is_ok() {
+            moe_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if let Ok(stage) = std::env::var("SEEKER_MOE_DIAG") {
+            moe_diag_test(&mut engine, model.weights(), &stage)?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_SSM_CONV_TEST").is_ok() {
+            ssm_conv_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_L2_NORM_TEST").is_ok() {
+            l2_norm_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_GDN_TEST").is_ok() {
+            gdn_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_WQ_DUMP").is_ok() {
+            wq_dump_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_NORM_WEIGHTS_DUMP").is_ok() {
+            norm_weights_dump(model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_EMBED_NORM_DUMP").is_ok() {
+            embed_norm_dump(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_TAP_SANITY").is_ok() {
+            tap_sanity_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_RMS_TEST").is_ok() {
+            rms_norm_qwen_smoke(&mut engine, model.weights())?;
+            return Ok(());
+        }
     }
 
     let max_seq_len = args
@@ -312,6 +319,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
 /// but in-place it double-applied the op nondeterministically (the root cause
 /// of run-to-run nondeterminism in the residual stream). We size N to span
 /// several blocks and deliberately straddle the 512 boundary.
+#[cfg(feature = "gpu_debug")]
 fn inplace_binary_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -369,6 +377,7 @@ fn inplace_binary_smoke_test(
 /// On success this proves the conv step is bug-free; failures show
 /// which (channel, token) position diverges and by how much, pointing
 /// at either a stride bug (transpose cast) or a shader bug (conv).
+#[cfg(feature = "gpu_debug")]
 fn ssm_conv_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -531,6 +540,7 @@ fn ssm_conv_smoke_test(
 /// `record_l2_norm` and compares against a CPU reference (per-(head,
 /// token) L2 normalization). This isolates whether our strided slice
 /// view + dispatch shape correctly hit every (head, token) row.
+#[cfg(feature = "gpu_debug")]
 fn l2_norm_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -639,6 +649,7 @@ fn l2_norm_smoke_test(
 /// Run rms_norm on a known input vs CPU reference. If the GPU output
 /// doesn't match the CPU computation of `x[i] / sqrt(mean(x^2)+eps) * w[i]`,
 /// the rms_norm shader has a numeric bug.
+#[cfg(feature = "gpu_debug")]
 fn rms_norm_qwen_smoke(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -739,6 +750,7 @@ fn rms_norm_qwen_smoke(
 /// of a scratch tensor, then tap it 4 times consecutively. All four
 /// taps must report the same sum (= number of elements). If they
 /// diverge, the tap path is broken.
+#[cfg(feature = "gpu_debug")]
 fn tap_sanity_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -770,6 +782,7 @@ fn tap_sanity_test(
 /// ("diserta") — the tokens that attention path collapses to — vs
 /// average norm. If these have unusually large magnitudes, they may
 /// be naturally favored argmax winners when residual is small/noisy.
+#[cfg(feature = "gpu_debug")]
 fn embed_norm_dump(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -811,6 +824,7 @@ fn embed_norm_dump(
 /// Dump the magnitudes of the per-head Q/K norm weights for each
 /// attention layer. If these are large (>2 typical), they amplify Q/K
 /// values before flash_attn, potentially saturating softmax.
+#[cfg(feature = "gpu_debug")]
 fn norm_weights_dump(
     weights: &crate::inference::weights::WeightsHandle,
 ) -> Result<(), Box<dyn Error>> {
@@ -846,6 +860,7 @@ fn norm_weights_dump(
 /// vs the Gate-half (positions 256..512). If these have wildly
 /// different magnitudes, the wq matmul or the GGUF tensor layout is
 /// the suspect.
+#[cfg(feature = "gpu_debug")]
 fn wq_dump_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -931,6 +946,7 @@ fn wq_dump_test(
 /// zero initial state, reads back output, compares against a CPU
 /// reference of the recurrent update. Verifies the most complex op
 /// in the SSM block.
+#[cfg(feature = "gpu_debug")]
 fn gdn_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -1156,6 +1172,7 @@ fn gdn_smoke_test(
 ///   up           — matvec_q4k_id(ffn_up_exps,   x_norm, ids)
 ///   ffnh         — silu(gate) * up
 ///   routed       — moe_down_q5k(ffn_down_exps, ffn_h, ids, weights) [n_embd, 1]
+#[cfg(feature = "gpu_debug")]
 fn moe_diag_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -1264,6 +1281,7 @@ fn moe_diag_test(
 /// reference — just confirms the dispatch chain runs to completion and
 /// produces non-NaN finite values for a deterministic input. A later
 /// pass should diff against llama.cpp's per-layer output.
+#[cfg(feature = "gpu_debug")]
 fn moe_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -1393,6 +1411,7 @@ fn moe_smoke_test(
 /// `SEEKER_MM_CM=1` set internally, and compares against the obvious CPU
 /// dot-product. Uses M=N=K=32 (smallest size that exercises CM) so any
 /// output-store layout error is loud.
+#[cfg(feature = "gpu_debug")]
 fn mm_cm_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -1475,6 +1494,7 @@ fn mm_cm_smoke_test(
     Ok(())
 }
 
+#[cfg(feature = "gpu_debug")]
 fn matmul_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -1527,6 +1547,7 @@ fn matmul_smoke_test(
     Ok(())
 }
 
+#[cfg(feature = "gpu_debug")]
 fn get_rows_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -1570,6 +1591,7 @@ fn get_rows_smoke_test(
     Ok(())
 }
 
+#[cfg(feature = "gpu_debug")]
 fn rms_norm_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -1612,6 +1634,7 @@ fn rms_norm_smoke_test(
     Ok(())
 }
 
+#[cfg(feature = "gpu_debug")]
 fn quant_roundtrip_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -1657,6 +1680,7 @@ fn quant_roundtrip_test(
     Ok(())
 }
 
+#[cfg(feature = "gpu_debug")]
 fn f16_bits_to_f32(h: u16) -> f32 {
     let sign = if (h >> 15) & 1 == 1 { -1.0f32 } else { 1.0f32 };
     let exp = (h >> 10) & 0x1F;
@@ -1676,6 +1700,7 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 /// CPU reference matmul-vec for a K-quant weight, compared against the GPU
 /// `mul_mat_vec_q{4,6}_k` kernel. Picks `blk.0.<name>.weight`, builds a
 /// deterministic input vector, and reports max abs / rel error.
+#[cfg(feature = "gpu_debug")]
 fn kquant_matmul_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
@@ -1747,6 +1772,7 @@ fn kquant_matmul_test(
 
 /// Dequantize one row (`k` elements) of a K-quant tensor stored in `raw`,
 /// into `out`. Mirrors llama.cpp's `dequantize_row_q{4,6}_K`.
+#[cfg(feature = "gpu_debug")]
 fn dequant_kquant_row(dtype: GgmlType, raw: &[u8], row: u64, k: usize, out: &mut [f32]) {
     match dtype {
         GgmlType::Q4_K => {
@@ -1849,6 +1875,7 @@ fn dequant_kquant_row(dtype: GgmlType, raw: &[u8], row: u64, k: usize, out: &mut
     }
 }
 
+#[cfg(feature = "gpu_debug")]
 fn f32_to_f16_bits(v: f32) -> u16 {
     // IEEE 754 conversion. Simple version — assumes finite values, no
     // denormals, no NaN handling beyond the spec.

@@ -288,7 +288,7 @@ pub fn render(
         ctx.insert(k.clone(), Value::from_serialize(v));
     }
     let rendered = tmpl.render(ctx)?;
-    if *crate::runtime_flags::CHAT_DEBUG {
+    if crate::runtime_flags::chat_debug() {
         eprintln!("=== rendered chat prompt ===\n{rendered}\n=== end ===");
     }
     Ok(rendered)

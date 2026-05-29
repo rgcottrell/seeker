@@ -26,11 +26,35 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
-# Per-block GPU timestamp profiling via vkCmdWriteTimestamp. When OFF
-# (the default), every `DispatchContext::mark(…)` call site compiles
-# to nothing and the `ProfileRecorder` infrastructure isn't built.
-# When ON, each forward writes ~80 timestamps into a query pool, reads
-# them back after fence wait, and prints a `PROF blocks: …` summary
-# line aggregated by `BlockClass` — adds ~80 µs of GPU overhead per
-# token (~0.4 % of decode), well below bench noise.
+# GPU performance *measurement*. OFF by default: every
+# `DispatchContext::mark(…)` call site compiles to nothing, the
+# `ProfileRecorder` query-pool infrastructure isn't built, the
+# `SEEKER_PROFILE_FORWARD` per-token CPU/GPU timing path is gone, and
+# the per-dispatch / per-barrier counters are not incremented (no
+# `ctx.n_dispatches += 1` in the dispatch hot path, no thread-local
+# barrier counting). When ON, each forward writes ~80 timestamps into a
+# query pool, prints `PROF blocks: …` aggregated by `BlockClass`, and
+# `SEEKER_PROFILE_FORWARD=1` adds a per-token `PROF forward:` line with
+# dispatch/barrier counts — ~80 µs GPU overhead/token (~0.4 % of
+# decode), well below bench noise.
 profile_gpu = []
+
+# GPU correctness *debugging*. OFF by default: all of the following
+# compile to nothing so production builds carry zero overhead —
+#   * Vulkan `VK_LAYER_KHRONOS_validation` + `VK_EXT_debug_utils`
+#     messenger (also auto-enabled in debug builds via `debug_assertions`).
+#   * `DispatchContext::tap(…)` layer-by-layer diff-dump vs llama.cpp's
+#     `cb()` callback (`SEEKER_QWEN_DIFF_DUMP` / `…_DIRECT`) — call sites
+#     become an `#[inline(always)]` no-op, and the engine's tap-readback
+#     loops + the `taps` field disappear.
+#   * `SEEKER_BARRIER_PARANOID` whole-buffer-barrier race-hunting mode,
+#     checked per barrier (500–1500×/decode forward).
+#   * qwen35moe per-block ablations (`SEEKER_QWEN_NO_*`,
+#     `SEEKER_QWEN_ONLY_RMS`, `SEEKER_QWEN_MAX_LAYERS`,
+#     `SEEKER_QWEN_GDN_SCALE`, `SEEKER_QWEN_SSM_DUMP`).
+#   * `SEEKER_DECODE_REPLAY=0` legacy record-each-token diagnostic.
+#   * `SEEKER_CHAT_DEBUG` rendered-prompt dump.
+#   * The `SEEKER_*_TEST` / `*_DUMP` op smoke-test harnesses in `seeker run`.
+# Each debug flag accessor constant-folds to `false`/`None` when the
+# feature is off, so the surrounding branches are eliminated entirely.
+gpu_debug = []

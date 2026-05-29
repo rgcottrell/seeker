@@ -180,32 +180,38 @@ pub fn record_dispatch_push(
 /// for unrelated parts of the scratch region, which adds up across the
 /// ~250 barriers a Llama-1B forward pass emits per token.
 ///
-/// `SEEKER_BARRIER_PARANOID=1` falls back to a whole-buffer barrier — use
-/// it to A/B-test correctness if a subtle race shows up downstream.
+/// `SEEKER_BARRIER_PARANOID=1` (requires the `gpu_debug` feature) falls
+/// back to a whole-buffer barrier — use it to A/B-test correctness if a
+/// subtle race shows up downstream. Compiled out otherwise.
 pub fn record_compute_barrier(device: &Device, cmd: vk::CommandBuffer, range: BufferRange) {
     record_compute_barriers(device, cmd, std::slice::from_ref(&range))
+}
+
+// Thread-local counters for the `SEEKER_PROFILE_FORWARD=1` breakdown.
+// Only present under the `profile_gpu` feature: reset by
+// `forward_sampled` before the dispatch graph is recorded, bumped by
+// each barrier-emitting path here. In default builds neither the
+// counters nor their increments exist, so the barrier hot path
+// (500–1500×/decode forward) carries no instrumentation at all.
+#[cfg(feature = "profile_gpu")]
+std::thread_local! {
+    pub static BARRIER_COMPUTE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    pub static BARRIER_GLOBAL_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Compute→Compute barrier across several disjoint ranges in one
 /// vkCmdPipelineBarrier call. Use after a batch of nofence dispatches
 /// that wrote disjoint regions (Q/K/V matmuls, FFN gate/up, etc.) to
 /// fence them all at once before downstream reads.
-// Thread-local counters for the SEEKER_PROFILE_FORWARD=1 breakdown.
-// Reset by `forward_sampled` before the dispatch graph is recorded;
-// bumped by each barrier-emitting path here. Out of the hot path
-// when profiling is off (no atomic / no shared state).
-std::thread_local! {
-    pub static BARRIER_COMPUTE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    pub static BARRIER_GLOBAL_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
 
 pub fn record_compute_barriers(device: &Device, cmd: vk::CommandBuffer, ranges: &[BufferRange]) {
+    #[cfg(feature = "profile_gpu")]
     BARRIER_COMPUTE_COUNT.with(|c| c.set(c.get() + 1));
-    // Cached at first access; LazyLock keeps subsequent reads to a
-    // single atomic-pointer load. This used to be `std::env::var(…)`,
-    // which is a getenv + string-alloc per call — and this function
-    // runs hundreds to ~1500 times per decode forward.
-    let paranoid = *crate::runtime_flags::BARRIER_PARANOID;
+    // `barrier_paranoid()` constant-folds to `false` without the
+    // `gpu_debug` feature, so this branch (and the whole-buffer path
+    // below) is eliminated from production builds — the barrier hot
+    // path runs hundreds to ~1500 times per decode forward.
+    let paranoid = crate::runtime_flags::barrier_paranoid();
     // Stack-allocated barrier scratch — most calls pass 1–4 ranges
     // (single barrier, or one coalesced set covering a parallel
     // dispatch group). Cap at 8.
@@ -266,6 +272,7 @@ pub fn record_compute_barriers(device: &Device, cmd: vk::CommandBuffer, ranges: 
 /// to every buffer. Used between dispatches that share data through
 /// `vkCmdCopyBuffer` (e.g. KV cache write / read).
 pub fn record_global_barrier(device: &Device, cmd: vk::CommandBuffer) {
+    #[cfg(feature = "profile_gpu")]
     BARRIER_GLOBAL_COUNT.with(|c| c.set(c.get() + 1));
     let bar = vk::MemoryBarrier::default()
         .src_access_mask(

@@ -195,7 +195,9 @@ impl Engine {
         #[cfg(feature = "profile_gpu")]
         self.profile.reset(&self.device, self.command_buffer);
 
-        let (logits_range, taps) = {
+        #[cfg(feature = "gpu_debug")]
+        let taps;
+        let logits_range = {
             let mut ctx = DispatchContext {
                 device: &self.device,
                 weights,
@@ -203,16 +205,21 @@ impl Engine {
                 pipelines: &mut self.pipelines,
                 descriptors: &self.descriptors,
                 cmd: self.command_buffer,
+                #[cfg(feature = "gpu_debug")]
                 taps: Vec::new(),
+                #[cfg(feature = "profile_gpu")]
                 n_dispatches: 0,
-                n_barriers: 0,
                 decode_dyn: decode_dyn_range,
                 replay_plan: None,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
             let r = record(&mut ctx)?;
-            (r, ctx.taps)
+            #[cfg(feature = "gpu_debug")]
+            {
+                taps = ctx.taps;
+            }
+            r
         };
         // Closing timestamp — the last marked region (typically LmHead
         // for the bulk `forward` path, since `sampler.record_chain`
@@ -259,7 +266,9 @@ impl Engine {
 
         // Print sums for any taps the model recorded. Used for layer-by-layer
         // diff dumps vs llama.cpp's `cb()` callback. Output is one line per
-        // tap: `TAP <name> n=<count> sum=<value> max_abs=<value>`.
+        // tap: `TAP <name> n=<count> sum=<value> max_abs=<value>`. The whole
+        // readback path is compiled out without the `gpu_debug` feature.
+        #[cfg(feature = "gpu_debug")]
         for (name, range) in &taps {
             if range.size % 4 != 0 {
                 eprintln!("TAP {name}: size {} not 4-byte aligned, skipping", range.size);
@@ -309,8 +318,9 @@ impl Engine {
         position_offset: u32,
         sampler: &mut sample::Sampler,
     ) -> Result<u32, Box<dyn Error>> {
-        let prof = *crate::runtime_flags::PROFILE_FORWARD;
+        let prof = crate::runtime_flags::profile_forward();
         let t0 = if prof { Some(std::time::Instant::now()) } else { None };
+        #[cfg(feature = "profile_gpu")]
         if prof {
             crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.set(0));
             crate::inference::command::BARRIER_GLOBAL_COUNT.with(|c| c.set(0));
@@ -329,12 +339,12 @@ impl Engine {
             None
         };
         let want_config_hash = sampler.config().graph_hash();
-        // `SEEKER_DECODE_REPLAY=0` forces the legacy record-each-token
-        // path — diagnostic only. Default is replay-on; the cached
-        // decode cmdbuf saves the ~2.5 ms/token CPU recording cost.
-        let allow_replay = std::env::var("SEEKER_DECODE_REPLAY")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        // `SEEKER_DECODE_REPLAY=0` (requires the `gpu_debug` feature) forces
+        // the legacy record-each-token path — diagnostic only. Default is
+        // replay-on; the cached decode cmdbuf saves the ~2.5 ms/token CPU
+        // recording cost. `decode_replay_disabled()` constant-folds to
+        // `false` in production builds, eliminating the per-token getenv.
+        let allow_replay = !crate::runtime_flags::decode_replay_disabled();
         let can_replay = is_decode
             && allow_replay
             && self.decode_cache.as_ref().is_some_and(|c| {
@@ -449,10 +459,16 @@ impl Engine {
 
         if let (Some(rec), Some(wait)) = (t_record, t_wait) {
             let total = t0.unwrap().elapsed();
-            let bc = crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.get());
-            let bg = crate::inference::command::BARRIER_GLOBAL_COUNT.with(|c| c.get());
+            #[cfg(feature = "profile_gpu")]
+            let counts = {
+                let bc = crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.get());
+                let bg = crate::inference::command::BARRIER_GLOBAL_COUNT.with(|c| c.get());
+                format!("barriers=(compute={bc} global={bg}) ")
+            };
+            #[cfg(not(feature = "profile_gpu"))]
+            let counts = "";
             eprintln!(
-                "PROF forward[replay]: barriers=(compute={bc} global={bg}) record={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
+                "PROF forward[replay]: {counts}record={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
                 rec.as_secs_f64() * 1000.0,
                 (wait - rec).as_secs_f64() * 1000.0,
                 (total - wait).as_secs_f64() * 1000.0,
@@ -520,7 +536,12 @@ impl Engine {
             None
         };
 
-        let (token_range, taps, n_dispatches, captured_plan) = {
+        let captured_plan;
+        #[cfg(feature = "gpu_debug")]
+        let taps;
+        #[cfg(feature = "profile_gpu")]
+        let n_dispatches;
+        let token_range = {
             let mut ctx = DispatchContext {
                 device: &self.device,
                 weights: model.weights(),
@@ -528,9 +549,10 @@ impl Engine {
                 pipelines: &mut self.pipelines,
                 descriptors: &self.descriptors,
                 cmd,
+                #[cfg(feature = "gpu_debug")]
                 taps: Vec::new(),
+                #[cfg(feature = "profile_gpu")]
                 n_dispatches: 0,
-                n_barriers: 0,
                 decode_dyn: decode_dyn_range,
                 replay_plan: replay_plan_init,
                 #[cfg(feature = "profile_gpu")]
@@ -538,7 +560,16 @@ impl Engine {
             };
             let logits = model.record_forward(&mut ctx, cache, tokens, position_offset)?;
             let r = sampler.record_chain(&mut ctx, logits)?;
-            (r, ctx.taps, ctx.n_dispatches, ctx.replay_plan)
+            #[cfg(feature = "gpu_debug")]
+            {
+                taps = ctx.taps;
+            }
+            #[cfg(feature = "profile_gpu")]
+            {
+                n_dispatches = ctx.n_dispatches;
+            }
+            captured_plan = ctx.replay_plan;
+            r
         };
         #[cfg(feature = "profile_gpu")]
         self.profile.mark(&self.device, cmd, profile::BlockClass::Sampler);
@@ -570,6 +601,7 @@ impl Engine {
             let src = host_ptr.add(token_range.offset as usize) as *const u32;
             std::ptr::read(src)
         };
+        #[cfg(feature = "gpu_debug")]
         for (name, range) in &taps {
             if range.size % 4 != 0 {
                 eprintln!("TAP {name}: size {} not 4-byte aligned, skipping", range.size);
@@ -614,10 +646,16 @@ impl Engine {
 
         if let (Some(rec), Some(wait)) = (t_record, t_wait) {
             let total = t0.unwrap().elapsed();
-            let bc = crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.get());
-            let bg = crate::inference::command::BARRIER_GLOBAL_COUNT.with(|c| c.get());
+            #[cfg(feature = "profile_gpu")]
+            let counts = {
+                let bc = crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.get());
+                let bg = crate::inference::command::BARRIER_GLOBAL_COUNT.with(|c| c.get());
+                format!("dispatches={n_dispatches} barriers=(compute={bc} global={bg}) ")
+            };
+            #[cfg(not(feature = "profile_gpu"))]
+            let counts = "";
             eprintln!(
-                "PROF forward: dispatches={n_dispatches} barriers=(compute={bc} global={bg}) record={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
+                "PROF forward: {counts}record={:.2}ms gpu_wait={:.2}ms readback={:.2}ms total={:.2}ms",
                 rec.as_secs_f64() * 1000.0,
                 (wait - rec).as_secs_f64() * 1000.0,
                 (total - wait).as_secs_f64() * 1000.0,

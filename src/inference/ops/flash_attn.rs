@@ -119,7 +119,7 @@ pub fn record(
     if ctx.device.coop_matrix
         && k.dtype == GgmlType::F16
         && v.dtype == GgmlType::F16
-        && std::env::var("SEEKER_FA_CM").is_ok_and(|v| v == "1")
+        && *crate::runtime_flags::FA_CM
     {
         if let Some(m) = mask {
             return record_cm1(ctx, q, k, v, m, out, params, kv_actual);
@@ -382,14 +382,12 @@ pub fn record(
 /// `SEEKER_FA_SPLIT=0` disables splitting; `SEEKER_FA_SPLIT_KNUM=<n>` pins it.
 pub fn pick_k_num(shader_core_count: u32, base_wgs: u32, kv: u32) -> (u32, u32) {
     let num_blocks = kv.div_ceil(FA_BC).max(1);
-    if std::env::var("SEEKER_FA_SPLIT").is_ok_and(|v| v == "0") {
+    if *crate::runtime_flags::FA_SPLIT_DISABLED {
         return (1, num_blocks);
     }
-    if let Ok(v) = std::env::var("SEEKER_FA_SPLIT_KNUM") {
-        if let Ok(k) = v.parse::<u32>() {
-            let k = k.clamp(1, num_blocks);
-            return (k, num_blocks.div_ceil(k));
-        }
+    if let Some(k) = *crate::runtime_flags::FA_SPLIT_KNUM {
+        let k = k.clamp(1, num_blocks);
+        return (k, num_blocks.div_ceil(k));
     }
 
     // Placeholder core count when the device doesn't report one; target is

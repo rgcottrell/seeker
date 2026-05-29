@@ -14,11 +14,13 @@
 //! sites can branch. Cooperative-matrix support (`VK_KHR_cooperative_matrix`
 //! and `VK_NV_cooperative_matrix2`) is treated the same way.
 //!
-//! Debug builds (`cfg(debug_assertions)`) additionally enable the
-//! `VK_LAYER_KHRONOS_validation` layer and a `VK_EXT_debug_utils` messenger
-//! that funnels driver/validation diagnostics into `tracing` under the
-//! `vulkan` target. The layer + extension are best-effort: if either is
-//! missing (e.g. SDK not installed) we log and continue.
+//! Debug builds (`cfg(debug_assertions)`) and any build with the
+//! `gpu_debug` feature additionally enable the `VK_LAYER_KHRONOS_validation`
+//! layer and a `VK_EXT_debug_utils` messenger that funnels
+//! driver/validation diagnostics into `tracing` under the `vulkan` target.
+//! Release builds without `gpu_debug` carry none of this. The layer +
+//! extension are best-effort: if either is missing (e.g. SDK not
+//! installed) we log and continue.
 
 use std::error::Error;
 use std::ffi::{c_char, CStr};
@@ -63,7 +65,7 @@ pub struct Device {
     /// Shader stages on which `requiredSubgroupSize` may be requested. We
     /// only care about COMPUTE; this is exposed so callers can sanity-check.
     pub required_subgroup_size_stages: vk::ShaderStageFlags,
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "gpu_debug"))]
     debug: Option<validation::Messenger>,
 }
 
@@ -90,7 +92,7 @@ impl Device {
             inst_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
         }
 
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "gpu_debug"))]
         let validation_enabled = {
             let layer_ok = validation::layer_available(&entry);
             let ext_ok = avail_inst_exts
@@ -100,7 +102,7 @@ impl Device {
             if enabled {
                 inst_ext_names.push(vk::EXT_DEBUG_UTILS_NAME.as_ptr());
                 inst_layer_names = vec![validation::LAYER.as_ptr()];
-                tracing::info!("Vulkan validation layer + debug_utils enabled (debug build)");
+                tracing::info!("Vulkan validation layer + debug_utils enabled (debug build / gpu_debug)");
             } else {
                 inst_layer_names = Vec::new();
                 if !layer_ok {
@@ -116,12 +118,12 @@ impl Device {
             }
             enabled
         };
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(any(debug_assertions, feature = "gpu_debug")))]
         {
             inst_layer_names = Vec::new();
         }
 
-        #[allow(unused_mut)] // reassigned via push_next under cfg(debug_assertions)
+        #[allow(unused_mut)] // reassigned via push_next when validation is enabled
         let mut instance_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&inst_ext_names)
@@ -131,16 +133,16 @@ impl Device {
         // `debug_info` must outlive `create_instance` because it's chained
         // via `push_next` so the validation layer can report errors that
         // occur during instance creation/destruction itself.
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "gpu_debug"))]
         let mut debug_info = validation::build_create_info();
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "gpu_debug"))]
         if validation_enabled {
             instance_info = instance_info.push(&mut debug_info);
         }
 
         let instance = unsafe { entry.create_instance(&instance_info, None) }?;
 
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "gpu_debug"))]
         let debug = if validation_enabled {
             match validation::Messenger::create(&entry, &instance) {
                 Ok(m) => Some(m),
@@ -431,7 +433,7 @@ impl Device {
             min_subgroup_size,
             max_subgroup_size,
             required_subgroup_size_stages,
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "gpu_debug"))]
             debug,
         })
     }
@@ -452,7 +454,7 @@ impl Drop for Device {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_device(None);
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "gpu_debug"))]
             if let Some(d) = self.debug.take() {
                 d.destroy();
             }
@@ -525,7 +527,7 @@ fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error
     Err("no Vulkan 1.4 physical device with a compute queue found".into())
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "gpu_debug"))]
 mod validation {
     use std::ffi::{c_void, CStr};
 

@@ -60,7 +60,10 @@ pub fn bind_and_dispatch(
         )?;
         record_dispatch(ctx.device, ctx.cmd, pipeline, set, push, workgroups);
     }
-    ctx.n_dispatches += 1;
+    #[cfg(feature = "profile_gpu")]
+    {
+        ctx.n_dispatches += 1;
+    }
     Ok(())
 }
 
@@ -91,7 +94,10 @@ pub fn bind_and_dispatch_indirect(
         push,
         indirect,
     );
-    ctx.n_dispatches += 1;
+    #[cfg(feature = "profile_gpu")]
+    {
+        ctx.n_dispatches += 1;
+    }
     Ok(())
 }
 

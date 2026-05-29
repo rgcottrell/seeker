@@ -39,13 +39,18 @@ pub struct DispatchContext<'a> {
     /// Optional list of `(name, range)` snapshots the model can push to.
     /// The engine reads these back after submit, alongside the main logits.
     /// Used for layer-by-layer diff dumps vs llama.cpp's `cb()` callback.
+    /// Present only under the `gpu_debug` feature; in default builds the
+    /// field doesn't exist and [`tap`](DispatchContext::tap) is an
+    /// `#[inline(always)]` no-op.
+    #[cfg(feature = "gpu_debug")]
     pub taps: Vec<(String, BufferRange)>,
-    /// Bumped by every `bind_and_dispatch` and barrier-emitting helper —
-    /// when `SEEKER_PROFILE_FORWARD=1` is set, `forward_sampled` prints
-    /// this alongside its timing breakdown to give a per-token count
-    /// of `vkCmdDispatch` and `vkCmdPipelineBarrier` calls.
+    /// Bumped by every `bind_and_dispatch` — when `SEEKER_PROFILE_FORWARD=1`
+    /// is set, `forward_sampled` prints this alongside its timing
+    /// breakdown to give a per-token count of `vkCmdDispatch` calls.
+    /// Present only under the `profile_gpu` feature so the per-dispatch
+    /// increment vanishes from default builds.
+    #[cfg(feature = "profile_gpu")]
     pub n_dispatches: u32,
-    pub n_barriers: u32,
     /// GPU-timestamp recorder for per-block profiling. Present only
     /// when the `profile_gpu` Cargo feature is enabled; in default
     /// builds the field doesn't exist and the [`mark`] method
@@ -109,9 +114,13 @@ impl<'a> DispatchContext<'a> {
 
     /// Copy `src` (any F32 tensor view) into a fresh contiguous F32 scratch
     /// slot and register it as a tap under `name`. The engine will read it
-    /// back after submit and print a sum. No-op if `SEEKER_QWEN_DIFF_DUMP`
-    /// env var is not set — keep call sites unconditional so the dump
-    /// instrumentation isn't litter when off.
+    /// back after submit and print a sum. No-op unless `SEEKER_QWEN_DIFF_DUMP`
+    /// is set.
+    ///
+    /// With the `gpu_debug` feature OFF (default) this whole method — and
+    /// the engine's tap-readback path and `taps` field — is compiled out;
+    /// the variant below is an `#[inline(always)]` no-op so model call
+    /// sites stay unconditional and emit no instructions in production.
     ///
     /// **Synchronization:** the tap cast READS from `src`. Without an
     /// explicit barrier, a later dispatch that WRITES to `src` (e.g. an
@@ -120,12 +129,9 @@ impl<'a> DispatchContext<'a> {
     /// explicit memory barrier orders them. We issue a barrier on `src`'s
     /// range right after the cast so any future writes to that memory
     /// wait for this cast to complete its read.
+    #[cfg(feature = "gpu_debug")]
     pub fn tap(&mut self, name: &str, src: TensorView) -> Result<(), Box<dyn Error>> {
-        // Fast path: cached LazyLock — first read does the env-var
-        // lookup, subsequent reads are a single atomic-pointer load.
-        // (Each forward has ~150 taps in the qwen35moe path; before
-        // caching, that was 150 getenv syscalls per forward.)
-        if !*crate::runtime_flags::QWEN_DIFF_DUMP {
+        if !crate::runtime_flags::qwen_diff_dump() {
             return Ok(());
         }
         debug_assert_eq!(src.dtype, GgmlType::F32, "tap only supports F32 tensors");
@@ -134,7 +140,7 @@ impl<'a> DispatchContext<'a> {
         // engine reads bytes directly at src.byte_offset after fence wait,
         // without a cast dispatch. This rules out the cast as a source of
         // discrepancy.
-        if *crate::runtime_flags::QWEN_DIFF_DIRECT {
+        if crate::runtime_flags::qwen_diff_direct() {
             self.taps.push((name.to_string(), BufferRange {
                 buffer: src.buffer,
                 offset: src.byte_offset,
@@ -149,6 +155,14 @@ impl<'a> DispatchContext<'a> {
             offset: dst.byte_offset,
             size: n_elements * 4,
         }));
+        Ok(())
+    }
+
+    /// No-op tap for production builds (`gpu_debug` off). Call sites in
+    /// model code stay unconditional; the optimizer elides them.
+    #[cfg(not(feature = "gpu_debug"))]
+    #[inline(always)]
+    pub fn tap(&mut self, _name: &str, _src: TensorView) -> Result<(), Box<dyn Error>> {
         Ok(())
     }
 
