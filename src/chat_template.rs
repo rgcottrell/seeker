@@ -13,7 +13,7 @@ use std::fmt;
 
 use minijinja::value::Value;
 use minijinja::{Environment, Error as MjError, ErrorKind, State};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Handle Python-style string methods that real-world chat templates rely
 /// on but MiniJinja doesn't ship by default. Qwen3's template uses
@@ -127,11 +127,11 @@ fn strftime_now(fmt: &str) -> String {
 /// read `message.reasoning_content` directly and decide per-turn whether to
 /// re-include it. It's omitted from serialization when `None`, so messages
 /// without reasoning render exactly as a plain `{role, content}`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
 }
 

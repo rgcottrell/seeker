@@ -1,5 +1,6 @@
 pub mod bench;
 pub mod chat;
+pub mod chat_cache;
 pub mod detokenize;
 pub mod download;
 pub mod inspect;

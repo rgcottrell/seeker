@@ -18,6 +18,7 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Completer, Editor, Helper, Hinter};
 
 use crate::chat_template::{self, ChatMessage};
+use crate::commands::chat_cache;
 use crate::commands::download::{resolve_hf, HfResolveArgs};
 use crate::gguf::{GgmlType, GgufFile, MetadataValue};
 use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
@@ -101,6 +102,16 @@ pub struct ChatArgs {
     /// path under the user's data directory.
     #[arg(long)]
     history_file: Option<PathBuf>,
+
+    /// Persist the conversation's KV cache (+ SSM state) and messages to this
+    /// file, and resume from it on the next run with the same model — skipping
+    /// the prefill of the restored prefix. (llama.cpp's `--prompt-cache`.)
+    #[arg(long = "prompt-cache")]
+    prompt_cache: Option<PathBuf>,
+
+    /// Load `--prompt-cache` but don't write it back on exit (read-only).
+    #[arg(long = "prompt-cache-ro", requires = "prompt_cache")]
+    prompt_cache_ro: bool,
 
     /// Max tokens per assistant reply.
     #[arg(long, default_value_t = 512)]
@@ -334,6 +345,24 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         session.set_system_prompt(text);
     }
 
+    // Resume from `--prompt-cache` if it exists and matches this model — this
+    // restores the saved KV/SSM + tokens + messages, overriding the fresh
+    // system prompt above. A missing file is a normal first run; a corrupt or
+    // mismatched file is warned about and ignored (fresh start).
+    let arch = gguf.architecture().unwrap_or("unknown").to_string();
+    if let Some(p) = &args.prompt_cache {
+        match chat_cache::load(p, &arch, &mut session.cache) {
+            Ok(Some((tokens, messages))) => {
+                let turns = messages.iter().filter(|m| m.role != "system").count();
+                session.prior_tokens = tokens;
+                session.messages = messages;
+                println!("(resumed {turns} turn(s) from {})", p.display());
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("{e}"),
+        }
+    }
+
     let history = if args.no_history {
         None
     } else {
@@ -342,13 +371,24 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
             .or_else(default_history_path)
     };
 
-    if std::io::stdin().is_terminal() {
+    let result = if std::io::stdin().is_terminal() {
         // Ctrl+C during a reply should stop that reply, not the program.
         spawn_interrupt_watcher();
         run_interactive(&mut session, &gguf, &path, history.as_deref(), args.multiline_input)
     } else {
         run_piped(&mut session)
+    };
+
+    // Persist the session for next time (best-effort; never fail the run).
+    if let Some(p) = &args.prompt_cache {
+        if !args.prompt_cache_ro {
+            match chat_cache::save(p, &arch, &session.cache, &session.prior_tokens, &session.messages) {
+                Ok(()) => tracing::info!(path = %p.display(), "prompt cache saved"),
+                Err(e) => tracing::warn!("prompt-cache save failed: {e}"),
+            }
+        }
     }
+    result
 }
 
 /// The system prompt to seed, from `--system-prompt` or `--system-prompt-file`
