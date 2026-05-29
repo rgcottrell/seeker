@@ -536,8 +536,19 @@ impl Engine {
             self.device
                 .device
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // A cached decode recording is resubmitted across many tokens
+            // by `forward_sampled_replay` without re-recording, so it must
+            // NOT carry ONE_TIME_SUBMIT (which promises a single submit and
+            // trips the validation layer on every replay). Replays are
+            // serial and fence-synchronized, so empty flags suffice — no
+            // SIMULTANEOUS_USE. The non-cached path submits once: keep the
+            // ONE_TIME_SUBMIT hint so the driver can optimize.
+            let flags = if cache_recording {
+                vk::CommandBufferUsageFlags::empty()
+            } else {
+                vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
+            };
+            let begin = vk::CommandBufferBeginInfo::default().flags(flags);
             self.device.device.begin_command_buffer(cmd, &begin)?;
         }
         #[cfg(feature = "profile_gpu")]
