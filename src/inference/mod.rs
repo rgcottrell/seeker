@@ -83,6 +83,22 @@ pub struct DecodeCache {
     pub model_constants: decode_dyn::ModelReplayConstants,
 }
 
+/// Result of one MTP speculative-decode step ([`Engine::decode_speculative`]).
+pub struct SpecStepOut {
+    /// Tokens accepted this step (`accept_len + 1`, always ≥ 1): the matched
+    /// draft prefix plus one bonus/corrective token. All are committed to the
+    /// KV cache and `cache.position` has advanced past them.
+    pub emitted: Vec<u32>,
+    /// Number of draft tokens accepted (`emitted.len() - 1`) — for logging /
+    /// acceptance-rate tracking.
+    pub accepted: u32,
+    /// Pre-`output_norm` hidden state at the last committed position — seeds
+    /// the next step's MTP drafting.
+    pub h_last: Vec<f32>,
+    /// The last committed token — fed as input to the next step's verify.
+    pub last_token: u32,
+}
+
 impl Engine {
     pub fn new(scratch_bytes: u64) -> Result<Self, Box<dyn Error>> {
         let device = Device::new()?;
@@ -681,6 +697,329 @@ impl Engine {
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
         Ok(())
+    }
+
+    /// Record one closure into a fresh command buffer, submit, wait, and
+    /// read back the requested scratch ranges as `Vec<f32>` each. Used by
+    /// the MTP speculative path, which needs fine-grained control over
+    /// multiple forwards per token-step with host decisions in between.
+    ///
+    /// Resets scratch + descriptors (so it invalidates any cached decode
+    /// recording) and reserves the `DecodeDyn` slot first (offset stable),
+    /// exactly like [`forward`]. The closure records dispatches and returns
+    /// the ranges to read back (logits, hidden states, …).
+    fn run_spec_record<F>(
+        &mut self,
+        weights: &WeightsHandle,
+        record: F,
+    ) -> Result<Vec<Vec<f32>>, Box<dyn Error>>
+    where
+        F: FnOnce(&mut DispatchContext) -> Result<Vec<BufferRange>, Box<dyn Error>>,
+    {
+        self.decode_cache = None;
+        self.scratch.reset();
+        self.descriptors.reset(&self.device)?;
+
+        let decode_dyn_range = {
+            let off = self.scratch.alloc(decode_dyn::DecodeDyn::SIZE)?;
+            BufferRange {
+                buffer: self.scratch.buffer,
+                offset: off,
+                size: decode_dyn::DecodeDyn::SIZE,
+            }
+        };
+
+        unsafe {
+            self.device
+                .device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)?;
+        }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.reset(&self.device, self.command_buffer);
+
+        let ranges = {
+            let mut ctx = DispatchContext {
+                device: &self.device,
+                weights,
+                scratch: &mut self.scratch,
+                pipelines: &mut self.pipelines,
+                descriptors: &self.descriptors,
+                cmd: self.command_buffer,
+                #[cfg(feature = "gpu_debug")]
+                taps: Vec::new(),
+                #[cfg(feature = "profile_gpu")]
+                n_dispatches: 0,
+                decode_dyn: decode_dyn_range,
+                replay_plan: None,
+                #[cfg(feature = "profile_gpu")]
+                profile: Some(&mut self.profile),
+            };
+            record(&mut ctx)?
+        };
+
+        unsafe {
+            self.device.device.end_command_buffer(self.command_buffer)?;
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.readback_and_print(&self.device);
+
+        let host_ptr = self
+            .scratch
+            .host_ptr
+            .ok_or("scratch region is not host-visible — spec readback needs host-visible scratch")?;
+        let mut out = Vec::with_capacity(ranges.len());
+        for r in &ranges {
+            if r.size % 4 != 0 {
+                return Err(format!("spec readback range size {} not 4-byte aligned", r.size).into());
+            }
+            let n = (r.size / 4) as usize;
+            let mut buf = vec![0f32; n];
+            // SAFETY: r lies within self.scratch (the buffer the ctx wrote to)
+            // and is fully in bounds; host_ptr maps the whole scratch region.
+            unsafe {
+                let src = host_ptr.add(r.offset as usize) as *const f32;
+                std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+            }
+            out.push(buf);
+        }
+        Ok(out)
+    }
+
+    /// Record + submit a single device-side buffer copy (no scratch /
+    /// descriptor reset). Used for the SSM-state snapshot/restore in
+    /// speculative decode — a GPU→GPU copy instead of a slow
+    /// write-combined host read.
+    fn run_copy(&mut self, src: BufferRange, dst: BufferRange) -> Result<(), Box<dyn Error>> {
+        unsafe {
+            self.device
+                .device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)?;
+        }
+        crate::inference::command::record_copy(&self.device, self.command_buffer, src, dst, src.size);
+        unsafe {
+            self.device.device.end_command_buffer(self.command_buffer)?;
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        Ok(())
+    }
+
+    /// Run one MTP speculative-decode step: draft `n_max` tokens with the
+    /// model's NextN head, verify them with a single batched main-model
+    /// forward, accept the longest prefix via lossless host sample-and-
+    /// compare, and roll back the KV + SSM state for rejected drafts.
+    ///
+    /// Preconditions: `cache.position == position`; `last_token` is the
+    /// most recently sampled token (not yet in the cache); `h_last` is the
+    /// main model's pre-`output_norm` hidden state at position
+    /// `position - 1` (length `n_embd`). The model must
+    /// [`support MTP spec`](crate::models::Model::supports_mtp_spec).
+    ///
+    /// On return, all `emitted` tokens are committed and `cache.position`
+    /// has advanced to `position + emitted.len()`.
+    pub fn decode_speculative(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        last_token: u32,
+        h_last: &[f32],
+        position: u32,
+        sampler: &mut sample::Sampler,
+        n_max: u32,
+    ) -> Result<SpecStepOut, Box<dyn Error>> {
+        let weights = model.weights();
+        let hidden = h_last.len();
+        let vocab = model.vocab_size() as usize;
+        let n = n_max.clamp(1, 8) as usize;
+
+        // ── 1. Draft N tokens with the MTP head (greedy argmax). Each step
+        //       is its own tiny submit so we can argmax on the host and feed
+        //       the recurrence forward.
+        let dbg = std::env::var("SEEKER_SPEC_DEBUG").is_ok();
+        let t_draft = std::time::Instant::now();
+        let mut drafts: Vec<u32> = Vec::with_capacity(n);
+        let mut h: Vec<f32> = h_last.to_vec();
+        let mut tok = last_token;
+        for k in 0..n as u32 {
+            let outs = self.run_spec_record(weights, |ctx| {
+                let d = model.record_mtp_draft(ctx, cache, &h, tok, k)?;
+                Ok(vec![d.draft_token, d.block_out.range()])
+            })?;
+            // outs[0] is the 4-byte u32 token id read back as f32 bits.
+            let draft_k = outs[0][0].to_bits();
+            drafts.push(draft_k);
+            h = outs[1].clone();
+            tok = draft_k;
+        }
+        let draft_ms = t_draft.elapsed().as_secs_f64() * 1000.0;
+
+        // ── 2. Verify: one batched main forward over [last_token, drafts…].
+        //       Snapshot the SSM/GDN state first so partial acceptance can
+        //       roll it back (the verify advances it through all N+1 tokens).
+        let t_snap = std::time::Instant::now();
+        if let Some((src, dst)) = cache.ssm_snapshot_ranges() {
+            self.run_copy(src, dst)?;
+        }
+        let snap_ms = t_snap.elapsed().as_secs_f64() * 1000.0;
+        let verify_tokens: Vec<u32> =
+            std::iter::once(last_token).chain(drafts.iter().copied()).collect();
+        // Greedy + no penalties → argmax each verify position on the GPU and
+        // read back only N+1 token ids (4 bytes each), avoiding the ~5 MB
+        // write-combined logits readback. Lossless and identical to the
+        // non-spec greedy path. Stochastic / penalty configs take the host
+        // sample-and-compare path (reads back full logits).
+        let greedy_verify = sampler.config().is_greedy() && !sampler.config().any_penalty();
+        let t_verify = std::time::Instant::now();
+        let (emitted, residual): (Vec<u32>, Vec<f32>) = if greedy_verify {
+            let vocab_u = vocab as u64;
+            let outs = self.run_spec_record(weights, |ctx| {
+                let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true)?;
+                let mut ranges = Vec::with_capacity(n + 2);
+                for i in 0..=n {
+                    let col = crate::inference::weights::TensorView {
+                        buffer: o.logits.buffer,
+                        byte_offset: o.logits.byte_offset + i as u64 * vocab_u * 4,
+                        byte_size: vocab_u * 4,
+                        dims: [vocab_u, 1, 1, 1],
+                        byte_stride: [4, vocab_u * 4, vocab_u * 4, vocab_u * 4],
+                        element_stride: [1, vocab_u, vocab_u, vocab_u],
+                        dtype: crate::gguf::GgmlType::F32,
+                    };
+                    ranges.push(crate::inference::ops::sampler::record_greedy(ctx, col)?);
+                }
+                ranges.push(o.residual.range());
+                Ok(ranges)
+            })?;
+            let main_argmax: Vec<u32> = (0..=n).map(|i| outs[i][0].to_bits()).collect();
+            // Greedy sample-and-compare on host (no logits needed).
+            let mut emitted = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let s = main_argmax[i];
+                sampler.accept(s);
+                emitted.push(s);
+                if i < n && s == drafts[i] {
+                    continue;
+                }
+                break;
+            }
+            (emitted, outs[n + 1].clone())
+        } else {
+            let outs = self.run_spec_record(weights, |ctx| {
+                let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true)?;
+                Ok(vec![o.logits.range(), o.residual.range()])
+            })?;
+            let all_logits = &outs[0]; // [vocab, n+1] (row i at i*vocab)
+            let logit_rows: Vec<Vec<f32>> = (0..=n)
+                .map(|i| all_logits[i * vocab..(i + 1) * vocab].to_vec())
+                .collect();
+            (sampler.sample_and_compare(&logit_rows, &drafts), outs[1].clone())
+        };
+        let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+        let residual = &residual; // [n_embd, n+1] contiguous (col i at i*hidden)
+
+        let accept_len = emitted.len() - 1; // # accepted drafts
+        let last_committed = *emitted.last().unwrap();
+
+        if dbg {
+            eprintln!(
+                "SPEC dbg: pos={position} last_token={last_token} drafts={drafts:?} emitted={emitted:?}",
+            );
+        }
+
+        // ── 4. Commit / rollback.
+        let new_pos = position + accept_len as u32 + 1;
+        let t_rerun = std::time::Instant::now();
+        let h_last_out: Vec<f32>;
+        if accept_len == n {
+            // Full acceptance: verify already advanced KV + SSM exactly to
+            // new_pos with correct state — nothing to undo.
+            cache.truncate(new_pos);
+            h_last_out = residual[accept_len * hidden..(accept_len + 1) * hidden].to_vec();
+        } else {
+            // Partial acceptance: the verify advanced SSM through rejected
+            // drafts. Restore the pre-verify SSM state and re-run the main
+            // model over just the accepted tokens to rebuild SSM + KV.
+            if let Some((src, dst)) = cache.ssm_restore_ranges() {
+                self.run_copy(src, dst)?;
+            }
+            cache.truncate(position);
+            let accepted_tokens: Vec<u32> = std::iter::once(last_token)
+                .chain(drafts.iter().take(accept_len).copied())
+                .collect();
+            let outs2 = self.run_spec_record(weights, |ctx| {
+                let o = model.record_forward_full(ctx, cache, &accepted_tokens, position, false)?;
+                Ok(vec![o.residual.range()])
+            })?;
+            let r = &outs2[0]; // [n_embd, accept_len+1]
+            h_last_out = r[accept_len * hidden..(accept_len + 1) * hidden].to_vec();
+        }
+        debug_assert_eq!(cache.position, new_pos, "spec step left cache.position wrong");
+        if dbg {
+            let rerun_ms = t_rerun.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "SPEC time: draft={draft_ms:.1}ms (×{n}) snap={snap_ms:.1}ms verify={verify_ms:.1}ms commit/rerun={rerun_ms:.1}ms accepted={accept_len}/{n}",
+            );
+        }
+
+        Ok(SpecStepOut {
+            emitted,
+            accepted: accept_len as u32,
+            h_last: h_last_out,
+            last_token: last_committed,
+        })
+    }
+
+    /// Run [`Model::record_forward_full`] and read back the logits plus the
+    /// last-position pre-`output_norm` hidden state. With `full_logits=false`
+    /// the returned logits is just the final position's vocab row
+    /// (`[vocab]`); otherwise all `L` rows concatenated (`[vocab*L]`).
+    /// `h_last` is `[n_embd]`. Used to seed MTP speculative decoding from a
+    /// prefill (or any) forward. Advances `cache.position` by `tokens.len()`.
+    pub fn forward_full_readback(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        position: u32,
+        full_logits: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>), Box<dyn Error>> {
+        let weights = model.weights();
+        let l = tokens.len();
+        let outs = self.run_spec_record(weights, |ctx| {
+            let o = model.record_forward_full(ctx, cache, tokens, position, full_logits)?;
+            Ok(vec![o.logits.range(), o.residual.range()])
+        })?;
+        let logits = outs[0].clone();
+        let residual = &outs[1];
+        let hidden = residual.len() / l.max(1);
+        let h_last = residual[(l - 1) * hidden..l * hidden].to_vec();
+        Ok((logits, h_last))
     }
 
     /// Write u32 data into a scratch slot (e.g. token ids for get_rows).

@@ -92,6 +92,13 @@ pub struct RunArgs {
     /// RNG seed for stochastic sampling.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+
+    /// Max MTP draft tokens per step for speculative decoding (llama.cpp's
+    /// `--spec-draft-n-max`). 0 (default) disables it and uses the normal
+    /// non-speculative decode loop. Only the qwen35moe model with NextN
+    /// weights supports it; other models silently ignore the flag.
+    #[arg(long = "spec-draft-n-max", default_value_t = 0)]
+    spec_draft_n_max: u32,
 }
 
 impl RunArgs {
@@ -136,7 +143,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         "weights uploaded to GPU",
     );
 
-    let model = crate::models::open(&gguf, weights, bundle)?;
+    let model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
 
     // Op smoke-test harnesses — model bring-up scaffolding, gated behind
     // the `gpu_debug` feature. In production builds this whole dispatch
@@ -258,28 +265,76 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     );
 
     let mut sampler = Sampler::new(args.sampler_config());
-    let mut step_tokens: Vec<u32> = tokens.clone();
     let mut generated: Vec<u32> = Vec::with_capacity(args.max_tokens as usize);
 
     // Prefill = first forward pass (N = prompt length). Decode = every
     // subsequent N=1 step. Reporting them separately matches llama.cpp's
     // `prompt eval` / `eval` timings and is what we want when comparing.
     let mut prefill_secs: f64 = 0.0;
-    let prefill_tokens = step_tokens.len();
+    let prefill_tokens = tokens.len();
     let mut decode_secs: f64 = 0.0;
 
-    for step in 0..args.max_tokens {
-        let position_offset = cache.position;
+    // Speculative decode is active only when --spec-draft-n-max > 0 AND the
+    // model loaded an MTP head. Otherwise fall through to the unchanged
+    // single-token loop (byte-for-byte identical to before).
+    let spec = args.spec_draft_n_max > 0 && model.supports_mtp_spec();
+    if spec {
+        let n_max = args.spec_draft_n_max;
+        // Prefill via the hidden-exposing forward; sample the first token on
+        // the host (the spec path samples on host throughout).
         let t0 = std::time::Instant::now();
-        let next_id = engine.forward_sampled(&*model, &mut cache, &step_tokens, position_offset, &mut sampler)?;
-        let elapsed = t0.elapsed().as_secs_f64();
-        if step == 0 {
-            prefill_secs = elapsed;
-        } else {
-            decode_secs += elapsed;
+        let (logits, mut h_last) =
+            engine.forward_full_readback(&*model, &mut cache, &tokens, 0, /*full_logits=*/ false)?;
+        prefill_secs = t0.elapsed().as_secs_f64();
+        let first = sampler.sample_one(&logits);
+        sampler.accept(first);
+        generated.push(first);
+        let mut last_token = first;
+
+        let mut total_accepted: u64 = 0;
+        let mut spec_steps: u64 = 0;
+        let t_dec = std::time::Instant::now();
+        while (generated.len() as u32) < args.max_tokens {
+            let position = cache.position;
+            let out = engine.decode_speculative(
+                &*model, &mut cache, last_token, &h_last, position, &mut sampler, n_max,
+            )?;
+            total_accepted += out.accepted as u64;
+            spec_steps += 1;
+            for &tk in &out.emitted {
+                if (generated.len() as u32) >= args.max_tokens {
+                    break;
+                }
+                generated.push(tk);
+            }
+            last_token = out.last_token;
+            h_last = out.h_last;
         }
-        generated.push(next_id);
-        step_tokens = vec![next_id];
+        decode_secs = t_dec.elapsed().as_secs_f64();
+        let mean_acc = if spec_steps > 0 {
+            total_accepted as f64 / spec_steps as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "SPEC: {spec_steps} steps, mean accepted {mean_acc:.2}/{n_max} drafts ({} tokens)",
+            generated.len(),
+        );
+    } else {
+        let mut step_tokens: Vec<u32> = tokens.clone();
+        for step in 0..args.max_tokens {
+            let position_offset = cache.position;
+            let t0 = std::time::Instant::now();
+            let next_id = engine.forward_sampled(&*model, &mut cache, &step_tokens, position_offset, &mut sampler)?;
+            let elapsed = t0.elapsed().as_secs_f64();
+            if step == 0 {
+                prefill_secs = elapsed;
+            } else {
+                decode_secs += elapsed;
+            }
+            generated.push(next_id);
+            step_tokens = vec![next_id];
+        }
     }
 
     let generated_text = model
@@ -299,7 +354,9 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     println!("generated: {generated_text}");
     println!("ids:       {generated:?}");
     let prefill_tps = (prefill_tokens as f64) / prefill_secs.max(1e-9);
-    let decode_steps = args.max_tokens.saturating_sub(1) as f64;
+    // Decode tokens = everything after the first (prefill-sampled) token.
+    // For spec decode this counts the multiple tokens emitted per step.
+    let decode_steps = generated.len().saturating_sub(1) as f64;
     let decode_tps = if decode_steps > 0.0 {
         decode_steps / decode_secs.max(1e-9)
     } else {

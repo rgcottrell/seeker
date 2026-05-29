@@ -227,6 +227,147 @@ impl Sampler {
         Ok(())
     }
 
+    /// Host-side speculative **sample-and-compare** over a batch of
+    /// verify-position logits. This is the acceptance step for MTP
+    /// speculative decoding and is *lossless at any temperature*: at each
+    /// position we draw a genuine sample from the main-model distribution
+    /// (the same sampler chain the GPU path runs, applied on the host) and
+    /// accept the draft only if our sample equals it. Every emitted token
+    /// is therefore a faithful sample of the target — the draft only
+    /// decides when we stop.
+    ///
+    /// `logits[i]` is the main model's vocab-wide logits at verify
+    /// position `i` (length `n_draft + 1`). `drafts[i]` is the MTP head's
+    /// proposal for position `i` (length `n_draft`). Returns the emitted
+    /// tokens `s_0..s_accept_len` (length `accept_len + 1`, always ≥ 1):
+    /// the matched prefix plus one bonus/corrective token.
+    ///
+    /// Mutates the sampler RNG + recent-token window for **every** emitted
+    /// token (we never sample past the stop point, so there is nothing to
+    /// roll back). Penalties at position `i` see the window updated by the
+    /// tokens accepted at `0..i` — matching llama.cpp's per-token
+    /// `common_sampler_accept` within a speculative batch.
+    pub fn sample_and_compare(&mut self, logits: &[Vec<f32>], drafts: &[u32]) -> Vec<u32> {
+        let n = drafts.len();
+        debug_assert_eq!(logits.len(), n + 1, "need n_draft+1 logit rows");
+        let mut emitted = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let tok = self.sample_one(&logits[i]);
+            self.accept(tok);
+            emitted.push(tok);
+            if i < n && tok == drafts[i] {
+                continue; // accepted — verify the next draft
+            }
+            break; // mismatch (or the final position) — tok is the bonus token
+        }
+        emitted
+    }
+
+    /// Draw one token from a single row of vocab-wide logits on the host,
+    /// mirroring the GPU chain order
+    /// (penalties → top_k → top_p → min_p → temp → categorical). Greedy
+    /// (`temperature == 0`) short-circuits to argmax after penalties.
+    /// Used by [`sample_and_compare`]; consumes one RNG draw on the
+    /// stochastic path.
+    pub fn sample_one(&mut self, logits_in: &[f32]) -> u32 {
+        let cfg = &self.config;
+        let mut logits: Vec<f32> = logits_in.to_vec();
+
+        // 1. Penalties on the raw logits (sign-conditional repeat penalty,
+        //    then frequency/presence), matching `apply_penalties_f32`.
+        if cfg.any_penalty() {
+            for (tid, count) in self.penalty_pairs() {
+                let l = &mut logits[tid as usize];
+                if cfg.repeat_penalty != 1.0 {
+                    *l = if *l > 0.0 {
+                        *l / cfg.repeat_penalty
+                    } else {
+                        *l * cfg.repeat_penalty
+                    };
+                }
+                *l -= count as f32 * cfg.frequency_penalty;
+                if count > 0 {
+                    *l -= cfg.presence_penalty;
+                }
+            }
+        }
+
+        // 2. Greedy short-circuit — argmax (lowest index on ties).
+        if cfg.is_greedy() {
+            return argmax(&logits);
+        }
+
+        // 3. top_k: candidate ids sorted DESC by logit, truncated to k.
+        let vocab = logits.len();
+        let mut cand: Vec<u32> = (0..vocab as u32).collect();
+        let k = if cfg.top_k > 0 && (cfg.top_k as usize) < vocab {
+            cfg.top_k as usize
+        } else {
+            vocab
+        };
+        // Sort by logit DESC, breaking ties by ascending id (deterministic).
+        cand.sort_unstable_by(|&a, &b| {
+            logits[b as usize]
+                .partial_cmp(&logits[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        cand.truncate(k);
+        let mut kept: Vec<f32> = cand.iter().map(|&i| logits[i as usize]).collect();
+
+        // 4. top_p: keep tokens while the *exclusive* cumulative prob ≤ p
+        //    (so the crossing token is kept, matching llama.cpp / the GPU
+        //    `record_top_p`). Operates on softmax of the kept logits.
+        if cfg.top_p < 1.0 && cfg.top_p > 0.0 {
+            let probs = softmax(&kept);
+            let mut cum = 0.0f32; // exclusive cumulative
+            for j in 0..kept.len() {
+                if cum > cfg.top_p {
+                    kept[j] = f32::NEG_INFINITY;
+                }
+                cum += probs[j];
+            }
+        }
+
+        // 5. min_p: log-space cutoff = max_logit + ln(min_p) (kept[0] is the
+        //    max since `cand` is sorted DESC), matching the GPU `record_min_p`.
+        if cfg.min_p > 0.0 {
+            let max_logit = kept[0];
+            let cutoff = max_logit + cfg.min_p.ln();
+            for v in kept.iter_mut() {
+                if *v < cutoff {
+                    *v = f32::NEG_INFINITY;
+                }
+            }
+        }
+
+        // 6. Temperature scale (last, before the categorical softmax).
+        if (cfg.temperature - 1.0).abs() > 1e-9 {
+            let inv_t = 1.0 / cfg.temperature.max(1e-9);
+            for v in kept.iter_mut() {
+                if v.is_finite() {
+                    *v *= inv_t;
+                }
+            }
+        }
+
+        // 7. Categorical inverse-CDF sample with the per-step uniform draw.
+        //    Mirrors the GPU `record_categorical`: pick the first index whose
+        //    cumulative probability ≥ u.
+        let probs = softmax(&kept);
+        let u = self.draw_uniform();
+        let mut cum = 0.0f32;
+        let mut chosen = kept.len() - 1; // clamp to last on FP shortfall
+        for j in 0..probs.len() {
+            cum += probs[j];
+            if cum >= u {
+                chosen = j;
+                break;
+            }
+        }
+        cand[chosen]
+    }
+
     /// Record the sampler chain into the command buffer. Returns a
     /// 4-byte `BufferRange` holding the sampled token id (u32). The engine
     /// reads back exactly those 4 bytes.
@@ -251,4 +392,37 @@ impl Sampler {
         };
         super::ops::sampler::record_chain(ctx, &self.config, logits, &pairs, uniform)
     }
+}
+
+/// Index of the largest element, ties broken by lowest index (matching the
+/// GPU argmax reduce). Empty input returns 0.
+fn argmax(xs: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in xs.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// Numerically-stable softmax over a slice. `-inf` entries (filtered by
+/// top_p / min_p masking) map to probability 0.
+fn softmax(xs: &[f32]) -> Vec<f32> {
+    let max = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        // All masked / empty — uniform fallback avoids NaN.
+        let n = xs.len().max(1) as f32;
+        return vec![1.0 / n; xs.len()];
+    }
+    let mut out: Vec<f32> = xs.iter().map(|&v| (v - max).exp()).collect();
+    let sum: f32 = out.iter().sum();
+    if sum > 0.0 {
+        for v in out.iter_mut() {
+            *v /= sum;
+        }
+    }
+    out
 }

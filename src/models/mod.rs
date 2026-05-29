@@ -96,6 +96,67 @@ pub trait Model: Send + Sync {
         tokens: &[u32],
         position_offset: u32,
     ) -> Result<TensorView, Box<dyn Error>>;
+
+    // ─── MTP speculative-decode hooks (optional; default unsupported) ───
+
+    /// True when this model loaded its MTP/NextN draft head (only when
+    /// the GGUF carries the tensors *and* spec decoding was requested at
+    /// load time). The engine's `decode_speculative` path requires this.
+    fn supports_mtp_spec(&self) -> bool {
+        false
+    }
+
+    /// Record a forward pass that also exposes the per-position hidden
+    /// state (the pre-final-norm residual), used by MTP speculative
+    /// decode. When `full_logits` is true the returned `logits` covers
+    /// **all** `L` positions (`[vocab, L]`) for batched verification;
+    /// otherwise just the last position (`[vocab, 1]`). `residual` is the
+    /// pre-`output_norm` hidden state `[n_embd, L]` for every position.
+    /// Advances `cache.position` by `tokens.len()` like `record_forward`.
+    fn record_forward_full(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _tokens: &[u32],
+        _position_offset: u32,
+        _full_logits: bool,
+    ) -> Result<ForwardFullOut, Box<dyn Error>> {
+        Err("model does not support record_forward_full (MTP spec decode)".into())
+    }
+
+    /// Record one autoregressive MTP draft step (`L=1`). Given the last
+    /// hidden state `h_last` (`[n_embd]`, host-uploaded) and the previously
+    /// accepted/drafted token `prev_token`, runs the NextN head and returns
+    /// the draft `logits` (`[vocab, 1]`) plus the MTP block output
+    /// `block_out` (`[n_embd, 1]`) that seeds the next draft step's hidden.
+    /// `rel_pos` is the position within the ephemeral per-step MTP KV slot.
+    fn record_mtp_draft(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _h_last: &[f32],
+        _prev_token: u32,
+        _rel_pos: u32,
+    ) -> Result<MtpDraftOut, Box<dyn Error>> {
+        Err("model does not support record_mtp_draft (MTP spec decode)".into())
+    }
+}
+
+/// Output of [`Model::record_forward_full`]: logits (last-position or all
+/// `L` positions depending on `full_logits`) plus the per-position
+/// pre-final-norm hidden state.
+pub struct ForwardFullOut {
+    pub logits: TensorView,
+    pub residual: TensorView,
+}
+
+/// Output of [`Model::record_mtp_draft`]: the greedily-selected draft
+/// token (a 4-byte `u32` on the GPU — drafting is always argmax, so we do
+/// the reduction on-device and avoid reading back full vocab logits) and
+/// the MTP block output that becomes the next step's hidden input.
+pub struct MtpDraftOut {
+    pub draft_token: crate::inference::buffer::BufferRange,
+    pub block_out: TensorView,
 }
 
 /// Per-layer SSM state dimensions for hybrid (attention + Mamba/GDN)
@@ -117,10 +178,14 @@ pub struct CacheDims {
 
 /// Construct the right `Model` for the given GGUF based on its
 /// `general.architecture` metadata key.
+///
+/// `spec_enabled` requests loading the MTP/NextN draft head (for
+/// `--spec-draft-n-max > 0`). Architectures without MTP support ignore it.
 pub fn open(
     gguf: &GgufFile,
     weights: WeightsHandle,
     tokenizer: TokenizerBundle,
+    spec_enabled: bool,
 ) -> Result<Box<dyn Model>, Box<dyn Error>> {
     let arch = gguf
         .architecture()
@@ -128,7 +193,10 @@ pub fn open(
     match arch {
         "llama" => Ok(Box::new(llama::LlamaModel::new(gguf, weights, tokenizer)?)),
         "qwen35moe" => Ok(Box::new(qwen35moe::Qwen35MoeModel::new(
-            gguf, weights, tokenizer,
+            gguf,
+            weights,
+            tokenizer,
+            spec_enabled,
         )?)),
         other => Err(ModelError::Unsupported(other.to_string()).into()),
     }

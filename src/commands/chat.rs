@@ -156,7 +156,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let engine = Engine::new(SCRATCH_BYTES)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
     let weights = engine.upload_weights(&gguf)?;
-    let model = crate::models::open(&gguf, weights, bundle)?;
+    let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
 
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,

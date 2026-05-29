@@ -73,6 +73,11 @@ pub struct KvCache {
     pub ssm_region: Option<Region>,
     pub ssm_conv_states: Vec<crate::inference::buffer::BufferRange>,
     pub ssm_gdn_states: Vec<crate::inference::buffer::BufferRange>,
+    /// Device-local backup of `ssm_region`, same size. Speculative decode
+    /// snapshots the recurrent state here (GPU→GPU copy) before a verify
+    /// forward and restores it on partial acceptance. A device-side copy
+    /// avoids reading the (write-combined, slow-to-read) host mapping.
+    pub ssm_backup: Option<Region>,
 }
 
 impl KvCache {
@@ -139,6 +144,7 @@ impl KvCache {
             ssm_region: None,
             ssm_conv_states: Vec::new(),
             ssm_gdn_states: Vec::new(),
+            ssm_backup: None,
         })
     }
 
@@ -165,7 +171,9 @@ impl KvCache {
         let region = Region::new(
             device,
             total.max(1),
-            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
         // Zero-init: each layer's state must start at zero on the first
@@ -193,9 +201,18 @@ impl KvCache {
             });
             cursor += gdn_aligned;
         }
+        // Device-local backup region for speculative-decode rollback.
+        let backup = Region::new(
+            device,
+            total.max(1),
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+
         self.ssm_region = Some(region);
         self.ssm_conv_states = conv_states;
         self.ssm_gdn_states = gdn_states;
+        self.ssm_backup = Some(backup);
         Ok(())
     }
 
@@ -205,11 +222,72 @@ impl KvCache {
         self.position = 0;
     }
 
+    /// Roll the write cursor back to `new_pos` after speculative decode
+    /// rejected some draft tokens. Symmetric to [`cache_io::advance`].
+    /// Buffer contents past `new_pos` are left in place — attention reads
+    /// are bounded by the position cursor / `DecodeDyn::kv_len`, so the
+    /// stale K/V tail is never read and is overwritten by the next
+    /// forward at the same offsets. Never advances (saturates at the
+    /// current position).
+    ///
+    /// NOTE: this only rolls back the *attention* K/V. The SSM/GDN
+    /// recurrent state has no per-position undo — pair this with
+    /// [`snapshot_ssm`]/[`restore_ssm`] for hybrid models.
+    ///
+    /// [`cache_io::advance`]: crate::inference::ops::cache_io::advance
+    pub fn truncate(&mut self, new_pos: u32) {
+        self.position = new_pos.min(self.position);
+    }
+
+    /// `(src, dst)` ranges to SNAPSHOT the SSM/GDN recurrent state
+    /// (`ssm_region` → `ssm_backup`) via a device-side `vkCmdCopyBuffer`.
+    /// Speculative decode captures the pre-verify state so partial
+    /// acceptance can roll it back (the verify advances the recurrent
+    /// state through draft tokens that may be rejected, and unlike the K/V
+    /// cache there is no position-cursor undo). `None` for pure-attention
+    /// models. A GPU-side copy is used because reading the write-combined
+    /// host mapping of a ~60 MB region is pathologically slow.
+    pub fn ssm_snapshot_ranges(
+        &self,
+    ) -> Option<(
+        crate::inference::buffer::BufferRange,
+        crate::inference::buffer::BufferRange,
+    )> {
+        let region = self.ssm_region.as_ref()?;
+        let backup = self.ssm_backup.as_ref()?;
+        Some((full_range(region), full_range(backup)))
+    }
+
+    /// `(src, dst)` ranges to RESTORE the snapshot (`ssm_backup` →
+    /// `ssm_region`). Pairs with [`ssm_snapshot_ranges`].
+    pub fn ssm_restore_ranges(
+        &self,
+    ) -> Option<(
+        crate::inference::buffer::BufferRange,
+        crate::inference::buffer::BufferRange,
+    )> {
+        let region = self.ssm_region.as_ref()?;
+        let backup = self.ssm_backup.as_ref()?;
+        Some((full_range(backup), full_range(region)))
+    }
+
     pub fn destroy(&mut self, device: &Device) {
         self.region.destroy(device);
         if let Some(mut r) = self.ssm_region.take() {
             r.destroy(device);
         }
+        if let Some(mut r) = self.ssm_backup.take() {
+            r.destroy(device);
+        }
+    }
+}
+
+/// Full-region `BufferRange` (offset 0, whole size).
+fn full_range(region: &Region) -> crate::inference::buffer::BufferRange {
+    crate::inference::buffer::BufferRange {
+        buffer: region.buffer,
+        offset: 0,
+        size: region.size,
     }
 }
 
