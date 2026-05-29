@@ -254,6 +254,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             gdn_state_floats = ssm.gdn_state_floats,
             "ssm state allocated",
         );
+        // Per-position SSM checkpoint buffers for spec decode — sized for
+        // L = (clamped n_draft)+1 snapshots. Lets partial acceptance roll
+        // the recurrent state back without a re-run.
+        if args.spec_draft_n_max > 0 && model.supports_mtp_spec() {
+            let max_snapshots = args.spec_draft_n_max.clamp(1, 8) + 1;
+            cache.allocate_ssm_snapshots(&engine.device, &ssm, max_snapshots)?;
+        }
     }
     tracing::info!(
         n_layer = dims.n_layer,

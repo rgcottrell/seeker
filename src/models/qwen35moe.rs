@@ -285,6 +285,8 @@ impl Model for Qwen35MoeModel {
             n_ssm_layers,
             conv_state_floats,
             gdn_state_floats,
+            conv_channels,
+            conv_kernel: p.ssm_conv,
         })
     }
 
@@ -360,7 +362,7 @@ impl Model for Qwen35MoeModel {
         position_offset: u32,
     ) -> Result<TensorView, Box<dyn Error>> {
         Ok(self
-            .forward_impl(ctx, cache, tokens, position_offset, /*full_logits=*/ false)?
+            .forward_impl(ctx, cache, tokens, position_offset, /*full_logits=*/ false, /*checkpoint=*/ false)?
             .logits)
     }
 
@@ -371,8 +373,18 @@ impl Model for Qwen35MoeModel {
         tokens: &[u32],
         position_offset: u32,
         full_logits: bool,
+        checkpoint: bool,
     ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
-        self.forward_impl(ctx, cache, tokens, position_offset, full_logits)
+        self.forward_impl(ctx, cache, tokens, position_offset, full_logits, checkpoint)
+    }
+
+    fn record_ssm_finalize(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        accept_len: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.ssm_finalize_impl(ctx, cache, accept_len)
     }
 
     fn record_mtp_draft(
@@ -392,6 +404,7 @@ impl Qwen35MoeModel {
     /// logits) and [`Model::record_forward_full`] (all-position logits +
     /// hidden). Returns the logits tensor and the per-position
     /// pre-`output_norm` residual `[n_embd, L]`.
+    #[allow(clippy::too_many_arguments)]
     fn forward_impl(
         &self,
         ctx: &mut DispatchContext,
@@ -399,6 +412,7 @@ impl Qwen35MoeModel {
         tokens: &[u32],
         position_offset: u32,
         full_logits: bool,
+        checkpoint: bool,
     ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
         let p = &self.params;
         let l = tokens.len() as u32;
@@ -552,7 +566,21 @@ impl Qwen35MoeModel {
                     let gdn_state = cache.ssm_gdn_states.get(ssm_layer_idx).copied();
                     let conv_state = cache.ssm_conv_states.get(ssm_layer_idx).copied();
                     let ssm_host_ptr = cache.ssm_region.as_ref().and_then(|r| r.host_ptr);
-                    ssm_block(ctx, ssm_w, residual, p, hidden, l, layer_idx as u32, gdn_state, conv_state, ssm_host_ptr)?;
+                    // Checkpoint mode (spec-decode verify): write per-position
+                    // GDN snapshots + a conv-input backup instead of the live
+                    // recurrent state, so a partial-accept step can roll back.
+                    let checkpoint_bufs = if checkpoint {
+                        match (
+                            cache.ssm_gdn_snapshots.get(ssm_layer_idx).copied(),
+                            cache.ssm_conv_backups.get(ssm_layer_idx).copied(),
+                        ) {
+                            (Some(g), Some(c)) => Some((g, c)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    ssm_block(ctx, ssm_w, residual, p, hidden, l, layer_idx as u32, gdn_state, conv_state, ssm_host_ptr, checkpoint_bufs)?;
                 }
                 _ => {
                     // block type currently passthrough'd via the matching
@@ -754,6 +782,103 @@ impl Qwen35MoeModel {
             draft_token,
             block_out: residual,
         })
+    }
+
+    /// Commit per-position SSM snapshots from a checkpoint verify into the
+    /// live recurrent state, selecting position `accept_len`. For each SSM
+    /// layer: copy GDN snapshot slot `accept_len` → live GDN state, and
+    /// extract the conv state at `accept_len` (rows `[accept_len+1 ..
+    /// accept_len+conv_kernel-1]` of the backed-up conv window) → live conv
+    /// state. Replaces the partial-acceptance re-run.
+    fn ssm_finalize_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        accept_len: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let elem = 4u64;
+        let conv_kernel = cache.ssm_conv_kernel as u64;
+        let conv_channels = cache.ssm_conv_channels as u64;
+        let n_padded = conv_kernel - 1 + cache.ssm_max_snapshots as u64;
+        let state_dim_inner = conv_kernel - 1;
+        let n_ssm = cache.ssm_gdn_states.len();
+
+        for i in 0..n_ssm {
+            // GDN: contiguous copy of snapshot slot[accept_len] → live state.
+            let live_gdn = cache.ssm_gdn_states[i];
+            let snap = cache.ssm_gdn_snapshots[i];
+            let state_floats = live_gdn.size / elem;
+            unsafe {
+                use ash::vk;
+                let copy = vk::BufferCopy::default()
+                    .src_offset(snap.offset + accept_len as u64 * state_floats * elem)
+                    .dst_offset(live_gdn.offset)
+                    .size(state_floats * elem);
+                ctx.device.device.cmd_copy_buffer(
+                    ctx.cmd,
+                    snap.buffer,
+                    live_gdn.buffer,
+                    std::slice::from_ref(&copy),
+                );
+                let bar = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(live_gdn.buffer)
+                    .offset(live_gdn.offset)
+                    .size(state_floats * elem);
+                ctx.device.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&bar),
+                    &[],
+                );
+            }
+
+            // Conv: strided cast of backup rows [accept_len+1 .. +kernel-1]
+            // → live conv state (same layout as the normal writeback).
+            let backup = cache.ssm_conv_backups[i];
+            let live_conv = cache.ssm_conv_states[i];
+            let src = TensorView {
+                buffer: backup.buffer,
+                byte_offset: backup.offset + (accept_len as u64 + 1) * elem,
+                byte_size: backup.size - (accept_len as u64 + 1) * elem,
+                dims: [state_dim_inner, conv_channels, 1, 1],
+                byte_stride: [
+                    elem,
+                    n_padded * elem,
+                    n_padded * conv_channels * elem,
+                    n_padded * conv_channels * elem,
+                ],
+                element_stride: [1, n_padded, n_padded * conv_channels, n_padded * conv_channels],
+                dtype: GgmlType::F32,
+            };
+            let dst = TensorView {
+                buffer: live_conv.buffer,
+                byte_offset: live_conv.offset,
+                byte_size: live_conv.size,
+                dims: [state_dim_inner, conv_channels, 1, 1],
+                byte_stride: [
+                    elem,
+                    state_dim_inner * elem,
+                    state_dim_inner * conv_channels * elem,
+                    state_dim_inner * conv_channels * elem,
+                ],
+                element_stride: [
+                    1,
+                    state_dim_inner,
+                    state_dim_inner * conv_channels,
+                    state_dim_inner * conv_channels,
+                ],
+                dtype: GgmlType::F32,
+            };
+            cast::record_cast(ctx, src, dst)?;
+        }
+        Ok(())
     }
 }
 
@@ -1009,6 +1134,15 @@ fn ssm_block(
     gdn_state_persistent: Option<crate::inference::buffer::BufferRange>,
     conv_state_persistent: Option<crate::inference::buffer::BufferRange>,
     ssm_region_host_ptr: Option<*mut u8>,
+    // Spec-decode checkpoint mode: `(gdn_snapshot, conv_backup)` per-layer
+    // buffers. When Some, the GDN scan emits L per-token state snapshots
+    // into `gdn_snapshot` and the full conv input window is copied into
+    // `conv_backup`, and the live recurrent-state writebacks are SKIPPED
+    // (finalize commits the accepted position later).
+    checkpoint: Option<(
+        crate::inference::buffer::BufferRange,
+        crate::inference::buffer::BufferRange,
+    )>,
 ) -> Result<(), Box<dyn Error>> {
     let l_u = l as u64;
     let num_k = p.ssm_groups as u64;          // 16
@@ -1184,10 +1318,45 @@ fn ssm_block(
     };
     cast::record_cast(ctx, qkv_as_token_inner, conv_input_tail)?;
 
-    // Save the last (conv_kernel-1) tokens of conv_input as the new
-    // persistent conv state, for the next forward to read. Mirrors
-    // llama.cpp's `conv_state_last` view at offset `s_idx = L`.
-    if let Some(persistent) = conv_state_persistent {
+    // Checkpoint mode: back up the entire conv input window (contiguous)
+    // so finalize can extract the conv state at the accepted position.
+    // Skips the live conv-state writeback below.
+    if let Some((_, conv_backup)) = checkpoint {
+        unsafe {
+            use ash::vk;
+            let bytes = conv_input.byte_size;
+            let copy = vk::BufferCopy::default()
+                .src_offset(conv_input.byte_offset)
+                .dst_offset(conv_backup.offset)
+                .size(bytes);
+            ctx.device.device.cmd_copy_buffer(
+                ctx.cmd,
+                conv_input.buffer,
+                conv_backup.buffer,
+                std::slice::from_ref(&copy),
+            );
+            let bar = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(conv_backup.buffer)
+                .offset(conv_backup.offset)
+                .size(bytes);
+            ctx.device.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&bar),
+                &[],
+            );
+        }
+    } else if let Some(persistent) = conv_state_persistent {
+        // Save the last (conv_kernel-1) tokens of conv_input as the new
+        // persistent conv state, for the next forward to read. Mirrors
+        // llama.cpp's `conv_state_last` view at offset `s_idx = L`.
         let state_dim_inner = conv_kernel - 1;
         let s_idx = l_u; // = n_padded - (kernel - 1)
         let conv_input_last = TensorView {
@@ -1373,7 +1542,9 @@ fn ssm_block(
     // floats, state is num_v * s_v * s_v floats.
     let attn_floats = l_u * num_v * s_v; // per-token outputs
     let state_floats = num_v * s_v * s_v; // single-snapshot state
-    let gdn_total_floats = attn_floats + state_floats;
+    // Checkpoint mode emits L per-token state snapshots (K = L) instead of 1.
+    let k_snapshots: u64 = if checkpoint.is_some() { l_u } else { 1 };
+    let gdn_total_floats = attn_floats + k_snapshots * state_floats;
     let gdn_dst = ctx.alloc_scratch(gdn_total_floats * elem)?;
     // state_in: either persistent (carried over from previous forward via
     // KvCache.ssm_gdn_states) or zero-initialized fallback if the engine
@@ -1456,14 +1627,47 @@ fn ssm_block(
         v_strides,
         b_strides,
         s_v as u32,
+        k_snapshots as u32,
     )?;
     let _ = (q_strides,); // q_normed_strides supersedes q_strides above
 
-    // Copy new GDN state from gdn_dst's state region back to the persistent
-    // state buffer. gdn_dst layout: [attn_floats outputs][state_floats state].
-    // After this copy, subsequent forwards' GDN read picks up where this one
-    // left off — needed for autoregressive decode quality.
-    if let Some(persistent) = gdn_state_persistent {
+    // Checkpoint mode: copy ALL K=L per-token state snapshots (contiguous in
+    // gdn_dst's state region) into the per-layer snapshot buffer for later
+    // finalize. Skips the live-state writeback below.
+    if let Some((gdn_snapshot, _)) = checkpoint {
+        unsafe {
+            use ash::vk;
+            let copy = vk::BufferCopy::default()
+                .src_offset(gdn_dst.offset + attn_floats * elem)
+                .dst_offset(gdn_snapshot.offset)
+                .size(k_snapshots * state_floats * elem);
+            ctx.device.device.cmd_copy_buffer(
+                ctx.cmd,
+                gdn_dst.buffer,
+                gdn_snapshot.buffer,
+                std::slice::from_ref(&copy),
+            );
+            let bar = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(gdn_snapshot.buffer)
+                .offset(gdn_snapshot.offset)
+                .size(k_snapshots * state_floats * elem);
+            ctx.device.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&bar),
+                &[],
+            );
+        }
+    } else if let Some(persistent) = gdn_state_persistent {
+        // Normal decode: copy the single final GDN state back to the
+        // persistent state buffer. gdn_dst: [attn outputs][state].
         unsafe {
             use ash::vk;
             let copy = vk::BufferCopy::default()

@@ -113,6 +113,11 @@ pub trait Model: Send + Sync {
     /// otherwise just the last position (`[vocab, 1]`). `residual` is the
     /// pre-`output_norm` hidden state `[n_embd, L]` for every position.
     /// Advances `cache.position` by `tokens.len()` like `record_forward`.
+    /// `checkpoint` (spec-decode verify only): the SSM layers emit
+    /// per-position recurrent-state snapshots into the cache's snapshot
+    /// buffers instead of writing the live state, so a partial-acceptance
+    /// step can roll back to the accepted position via
+    /// [`record_ssm_finalize`] without re-running the model.
     fn record_forward_full(
         &self,
         _ctx: &mut DispatchContext,
@@ -120,8 +125,21 @@ pub trait Model: Send + Sync {
         _tokens: &[u32],
         _position_offset: u32,
         _full_logits: bool,
+        _checkpoint: bool,
     ) -> Result<ForwardFullOut, Box<dyn Error>> {
         Err("model does not support record_forward_full (MTP spec decode)".into())
+    }
+
+    /// Commit the per-position SSM snapshots from a checkpoint verify into
+    /// the live recurrent state, selecting the state as of the accepted
+    /// position (`accept_len`). Replaces the partial-acceptance re-run.
+    fn record_ssm_finalize(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _accept_len: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        Err("model does not support record_ssm_finalize (MTP spec decode)".into())
     }
 
     /// Record one autoregressive MTP draft step (`L=1`). Given the last
@@ -167,6 +185,11 @@ pub struct SsmStateDims {
     pub n_ssm_layers: u32,
     pub conv_state_floats: u32,
     pub gdn_state_floats: u32,
+    /// Conv1d channel count (`conv_state_floats = (conv_kernel-1) * conv_channels`).
+    /// Needed to size the per-position conv checkpoint backup for MTP spec decode.
+    pub conv_channels: u32,
+    /// Conv1d kernel size.
+    pub conv_kernel: u32,
 }
 
 #[derive(Debug, Clone, Copy)]

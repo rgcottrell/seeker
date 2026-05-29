@@ -73,11 +73,23 @@ pub struct KvCache {
     pub ssm_region: Option<Region>,
     pub ssm_conv_states: Vec<crate::inference::buffer::BufferRange>,
     pub ssm_gdn_states: Vec<crate::inference::buffer::BufferRange>,
-    /// Device-local backup of `ssm_region`, same size. Speculative decode
-    /// snapshots the recurrent state here (GPU→GPU copy) before a verify
-    /// forward and restores it on partial acceptance. A device-side copy
-    /// avoids reading the (write-combined, slow-to-read) host mapping.
-    pub ssm_backup: Option<Region>,
+    /// Per-position GDN state snapshots written by a checkpoint verify
+    /// forward (the GDN shader emits `K = L` snapshots, slot t = state
+    /// after token t). One region; `ssm_gdn_snapshots[layer]` is that
+    /// layer's `max_snapshots × gdn_state_floats` slice. Finalize copies
+    /// slot `accept_len` into the live `ssm_gdn_states[layer]` — no re-run.
+    pub ssm_gdn_snap_region: Option<Region>,
+    pub ssm_gdn_snapshots: Vec<crate::inference::buffer::BufferRange>,
+    /// Per-layer backup of the full conv1d input window (`[n_padded,
+    /// conv_channels]`) from a checkpoint verify, so finalize can extract
+    /// the conv state at the accepted position. One region; per-layer slices.
+    pub ssm_conv_backup_region: Option<Region>,
+    pub ssm_conv_backups: Vec<crate::inference::buffer::BufferRange>,
+    /// `L` (= n_draft+1) the snapshot buffers were sized for; also the
+    /// `n_padded` channel stride of the conv backups is `(conv_kernel-1)+this`.
+    pub ssm_max_snapshots: u32,
+    pub ssm_conv_kernel: u32,
+    pub ssm_conv_channels: u32,
 }
 
 impl KvCache {
@@ -144,7 +156,13 @@ impl KvCache {
             ssm_region: None,
             ssm_conv_states: Vec::new(),
             ssm_gdn_states: Vec::new(),
-            ssm_backup: None,
+            ssm_gdn_snap_region: None,
+            ssm_gdn_snapshots: Vec::new(),
+            ssm_conv_backup_region: None,
+            ssm_conv_backups: Vec::new(),
+            ssm_max_snapshots: 0,
+            ssm_conv_kernel: 0,
+            ssm_conv_channels: 0,
         })
     }
 
@@ -201,18 +219,66 @@ impl KvCache {
             });
             cursor += gdn_aligned;
         }
-        // Device-local backup region for speculative-decode rollback.
-        let backup = Region::new(
-            device,
-            total.max(1),
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-
         self.ssm_region = Some(region);
         self.ssm_conv_states = conv_states;
         self.ssm_gdn_states = gdn_states;
-        self.ssm_backup = Some(backup);
+        Ok(())
+    }
+
+    /// Allocate per-position checkpoint buffers for MTP speculative decode:
+    /// `max_snapshots` (= n_draft+1) GDN state snapshots per SSM layer plus a
+    /// backup of each layer's conv1d input window. Lets a partial-acceptance
+    /// step roll the recurrent state back to the accepted position by copying
+    /// one snapshot, instead of re-running the main model. Call after
+    /// [`allocate_ssm_state`]. No-op (regions stay `None`) when
+    /// `max_snapshots == 0` or the model has no SSM state.
+    pub fn allocate_ssm_snapshots(
+        &mut self,
+        device: &Device,
+        dims: &crate::models::SsmStateDims,
+        max_snapshots: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        if max_snapshots == 0 || dims.n_ssm_layers == 0 {
+            return Ok(());
+        }
+        let n = dims.n_ssm_layers as u64;
+        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST;
+        let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+
+        // GDN: max_snapshots × gdn_state_floats per layer.
+        let gdn_bytes = (max_snapshots as u64) * (dims.gdn_state_floats as u64) * 4;
+        let gdn_aligned = align_up(gdn_bytes, align);
+        let gdn_region = Region::new(device, (n * gdn_aligned).max(1), usage, mem)?;
+        // Conv: [(conv_kernel-1)+max_snapshots] × conv_channels per layer.
+        let n_padded = (dims.conv_kernel - 1 + max_snapshots) as u64;
+        let conv_bytes = n_padded * (dims.conv_channels as u64) * 4;
+        let conv_aligned = align_up(conv_bytes, align);
+        let conv_region = Region::new(device, (n * conv_aligned).max(1), usage, mem)?;
+
+        let mut gdn_snaps = Vec::with_capacity(dims.n_ssm_layers as usize);
+        let mut conv_backs = Vec::with_capacity(dims.n_ssm_layers as usize);
+        for i in 0..n {
+            gdn_snaps.push(crate::inference::buffer::BufferRange {
+                buffer: gdn_region.buffer,
+                offset: i * gdn_aligned,
+                size: gdn_bytes,
+            });
+            conv_backs.push(crate::inference::buffer::BufferRange {
+                buffer: conv_region.buffer,
+                offset: i * conv_aligned,
+                size: conv_bytes,
+            });
+        }
+        self.ssm_gdn_snap_region = Some(gdn_region);
+        self.ssm_gdn_snapshots = gdn_snaps;
+        self.ssm_conv_backup_region = Some(conv_region);
+        self.ssm_conv_backups = conv_backs;
+        self.ssm_max_snapshots = max_snapshots;
+        self.ssm_conv_kernel = dims.conv_kernel;
+        self.ssm_conv_channels = dims.conv_channels;
         Ok(())
     }
 
@@ -239,55 +305,18 @@ impl KvCache {
         self.position = new_pos.min(self.position);
     }
 
-    /// `(src, dst)` ranges to SNAPSHOT the SSM/GDN recurrent state
-    /// (`ssm_region` → `ssm_backup`) via a device-side `vkCmdCopyBuffer`.
-    /// Speculative decode captures the pre-verify state so partial
-    /// acceptance can roll it back (the verify advances the recurrent
-    /// state through draft tokens that may be rejected, and unlike the K/V
-    /// cache there is no position-cursor undo). `None` for pure-attention
-    /// models. A GPU-side copy is used because reading the write-combined
-    /// host mapping of a ~60 MB region is pathologically slow.
-    pub fn ssm_snapshot_ranges(
-        &self,
-    ) -> Option<(
-        crate::inference::buffer::BufferRange,
-        crate::inference::buffer::BufferRange,
-    )> {
-        let region = self.ssm_region.as_ref()?;
-        let backup = self.ssm_backup.as_ref()?;
-        Some((full_range(region), full_range(backup)))
-    }
-
-    /// `(src, dst)` ranges to RESTORE the snapshot (`ssm_backup` →
-    /// `ssm_region`). Pairs with [`ssm_snapshot_ranges`].
-    pub fn ssm_restore_ranges(
-        &self,
-    ) -> Option<(
-        crate::inference::buffer::BufferRange,
-        crate::inference::buffer::BufferRange,
-    )> {
-        let region = self.ssm_region.as_ref()?;
-        let backup = self.ssm_backup.as_ref()?;
-        Some((full_range(backup), full_range(region)))
-    }
 
     pub fn destroy(&mut self, device: &Device) {
         self.region.destroy(device);
         if let Some(mut r) = self.ssm_region.take() {
             r.destroy(device);
         }
-        if let Some(mut r) = self.ssm_backup.take() {
+        if let Some(mut r) = self.ssm_gdn_snap_region.take() {
             r.destroy(device);
         }
-    }
-}
-
-/// Full-region `BufferRange` (offset 0, whole size).
-fn full_range(region: &Region) -> crate::inference::buffer::BufferRange {
-    crate::inference::buffer::BufferRange {
-        buffer: region.buffer,
-        offset: 0,
-        size: region.size,
+        if let Some(mut r) = self.ssm_conv_backup_region.take() {
+            r.destroy(device);
+        }
     }
 }
 

@@ -799,37 +799,6 @@ impl Engine {
         Ok(out)
     }
 
-    /// Record + submit a single device-side buffer copy (no scratch /
-    /// descriptor reset). Used for the SSM-state snapshot/restore in
-    /// speculative decode — a GPU→GPU copy instead of a slow
-    /// write-combined host read.
-    fn run_copy(&mut self, src: BufferRange, dst: BufferRange) -> Result<(), Box<dyn Error>> {
-        unsafe {
-            self.device
-                .device
-                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device
-                .device
-                .begin_command_buffer(self.command_buffer, &begin)?;
-        }
-        crate::inference::command::record_copy(&self.device, self.command_buffer, src, dst, src.size);
-        unsafe {
-            self.device.device.end_command_buffer(self.command_buffer)?;
-            self.device.device.reset_fences(&[self.fence])?;
-            let submit = vk::SubmitInfo::default()
-                .command_buffers(std::slice::from_ref(&self.command_buffer));
-            self.device
-                .device
-                .queue_submit(self.device.queue, &[submit], self.fence)?;
-            self.device
-                .device
-                .wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(())
-    }
-
     /// Run one MTP speculative-decode step: draft `n_max` tokens with the
     /// model's NextN head, verify them with a single batched main-model
     /// forward, accept the longest prefix via lossless host sample-and-
@@ -879,14 +848,11 @@ impl Engine {
         }
         let draft_ms = t_draft.elapsed().as_secs_f64() * 1000.0;
 
-        // ── 2. Verify: one batched main forward over [last_token, drafts…].
-        //       Snapshot the SSM/GDN state first so partial acceptance can
-        //       roll it back (the verify advances it through all N+1 tokens).
-        let t_snap = std::time::Instant::now();
-        if let Some((src, dst)) = cache.ssm_snapshot_ranges() {
-            self.run_copy(src, dst)?;
-        }
-        let snap_ms = t_snap.elapsed().as_secs_f64() * 1000.0;
+        // ── 2. Verify: one batched main forward over [last_token, drafts…],
+        //       in CHECKPOINT mode so each SSM layer emits per-position
+        //       recurrent-state snapshots (instead of writing the live
+        //       state). Partial acceptance then rolls back by committing one
+        //       snapshot in finalize — no re-run.
         let verify_tokens: Vec<u32> =
             std::iter::once(last_token).chain(drafts.iter().copied()).collect();
         // Greedy + no penalties → argmax each verify position on the GPU and
@@ -899,7 +865,7 @@ impl Engine {
         let (emitted, residual): (Vec<u32>, Vec<f32>) = if greedy_verify {
             let vocab_u = vocab as u64;
             let outs = self.run_spec_record(weights, |ctx| {
-                let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true)?;
+                let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
                 let mut ranges = Vec::with_capacity(n + 2);
                 for i in 0..=n {
                     let col = crate::inference::weights::TensorView {
@@ -931,7 +897,7 @@ impl Engine {
             (emitted, outs[n + 1].clone())
         } else {
             let outs = self.run_spec_record(weights, |ctx| {
-                let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true)?;
+                let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
                 Ok(vec![o.logits.range(), o.residual.range()])
             })?;
             let all_logits = &outs[0]; // [vocab, n+1] (row i at i*vocab)
@@ -952,38 +918,27 @@ impl Engine {
             );
         }
 
-        // ── 4. Commit / rollback.
+        // ── 4. Commit. Truncate the main K/V to the accepted length (stale
+        //       draft K/V is never read), then FINALIZE the SSM state by
+        //       committing the per-position snapshot at the accepted
+        //       position — no re-run. The verify advanced cache.position
+        //       through all N+1 tokens; roll it back to new_pos.
         let new_pos = position + accept_len as u32 + 1;
-        let t_rerun = std::time::Instant::now();
-        let h_last_out: Vec<f32>;
-        if accept_len == n {
-            // Full acceptance: verify already advanced KV + SSM exactly to
-            // new_pos with correct state — nothing to undo.
-            cache.truncate(new_pos);
-            h_last_out = residual[accept_len * hidden..(accept_len + 1) * hidden].to_vec();
-        } else {
-            // Partial acceptance: the verify advanced SSM through rejected
-            // drafts. Restore the pre-verify SSM state and re-run the main
-            // model over just the accepted tokens to rebuild SSM + KV.
-            if let Some((src, dst)) = cache.ssm_restore_ranges() {
-                self.run_copy(src, dst)?;
-            }
-            cache.truncate(position);
-            let accepted_tokens: Vec<u32> = std::iter::once(last_token)
-                .chain(drafts.iter().take(accept_len).copied())
-                .collect();
-            let outs2 = self.run_spec_record(weights, |ctx| {
-                let o = model.record_forward_full(ctx, cache, &accepted_tokens, position, false)?;
-                Ok(vec![o.residual.range()])
+        cache.truncate(new_pos);
+        let h_last_out = residual[accept_len * hidden..(accept_len + 1) * hidden].to_vec();
+        let t_fin = std::time::Instant::now();
+        let needs_finalize = !cache.ssm_gdn_snapshots.is_empty();
+        if needs_finalize {
+            self.run_spec_record(weights, |ctx| {
+                model.record_ssm_finalize(ctx, cache, accept_len as u32)?;
+                Ok(vec![])
             })?;
-            let r = &outs2[0]; // [n_embd, accept_len+1]
-            h_last_out = r[accept_len * hidden..(accept_len + 1) * hidden].to_vec();
         }
         debug_assert_eq!(cache.position, new_pos, "spec step left cache.position wrong");
         if dbg {
-            let rerun_ms = t_rerun.elapsed().as_secs_f64() * 1000.0;
+            let fin_ms = t_fin.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
-                "SPEC time: draft={draft_ms:.1}ms (×{n}) snap={snap_ms:.1}ms verify={verify_ms:.1}ms commit/rerun={rerun_ms:.1}ms accepted={accept_len}/{n}",
+                "SPEC time: draft={draft_ms:.1}ms (×{n}) verify={verify_ms:.1}ms finalize={fin_ms:.1}ms accepted={accept_len}/{n}",
             );
         }
 
@@ -1012,7 +967,7 @@ impl Engine {
         let weights = model.weights();
         let l = tokens.len();
         let outs = self.run_spec_record(weights, |ctx| {
-            let o = model.record_forward_full(ctx, cache, tokens, position, full_logits)?;
+            let o = model.record_forward_full(ctx, cache, tokens, position, full_logits, false)?;
             Ok(vec![o.logits.range(), o.residual.range()])
         })?;
         let logits = outs[0].clone();

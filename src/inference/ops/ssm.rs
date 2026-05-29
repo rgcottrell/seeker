@@ -191,6 +191,11 @@ pub fn record_gated_delta_net(
     v_strides: GdnStrides,
     b_strides: GdnStrides,
     state_v: u32, // = S_V = head_v_dim
+    // Number of per-token state snapshots to emit (K in the shader). 1 =
+    // just the final state (normal decode); = n_tokens emits one state per
+    // token (the last K tokens; shift = n_tokens - K) for spec-decode
+    // checkpointing. dst's state region must hold K * state_size_per_snap.
+    k_snapshots: u32,
 ) -> Result<(), Box<dyn Error>> {
     let mut push = [0u8; GDN_PUSH_BYTES as usize];
     let mut w = 0;
@@ -218,7 +223,7 @@ pub fn record_gated_delta_net(
     put_u(&mut push, &mut w, head_count_k);   // neq1: wrap Q/K head index for GQA-like repeat
     put_u(&mut push, &mut w, 1);              // rq3 = 1 for our text-only single-batch path
     put_f(&mut push, &mut w, scale);
-    put_u(&mut push, &mut w, 1);              // K = 1 — single state snapshot
+    put_u(&mut push, &mut w, k_snapshots);    // K — number of per-token state snapshots
     put_u(&mut push, &mut w, 0);              // padding to round up to 18*4
 
     // Spec constants: S_V, KDA=0 (per-token scalar gate, not per-element),
