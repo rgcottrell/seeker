@@ -11,7 +11,7 @@ use crate::gguf::{GgmlType, GgufFile};
 
 use super::buffer::BufferRange;
 use super::device::Device;
-use super::memory::Region;
+use super::memory::DeviceBuffer;
 
 /// Logical view of a tensor in GPU memory. Strides follow ggml convention:
 /// `stride[0] = element_size`, `stride[i] = dims[i-1] * stride[i-1]`.
@@ -49,8 +49,15 @@ impl TensorView {
 }
 
 pub struct WeightsHandle {
-    pub region: Region,
+    /// One buffer per tensor (no single buffer exceeds `maxBufferSize`).
+    /// Owned here and freed in `Drop`.
+    pub buffers: Vec<DeviceBuffer>,
     pub views: HashMap<String, TensorView>,
+    /// Sum of tensor byte sizes uploaded (for logging).
+    pub total_bytes: u64,
+    /// Cloned device handle so `Drop` can free the per-tensor buffers
+    /// without threading a `&Device` through the model that owns us.
+    ash_device: ash::Device,
 }
 
 impl WeightsHandle {
@@ -64,95 +71,173 @@ impl WeightsHandle {
     pub fn range(&self, name: &str) -> Result<BufferRange, Box<dyn Error>> {
         Ok(self.view(name)?.range())
     }
-}
 
-/// Compute the total bytes needed for all tensors, padded per-tensor to the
-/// device's storage-buffer offset alignment.
-pub fn required_bytes(device: &Device, gguf: &GgufFile) -> u64 {
-    let align = device.limits.min_storage_buffer_offset_alignment.max(1);
-    let mut total: u64 = 0;
-    for t in gguf.tensors() {
-        total = align_up(total, align);
-        total += t.byte_size as u64;
+    /// Host base pointer of the buffer backing `view`. Weights are
+    /// device-local, so this is always `None` now — the `gpu_debug`
+    /// reference dumps that call it therefore fail fast (they predate the
+    /// device-local move and would need a staging readback to work again).
+    /// Kept as the natural hook if that's ever added.
+    #[cfg(feature = "gpu_debug")]
+    pub fn debug_host_base(&self, view: &TensorView) -> Option<*const u8> {
+        self.buffers
+            .iter()
+            .find(|b| b.buffer == view.buffer)
+            .and_then(|b| b.host_ptr)
+            .map(|p| p as *const u8)
     }
-    total = align_up(total, align);
-    total.max(1)
 }
 
-/// Allocate a weights region sized for this GGUF, copy each tensor's bytes
-/// in via memcpy (host-visible path) or staging buffer (device-local-only).
-/// MVP: require host-visible memory (true on Apple Silicon's unified memory
-/// and on most discrete GPUs via BAR / ReBAR). Errors loudly otherwise.
-pub fn upload(device: &Device, gguf: &GgufFile) -> Result<WeightsHandle, Box<dyn Error>> {
-    let bytes = required_bytes(device, gguf);
-    let region = Region::new(
+impl Drop for WeightsHandle {
+    fn drop(&mut self) {
+        for b in &self.buffers {
+            b.destroy(&self.ash_device);
+        }
+    }
+}
+
+/// Build the logical [`TensorView`] for a tensor living at offset 0 in its
+/// own `buffer`.
+fn build_view(t: &crate::gguf::TensorInfo, buffer: vk::Buffer) -> TensorView {
+    let mut dims = [1u64; 4];
+    for (i, d) in t.dims.iter().enumerate().take(4) {
+        dims[i] = *d;
+    }
+    let element_size = element_size_bytes(t.ggml_type);
+    let byte_stride = ggml_byte_strides(&dims, t.ggml_type);
+    let mut element_stride = [0u64; 4];
+    for i in 0..4 {
+        element_stride[i] = byte_stride[i] / element_size.max(1);
+    }
+    TensorView {
+        buffer,
+        byte_offset: 0,
+        byte_size: t.byte_size as u64,
+        dims,
+        byte_stride,
+        element_stride,
+        dtype: t.ggml_type,
+    }
+}
+
+/// Borrow a tensor's bytes from the GGUF, erroring if the slice length
+/// disagrees with the header.
+fn tensor_bytes<'a>(gguf: &'a GgufFile, t: &crate::gguf::TensorInfo) -> Result<&'a [u8], Box<dyn Error>> {
+    let data = gguf
+        .tensor_data(&t.name)
+        .ok_or_else(|| format!("tensor {} has no data slice", t.name))?;
+    if data.len() != t.byte_size {
+        return Err(format!(
+            "tensor {}: data slice {} bytes != header byte_size {}",
+            t.name,
+            data.len(),
+            t.byte_size
+        )
+        .into());
+    }
+    Ok(data)
+}
+
+/// Upload every tensor into **its own device-local buffer** — so no single
+/// VkBuffer or allocation exceeds the device's `maxBufferSize` /
+/// `maxMemoryAllocationSize` (the old single 27 GB region tripped both on
+/// RADV). Each buffer is filled through one reused host-visible staging
+/// buffer + `cmdCopyBuffer`, so weights land on the GPU's native heap and
+/// are never host-mapped.
+///
+/// `cmd_pool` / `queue` / `fence` come from the engine (no forward pass is
+/// in flight yet) and drive the staging copies.
+pub fn upload(
+    device: &Device,
+    gguf: &GgufFile,
+    cmd_pool: vk::CommandPool,
+    queue: vk::Queue,
+    fence: vk::Fence,
+) -> Result<WeightsHandle, Box<dyn Error>> {
+    let tensors = gguf.tensors();
+    let mut views: HashMap<String, TensorView> = HashMap::with_capacity(tensors.len());
+    let mut buffers: Vec<DeviceBuffer> = Vec::with_capacity(tensors.len());
+    let mut total_bytes: u64 = 0;
+
+    // One staging buffer sized to the largest tensor, reused for every copy;
+    // one transient command buffer, reset + resubmitted per tensor (serial,
+    // fence-synchronized).
+    let max_size = tensors
+        .iter()
+        .map(|t| t.byte_size as u64)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let staging = DeviceBuffer::new(
         device,
-        bytes,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
+        max_size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-    let host_ptr = region
-        .host_ptr
-        .ok_or("weights region is not host-visible — staging-buffer upload not implemented yet")?;
+    let staging_ptr = staging.host_ptr.ok_or("staging buffer was not mapped")?;
 
-    let mut views: HashMap<String, TensorView> = HashMap::with_capacity(gguf.tensors().len());
-    let mut cursor: u64 = 0;
-    let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+    let alloc = vk::CommandBufferAllocateInfo::default()
+        .command_pool(cmd_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    let cmd = unsafe { device.device.allocate_command_buffers(&alloc) }?[0];
 
-    for t in gguf.tensors() {
-        cursor = align_up(cursor, align);
-        let data = gguf
-            .tensor_data(&t.name)
-            .ok_or_else(|| format!("tensor {} has no data slice", t.name))?;
-        if data.len() != t.byte_size {
-            return Err(format!(
-                "tensor {}: data slice {} bytes != header byte_size {}",
-                t.name,
-                data.len(),
-                t.byte_size
-            )
-            .into());
+    let upload_result = (|| -> Result<(), Box<dyn Error>> {
+        for t in tensors {
+            let data = tensor_bytes(gguf, t)?;
+            let dst = DeviceBuffer::new(
+                device,
+                t.byte_size as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+            // SAFETY: staging.size == max tensor size >= data.len().
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), staging_ptr, data.len()) };
+            unsafe {
+                device
+                    .device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+                let begin = vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                device.device.begin_command_buffer(cmd, &begin)?;
+                let region = vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: t.byte_size as u64,
+                };
+                device.device.cmd_copy_buffer(
+                    cmd,
+                    staging.buffer,
+                    dst.buffer,
+                    std::slice::from_ref(&region),
+                );
+                device.device.end_command_buffer(cmd)?;
+                device.device.reset_fences(std::slice::from_ref(&fence))?;
+                let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+                device
+                    .device
+                    .queue_submit(queue, std::slice::from_ref(&submit), fence)?;
+                device
+                    .device
+                    .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
+            }
+            views.insert(t.name.clone(), build_view(t, dst.buffer));
+            total_bytes += t.byte_size as u64;
+            buffers.push(dst);
         }
-        // SAFETY: cursor + len <= region.size by construction (required_bytes
-        // already accounts for the per-tensor padding); host_ptr is valid for
-        // the entire region while the Region is alive.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                host_ptr.add(cursor as usize),
-                data.len(),
-            );
-        }
+        Ok(())
+    })();
 
-        let mut dims = [1u64; 4];
-        for (i, d) in t.dims.iter().enumerate().take(4) {
-            dims[i] = *d;
-        }
-        let element_size = element_size_bytes(t.ggml_type);
-        let byte_stride = ggml_byte_strides(&dims, t.ggml_type);
-        let mut element_stride = [0u64; 4];
-        for i in 0..4 {
-            element_stride[i] = byte_stride[i] / element_size.max(1);
-        }
+    // Tear down upload-only resources regardless of success.
+    staging.destroy(&device.device);
+    unsafe { device.device.free_command_buffers(cmd_pool, std::slice::from_ref(&cmd)) };
+    upload_result?;
 
-        views.insert(
-            t.name.clone(),
-            TensorView {
-                buffer: region.buffer,
-                byte_offset: cursor,
-                byte_size: t.byte_size as u64,
-                dims,
-                byte_stride,
-                element_stride,
-                dtype: t.ggml_type,
-            },
-        );
-        cursor += t.byte_size as u64;
-    }
-
-    let mut region = region;
-    region.cursor = cursor;
-    Ok(WeightsHandle { region, views })
+    Ok(WeightsHandle {
+        buffers,
+        views,
+        total_bytes,
+        ash_device: device.device.clone(),
+    })
 }
 
 /// Element size in bytes, used for computing strides. For quantized types
@@ -188,8 +273,4 @@ fn ggml_byte_strides(dims: &[u64; 4], ty: GgmlType) -> [u64; 4] {
     nb[2] = nb[1] * dims[1];
     nb[3] = nb[2] * dims[2];
     nb
-}
-
-fn align_up(v: u64, alignment: u64) -> u64 {
-    (v + alignment - 1) & !(alignment - 1)
 }

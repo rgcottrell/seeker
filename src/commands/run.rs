@@ -139,7 +139,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let weights = engine.upload_weights(&gguf)?;
     tracing::info!(
         tensors = weights.views.len(),
-        bytes = weights.region.cursor,
+        bytes = weights.total_bytes,
         "weights uploaded to GPU",
     );
 
@@ -473,14 +473,13 @@ fn ssm_conv_smoke_test(
 
     // Read kernel weights to host once so we can build the CPU reference.
     let kernel_host: Vec<f32> = {
-        let host_ptr = weights
-            .region
-            .host_ptr
-            .ok_or("weights region not host-visible")?;
+        let base = weights.debug_host_base(&kernel).ok_or(
+            "host-side weight reads unsupported (weights are device-local)",
+        )?;
         let total = (conv_kernel * conv_channels) as usize;
         let mut out = vec![0f32; total];
         unsafe {
-            let src = host_ptr.add(kernel.byte_offset as usize) as *const f32;
+            let src = base.add(kernel.byte_offset as usize) as *const f32;
             std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), total);
         }
         out
@@ -733,7 +732,6 @@ fn rms_norm_qwen_smoke(
     let eps: f32 = 1e-6;
     // Build a known input (embedding of token 9419 = "Hello") + known weight
     // (blk.0.attn_norm.weight). Compute CPU reference.
-    let host_ptr = weights.region.host_ptr.ok_or("weights not host-visible")?;
     let embed_view = weights.view("token_embd.weight")?;
     let weight_view = weights.view("blk.0.attn_norm.weight")?;
     // Read embed row for token 9419 (Q8_0 — need to dequantize)
@@ -756,8 +754,11 @@ fn rms_norm_qwen_smoke(
     println!("input head={:?}, max_abs={:.4}", &input[..5],
         input.iter().map(|v| v.abs()).fold(0.0, f32::max));
     let mut w_host = vec![0f32; n as usize];
+    let weight_base = weights.debug_host_base(&weight_view).ok_or(
+        "host-side weight reads unsupported (weights are device-local)",
+    )?;
     unsafe {
-        let p = host_ptr.add(weight_view.byte_offset as usize) as *const f32;
+        let p = weight_base.add(weight_view.byte_offset as usize) as *const f32;
         std::ptr::copy_nonoverlapping(p, w_host.as_mut_ptr(), n as usize);
     }
     // CPU reference
@@ -903,17 +904,19 @@ fn embed_norm_dump(
 fn norm_weights_dump(
     weights: &crate::inference::weights::WeightsHandle,
 ) -> Result<(), Box<dyn Error>> {
-    let host_ptr = weights.region.host_ptr.ok_or("weights not host-visible")?;
     for layer in [3u32, 7, 11, 15, 19, 23, 27, 31, 35, 39] {
         for kind in ["attn_q_norm", "attn_k_norm"] {
             let name = format!("blk.{layer}.{kind}.weight");
             let view = weights.view(&name)?;
             let n = view.dims[0] as usize;
+            let base = weights.debug_host_base(&view).ok_or(
+                "host-side weight reads unsupported (weights are device-local)",
+            )?;
             let mut sum_sq = 0f32;
             let mut max_abs = 0f32;
             let mut mean = 0f32;
             unsafe {
-                let p = host_ptr.add(view.byte_offset as usize) as *const f32;
+                let p = base.add(view.byte_offset as usize) as *const f32;
                 for i in 0..n {
                     let v = *p.add(i);
                     mean += v;

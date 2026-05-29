@@ -120,6 +120,95 @@ impl Region {
     }
 }
 
+/// A single `VkBuffer` over its own dedicated `VkDeviceMemory`. Unlike
+/// [`Region`] (a bump arena shared by many sub-allocations), this owns
+/// exactly one resource — used per-tensor for weights (so no single buffer
+/// exceeds `maxBufferSize`) and for the reusable staging buffer that feeds
+/// the device-local upload copies.
+pub struct DeviceBuffer {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    pub size: u64,
+    /// Mapped pointer when the chosen memory type is host-visible (e.g.
+    /// the weight-upload staging buffer); `None` for device-local memory.
+    pub host_ptr: Option<*mut u8>,
+}
+
+unsafe impl Send for DeviceBuffer {}
+unsafe impl Sync for DeviceBuffer {}
+
+impl DeviceBuffer {
+    /// Create a buffer of `size` bytes backed by a fresh allocation of a
+    /// memory type satisfying `required_flags`. `TRANSFER_SRC | TRANSFER_DST`
+    /// are always added so the buffer can participate in staging copies.
+    /// Host-visible memory is mapped persistently.
+    pub fn new(
+        device: &Device,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        required_flags: vk::MemoryPropertyFlags,
+    ) -> Result<Self, Box<dyn Error>> {
+        let buf_info = vk::BufferCreateInfo::default()
+            .size(size.max(1))
+            .usage(usage | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { device.device.create_buffer(&buf_info, None) }?;
+        let reqs = unsafe { device.device.get_buffer_memory_requirements(buffer) };
+
+        let mem_type = pick_memory_type(&device.mem_props, reqs.memory_type_bits, required_flags)
+            .ok_or_else(|| {
+                format!(
+                    "no memory type satisfies bits={:#x} flags={:?}",
+                    reqs.memory_type_bits, required_flags
+                )
+            })?;
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(mem_type);
+        let memory = match unsafe { device.device.allocate_memory(&alloc_info, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { device.device.destroy_buffer(buffer, None) };
+                return Err(format!("vkAllocateMemory failed: {e:?} (size={})", reqs.size).into());
+            }
+        };
+        unsafe { device.device.bind_buffer_memory(buffer, memory, 0) }?;
+
+        let mt = device.mem_props.memory_types[mem_type as usize];
+        let host_visible = mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+        let host_ptr = if host_visible {
+            let ptr = unsafe {
+                device
+                    .device
+                    .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            }?;
+            Some(ptr as *mut u8)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            buffer,
+            memory,
+            size: reqs.size,
+            host_ptr,
+        })
+    }
+
+    /// Unmap (if mapped) and free the buffer + its memory. Takes the raw
+    /// `ash::Device` so owners that only hold a cloned device handle (e.g.
+    /// `WeightsHandle::drop`) can call it.
+    pub fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            if self.host_ptr.is_some() {
+                device.unmap_memory(self.memory);
+            }
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
 fn pick_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,

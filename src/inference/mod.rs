@@ -155,7 +155,15 @@ impl Engine {
 
     /// Upload every tensor in `gguf` into a new dedicated weights region.
     pub fn upload_weights(&self, gguf: &GgufFile) -> Result<WeightsHandle, Box<dyn Error>> {
-        weights::upload(&self.device, gguf)
+        // The device-local upload path stages copies through the engine's
+        // command pool / queue / fence (no forward pass is in flight yet).
+        weights::upload(
+            &self.device,
+            gguf,
+            self.command_pool,
+            self.device.queue,
+            self.fence,
+        )
     }
 
     /// Allocate a KV cache sized for the given architecture. Caller picks
