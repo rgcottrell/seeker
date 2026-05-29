@@ -120,6 +120,106 @@ pub trait Model: Send + Sync {
         k_dtype: crate::gguf::GgmlType,
         v_dtype: crate::gguf::GgmlType,
     ) -> u64;
+
+    // ─── MTP speculative-decode hooks (optional; default unsupported) ───
+
+    /// True when this model loaded its MTP/NextN draft head (only when
+    /// the GGUF carries the tensors *and* spec decoding was requested at
+    /// load time). The engine's `decode_speculative` path requires this.
+    fn supports_mtp_spec(&self) -> bool {
+        false
+    }
+
+    /// Record a forward pass that also exposes the per-position hidden
+    /// state (the pre-final-norm residual), used by MTP speculative
+    /// decode. When `full_logits` is true the returned `logits` covers
+    /// **all** `L` positions (`[vocab, L]`) for batched verification;
+    /// otherwise just the last position (`[vocab, 1]`). `residual` is the
+    /// pre-`output_norm` hidden state `[n_embd, L]` for every position.
+    /// Advances `cache.position` by `tokens.len()` like `record_forward`.
+    /// `checkpoint` (spec-decode verify only): the SSM layers emit
+    /// per-position recurrent-state snapshots into the cache's snapshot
+    /// buffers instead of writing the live state, so a partial-acceptance
+    /// step can roll back to the accepted position via
+    /// [`record_ssm_finalize`] without re-running the model.
+    fn record_forward_full(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _tokens: &[u32],
+        _position_offset: u32,
+        _full_logits: bool,
+        _checkpoint: bool,
+    ) -> Result<ForwardFullOut, Box<dyn Error>> {
+        Err("model does not support record_forward_full (MTP spec decode)".into())
+    }
+
+    /// Commit the per-position SSM snapshots from a checkpoint verify into
+    /// the live recurrent state, selecting the state as of the accepted
+    /// position (`accept_len`). Replaces the partial-acceptance re-run.
+    fn record_ssm_finalize(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _accept_len: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        Err("model does not support record_ssm_finalize (MTP spec decode)".into())
+    }
+
+    /// Populate the MTP draft head's KV cache for positions
+    /// `[position_offset, position_offset + tokens.len())` from the main
+    /// model's hidden states (`hiddens`, `[n_embd, L]` row-major by
+    /// position) and the corresponding next-token ids (`tokens[i]` =
+    /// `t_{position_offset+i+1}`). Runs the NextN block's KV projections
+    /// only (no MoE / output head). Used to seed the draft head from the
+    /// prompt after prefill so drafting attends to real prior context.
+    fn record_mtp_seed(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _hiddens: &[f32],
+        _tokens: &[u32],
+        _position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        Err("model does not support record_mtp_seed (MTP spec decode)".into())
+    }
+
+    /// Record one autoregressive MTP draft step (`L=1`). Given the last
+    /// hidden state `h_last` (`[n_embd]`, host-uploaded) and the previously
+    /// accepted/drafted token `prev_token`, runs the NextN head and returns
+    /// the draft `logits` (`[vocab, 1]`) plus the MTP block output
+    /// `block_out` (`[n_embd, 1]`) that seeds the next draft step's hidden.
+    /// `rel_pos` is the position within the ephemeral per-step MTP KV slot.
+    fn record_mtp_draft(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _h_last: &[f32],
+        _prev_token: u32,
+        _rel_pos: u32,
+    ) -> Result<MtpDraftOut, Box<dyn Error>> {
+        Err("model does not support record_mtp_draft (MTP spec decode)".into())
+    }
+}
+
+/// Output of [`Model::record_forward_full`]: logits (last-position or all
+/// `L` positions depending on `full_logits`) plus the per-position
+/// pre-final-norm hidden state. `logits` is `None` only when the shared
+/// forward body was invoked with `compute_logits=false` (the chunked-prefill
+/// intermediate-ubatch path via `record_forward`); `record_forward_full`
+/// always populates it.
+pub struct ForwardFullOut {
+    pub logits: Option<TensorView>,
+    pub residual: TensorView,
+}
+
+/// Output of [`Model::record_mtp_draft`]: the greedily-selected draft
+/// token (a 4-byte `u32` on the GPU — drafting is always argmax, so we do
+/// the reduction on-device and avoid reading back full vocab logits) and
+/// the MTP block output that becomes the next step's hidden input.
+pub struct MtpDraftOut {
+    pub draft_token: crate::inference::buffer::BufferRange,
+    pub block_out: TensorView,
 }
 
 /// Per-layer SSM state dimensions for hybrid (attention + Mamba/GDN)
@@ -130,6 +230,11 @@ pub struct SsmStateDims {
     pub n_ssm_layers: u32,
     pub conv_state_floats: u32,
     pub gdn_state_floats: u32,
+    /// Conv1d channel count (`conv_state_floats = (conv_kernel-1) * conv_channels`).
+    /// Needed to size the per-position conv checkpoint backup for MTP spec decode.
+    pub conv_channels: u32,
+    /// Conv1d kernel size.
+    pub conv_kernel: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -141,10 +246,14 @@ pub struct CacheDims {
 
 /// Construct the right `Model` for the given GGUF based on its
 /// `general.architecture` metadata key.
+///
+/// `spec_enabled` requests loading the MTP/NextN draft head (for
+/// `--spec-draft-n-max > 0`). Architectures without MTP support ignore it.
 pub fn open(
     gguf: &GgufFile,
     weights: WeightsHandle,
     tokenizer: TokenizerBundle,
+    spec_enabled: bool,
 ) -> Result<Box<dyn Model>, Box<dyn Error>> {
     let arch = gguf
         .architecture()
@@ -152,7 +261,10 @@ pub fn open(
     match arch {
         "llama" => Ok(Box::new(llama::LlamaModel::new(gguf, weights, tokenizer)?)),
         "qwen35moe" => Ok(Box::new(qwen35moe::Qwen35MoeModel::new(
-            gguf, weights, tokenizer,
+            gguf,
+            weights,
+            tokenizer,
+            spec_enabled,
         )?)),
         other => Err(ModelError::Unsupported(other.to_string()).into()),
     }

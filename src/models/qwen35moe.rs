@@ -172,6 +172,26 @@ impl BlockWeights {
     }
 }
 
+/// MTP / NextN draft-head weights (the block at GGUF index `n_main`).
+/// Loaded only when speculative decoding is requested and the checkpoint
+/// actually ships the `blk.{n_main}.nextn.*` tensors. The output head is
+/// shared with the main model (`Qwen35MoeWeights::output` / `token_embd`),
+/// so only the NextN-specific norms + projection and the transformer
+/// `body` are held here.
+pub struct MtpWeights {
+    /// RMSNorm applied to the embedding of the accepted token.
+    pub enorm: TensorView,
+    /// RMSNorm applied to the previous-layer hidden state.
+    pub hnorm: TensorView,
+    /// `[2*n_embd, n_embd]` projection of concat(hnorm(h), enorm(emb)).
+    pub eh_proj: TensorView,
+    /// Final RMSNorm before the shared output head (replaces `output_norm`).
+    pub shared_head_norm: TensorView,
+    /// The MTP transformer block — full attention + MoE FFN, structurally
+    /// identical to a main attention block.
+    pub body: AttentionBlockWeights,
+}
+
 pub struct Qwen35MoeWeights {
     pub token_embd: TensorView,
     pub output_norm: TensorView,
@@ -179,6 +199,9 @@ pub struct Qwen35MoeWeights {
     pub output: Option<TensorView>,
     /// One entry per main-trunk block. MTP blocks are not stored here.
     pub blocks: Vec<BlockWeights>,
+    /// MTP / NextN draft head — `Some` only when spec decoding requested
+    /// and the tensors exist. `None` ⇒ model behaves exactly as before.
+    pub mtp: Option<MtpWeights>,
 }
 
 pub struct Qwen35MoeModel {
@@ -194,9 +217,10 @@ impl Qwen35MoeModel {
         gguf: &GgufFile,
         handle: WeightsHandle,
         tokenizer: TokenizerBundle,
+        spec_enabled: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let params = parse_params(gguf, &handle)?;
-        let weights = collect_weights(&handle, &params)?;
+        let weights = collect_weights(&handle, &params, spec_enabled)?;
         tracing::info!(
             arch = ARCH,
             n_layer = params.n_layer,
@@ -205,6 +229,7 @@ impl Qwen35MoeModel {
             ssm_layers = (0..params.n_main).filter(|&i| !params.is_attention_layer(i)).count(),
             n_expert = params.n_expert,
             n_expert_used = params.n_expert_used,
+            mtp = weights.mtp.is_some(),
             "qwen35moe model loaded",
         );
         Ok(Self {
@@ -225,13 +250,21 @@ impl Model for Qwen35MoeModel {
         self.params.n_vocab
     }
 
+    fn supports_mtp_spec(&self) -> bool {
+        self.weights.mtp.is_some()
+    }
+
     fn cache_dims(&self) -> CacheDims {
         // Only attention blocks need a KV cache, but the engine indexes the
         // cache by layer (one slot per `n_layer`). For Phase 1 we expose the
         // attention block dims uniformly and accept the unused-SSM-layer
         // waste; a later optimization can compact to attention-only slots.
+        //
+        // When the MTP draft head is loaded it needs its own (ephemeral,
+        // per-step) KV slot at index `n_main`, so allocate one extra layer.
+        let mtp_slots = if self.weights.mtp.is_some() { 1 } else { 0 };
         CacheDims {
-            n_layer: self.params.n_main,
+            n_layer: self.params.n_main + mtp_slots,
             head_dim: self.params.head_dim_k,
             n_head_kv: self.params.n_head_kv,
         }
@@ -252,6 +285,8 @@ impl Model for Qwen35MoeModel {
             n_ssm_layers,
             conv_state_floats,
             gdn_state_floats,
+            conv_channels,
+            conv_kernel: p.ssm_conv,
         })
     }
 
@@ -370,6 +405,91 @@ impl Model for Qwen35MoeModel {
         position_offset: u32,
         compute_logits: bool,
     ) -> Result<Option<TensorView>, Box<dyn Error>> {
+        Ok(self
+            .forward_impl(
+                ctx,
+                cache,
+                tokens,
+                position_offset,
+                compute_logits,
+                /*full_logits=*/ false,
+                /*checkpoint=*/ false,
+            )?
+            .logits)
+    }
+
+    fn record_forward_full(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        position_offset: u32,
+        full_logits: bool,
+        checkpoint: bool,
+    ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
+        self.forward_impl(
+            ctx,
+            cache,
+            tokens,
+            position_offset,
+            /*compute_logits=*/ true,
+            full_logits,
+            checkpoint,
+        )
+    }
+
+    fn record_ssm_finalize(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        accept_len: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.ssm_finalize_impl(ctx, cache, accept_len)
+    }
+
+    fn record_mtp_seed(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        hiddens: &[f32],
+        tokens: &[u32],
+        position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.mtp_seed_impl(ctx, cache, hiddens, tokens, position_offset)
+    }
+
+    fn record_mtp_draft(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        h_last: &[f32],
+        prev_token: u32,
+        position: u32,
+    ) -> Result<crate::models::MtpDraftOut, Box<dyn Error>> {
+        self.mtp_draft_impl(ctx, cache, h_last, prev_token, position)
+    }
+}
+
+impl Qwen35MoeModel {
+    /// Shared forward body for both [`Model::record_forward`] (last-token
+    /// logits) and [`Model::record_forward_full`] (all-position logits +
+    /// hidden). Returns the logits tensor and the per-position
+    /// pre-`output_norm` residual `[n_embd, L]`.
+    ///
+    /// `compute_logits=false` (chunked-prefill intermediate ubatch) runs the
+    /// layers to populate the KV / recurrent state but skips the epilogue;
+    /// the returned `logits` is then `None`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        position_offset: u32,
+        compute_logits: bool,
+        full_logits: bool,
+        checkpoint: bool,
+    ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
         let p = &self.params;
         let l = tokens.len() as u32;
         if l == 0 {
@@ -525,7 +645,21 @@ impl Model for Qwen35MoeModel {
                     let gdn_state = cache.ssm_gdn_states.get(ssm_layer_idx).copied();
                     let conv_state = cache.ssm_conv_states.get(ssm_layer_idx).copied();
                     let ssm_host_ptr = cache.ssm_region.as_ref().and_then(|r| r.host_ptr);
-                    ssm_block(ctx, ssm_w, residual, p, hidden, l, layer_idx as u32, gdn_state, conv_state, ssm_host_ptr)?;
+                    // Checkpoint mode (spec-decode verify): write per-position
+                    // GDN snapshots + a conv-input backup instead of the live
+                    // recurrent state, so a partial-accept step can roll back.
+                    let checkpoint_bufs = if checkpoint {
+                        match (
+                            cache.ssm_gdn_snapshots.get(ssm_layer_idx).copied(),
+                            cache.ssm_conv_backups.get(ssm_layer_idx).copied(),
+                        ) {
+                            (Some(g), Some(c)) => Some((g, c)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    ssm_block(ctx, ssm_w, residual, p, hidden, l, layer_idx as u32, gdn_state, conv_state, ssm_host_ptr, checkpoint_bufs)?;
                 }
                 _ => {
                     // block type currently passthrough'd via the matching
@@ -548,41 +682,438 @@ impl Model for Qwen35MoeModel {
 
         // Intermediate prefill ubatches only populate the KV / recurrent
         // state — skip the epilogue (no logits needed until the last
-        // ubatch). cache.position is still advanced below.
+        // ubatch). cache.position is still advanced.
         if !compute_logits {
             cache_io::advance(cache, l);
-            return Ok(None);
+            return Ok(crate::models::ForwardFullOut {
+                logits: None,
+                residual,
+            });
         }
 
         // ─── Epilogue: final norm + lm_head ───
-        // Only normalize + project the LAST token's residual: we sample
-        // from the final position only, and full-batch logits would burn
-        // n_vocab × L bytes of scratch (~318MB at L=320 with vocab=248k).
-        // Slicing residual to the last token via a strided TensorView lets
-        // both rms_norm and the lm_head matmul run with L=1.
         let elem_size = 4u64;
         let vocab = p.n_vocab as u64;
-        let residual_last = TensorView {
-            buffer: residual.buffer,
-            byte_offset: residual.byte_offset + (l as u64 - 1) * hidden * elem_size,
-            byte_size: hidden * elem_size,
-            dims: [hidden, 1, 1, 1],
-            byte_stride: [elem_size, hidden * elem_size, hidden * elem_size, hidden * elem_size],
-            element_stride: [1, hidden, hidden, hidden],
-            dtype: residual.dtype,
-        };
         ctx.mark(crate::inference::profile::BlockClass::Epilogue);
-        let final_norm = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
-        rms_norm::record(ctx, residual_last, self.weights.output_norm, final_norm, p.rms_eps)?;
-        ctx.tap("final_norm", final_norm)?;
-
-        ctx.mark(crate::inference::profile::BlockClass::LmHead);
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
-        let last_logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
-        matmul::record(ctx, lm_head, final_norm, last_logits)?;
+        let logits = Some(if full_logits {
+            // Batched verify path: final-norm + project ALL L positions.
+            // n_vocab × L scratch is fine here because L = n_draft+1 is small.
+            let final_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, residual, self.weights.output_norm, final_norm, p.rms_eps)?;
+            ctx.mark(crate::inference::profile::BlockClass::LmHead);
+            let all_logits = ctx.alloc_tensor([vocab, l as u64, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, lm_head, final_norm, all_logits)?;
+            all_logits
+        } else {
+            // Default decode/prefill: only the LAST token's residual is
+            // normalized + projected — full-batch logits would burn
+            // n_vocab × L scratch (~318MB at L=320 with vocab=248k).
+            let residual_last = TensorView {
+                buffer: residual.buffer,
+                byte_offset: residual.byte_offset + (l as u64 - 1) * hidden * elem_size,
+                byte_size: hidden * elem_size,
+                dims: [hidden, 1, 1, 1],
+                byte_stride: [elem_size, hidden * elem_size, hidden * elem_size, hidden * elem_size],
+                element_stride: [1, hidden, hidden, hidden],
+                dtype: residual.dtype,
+            };
+            let final_norm = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, residual_last, self.weights.output_norm, final_norm, p.rms_eps)?;
+            ctx.tap("final_norm", final_norm)?;
+            ctx.mark(crate::inference::profile::BlockClass::LmHead);
+            let last_logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, lm_head, final_norm, last_logits)?;
+            last_logits
+        });
 
         cache_io::advance(cache, l);
-        Ok(Some(last_logits))
+        Ok(crate::models::ForwardFullOut { logits, residual })
+    }
+
+    /// Record one autoregressive MTP / NextN draft step (`L = 1`).
+    ///
+    /// Mirrors the DeepSeek-V3 / Qwen3-Next MTP module:
+    /// `proj = eh_proj · concat(hnorm(h_last), enorm(emb(prev_token)))`,
+    /// then the MTP transformer block (attention + MoE), then
+    /// `logits = output · shared_head_norm(block_out)`. The block output
+    /// (`block_out`) is the recurrence hidden for the next draft step.
+    ///
+    /// The MTP attention uses its own persistent KV slot (index `n_main`)
+    /// at absolute `position`, so it attends to the full prior context
+    /// [0, position) — seeded from the prompt's main hidden states
+    /// ([`mtp_seed_impl`]) and extended by prior steps' drafts — plus the
+    /// current draft token. Draft-window quality only affects acceptance;
+    /// verification keeps the emitted tokens lossless regardless.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_draft_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        h_last: &[f32],
+        prev_token: u32,
+        position: u32,
+    ) -> Result<crate::models::MtpDraftOut, Box<dyn Error>> {
+        let p = &self.params;
+        let mtp = self
+            .weights
+            .mtp
+            .as_ref()
+            .ok_or("mtp_draft called but MTP weights are not loaded")?;
+
+        let hidden = p.n_embd as u64;
+        let head_dim_k = p.head_dim_k as u64;
+        let head_dim_v = p.head_dim_v as u64;
+        let n_head = p.n_head as u64;
+        let n_head_kv = p.n_head_kv as u64;
+        let n_embd_kv = p.n_embd_k_gqa() as u64;
+        let n_embd_vv = p.n_embd_v_gqa() as u64;
+        let wq_out = p.wq_out() as u64;
+        let hidden_v = head_dim_v * n_head;
+        let vocab = p.n_vocab as u64;
+        let mtp_layer = p.n_main; // dedicated KV slot index
+
+        if h_last.len() as u64 != hidden {
+            return Err(format!(
+                "mtp_draft: h_last len {} != n_embd {hidden}",
+                h_last.len()
+            )
+            .into());
+        }
+
+        // Upload the seed hidden state and embed the previous token.
+        let h_tensor = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
+        write_f32(ctx, h_tensor.range(), h_last)?;
+        let tok_buf = ctx.alloc_scratch(4)?;
+        write_u32(ctx, tok_buf, &[prev_token])?;
+        let emb = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, tok_buf, 1, emb)?;
+
+        // combined = concat(enorm(emb), hnorm(h)) — EMBEDDING FIRST, then
+        // hidden, matching llama.cpp's `ggml_concat(e_norm, h_norm, dim=0)`
+        // (qwen35moe.cpp). Normalize directly into the two halves of a
+        // [2*n_embd] buffer (no separate copy).
+        let combined = ctx.alloc_tensor([2 * hidden, 1, 1, 1], GgmlType::F32)?;
+        let half = |off_elems: u64| -> TensorView {
+            TensorView {
+                buffer: combined.buffer,
+                byte_offset: combined.byte_offset + off_elems * 4,
+                byte_size: hidden * 4,
+                dims: [hidden, 1, 1, 1],
+                byte_stride: [4, hidden * 4, hidden * 4, hidden * 4],
+                element_stride: [1, hidden, hidden, hidden],
+                dtype: GgmlType::F32,
+            }
+        };
+        rms_norm::record(ctx, emb, mtp.enorm, half(0), p.rms_eps)?;
+        rms_norm::record(ctx, h_tensor, mtp.hnorm, half(hidden), p.rms_eps)?;
+        crate::inference::command::record_compute_barrier(ctx.device, ctx.cmd, combined.range());
+
+        // projected = eh_proj @ combined  → [n_embd, 1]. Becomes the block
+        // input residual that attention + MoE accumulate into.
+        let residual = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, mtp.eh_proj, combined, residual)?;
+
+        // M-RoPE positions for this single token (4 axes, all = absolute position).
+        let positions_buf = ctx.alloc_scratch(4 * 4)?;
+        write_u32(ctx, positions_buf, &[position; 4])?;
+
+        let rope_params =
+            rope_multi::RopeMultiParams::qwen_default(p.rope_dim, p.rope_freq_base, p.rope_sections);
+        let scale = 1.0 / (head_dim_k as f32).sqrt();
+        let fa_params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim_k as u32,
+            head_dim_v: head_dim_v as u32,
+            gqa_ratio: (p.n_head / p.n_head_kv).max(1),
+            scale,
+        };
+        let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
+        // Persistent MTP KV: the draft at absolute `position` attends to the
+        // full prior context [0, position) (seeded from the prompt's main
+        // hidden states + prior steps' drafts) plus itself.
+        let total_len = position + 1;
+
+        attention_block(
+            ctx,
+            &mtp.body,
+            cache,
+            residual,
+            /*mask=*/ None,
+            positions_buf,
+            rope_params,
+            fa_params,
+            mtp_layer,
+            /*position_offset=*/ position,
+            total_len,
+            total_len as u64,
+            /*l=*/ 1,
+            p,
+            head_dim_k,
+            head_dim_v,
+            n_head,
+            n_head_kv,
+            n_embd_kv,
+            n_embd_vv,
+            wq_out,
+            hidden,
+            hidden_v,
+            cache_direct,
+        )?;
+        moe_ffn(ctx, &mtp.body.moe, mtp.body.post_attn_norm, residual, p, hidden, 1, mtp_layer)?;
+        // `residual` now holds the MTP block output (the recurrence hidden).
+
+        // logits = output · shared_head_norm(block_out), then argmax on the
+        // GPU (drafting is greedy) so only a 4-byte token id is read back.
+        let normed = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
+        rms_norm::record(ctx, residual, mtp.shared_head_norm, normed, p.rms_eps)?;
+        let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
+        let logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, lm_head, normed, logits)?;
+        let draft_token = crate::inference::ops::sampler::record_greedy(ctx, logits)?;
+
+        Ok(crate::models::MtpDraftOut {
+            draft_token,
+            block_out: residual,
+        })
+    }
+
+    /// Populate the MTP draft head's KV (slot `n_main`) for `L` positions
+    /// `[position_offset, position_offset+L)` from the main model's hidden
+    /// states + next-token ids — the batched (`L>1`) form of the NextN
+    /// prologue + attention, run for its K/V side effect only (no MoE / no
+    /// output head). Used to seed/extend the draft head's context so
+    /// drafting attends to the real prior sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_seed_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        hiddens: &[f32],
+        tokens: &[u32],
+        position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let p = &self.params;
+        let mtp = self
+            .weights
+            .mtp
+            .as_ref()
+            .ok_or("mtp_seed called but MTP weights are not loaded")?;
+        let l = tokens.len() as u32;
+        if l == 0 {
+            return Ok(());
+        }
+        let hidden = p.n_embd as u64;
+        let head_dim_k = p.head_dim_k as u64;
+        let head_dim_v = p.head_dim_v as u64;
+        let n_head = p.n_head as u64;
+        let n_head_kv = p.n_head_kv as u64;
+        let n_embd_kv = p.n_embd_k_gqa() as u64;
+        let n_embd_vv = p.n_embd_v_gqa() as u64;
+        let wq_out = p.wq_out() as u64;
+        let hidden_v = head_dim_v * n_head;
+        let mtp_layer = p.n_main;
+        let l_u = l as u64;
+        if hiddens.len() as u64 != hidden * l_u {
+            return Err(format!(
+                "mtp_seed: hiddens len {} != n_embd*L {}",
+                hiddens.len(),
+                hidden * l_u
+            )
+            .into());
+        }
+
+        // Upload hiddens [n_embd, L] and embed the next tokens.
+        let h_tensor = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
+        write_f32(ctx, h_tensor.range(), hiddens)?;
+        let tok_buf = ctx.alloc_scratch(l_u * 4)?;
+        write_u32(ctx, tok_buf, tokens)?;
+        let emb = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, tok_buf, l, emb)?;
+
+        // combined[:, i] = concat(enorm(emb_i), hnorm(h_i)) — per-position,
+        // embedding first. combined is [2*n_embd, L]; the two halves are
+        // strided views (gap of 2*n_embd between columns).
+        let combined = ctx.alloc_tensor([2 * hidden, l_u, 1, 1], GgmlType::F32)?;
+        let half = |off_elems: u64| -> TensorView {
+            TensorView {
+                buffer: combined.buffer,
+                byte_offset: combined.byte_offset + off_elems * 4,
+                byte_size: combined.byte_size - off_elems * 4,
+                dims: [hidden, l_u, 1, 1],
+                byte_stride: [4, 2 * hidden * 4, 2 * hidden * l_u * 4, 2 * hidden * l_u * 4],
+                element_stride: [1, 2 * hidden, 2 * hidden * l_u, 2 * hidden * l_u],
+                dtype: GgmlType::F32,
+            }
+        };
+        rms_norm::record(ctx, emb, mtp.enorm, half(0), p.rms_eps)?;
+        rms_norm::record(ctx, h_tensor, mtp.hnorm, half(hidden), p.rms_eps)?;
+        crate::inference::command::record_compute_barrier(ctx.device, ctx.cmd, combined.range());
+
+        let residual = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, mtp.eh_proj, combined, residual)?;
+
+        // M-RoPE positions (4 axes × L) + causal mask for the batched attn.
+        let positions_buf = ctx.alloc_scratch(4 * l_u * 4)?;
+        let mut positions: Vec<u32> = Vec::with_capacity(4 * l as usize);
+        for _axis in 0..4 {
+            for pos in position_offset..position_offset + l {
+                positions.push(pos);
+            }
+        }
+        write_u32(ctx, positions_buf, &positions)?;
+
+        let total_len = position_offset + l;
+        let kv_len_u = total_len as u64;
+        let mask = if l > 1 {
+            // Within-chunk mask [l × l]; the cached prefix [0, position_offset)
+            // is always visible and handled shader-side via mask_kv_offset
+            // (matches forward_impl + attention_block after the chunked-prefill
+            // mask change).
+            let m = ctx.alloc_tensor([l_u, l_u, 1, 1], GgmlType::F32)?;
+            write_causal_mask(ctx, m, l)?;
+            Some(m)
+        } else {
+            None
+        };
+
+        let rope_params =
+            rope_multi::RopeMultiParams::qwen_default(p.rope_dim, p.rope_freq_base, p.rope_sections);
+        let scale = 1.0 / (head_dim_k as f32).sqrt();
+        let fa_params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim_k as u32,
+            head_dim_v: head_dim_v as u32,
+            gqa_ratio: (p.n_head / p.n_head_kv).max(1),
+            scale,
+        };
+        let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
+
+        // Attention block writes K/V into the MTP slot for these positions.
+        // Its attention output is discarded — we only want the KV side effect,
+        // so MoE + output head are skipped.
+        attention_block(
+            ctx,
+            &mtp.body,
+            cache,
+            residual,
+            mask,
+            positions_buf,
+            rope_params,
+            fa_params,
+            mtp_layer,
+            position_offset,
+            total_len,
+            kv_len_u,
+            l,
+            p,
+            head_dim_k,
+            head_dim_v,
+            n_head,
+            n_head_kv,
+            n_embd_kv,
+            n_embd_vv,
+            wq_out,
+            hidden,
+            hidden_v,
+            cache_direct,
+        )?;
+        Ok(())
+    }
+
+    /// Commit per-position SSM snapshots from a checkpoint verify into the
+    /// live recurrent state, selecting position `accept_len`. For each SSM
+    /// layer: copy GDN snapshot slot `accept_len` → live GDN state, and
+    /// extract the conv state at `accept_len` (rows `[accept_len+1 ..
+    /// accept_len+conv_kernel-1]` of the backed-up conv window) → live conv
+    /// state. Replaces the partial-acceptance re-run.
+    fn ssm_finalize_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        accept_len: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let elem = 4u64;
+        let conv_kernel = cache.ssm_conv_kernel as u64;
+        let conv_channels = cache.ssm_conv_channels as u64;
+        let n_padded = conv_kernel - 1 + cache.ssm_max_snapshots as u64;
+        let state_dim_inner = conv_kernel - 1;
+        let n_ssm = cache.ssm_gdn_states.len();
+
+        for i in 0..n_ssm {
+            // GDN: contiguous copy of snapshot slot[accept_len] → live state.
+            let live_gdn = cache.ssm_gdn_states[i];
+            let snap = cache.ssm_gdn_snapshots[i];
+            let state_floats = live_gdn.size / elem;
+            unsafe {
+                use ash::vk;
+                let copy = vk::BufferCopy::default()
+                    .src_offset(snap.offset + accept_len as u64 * state_floats * elem)
+                    .dst_offset(live_gdn.offset)
+                    .size(state_floats * elem);
+                ctx.device.device.cmd_copy_buffer(
+                    ctx.cmd,
+                    snap.buffer,
+                    live_gdn.buffer,
+                    std::slice::from_ref(&copy),
+                );
+                let bar = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(live_gdn.buffer)
+                    .offset(live_gdn.offset)
+                    .size(state_floats * elem);
+                ctx.device.device.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&bar),
+                    &[],
+                );
+            }
+
+            // Conv: strided cast of backup rows [accept_len+1 .. +kernel-1]
+            // → live conv state (same layout as the normal writeback).
+            let backup = cache.ssm_conv_backups[i];
+            let live_conv = cache.ssm_conv_states[i];
+            let src = TensorView {
+                buffer: backup.buffer,
+                byte_offset: backup.offset + (accept_len as u64 + 1) * elem,
+                byte_size: backup.size - (accept_len as u64 + 1) * elem,
+                dims: [state_dim_inner, conv_channels, 1, 1],
+                byte_stride: [
+                    elem,
+                    n_padded * elem,
+                    n_padded * conv_channels * elem,
+                    n_padded * conv_channels * elem,
+                ],
+                element_stride: [1, n_padded, n_padded * conv_channels, n_padded * conv_channels],
+                dtype: GgmlType::F32,
+            };
+            let dst = TensorView {
+                buffer: live_conv.buffer,
+                byte_offset: live_conv.offset,
+                byte_size: live_conv.size,
+                dims: [state_dim_inner, conv_channels, 1, 1],
+                byte_stride: [
+                    elem,
+                    state_dim_inner * elem,
+                    state_dim_inner * conv_channels * elem,
+                    state_dim_inner * conv_channels * elem,
+                ],
+                element_stride: [
+                    1,
+                    state_dim_inner,
+                    state_dim_inner * conv_channels,
+                    state_dim_inner * conv_channels,
+                ],
+                dtype: GgmlType::F32,
+            };
+            cast::record_cast(ctx, src, dst)?;
+        }
+        Ok(())
     }
 }
 
@@ -838,6 +1369,15 @@ fn ssm_block(
     gdn_state_persistent: Option<crate::inference::buffer::BufferRange>,
     conv_state_persistent: Option<crate::inference::buffer::BufferRange>,
     ssm_region_host_ptr: Option<*mut u8>,
+    // Spec-decode checkpoint mode: `(gdn_snapshot, conv_backup)` per-layer
+    // buffers. When Some, the GDN scan emits L per-token state snapshots
+    // into `gdn_snapshot` and the full conv input window is copied into
+    // `conv_backup`, and the live recurrent-state writebacks are SKIPPED
+    // (finalize commits the accepted position later).
+    checkpoint: Option<(
+        crate::inference::buffer::BufferRange,
+        crate::inference::buffer::BufferRange,
+    )>,
 ) -> Result<(), Box<dyn Error>> {
     let l_u = l as u64;
     let num_k = p.ssm_groups as u64;          // 16
@@ -1013,10 +1553,45 @@ fn ssm_block(
     };
     cast::record_cast(ctx, qkv_as_token_inner, conv_input_tail)?;
 
-    // Save the last (conv_kernel-1) tokens of conv_input as the new
-    // persistent conv state, for the next forward to read. Mirrors
-    // llama.cpp's `conv_state_last` view at offset `s_idx = L`.
-    if let Some(persistent) = conv_state_persistent {
+    // Checkpoint mode: back up the entire conv input window (contiguous)
+    // so finalize can extract the conv state at the accepted position.
+    // Skips the live conv-state writeback below.
+    if let Some((_, conv_backup)) = checkpoint {
+        unsafe {
+            use ash::vk;
+            let bytes = conv_input.byte_size;
+            let copy = vk::BufferCopy::default()
+                .src_offset(conv_input.byte_offset)
+                .dst_offset(conv_backup.offset)
+                .size(bytes);
+            ctx.device.device.cmd_copy_buffer(
+                ctx.cmd,
+                conv_input.buffer,
+                conv_backup.buffer,
+                std::slice::from_ref(&copy),
+            );
+            let bar = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(conv_backup.buffer)
+                .offset(conv_backup.offset)
+                .size(bytes);
+            ctx.device.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&bar),
+                &[],
+            );
+        }
+    } else if let Some(persistent) = conv_state_persistent {
+        // Save the last (conv_kernel-1) tokens of conv_input as the new
+        // persistent conv state, for the next forward to read. Mirrors
+        // llama.cpp's `conv_state_last` view at offset `s_idx = L`.
         let state_dim_inner = conv_kernel - 1;
         let s_idx = l_u; // = n_padded - (kernel - 1)
         let conv_input_last = TensorView {
@@ -1202,7 +1777,9 @@ fn ssm_block(
     // floats, state is num_v * s_v * s_v floats.
     let attn_floats = l_u * num_v * s_v; // per-token outputs
     let state_floats = num_v * s_v * s_v; // single-snapshot state
-    let gdn_total_floats = attn_floats + state_floats;
+    // Checkpoint mode emits L per-token state snapshots (K = L) instead of 1.
+    let k_snapshots: u64 = if checkpoint.is_some() { l_u } else { 1 };
+    let gdn_total_floats = attn_floats + k_snapshots * state_floats;
     let gdn_dst = ctx.alloc_scratch(gdn_total_floats * elem)?;
     // state_in: either persistent (carried over from previous forward via
     // KvCache.ssm_gdn_states) or zero-initialized fallback if the engine
@@ -1285,14 +1862,47 @@ fn ssm_block(
         v_strides,
         b_strides,
         s_v as u32,
+        k_snapshots as u32,
     )?;
     let _ = (q_strides,); // q_normed_strides supersedes q_strides above
 
-    // Copy new GDN state from gdn_dst's state region back to the persistent
-    // state buffer. gdn_dst layout: [attn_floats outputs][state_floats state].
-    // After this copy, subsequent forwards' GDN read picks up where this one
-    // left off — needed for autoregressive decode quality.
-    if let Some(persistent) = gdn_state_persistent {
+    // Checkpoint mode: copy ALL K=L per-token state snapshots (contiguous in
+    // gdn_dst's state region) into the per-layer snapshot buffer for later
+    // finalize. Skips the live-state writeback below.
+    if let Some((gdn_snapshot, _)) = checkpoint {
+        unsafe {
+            use ash::vk;
+            let copy = vk::BufferCopy::default()
+                .src_offset(gdn_dst.offset + attn_floats * elem)
+                .dst_offset(gdn_snapshot.offset)
+                .size(k_snapshots * state_floats * elem);
+            ctx.device.device.cmd_copy_buffer(
+                ctx.cmd,
+                gdn_dst.buffer,
+                gdn_snapshot.buffer,
+                std::slice::from_ref(&copy),
+            );
+            let bar = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(gdn_snapshot.buffer)
+                .offset(gdn_snapshot.offset)
+                .size(k_snapshots * state_floats * elem);
+            ctx.device.device.cmd_pipeline_barrier(
+                ctx.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&bar),
+                &[],
+            );
+        }
+    } else if let Some(persistent) = gdn_state_persistent {
+        // Normal decode: copy the single final GDN state back to the
+        // persistent state buffer. gdn_dst: [attn outputs][state].
         unsafe {
             use ash::vk;
             let copy = vk::BufferCopy::default()
@@ -1547,8 +2157,9 @@ fn moe_ffn(
     elementwise::record_swiglu_split(ctx, gate, up, ffn_h)?;
     ctx.tap(&format!("ffn_moe_swiglu-{layer_idx}"), ffn_h)?;
 
-    // Fused routing-weighted down. The Q4_K_XL checkpoint mixes Q5_K
-    // and Q6_K for `ffn_down_exps` — dispatch on dtype.
+    // Fused routing-weighted down. Checkpoints mix dtypes for
+    // `ffn_down_exps`: Q4_K_XL uses Q5_K/Q6_K; Q5_K_XL uses Q6_K/Q8_0.
+    // Dispatch on dtype.
     let routed = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     match w.ffn_down_exps.dtype {
         GgmlType::Q5_K => {
@@ -1557,11 +2168,14 @@ fn moe_ffn(
         GgmlType::Q6_K => {
             moe::record_moe_down_q6k(ctx, w.ffn_down_exps, ffn_h, ids, weights_buf, routed, n_used)?;
         }
+        GgmlType::Q8_0 => {
+            moe::record_moe_down_q8_0(ctx, w.ffn_down_exps, ffn_h, ids, weights_buf, routed, n_used)?;
+        }
         other => {
-            return Err(
-                format!("qwen35moe: ffn_down_exps dtype {other:?} not supported (need Q5_K or Q6_K)")
-                    .into(),
-            );
+            return Err(format!(
+                "qwen35moe: ffn_down_exps dtype {other:?} not supported (need Q5_K, Q6_K or Q8_0)"
+            )
+            .into());
         }
     }
     ctx.tap(&format!("ffn_moe_out-{layer_idx}"), routed)?;
@@ -1740,20 +2354,17 @@ fn read_sections(gguf: &GgufFile, key: &'static str) -> Result<[u32; 4], Box<dyn
 fn collect_weights(
     handle: &WeightsHandle,
     params: &Qwen35MoeParams,
+    spec_enabled: bool,
 ) -> Result<Qwen35MoeWeights, Box<dyn Error>> {
     let view = |name: &str| -> Result<TensorView, Box<dyn Error>> {
         handle
             .view(name)
             .map_err(|_| ModelError::MissingTensor(name.to_string()).into())
     };
-
-    let token_embd = view("token_embd.weight")?;
-    let output_norm = view("output_norm.weight")?;
-    let output = handle.view("output.weight").ok();
-
-    let mut blocks = Vec::with_capacity(params.n_main as usize);
-    for i in 0..params.n_main {
-        let moe = MoeFfnWeights {
+    // Load the 8 MoE FFN tensors for block `i`. Shared by the main-trunk
+    // loop and the MTP block loader below.
+    let load_moe = |i: u32| -> Result<MoeFfnWeights, Box<dyn Error>> {
+        Ok(MoeFfnWeights {
             ffn_gate_inp: view(&format!("blk.{i}.ffn_gate_inp.weight"))?,
             ffn_gate_inp_shexp: view(&format!("blk.{i}.ffn_gate_inp_shexp.weight"))?,
             ffn_gate_exps: view(&format!("blk.{i}.ffn_gate_exps.weight"))?,
@@ -1762,19 +2373,32 @@ fn collect_weights(
             ffn_gate_shexp: view(&format!("blk.{i}.ffn_gate_shexp.weight"))?,
             ffn_up_shexp: view(&format!("blk.{i}.ffn_up_shexp.weight"))?,
             ffn_down_shexp: view(&format!("blk.{i}.ffn_down_shexp.weight"))?,
-        };
+        })
+    };
+    // Load an attention block's transformer tensors for block `i`.
+    let load_attn = |i: u32, moe: MoeFfnWeights| -> Result<AttentionBlockWeights, Box<dyn Error>> {
+        Ok(AttentionBlockWeights {
+            attn_norm: view(&format!("blk.{i}.attn_norm.weight"))?,
+            post_attn_norm: view(&format!("blk.{i}.post_attention_norm.weight"))?,
+            wq: view(&format!("blk.{i}.attn_q.weight"))?,
+            wk: view(&format!("blk.{i}.attn_k.weight"))?,
+            wv: view(&format!("blk.{i}.attn_v.weight"))?,
+            wo: view(&format!("blk.{i}.attn_output.weight"))?,
+            attn_q_norm: view(&format!("blk.{i}.attn_q_norm.weight"))?,
+            attn_k_norm: view(&format!("blk.{i}.attn_k_norm.weight"))?,
+            moe,
+        })
+    };
+
+    let token_embd = view("token_embd.weight")?;
+    let output_norm = view("output_norm.weight")?;
+    let output = handle.view("output.weight").ok();
+
+    let mut blocks = Vec::with_capacity(params.n_main as usize);
+    for i in 0..params.n_main {
+        let moe = load_moe(i)?;
         let block = if params.is_attention_layer(i) {
-            BlockWeights::Attention(AttentionBlockWeights {
-                attn_norm: view(&format!("blk.{i}.attn_norm.weight"))?,
-                post_attn_norm: view(&format!("blk.{i}.post_attention_norm.weight"))?,
-                wq: view(&format!("blk.{i}.attn_q.weight"))?,
-                wk: view(&format!("blk.{i}.attn_k.weight"))?,
-                wv: view(&format!("blk.{i}.attn_v.weight"))?,
-                wo: view(&format!("blk.{i}.attn_output.weight"))?,
-                attn_q_norm: view(&format!("blk.{i}.attn_q_norm.weight"))?,
-                attn_k_norm: view(&format!("blk.{i}.attn_k_norm.weight"))?,
-                moe,
-            })
+            BlockWeights::Attention(load_attn(i, moe)?)
         } else {
             BlockWeights::Ssm(SsmBlockWeights {
                 attn_norm: view(&format!("blk.{i}.attn_norm.weight"))?,
@@ -1795,11 +2419,50 @@ fn collect_weights(
         blocks.push(block);
     }
 
+    // MTP / NextN draft head — block index `n_main`. Loaded only when
+    // speculative decoding was requested AND the checkpoint ships the
+    // tensors. A missing tensor degrades gracefully to non-speculative
+    // decode (mtp = None) rather than failing the whole load.
+    let mtp = if spec_enabled && params.nextn_predict_layers >= 1 {
+        let i = params.n_main;
+        let load = || -> Result<MtpWeights, Box<dyn Error>> {
+            let moe = load_moe(i)?;
+            Ok(MtpWeights {
+                enorm: view(&format!("blk.{i}.nextn.enorm.weight"))?,
+                hnorm: view(&format!("blk.{i}.nextn.hnorm.weight"))?,
+                eh_proj: view(&format!("blk.{i}.nextn.eh_proj.weight"))?,
+                shared_head_norm: view(&format!("blk.{i}.nextn.shared_head_norm.weight"))?,
+                body: load_attn(i, moe)?,
+            })
+        };
+        match load() {
+            Ok(w) => {
+                if params.nextn_predict_layers > 1 {
+                    tracing::warn!(
+                        nextn_predict_layers = params.nextn_predict_layers,
+                        "qwen35moe: only the first MTP layer is used; multi-MTP chains deferred",
+                    );
+                }
+                Some(w)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "qwen35moe: MTP weights not loaded — falling back to non-speculative decode",
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(Qwen35MoeWeights {
         token_embd,
         output_norm,
         output,
         blocks,
+        mtp,
     })
 }
 
@@ -1831,6 +2494,7 @@ fn dispatch_matvec_id(
     match a.dtype {
         GgmlType::Q4_K => moe::record_matvec_q4k_id(ctx, a, b, ids, dst, n_expert_used),
         GgmlType::Q5_K => moe::record_matvec_q5k_id(ctx, a, b, ids, dst, n_expert_used),
+        GgmlType::Q6_K => moe::record_matvec_q6k_id(ctx, a, b, ids, dst, n_expert_used),
         other => Err(format!("matvec_id: expert weight dtype {other:?} not yet wired").into()),
     }
 }
@@ -1847,6 +2511,7 @@ fn dispatch_matvec_id_nofence(
     match a.dtype {
         GgmlType::Q4_K => moe::record_matvec_q4k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
         GgmlType::Q5_K => moe::record_matvec_q5k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
+        GgmlType::Q6_K => moe::record_matvec_q6k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
         other => Err(format!("matvec_id: expert weight dtype {other:?} not yet wired").into()),
     }
 }
@@ -1868,6 +2533,24 @@ fn write_u32(
         .ok_or("scratch region not host-visible")?;
     unsafe {
         let dst = host_ptr.add(range.offset as usize) as *mut u32;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+    }
+    Ok(())
+}
+
+/// Host-write a `[N]` array of `f32` into a scratch slot via the mapped
+/// pointer. Used by the MTP draft path to upload the seed hidden state.
+fn write_f32(
+    ctx: &mut DispatchContext,
+    range: crate::inference::buffer::BufferRange,
+    data: &[f32],
+) -> Result<(), Box<dyn Error>> {
+    let host_ptr = ctx
+        .scratch
+        .host_ptr
+        .ok_or("scratch region not host-visible")?;
+    unsafe {
+        let dst = host_ptr.add(range.offset as usize) as *mut f32;
         std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
     Ok(())

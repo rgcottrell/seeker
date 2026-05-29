@@ -166,7 +166,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
     let weights = engine.upload_weights(&gguf)?;
-    let model = crate::models::open(&gguf, weights, bundle)?;
+    let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
 
     // Size the scratch (compute buffer) for this model + n_ubatch (and the
     // full ctx for heterogeneous caches), replacing the Engine::new

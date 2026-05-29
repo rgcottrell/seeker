@@ -128,7 +128,7 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
     let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
     let weights = engine.upload_weights(&gguf)?;
-    let model = crate::models::open(&gguf, weights, bundle)?;
+    let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
 
     let max_seq_len = (prefill_tokens as u32)
         .saturating_add(args.warmup)

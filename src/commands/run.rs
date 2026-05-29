@@ -102,6 +102,13 @@ pub struct RunArgs {
     /// 0 = unbounded (single pass). (short: -ub)
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: u32,
+
+    /// Max MTP draft tokens per step for speculative decoding (llama.cpp's
+    /// `--spec-draft-n-max`). 0 (default) disables it and uses the normal
+    /// non-speculative decode loop. Only the qwen35moe model with NextN
+    /// weights supports it; other models silently ignore the flag.
+    #[arg(long = "spec-draft-n-max", default_value_t = 0)]
+    spec_draft_n_max: u32,
 }
 
 impl RunArgs {
@@ -142,11 +149,11 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let weights = engine.upload_weights(&gguf)?;
     tracing::info!(
         tensors = weights.views.len(),
-        bytes = weights.region.cursor,
+        bytes = weights.total_bytes,
         "weights uploaded to GPU",
     );
 
-    let model = crate::models::open(&gguf, weights, bundle)?;
+    let model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
 
     // Size the scratch (compute buffer) for this model + n_ubatch before any
     // forward (including the debug-dump paths below), replacing the placeholder
@@ -269,6 +276,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             gdn_state_floats = ssm.gdn_state_floats,
             "ssm state allocated",
         );
+        // Per-position SSM checkpoint buffers for spec decode — sized for
+        // L = (clamped n_draft)+1 snapshots. Lets partial acceptance roll
+        // the recurrent state back without a re-run.
+        if args.spec_draft_n_max > 0 && model.supports_mtp_spec() {
+            let max_snapshots = args.spec_draft_n_max.clamp(1, 8) + 1;
+            cache.allocate_ssm_snapshots(&engine.device, &ssm, max_snapshots)?;
+        }
     }
     tracing::info!(
         n_layer = dims.n_layer,
@@ -280,28 +294,87 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     );
 
     let mut sampler = Sampler::new(args.sampler_config());
-    let mut step_tokens: Vec<u32> = tokens.clone();
     let mut generated: Vec<u32> = Vec::with_capacity(args.max_tokens as usize);
 
     // Prefill = first forward pass (N = prompt length). Decode = every
     // subsequent N=1 step. Reporting them separately matches llama.cpp's
     // `prompt eval` / `eval` timings and is what we want when comparing.
     let mut prefill_secs: f64 = 0.0;
-    let prefill_tokens = step_tokens.len();
+    let prefill_tokens = tokens.len();
     let mut decode_secs: f64 = 0.0;
 
-    for step in 0..args.max_tokens {
-        let position_offset = cache.position;
+    // Speculative decode is active only when --spec-draft-n-max > 0 AND the
+    // model loaded an MTP head. Otherwise fall through to the unchanged
+    // single-token loop (byte-for-byte identical to before).
+    let spec = args.spec_draft_n_max > 0 && model.supports_mtp_spec();
+    if spec {
+        let n_max = args.spec_draft_n_max;
+        // Prefill via the hidden-exposing forward; sample the first token on
+        // the host (the spec path samples on host throughout).
         let t0 = std::time::Instant::now();
-        let next_id = engine.forward_sampled(&*model, &mut cache, &step_tokens, position_offset, &mut sampler)?;
-        let elapsed = t0.elapsed().as_secs_f64();
-        if step == 0 {
-            prefill_secs = elapsed;
-        } else {
-            decode_secs += elapsed;
+        let (logits, residual) =
+            engine.forward_full_readback(&*model, &mut cache, &tokens, 0, /*full_logits=*/ false)?;
+        let prompt_len = tokens.len();
+        let hsz = residual.len() / prompt_len;
+        let mut h_last = residual[(prompt_len - 1) * hsz..prompt_len * hsz].to_vec();
+        // Seed the MTP draft head's KV from the prompt's main hidden states so
+        // the first draft attends to real prior context (raises acceptance).
+        // MTP-KV[i] (i in [0, prompt_len-1)) uses h_i + embed(t_{i+1}).
+        if prompt_len >= 2 {
+            let seed_hiddens = &residual[0..(prompt_len - 1) * hsz];
+            let seed_tokens = &tokens[1..prompt_len];
+            engine.run_mtp_seed(&*model, &mut cache, seed_hiddens, seed_tokens, 0)?;
         }
-        generated.push(next_id);
-        step_tokens = vec![next_id];
+        prefill_secs = t0.elapsed().as_secs_f64();
+        let first = sampler.sample_one(&logits);
+        sampler.accept(first);
+        generated.push(first);
+        let mut last_token = first;
+
+        let mut total_accepted: u64 = 0;
+        let mut spec_steps: u64 = 0;
+        let t_dec = std::time::Instant::now();
+        while (generated.len() as u32) < args.max_tokens {
+            let position = cache.position;
+            let out = engine.decode_speculative(
+                &*model, &mut cache, last_token, &h_last, position, &mut sampler, n_max,
+            )?;
+            total_accepted += out.accepted as u64;
+            spec_steps += 1;
+            for &tk in &out.emitted {
+                if (generated.len() as u32) >= args.max_tokens {
+                    break;
+                }
+                generated.push(tk);
+            }
+            last_token = out.last_token;
+            h_last = out.h_last;
+        }
+        decode_secs = t_dec.elapsed().as_secs_f64();
+        let mean_acc = if spec_steps > 0 {
+            total_accepted as f64 / spec_steps as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "SPEC: {spec_steps} steps, mean accepted {mean_acc:.2}/{n_max} drafts ({} tokens)",
+            generated.len(),
+        );
+    } else {
+        let mut step_tokens: Vec<u32> = tokens.clone();
+        for step in 0..args.max_tokens {
+            let position_offset = cache.position;
+            let t0 = std::time::Instant::now();
+            let next_id = engine.forward_sampled(&*model, &mut cache, &step_tokens, position_offset, &mut sampler)?;
+            let elapsed = t0.elapsed().as_secs_f64();
+            if step == 0 {
+                prefill_secs = elapsed;
+            } else {
+                decode_secs += elapsed;
+            }
+            generated.push(next_id);
+            step_tokens = vec![next_id];
+        }
     }
 
     let generated_text = model
@@ -321,7 +394,9 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     println!("generated: {generated_text}");
     println!("ids:       {generated:?}");
     let prefill_tps = (prefill_tokens as f64) / prefill_secs.max(1e-9);
-    let decode_steps = args.max_tokens.saturating_sub(1) as f64;
+    // Decode tokens = everything after the first (prefill-sampled) token.
+    // For spec decode this counts the multiple tokens emitted per step.
+    let decode_steps = generated.len().saturating_sub(1) as f64;
     let decode_tps = if decode_steps > 0.0 {
         decode_steps / decode_secs.max(1e-9)
     } else {
@@ -420,14 +495,13 @@ fn ssm_conv_smoke_test(
 
     // Read kernel weights to host once so we can build the CPU reference.
     let kernel_host: Vec<f32> = {
-        let host_ptr = weights
-            .region
-            .host_ptr
-            .ok_or("weights region not host-visible")?;
+        let base = weights.debug_host_base(&kernel).ok_or(
+            "host-side weight reads unsupported (weights are device-local)",
+        )?;
         let total = (conv_kernel * conv_channels) as usize;
         let mut out = vec![0f32; total];
         unsafe {
-            let src = host_ptr.add(kernel.byte_offset as usize) as *const f32;
+            let src = base.add(kernel.byte_offset as usize) as *const f32;
             std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), total);
         }
         out
@@ -680,7 +754,6 @@ fn rms_norm_qwen_smoke(
     let eps: f32 = 1e-6;
     // Build a known input (embedding of token 9419 = "Hello") + known weight
     // (blk.0.attn_norm.weight). Compute CPU reference.
-    let host_ptr = weights.region.host_ptr.ok_or("weights not host-visible")?;
     let embed_view = weights.view("token_embd.weight")?;
     let weight_view = weights.view("blk.0.attn_norm.weight")?;
     // Read embed row for token 9419 (Q8_0 — need to dequantize)
@@ -703,8 +776,11 @@ fn rms_norm_qwen_smoke(
     println!("input head={:?}, max_abs={:.4}", &input[..5],
         input.iter().map(|v| v.abs()).fold(0.0, f32::max));
     let mut w_host = vec![0f32; n as usize];
+    let weight_base = weights.debug_host_base(&weight_view).ok_or(
+        "host-side weight reads unsupported (weights are device-local)",
+    )?;
     unsafe {
-        let p = host_ptr.add(weight_view.byte_offset as usize) as *const f32;
+        let p = weight_base.add(weight_view.byte_offset as usize) as *const f32;
         std::ptr::copy_nonoverlapping(p, w_host.as_mut_ptr(), n as usize);
     }
     // CPU reference
@@ -850,17 +926,19 @@ fn embed_norm_dump(
 fn norm_weights_dump(
     weights: &crate::inference::weights::WeightsHandle,
 ) -> Result<(), Box<dyn Error>> {
-    let host_ptr = weights.region.host_ptr.ok_or("weights not host-visible")?;
     for layer in [3u32, 7, 11, 15, 19, 23, 27, 31, 35, 39] {
         for kind in ["attn_q_norm", "attn_k_norm"] {
             let name = format!("blk.{layer}.{kind}.weight");
             let view = weights.view(&name)?;
             let n = view.dims[0] as usize;
+            let base = weights.debug_host_base(&view).ok_or(
+                "host-side weight reads unsupported (weights are device-local)",
+            )?;
             let mut sum_sq = 0f32;
             let mut max_abs = 0f32;
             let mut mean = 0f32;
             unsafe {
-                let p = host_ptr.add(view.byte_offset as usize) as *const f32;
+                let p = base.add(view.byte_offset as usize) as *const f32;
                 for i in 0..n {
                     let v = *p.add(i);
                     mean += v;
