@@ -113,6 +113,7 @@ impl RunArgs {
             repeat_penalty: self.repeat_penalty,
             penalty_last_n: self.penalty_last_n,
             seed: self.seed,
+            logit_bias: Vec::new(),
         }
     }
 }

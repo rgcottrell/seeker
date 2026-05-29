@@ -148,6 +148,7 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         repeat_penalty: 1.0,
         penalty_last_n: 0,
         seed: 0,
+        logit_bias: Vec::new(),
     });
 
     // ── Prefill ─────────────────────────────────────────────────────────

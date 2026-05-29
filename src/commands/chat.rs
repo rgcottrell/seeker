@@ -162,6 +162,12 @@ pub struct ChatArgs {
     #[arg(long = "ignore-eos")]
     ignore_eos: bool,
 
+    /// Bias a token's logit, repeatable. Format `ID(+/-)BIAS` (llama.cpp
+    /// style) or `ID=BIAS`, e.g. `--logit-bias 15043+2.0 --logit-bias
+    /// 128009-inf` (boost 15043, ban 128009). `-inf` bans, `+inf` forces.
+    #[arg(long = "logit-bias", value_parser = parse_logit_bias)]
+    logit_bias: Vec<(u32, f32)>,
+
     /// RNG seed for stochastic sampling.
     #[arg(long, default_value_t = 0)]
     seed: u64,
@@ -192,6 +198,31 @@ fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
     parse_dtype(s)
 }
 
+/// Parse one `--logit-bias` entry: `ID=BIAS` or llama.cpp's `ID(+/-)BIAS`
+/// (the sign is part of the bias). BIAS may be `inf` / `-inf` to force / ban.
+fn parse_logit_bias(s: &str) -> Result<(u32, f32), String> {
+    let (id_str, bias_str) = if let Some((a, b)) = s.split_once('=') {
+        (a, b)
+    } else {
+        // Leading digits are the token id; the remainder (with its sign) is
+        // the bias — e.g. "15043+2.0", "128009-inf".
+        let split = s
+            .find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| format!("--logit-bias {s:?}: expected ID followed by +/-BIAS"))?;
+        if split == 0 {
+            return Err(format!("--logit-bias {s:?}: missing token id"));
+        }
+        (&s[..split], &s[split..])
+    };
+    let id: u32 = id_str
+        .parse()
+        .map_err(|_| format!("--logit-bias {s:?}: invalid token id {id_str:?}"))?;
+    let bias: f32 = bias_str
+        .parse()
+        .map_err(|_| format!("--logit-bias {s:?}: invalid bias {bias_str:?}"))?;
+    Ok((id, bias))
+}
+
 impl ChatArgs {
     fn sampler_config(&self) -> SamplerConfig {
         SamplerConfig {
@@ -209,6 +240,7 @@ impl ChatArgs {
                 self.penalty_last_n as usize
             },
             seed: self.seed,
+            logit_bias: self.logit_bias.clone(),
         }
     }
 }
@@ -1208,7 +1240,20 @@ fn handle_glob(session: &mut ChatSession, pattern: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::prompt_opens_think;
+    use super::{parse_logit_bias, prompt_opens_think};
+
+    #[test]
+    fn parse_logit_bias_forms() {
+        assert_eq!(parse_logit_bias("15043+2.0"), Ok((15043, 2.0)));
+        assert_eq!(parse_logit_bias("7-1.5"), Ok((7, -1.5)));
+        assert_eq!(parse_logit_bias("5=1.5"), Ok((5, 1.5)));
+        assert_eq!(parse_logit_bias("128009-inf"), Ok((128009, f32::NEG_INFINITY)));
+        assert_eq!(parse_logit_bias("9=inf"), Ok((9, f32::INFINITY)));
+        // Missing id / non-numeric id / no bias → errors, not panics.
+        assert!(parse_logit_bias("+1").is_err());
+        assert!(parse_logit_bias("abc").is_err());
+        assert!(parse_logit_bias("12").is_err());
+    }
 
     #[test]
     fn prompt_opens_think_detects_open_block() {

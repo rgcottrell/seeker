@@ -81,6 +81,7 @@ impl ChatCompletionRequest {
             repeat_penalty: self.repeat_penalty.unwrap_or(d.repeat_penalty),
             penalty_last_n: self.repeat_last_n.unwrap_or(d.penalty_last_n),
             seed: self.seed.unwrap_or(d.seed),
+            logit_bias: Vec::new(),
         }
     }
 }

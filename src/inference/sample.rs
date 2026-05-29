@@ -51,6 +51,10 @@ pub struct SamplerConfig {
     pub penalty_last_n: usize,
     /// RNG seed for stochastic sampling.
     pub seed: u64,
+    /// Static `(token_id, bias)` adjustments added to the raw logits before
+    /// any other stage (`--logit-bias`). Empty → no bias dispatch. A `-inf`
+    /// bias hard-bans a token; `+inf` forces it. Constant for the session.
+    pub logit_bias: Vec<(u32, f32)>,
 }
 
 impl Default for SamplerConfig {
@@ -67,6 +71,7 @@ impl Default for SamplerConfig {
             repeat_penalty: 1.0,
             penalty_last_n: 64,
             seed: 0,
+            logit_bias: Vec::new(),
         }
     }
 }
@@ -102,6 +107,12 @@ impl SamplerConfig {
         self.frequency_penalty.to_bits().hash(&mut h);
         self.presence_penalty.to_bits().hash(&mut h);
         self.penalty_last_n.hash(&mut h);
+        // logit_bias is uploaded to scratch at record time, so any change
+        // (count *or* value) must force a re-record to re-upload it.
+        for &(tid, b) in &self.logit_bias {
+            tid.hash(&mut h);
+            b.to_bits().hash(&mut h);
+        }
         h.finish()
     }
 }
@@ -272,6 +283,14 @@ impl Sampler {
     pub fn sample_one(&mut self, logits_in: &[f32]) -> u32 {
         let cfg = &self.config;
         let mut logits: Vec<f32> = logits_in.to_vec();
+
+        // 0. Static logit bias first (matches the GPU chain / llama.cpp): a
+        //    `-inf` bias bans a token, `+inf` forces it.
+        for &(tid, b) in &cfg.logit_bias {
+            if let Some(l) = logits.get_mut(tid as usize) {
+                *l += b;
+            }
+        }
 
         // 1. Penalties on the raw logits (sign-conditional repeat penalty,
         //    then frequency/presence), matching `apply_penalties_f32`.

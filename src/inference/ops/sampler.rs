@@ -26,6 +26,7 @@ const SUM_ROWS_PARAMS_BYTES: u32 = 15 * 4;
 const SOFT_MAX_PARAMS_BYTES: u32 = 17 * 4;
 const TOPK_PARAMS_BYTES: u32 = 7 * 4;
 const PENALTY_PARAMS_BYTES: u32 = 4 * 4;
+const LOGIT_BIAS_PARAMS_BYTES: u32 = 4;
 const TOPK_BLOCK_SIZE: u32 = 1024;
 
 /// Top-level dispatcher for the sampler chain. Returns a 4-byte
@@ -44,7 +45,13 @@ pub fn record_chain(
     penalty_pairs: &[(u32, u32)],
     uniform: f32,
 ) -> Result<BufferRange, Box<dyn Error>> {
-    // Penalties run first because the repetition penalty's multiply/divide
+    // Static `--logit-bias` runs first (matches llama.cpp's sampler order),
+    // so a forced/banned token is adjusted before penalties and filtering.
+    if !config.logit_bias.is_empty() {
+        record_apply_logit_bias(ctx, logits, &config.logit_bias)?;
+    }
+
+    // Penalties run next because the repetition penalty's multiply/divide
     // is sign-conditional on the *raw* logit. Always record the dispatch
     // when the config has any penalty term — the kernel sources its valid
     // pair count from DecodeDyn at submit time, so the cmdbuf is
@@ -358,6 +365,56 @@ fn record_categorical(
 /// replay-stable. The shader reads the live pair count from DecodeDyn
 /// and bails out per-thread when `i >= penalty_count`, so unused slots
 /// are skipped at submit time.
+/// Add a static `(token_id, bias)` table to the logits in place. Unlike the
+/// penalty pass this data is constant for the session — the count rides in a
+/// push constant and the table is uploaded once at record time. The decode
+/// cmdbuf reads the same scratch offset on every replay and nothing overwrites
+/// it there, so no replay-refresh slot is needed (re-records, which happen on
+/// any sampler-config change, re-upload it).
+fn record_apply_logit_bias(
+    ctx: &mut DispatchContext,
+    logits: TensorView,
+    bias: &[(u32, f32)],
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(logits.dtype, GgmlType::F32);
+    let n = bias.len() as u32;
+
+    // Pack (token_id, bias_bits) int2 entries into a scratch SSBO; the shader
+    // reads y via `asfloat` to recover the bias.
+    let bias_t = ctx.alloc_tensor([2 * n.max(1) as u64, 1, 1, 1], GgmlType::I32)?;
+    let host_ptr = ctx
+        .scratch
+        .host_ptr
+        .ok_or("scratch not host-visible — logit_bias needs an upload")?;
+    unsafe {
+        let dst = host_ptr.add(bias_t.byte_offset as usize) as *mut u32;
+        for (i, &(tid, b)) in bias.iter().enumerate() {
+            std::ptr::write(dst.add(2 * i), tid);
+            std::ptr::write(dst.add(2 * i + 1), b.to_bits());
+        }
+    }
+
+    let mut push = [0u8; LOGIT_BIAS_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&n.to_ne_bytes());
+
+    let key = PipelineKey::dense("apply_logit_bias_f32", 2, LOGIT_BIAS_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::APPLY_LOGIT_BIAS_F32_SPV.as_bytes(),
+    )?;
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[logits.range(), bias_t.range()],
+        &push,
+        [n.div_ceil(256).max(1), 1, 1],
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, logits.range());
+    Ok(())
+}
+
 fn record_apply_penalties(
     ctx: &mut DispatchContext,
     logits: TensorView,
