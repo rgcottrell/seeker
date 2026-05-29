@@ -282,10 +282,31 @@ impl KvCache {
         Ok(())
     }
 
-    /// Reset the position counter to 0. Buffer contents stay (will be
-    /// overwritten by the next forward pass).
+    /// Reset the write cursor to 0, starting a fresh sequence.
+    ///
+    /// Attention K/V buffer contents are left in place: they're overwritten
+    /// position-by-position by the next forward, and reads are bounded by
+    /// `position`. SSM/GDN recurrent state is different — it is *seeded from
+    /// the buffer* at the start of every forward and accumulated across the
+    /// whole sequence, never overwritten per-position. So a fresh sequence
+    /// must zero it, or the new conversation inherits the previous one's
+    /// recurrent prior (silent corruption, no error). Mirrors the zero-init in
+    /// [`allocate_ssm_state`]. The per-position snapshot/backup buffers are
+    /// spec-decode scratch, rewritten within a step, so they need no reset.
     pub fn reset(&mut self) {
         self.position = 0;
+        if let Some((host_ptr, size)) = self
+            .ssm_region
+            .as_ref()
+            .and_then(|r| r.host_ptr.map(|p| (p, r.size as usize)))
+        {
+            // SAFETY: host_ptr maps the whole HOST_VISIBLE|HOST_COHERENT
+            // ssm_region of `size` bytes — the same write performed at
+            // allocation time.
+            unsafe {
+                std::ptr::write_bytes(host_ptr, 0, size);
+            }
+        }
     }
 
     /// Roll the write cursor back to `new_pos` after speculative decode

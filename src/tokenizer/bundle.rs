@@ -37,4 +37,9 @@ pub struct TokenizerBundle {
     /// `tokens` array using the corresponding `*_token_id`.
     pub bos_token: Option<String>,
     pub eos_token: Option<String>,
+    /// Every end-of-generation token id (EOS + EOT + EOM + well-known turn
+    /// terminators), matching llama.cpp's `llama_token_is_eog`. Generation
+    /// should stop on **any** of these; stopping on only `eos_id` lets a model
+    /// whose turn terminator differs from its EOS run to the token budget.
+    pub eog_ids: Vec<u32>,
 }

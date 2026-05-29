@@ -187,13 +187,11 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
 
     let sampler = Sampler::new(args.sampler_config());
 
-    // Stop on the GGUF-declared EOS. For chat-tuned models this is
-    // usually `<|im_end|>` (or equivalent); for non-chat models we
-    // already errored above.
-    let mut eos_ids: Vec<u32> = Vec::new();
-    if let Some(id) = model.tokenizer().eos_id {
-        eos_ids.push(id);
-    }
+    // Stop on any end-of-generation token (EOS / EOT / EOM / well-known turn
+    // terminators), matching llama.cpp's `llama_token_is_eog`. A chat-tuned
+    // model whose turn terminator (`<|im_end|>`) differs from its EOS would
+    // otherwise never stop and burn to --max-tokens every reply.
+    let eos_ids: Vec<u32> = model.tokenizer().eog_ids.clone();
 
     // Reasoning-model think markers, if present (single special tokens for
     // Qwen3-style models). Used to split reasoning from the final answer.
@@ -393,7 +391,9 @@ impl ChatSession {
             .count();
         if common > self.cache.position as usize {
             // Shouldn't happen — prior_tokens tracks what's in the cache —
-            // but be defensive.
+            // but be defensive. Roll back the just-pushed user turn so a
+            // failed turn doesn't leave a dangling message in the history.
+            self.messages.pop();
             return Err(format!(
                 "cache/prior_tokens drift: common={common} cache.position={}",
                 self.cache.position
@@ -407,10 +407,12 @@ impl ChatSession {
             // (e.g. empty content). Force at least the assistant opener
             // by feeding one rendered token, otherwise the model has no
             // logits to sample from.
+            self.messages.pop();
             return Err("nothing new to feed after template render".into());
         }
 
         if (common + delta.len()) as u32 > self.cache.config.max_seq_len {
+            self.messages.pop();
             return Err(format!(
                 "conversation length {} exceeds --ctx-size {}",
                 common + delta.len(),
@@ -514,6 +516,24 @@ impl ChatSession {
             step_tokens = vec![token];
         }
 
+        // No forward ran: the prompt filled the context window exactly
+        // (common + delta == --ctx-size), so the loop-top budget guard broke
+        // before the prefill — there's no slot to sample even the first token.
+        // Roll back the just-pushed user turn and report it. Otherwise we'd
+        // store an empty reply and set `prior_tokens` longer than
+        // `cache.position`, tripping the drift guard on every later turn and
+        // wedging the session until `/clear`.
+        if forwards == 0 {
+            self.messages.pop();
+            return Err(format!(
+                "context window full: prompt is {} tokens but --ctx-size is {} \
+                 (no room to generate) — use /clear or raise --ctx-size",
+                common + prompt_tokens,
+                self.cache.config.max_seq_len
+            )
+            .into());
+        }
+
         // Split the reply into final answer + reasoning at the `</think>`
         // token (when one was emitted). `decode` with skip_special_tokens
         // drops the think markers and EOS from each half. Storing reasoning
@@ -533,9 +553,21 @@ impl ChatSession {
                 let r = (!reasoning.is_empty()).then(|| reasoning.to_string());
                 (answer, r)
             }
-            // No closed think block (non-reasoning model, thinking disabled, or
-            // the budget ran out mid-thought): keep the whole reply as the
-            // answer so nothing is lost.
+            // Think block was opened (the prompt seeded it on, or the model
+            // emitted `<think>`) but never closed — generation stopped
+            // mid-thought (EOS or max_tokens before `</think>`). The whole
+            // reply is reasoning, not an answer; store it as `reasoning_content`
+            // so the next turn's template splits it correctly instead of
+            // re-rendering raw chain-of-thought as the assistant's final answer
+            // (and re-prefixing it into the cache).
+            None if in_think => {
+                let reasoning = decode(&assistant_tokens)?;
+                let reasoning = reasoning.trim();
+                let r = (!reasoning.is_empty()).then(|| reasoning.to_string());
+                (String::new(), r)
+            }
+            // No think block at all (non-reasoning model or thinking disabled):
+            // the whole reply is the answer.
             None => (decode(&assistant_tokens)?, None),
         };
 

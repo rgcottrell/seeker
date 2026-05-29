@@ -47,12 +47,15 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
 
     let bos_id = read_optional_u32(gguf, "tokenizer.ggml.bos_token_id");
     let eos_id = read_optional_u32(gguf, "tokenizer.ggml.eos_token_id");
+    let eot_id = read_optional_u32(gguf, "tokenizer.ggml.eot_token_id");
+    let eom_id = read_optional_u32(gguf, "tokenizer.ggml.eom_token_id");
     let unk_id = read_optional_u32(gguf, "tokenizer.ggml.unknown_token_id");
     let add_bos_default = read_optional_bool(gguf, "tokenizer.ggml.add_bos_token").unwrap_or(false);
     let add_eos_default = read_optional_bool(gguf, "tokenizer.ggml.add_eos_token").unwrap_or(false);
 
     let bos_token = bos_id.and_then(|i| tokens.get(i as usize).cloned());
     let eos_token = eos_id.and_then(|i| tokens.get(i as usize).cloned());
+    let eog_ids = collect_eog_ids(&tokens, eos_id, eot_id, eom_id);
     let chat_template = read_optional_string(gguf, "tokenizer.chat_template");
     let token_types = read_optional_i32_array(gguf, "tokenizer.ggml.token_type");
 
@@ -74,7 +77,49 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
         chat_template,
         bos_token,
         eos_token,
+        eog_ids,
     })
+}
+
+/// Collect every "end of generation" token id, matching llama.cpp's
+/// `llama_token_is_eog`: the declared EOS / EOT / EOM ids, plus any vocab
+/// token whose text is a well-known end-of-turn marker (some models ship the
+/// token but omit the `*_token_id` metadata key). A generation loop should
+/// stop on ANY of these — stopping on only the single `eos_token_id` lets a
+/// model with a distinct turn terminator (e.g. `<|im_end|>` alongside a
+/// separate `<|endoftext|>` EOS) run on until the token budget is exhausted.
+/// Order is stable and de-duplicated; ids are kept even if not flagged
+/// special, mirroring upstream's by-name sweep.
+fn collect_eog_ids(
+    tokens: &[String],
+    eos_id: Option<u32>,
+    eot_id: Option<u32>,
+    eom_id: Option<u32>,
+) -> Vec<u32> {
+    // The by-name set from llama.cpp's vocab loader (`llama-vocab.cpp`).
+    const EOG_TOKENS: &[&str] = &[
+        "<|eot_id|>",
+        "<|im_end|>",
+        "<|end|>",
+        "<end_of_turn>",
+        "<|endoftext|>",
+        "<|eom_id|>",
+        "<EOT>",
+        "_<EOT>",
+        "<｜end▁of▁sentence｜>", // DeepSeek
+    ];
+    let mut ids: Vec<u32> = Vec::new();
+    for id in [eos_id, eot_id, eom_id].into_iter().flatten() {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    for (i, tok) in tokens.iter().enumerate() {
+        if EOG_TOKENS.contains(&tok.as_str()) && !ids.contains(&(i as u32)) {
+            ids.push(i as u32);
+        }
+    }
+    ids
 }
 
 /// Register the model's special tokens as *added tokens* so the BPE/Unigram
@@ -212,6 +257,36 @@ mod tests {
         let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
         install_specials(&mut tk, &owned, Some(&token_types), None, None, None);
         assert_eq!(ids(&tk, "<|x|>"), vec![4]);
+    }
+
+    /// EOG set folds in the declared EOS/EOT/EOM ids and any well-known
+    /// terminator present in the vocab, de-duplicated. Models that declare only
+    /// `eos_token_id` but ship a distinct `<|im_end|>` must still stop on it.
+    #[test]
+    fn collect_eog_ids_unions_declared_and_by_name() {
+        let tokens: Vec<String> = ["<unk>", "<s>", "</s>", "<|im_end|>", "hi", "<|eot_id|>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // eos = </s> (id 2); no eot/eom metadata. <|im_end|> (3) and
+        // <|eot_id|> (5) must be picked up by name.
+        let ids = super::collect_eog_ids(&tokens, Some(2), None, None);
+        assert!(ids.contains(&2), "declared eos missing: {ids:?}");
+        assert!(ids.contains(&3), "<|im_end|> not detected by name: {ids:?}");
+        assert!(ids.contains(&5), "<|eot_id|> not detected by name: {ids:?}");
+
+        // Declared eot that coincides with a by-name match is not duplicated.
+        let ids = super::collect_eog_ids(&tokens, Some(2), Some(5), None);
+        assert_eq!(
+            ids.iter().filter(|&&i| i == 5).count(),
+            1,
+            "duplicate eot id: {ids:?}"
+        );
+
+        // No EOS and no terminators in vocab → empty (loop falls back to the
+        // token budget, matching prior behavior).
+        let plain: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert!(super::collect_eog_ids(&plain, None, None, None).is_empty());
     }
 
     /// End-to-end against the real Llama-3.2 GGUF: the chat header control
