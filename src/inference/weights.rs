@@ -9,8 +9,10 @@ use ash::vk;
 
 use crate::gguf::{GgmlType, GgufFile};
 
+use std::sync::Arc;
+
 use super::buffer::BufferRange;
-use super::device::Device;
+use super::device::{Device, DeviceShared};
 use super::memory::DeviceBuffer;
 
 /// Logical view of a tensor in GPU memory. Strides follow ggml convention:
@@ -55,9 +57,10 @@ pub struct WeightsHandle {
     pub views: HashMap<String, TensorView>,
     /// Sum of tensor byte sizes uploaded (for logging).
     pub total_bytes: u64,
-    /// Cloned device handle so `Drop` can free the per-tensor buffers
-    /// without threading a `&Device` through the model that owns us.
-    ash_device: ash::Device,
+    /// Refcounted device owner — keeps the logical device alive until
+    /// `Drop` has freed every per-tensor buffer, independent of whether the
+    /// owning model/engine drops first.
+    device: Arc<DeviceShared>,
 }
 
 impl WeightsHandle {
@@ -89,8 +92,9 @@ impl WeightsHandle {
 
 impl Drop for WeightsHandle {
     fn drop(&mut self) {
+        let dev = self.device.raw();
         for b in &self.buffers {
-            b.destroy(&self.ash_device);
+            b.destroy(dev);
         }
     }
 }
@@ -236,7 +240,7 @@ pub fn upload(
         buffers,
         views,
         total_bytes,
-        ash_device: device.device.clone(),
+        device: device.shared(),
     })
 }
 

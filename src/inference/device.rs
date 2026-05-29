@@ -24,15 +24,60 @@
 
 use std::error::Error;
 use std::ffi::{c_char, CStr};
+use std::sync::Arc;
 
 use ash::{vk, Entry, Instance};
 use vk::TaggedStructure as _;
 
 const REQUIRED_API_VERSION: u32 = vk::make_api_version(0, 1, 4, 0);
 
+/// Refcounted owner of the destroyable Vulkan objects (logical device,
+/// instance, debug messenger). The actual destruction happens here, in
+/// `Drop`, when the *last* `Arc<DeviceShared>` is released — so any
+/// `WeightsHandle` / `KvCache` that holds a clone keeps the device alive
+/// until it has freed its own buffers, regardless of drop order. Without
+/// this, destroying the `Device` before those resources segfaults their
+/// `Drop` (which calls `destroy_buffer` on a dead device).
+pub(crate) struct DeviceShared {
+    // Kept alive for the device's lifetime (loader + parent objects).
+    #[allow(dead_code)]
+    entry: Entry,
+    instance: Instance,
+    device: ash::Device,
+    #[cfg(any(debug_assertions, feature = "gpu_debug"))]
+    debug: Option<validation::Messenger>,
+}
+
+impl DeviceShared {
+    /// The raw logical-device handle, for resource owners to free their
+    /// buffers/memory during their own `Drop`.
+    pub(crate) fn raw(&self) -> &ash::Device {
+        &self.device
+    }
+}
+
+impl Drop for DeviceShared {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
+            #[cfg(any(debug_assertions, feature = "gpu_debug"))]
+            if let Some(d) = self.debug.take() {
+                d.destroy();
+            }
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
 /// Vulkan handles needed throughout the inference module. Owns the
 /// `ash::Entry` so the loader stays alive for the device's lifetime.
 pub struct Device {
+    /// Refcounted destroy-owner. Cloned into every resource holder
+    /// (weights, KV cache) so the logical device outlives them. The
+    /// `entry` / `instance` / `device` fields below are non-owning
+    /// handle copies for the `&Device` access API.
+    shared: Arc<DeviceShared>,
     pub entry: Entry,
     pub instance: Instance,
     pub physical: vk::PhysicalDevice,
@@ -65,11 +110,16 @@ pub struct Device {
     /// Shader stages on which `requiredSubgroupSize` may be requested. We
     /// only care about COMPUTE; this is exposed so callers can sanity-check.
     pub required_subgroup_size_stages: vk::ShaderStageFlags,
-    #[cfg(any(debug_assertions, feature = "gpu_debug"))]
-    debug: Option<validation::Messenger>,
 }
 
 impl Device {
+    /// Clone the refcounted destroy-owner so a resource holder (weights,
+    /// KV cache) keeps the logical device alive until it has freed its own
+    /// buffers in `Drop`.
+    pub(crate) fn shared(&self) -> Arc<DeviceShared> {
+        self.shared.clone()
+    }
+
     pub fn new() -> Result<Self, Box<dyn Error>> {
         let entry = unsafe { Entry::load() }?;
 
@@ -409,7 +459,21 @@ impl Device {
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical) };
         let limits = props.limits;
 
+        // Move the destroyable objects into a refcounted owner; keep
+        // non-owning handle clones on `Device` for the access API. ash's
+        // Entry/Instance/Device are cheap handle+Arc clones — destruction
+        // is explicit (in `DeviceShared::drop`), so cloning never
+        // double-frees.
+        let shared = Arc::new(DeviceShared {
+            entry: entry.clone(),
+            instance: instance.clone(),
+            device: device.clone(),
+            #[cfg(any(debug_assertions, feature = "gpu_debug"))]
+            debug,
+        });
+
         Ok(Self {
+            shared,
             entry,
             instance,
             physical,
@@ -433,8 +497,6 @@ impl Device {
             min_subgroup_size,
             max_subgroup_size,
             required_subgroup_size_stages,
-            #[cfg(any(debug_assertions, feature = "gpu_debug"))]
-            debug,
         })
     }
 
@@ -449,19 +511,10 @@ impl Device {
     }
 }
 
-impl Drop for Device {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.device.device_wait_idle();
-            self.device.destroy_device(None);
-            #[cfg(any(debug_assertions, feature = "gpu_debug"))]
-            if let Some(d) = self.debug.take() {
-                d.destroy();
-            }
-            self.instance.destroy_instance(None);
-        }
-    }
-}
+// NOTE: `Device` has no `Drop`. The destroyable objects live in
+// `DeviceShared` (an `Arc`), so the logical device / instance are torn down
+// only when the last holder — `Device` itself plus any `WeightsHandle` /
+// `KvCache` clones — is released. This makes teardown order-independent.
 
 fn ext_name(name: &[c_char; 256]) -> &CStr {
     unsafe { CStr::from_ptr(name.as_ptr()) }
