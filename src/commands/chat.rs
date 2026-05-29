@@ -496,13 +496,6 @@ impl ChatSession {
         result
     }
 
-    /// Render the current `messages` (which must end at a user turn) with a
-    /// generation prompt, prefill the divergent suffix, decode the reply, and
-    /// push it as an assistant turn. `on_text` fires once per sampled token
-    /// with the newly-emitted byte slice — the REPL streams output through it.
-    ///
-    /// Callers own `messages` rollback: this never pops on error. The returned
-    /// `ReplyStats` carries per-turn timing (and an `interrupted` flag).
     /// Render the current conversation with a generation prompt and tokenize
     /// it (`add_special_tokens=false` — the template emits any BOS it wants).
     /// Returns both the rendered string (the reasoning seed reads it) and the
@@ -573,6 +566,21 @@ impl ChatSession {
         Ok(dropped)
     }
 
+    /// Render the current `messages` (which must end at a user turn) with a
+    /// generation prompt, prefill the divergent suffix, decode the reply, and
+    /// push it as an assistant turn. `on_text` fires once per sampled token
+    /// with the newly-emitted byte slice — the REPL streams output through it.
+    /// Callers own `messages` rollback: this never pops on error.
+    ///
+    /// Prefix reuse keeps the cached prefix that still matches `prior_tokens`.
+    /// For **reasoning models** this prefix is shorter than it looks: the
+    /// generation prompt's `<think>…</think>` block is in the cache, but the
+    /// template drops it when re-rendering that turn as history, which shifts
+    /// the previous answer and invalidates its K/V — so the answer (and the
+    /// new turn) re-prefill every turn. That re-prefill is correctness-required
+    /// (re-injecting the stripped reasoning would corrupt what the model sees),
+    /// not a bug; it's logged at debug when it happens. Preserving thinking via
+    /// `--chat-template-kwargs` trades context growth for full prefix reuse.
     fn generate(
         &mut self,
         mut on_text: impl FnMut(&str, Segment),
@@ -609,6 +617,21 @@ impl ChatSession {
         } else {
             return Err("empty prompt — nothing to generate".into());
         };
+        // Surface the re-prefill that was otherwise silent: when we can reuse
+        // less than the whole cached prefix, some computed K/V is discarded and
+        // re-fed. Expected on reasoning models (the dropped <think> block, see
+        // the doc above) and after edited/regenerated history; a perfectly
+        // matching turn reuses everything and stays quiet.
+        let cached = self.prior_tokens.len();
+        if common < cached {
+            tracing::debug!(
+                reused = common,
+                discarded = cached - common,
+                reprefilled = delta.len(),
+                "prefix reuse fell short of the cached prefix — re-prefilling \
+                 (reasoning <think>-drop, /regen, or edited history)"
+            );
+        }
         self.cache.position = common as u32;
 
         if (common + delta.len()) as u32 > self.cache.config.max_seq_len {

@@ -343,6 +343,30 @@ mod tests {
         assert!(out.ends_with("<|im_start|>assistant\n"), "missing assistant opener: {out:?}");
     }
 
+    /// An assistant turn's `reasoning_content` must not leak into a
+    /// content-only history render (this is exactly how reasoning models like
+    /// Qwen3 drop the previous turn's chain-of-thought) — which is the root of
+    /// the prefix-reuse divergence: the generated `<think>` tokens are in the
+    /// KV cache but absent from the re-rendered prompt, forcing a re-prefill.
+    #[test]
+    fn reasoning_content_not_rendered_by_content_only_template() {
+        let messages = vec![
+            ChatMessage::user("q1"),
+            ChatMessage::assistant("the final answer", Some("hidden chain of thought".into())),
+            ChatMessage::user("q2"),
+        ];
+        let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "", &serde_json::Map::new())
+            .expect("render");
+        assert!(
+            out.contains("<|im_start|>assistant\nthe final answer<|im_end|>"),
+            "answer should round-trip into history: {out:?}"
+        );
+        assert!(
+            !out.contains("hidden chain of thought"),
+            "reasoning_content leaked into the rendered history: {out:?}"
+        );
+    }
+
     #[test]
     fn system_constructor_renders_as_system_turn() {
         let messages = vec![
