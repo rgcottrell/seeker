@@ -2074,8 +2074,9 @@ fn moe_ffn(
     elementwise::record_swiglu_split(ctx, gate, up, ffn_h)?;
     ctx.tap(&format!("ffn_moe_swiglu-{layer_idx}"), ffn_h)?;
 
-    // Fused routing-weighted down. The Q4_K_XL checkpoint mixes Q5_K
-    // and Q6_K for `ffn_down_exps` — dispatch on dtype.
+    // Fused routing-weighted down. Checkpoints mix dtypes for
+    // `ffn_down_exps`: Q4_K_XL uses Q5_K/Q6_K; Q5_K_XL uses Q6_K/Q8_0.
+    // Dispatch on dtype.
     let routed = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     match w.ffn_down_exps.dtype {
         GgmlType::Q5_K => {
@@ -2084,11 +2085,14 @@ fn moe_ffn(
         GgmlType::Q6_K => {
             moe::record_moe_down_q6k(ctx, w.ffn_down_exps, ffn_h, ids, weights_buf, routed, n_used)?;
         }
+        GgmlType::Q8_0 => {
+            moe::record_moe_down_q8_0(ctx, w.ffn_down_exps, ffn_h, ids, weights_buf, routed, n_used)?;
+        }
         other => {
-            return Err(
-                format!("qwen35moe: ffn_down_exps dtype {other:?} not supported (need Q5_K or Q6_K)")
-                    .into(),
-            );
+            return Err(format!(
+                "qwen35moe: ffn_down_exps dtype {other:?} not supported (need Q5_K, Q6_K or Q8_0)"
+            )
+            .into());
         }
     }
     ctx.tap(&format!("ffn_moe_out-{layer_idx}"), routed)?;
@@ -2407,6 +2411,7 @@ fn dispatch_matvec_id(
     match a.dtype {
         GgmlType::Q4_K => moe::record_matvec_q4k_id(ctx, a, b, ids, dst, n_expert_used),
         GgmlType::Q5_K => moe::record_matvec_q5k_id(ctx, a, b, ids, dst, n_expert_used),
+        GgmlType::Q6_K => moe::record_matvec_q6k_id(ctx, a, b, ids, dst, n_expert_used),
         other => Err(format!("matvec_id: expert weight dtype {other:?} not yet wired").into()),
     }
 }
@@ -2423,6 +2428,7 @@ fn dispatch_matvec_id_nofence(
     match a.dtype {
         GgmlType::Q4_K => moe::record_matvec_q4k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
         GgmlType::Q5_K => moe::record_matvec_q5k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
+        GgmlType::Q6_K => moe::record_matvec_q6k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
         other => Err(format!("matvec_id: expert weight dtype {other:?} not yet wired").into()),
     }
 }
