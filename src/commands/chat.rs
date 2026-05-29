@@ -155,6 +155,18 @@ pub struct ChatArgs {
     /// applies. Mirrors llama.cpp's `--chat-template-kwargs`.
     #[arg(long = "chat-template-kwargs", value_parser = chat_template::parse_template_kwargs)]
     chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// System prompt, prepended as the conversation's first (system) message.
+    /// Overrides any default the chat template would inject, persists across
+    /// `/clear`, and can be changed mid-session with `/system <text>`.
+    /// (short: -sys)
+    #[arg(long = "system-prompt")]
+    system_prompt: Option<String>,
+
+    /// Read the system prompt from a UTF-8 text file instead of the CLI.
+    /// (short: -sysf)
+    #[arg(long = "system-prompt-file", conflicts_with = "system_prompt")]
+    system_prompt_file: Option<PathBuf>,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -245,6 +257,11 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
     };
 
+    // Seed an optional system prompt (CLI flag or file) as messages[0].
+    if let Some(text) = resolve_system_prompt(&args)? {
+        session.set_system_prompt(text);
+    }
+
     let history = if args.no_history {
         None
     } else {
@@ -260,6 +277,21 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     } else {
         run_piped(&mut session)
     }
+}
+
+/// The system prompt to seed, from `--system-prompt` or `--system-prompt-file`
+/// (clap makes them mutually exclusive). The file's trailing newline is
+/// trimmed so an editor's stray `\n` doesn't leak into the prompt.
+fn resolve_system_prompt(args: &ChatArgs) -> Result<Option<String>, Box<dyn Error>> {
+    if let Some(s) = &args.system_prompt {
+        return Ok(Some(s.clone()));
+    }
+    if let Some(path) = &args.system_prompt_file {
+        let s = fs::read_to_string(path)
+            .map_err(|e| format!("--system-prompt-file {}: {e}", path.display()))?;
+        return Ok(Some(s.trim_end().to_string()));
+    }
+    Ok(None)
 }
 
 async fn resolve_model_path(args: &ChatArgs) -> Result<PathBuf, Box<dyn Error>> {
@@ -682,11 +714,39 @@ impl ChatSession {
         })
     }
 
+    /// Set (or replace) the leading system message, then reset the cache and
+    /// prior-token tracking so the next turn re-prefills the whole conversation
+    /// from the new prompt. The full reset is required because the prefix
+    /// changes at position 0 — and the SSM/GDN recurrent state has no partial
+    /// rewind, so it must rebuild from scratch (see `KvCache::reset`).
+    fn set_system_prompt(&mut self, text: impl Into<String>) {
+        let msg = ChatMessage::system(text);
+        match self.messages.first() {
+            Some(m) if m.role == "system" => self.messages[0] = msg,
+            _ => self.messages.insert(0, msg),
+        }
+        self.prior_tokens.clear();
+        self.cache.reset();
+    }
+
+    /// The current system prompt, if one is set (the leading system message).
+    fn system_prompt(&self) -> Option<&str> {
+        match self.messages.first() {
+            Some(m) if m.role == "system" => Some(&m.content),
+            _ => None,
+        }
+    }
+
     /// Reset everything that ties to the current conversation; keep the
-    /// model / engine / sampler RNG so deterministic seeds still
-    /// reproduce after a `/clear`.
+    /// model / engine / sampler RNG so deterministic seeds still reproduce
+    /// after a `/clear`. A system prompt is preserved across the clear (like
+    /// llama.cpp) — only the user/assistant turns are dropped.
     fn clear(&mut self) {
+        let system = self.system_prompt().map(|s| ChatMessage::system(s));
         self.messages.clear();
+        if let Some(s) = system {
+            self.messages.push(s);
+        }
         self.prior_tokens.clear();
         self.cache.reset();
         self.sampler.reset_recent();
@@ -785,6 +845,7 @@ fn print_banner(gguf: &GgufFile, path: &Path) {
     println!("available commands:");
     println!("  /exit or Ctrl+C     stop or exit");
     println!("  /regen              regenerate the last response");
+    println!("  /system [text]      show or set the system prompt");
     println!("  /clear              clear the chat history");
     println!("  /read <file>        add a text file");
     println!("  /glob <pattern>     add text files using globbing pattern");
@@ -827,6 +888,17 @@ fn run_interactive(
                         break;
                     } else if cmd == "regen" {
                         emit_regen(session);
+                    } else if let Some(arg) = cmd.strip_prefix("system") {
+                        let text = arg.trim();
+                        if text.is_empty() {
+                            match session.system_prompt() {
+                                Some(s) => println!("system prompt:\n{s}"),
+                                None => println!("(no system prompt set)"),
+                            }
+                        } else {
+                            session.set_system_prompt(text);
+                            println!("(system prompt set)");
+                        }
                     } else if cmd == "clear" {
                         session.clear();
                         println!("(conversation cleared)");

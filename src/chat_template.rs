@@ -195,6 +195,17 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// A system turn — the leading instruction message. Most chat templates
+    /// render it specially (and skip their built-in default system prompt when
+    /// one is present).
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: content.into(),
+            reasoning_content: None,
+        }
+    }
+
     /// A user turn (never carries reasoning).
     pub fn user(content: impl Into<String>) -> Self {
         Self {
@@ -330,6 +341,18 @@ mod tests {
         assert!(out.contains("<|im_start|>system\nYou are a helpful AI assistant"), "missing default system block: {out:?}");
         assert!(out.contains("<|im_start|>user\nHello<|im_end|>"), "missing user turn: {out:?}");
         assert!(out.ends_with("<|im_start|>assistant\n"), "missing assistant opener: {out:?}");
+    }
+
+    #[test]
+    fn system_constructor_renders_as_system_turn() {
+        let messages = vec![
+            ChatMessage::system("Be terse."),
+            ChatMessage::user("hi"),
+        ];
+        let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "", &serde_json::Map::new())
+            .expect("render");
+        assert!(out.contains("<|im_start|>system\nBe terse.<|im_end|>"), "{out:?}");
+        assert!(!out.contains("You are a helpful AI assistant"), "default not skipped: {out:?}");
     }
 
     #[test]

@@ -99,6 +99,8 @@ where
                 "-hf" | "-hfr" => Some("--hf-repo"),
                 "-hff" => Some("--hf-file"),
                 "-hft" => Some("--hf-token"),
+                "-sys" => Some("--system-prompt"),
+                "-sysf" => Some("--system-prompt-file"),
                 _ => None,
             };
             match (canonical, tail) {
@@ -113,6 +115,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::rewrite_shorts;
+
+    #[test]
+    fn rewrites_system_prompt_shorts() {
+        assert_eq!(
+            rewrite_shorts(["seeker", "chat", "-sys", "Be terse.", "-sysf=p.txt"]),
+            vec!["seeker", "chat", "--system-prompt", "Be terse.", "--system-prompt-file=p.txt"]
+        );
+    }
 
     #[test]
     fn rewrites_space_form() {
