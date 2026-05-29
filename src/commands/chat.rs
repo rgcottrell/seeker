@@ -152,9 +152,15 @@ pub struct ChatArgs {
     #[arg(long = "repeat-penalty", alias = "repetition-penalty", default_value_t = 1.0)]
     repeat_penalty: f32,
 
-    /// How many trailing tokens contribute to penalties.
-    #[arg(long = "penalty-last-n", default_value_t = 64)]
-    penalty_last_n: usize,
+    /// How many trailing tokens contribute to penalties. `-1` = the whole
+    /// context (`--ctx-size`); `0` = disabled. (llama.cpp's `--repeat-last-n`.)
+    #[arg(long = "penalty-last-n", default_value_t = 64, allow_hyphen_values = true)]
+    penalty_last_n: i32,
+
+    /// Never stop on an end-of-generation token; generate until `--max-tokens`.
+    /// (llama.cpp's `--ignore-eos`.)
+    #[arg(long = "ignore-eos")]
+    ignore_eos: bool,
 
     /// RNG seed for stochastic sampling.
     #[arg(long, default_value_t = 0)]
@@ -196,7 +202,12 @@ impl ChatArgs {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             repeat_penalty: self.repeat_penalty,
-            penalty_last_n: self.penalty_last_n,
+            // -1 → whole context window; otherwise the literal count (0 = off).
+            penalty_last_n: if self.penalty_last_n < 0 {
+                self.ctx_size as usize
+            } else {
+                self.penalty_last_n as usize
+            },
             seed: self.seed,
         }
     }
@@ -248,7 +259,13 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     // terminators), matching llama.cpp's `llama_token_is_eog`. A chat-tuned
     // model whose turn terminator (`<|im_end|>`) differs from its EOS would
     // otherwise never stop and burn to --max-tokens every reply.
-    let eos_ids: Vec<u32> = model.tokenizer().eog_ids.clone();
+    // `--ignore-eos` drops the whole stop set, so generation runs to
+    // --max-tokens (or a /clear / Ctrl+C).
+    let eos_ids: Vec<u32> = if args.ignore_eos {
+        Vec::new()
+    } else {
+        model.tokenizer().eog_ids.clone()
+    };
 
     // Reasoning-model think markers, if present (single special tokens for
     // Qwen3-style models). Used to split reasoning from the final answer.

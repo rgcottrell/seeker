@@ -102,7 +102,10 @@ void main(uint3 gl_LocalInvocationID : SV_GroupThreadID) {
         const float incl_cdf = scan[tid];
         const float my_prob  = (sum_raw > 0.0) ? (raw_exp / sum_raw) : 0.0;
         const float excl_cdf = incl_cdf - my_prob;
-        kept = kept && (excl_cdf < p.top_p);
+        // `<=`: keep the token that *crosses* top_p, matching the host
+        // `sample_one` / `record_top_p` contract and llama.cpp (drop only
+        // tokens strictly past the cutoff).
+        kept = kept && (excl_cdf <= p.top_p);
     }
 
     // ── Apply temperature. The argmax is preserved (sort order intact
