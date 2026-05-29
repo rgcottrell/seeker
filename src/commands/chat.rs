@@ -9,6 +9,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Args;
 use rustyline::error::ReadlineError;
@@ -24,6 +25,37 @@ use crate::inference::Engine;
 use crate::tokenizer::build_tokenizer;
 
 const SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Set by the SIGINT watcher when the user presses Ctrl+C *during* generation
+/// (in interactive mode). The decode loop polls it between tokens and stops
+/// the current reply, returning control to the prompt instead of letting the
+/// default SIGINT kill the process. At the readline prompt rustyline runs the
+/// terminal in raw mode (ISIG off), so Ctrl+C there surfaces as
+/// `ReadlineError::Interrupted` rather than a signal — this flag is only ever
+/// set mid-generation.
+static GENERATION_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Install a SIGINT handler that flips [`GENERATION_CANCELLED`] so an
+/// in-progress reply can be interrupted (interactive mode only — piped mode
+/// keeps the default kill-on-Ctrl+C). Uses a `recv()` loop so it re-arms for
+/// every turn, not just the first interrupt. A failure to install is logged
+/// and ignored (Ctrl+C then falls back to the default action).
+#[cfg(unix)]
+fn spawn_interrupt_watcher() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::interrupt()) {
+        Ok(mut sigint) => {
+            tokio::spawn(async move {
+                while sigint.recv().await.is_some() {
+                    GENERATION_CANCELLED.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+        Err(e) => tracing::debug!(error = %e, "could not install SIGINT handler"),
+    }
+}
+#[cfg(not(unix))]
+fn spawn_interrupt_watcher() {}
 
 const BANNER: &str = r#"███████ ███████ ███████ ██  ██ ███████ ██████
 ██      ██      ██      ██ ██  ██      ██   ██
@@ -222,6 +254,8 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     };
 
     if std::io::stdin().is_terminal() {
+        // Ctrl+C during a reply should stop that reply, not the program.
+        spawn_interrupt_watcher();
         run_interactive(&mut session, &gguf, &path, history.as_deref())
     } else {
         run_piped(&mut session)
@@ -283,6 +317,8 @@ struct ReplyStats {
     prefill_secs: f64,
     decode_tokens: usize,
     decode_secs: f64,
+    /// True when the user interrupted the reply with Ctrl+C (partial output).
+    interrupted: bool,
 }
 
 /// Which part of a streamed reply a piece belongs to — drives its color.
@@ -350,18 +386,53 @@ impl Highlighter for ChatHelper {
 }
 
 impl ChatSession {
-    /// Push a user turn, render + tokenize, decode the assistant reply, and
-    /// store the turn. `on_text` fires once per sampled token with the
-    /// newly-emitted byte slice — the REPL streams output through it. The
-    /// full reply is stored in `self.messages`; the return value carries
-    /// per-turn timing for the stats line.
+    /// Push a user turn and generate the assistant reply via [`generate`]. On
+    /// any error the just-pushed user turn is rolled back so a failed turn
+    /// never leaves a dangling message in the history.
     fn handle_user_message(
         &mut self,
         text: &str,
-        mut on_text: impl FnMut(&str, Segment),
+        on_text: impl FnMut(&str, Segment),
     ) -> Result<ReplyStats, Box<dyn Error>> {
         self.messages.push(ChatMessage::user(text));
+        let result = self.generate(on_text);
+        if result.is_err() {
+            self.messages.pop();
+        }
+        result
+    }
 
+    /// Drop the last assistant reply and generate a fresh one from the same
+    /// prompt (`/regen`). The conversation prompt is already fully in the
+    /// cache, so [`generate`] re-feeds just its last token to get new logits;
+    /// with a non-zero temperature the advanced RNG yields a different sample.
+    /// On error the dropped reply is restored.
+    fn regenerate(
+        &mut self,
+        on_text: impl FnMut(&str, Segment),
+    ) -> Result<ReplyStats, Box<dyn Error>> {
+        if self.messages.last().map(|m| m.role.as_str()) != Some("assistant") {
+            return Err("nothing to regenerate yet".into());
+        }
+        let prev = self.messages.pop().expect("last message is assistant");
+        let result = self.generate(on_text);
+        if result.is_err() {
+            self.messages.push(prev);
+        }
+        result
+    }
+
+    /// Render the current `messages` (which must end at a user turn) with a
+    /// generation prompt, prefill the divergent suffix, decode the reply, and
+    /// push it as an assistant turn. `on_text` fires once per sampled token
+    /// with the newly-emitted byte slice — the REPL streams output through it.
+    ///
+    /// Callers own `messages` rollback: this never pops on error. The returned
+    /// `ReplyStats` carries per-turn timing (and an `interrupted` flag).
+    fn generate(
+        &mut self,
+        mut on_text: impl FnMut(&str, Segment),
+    ) -> Result<ReplyStats, Box<dyn Error>> {
         let bundle = self.model.tokenizer();
         let bos = bundle.bos_token.as_deref().unwrap_or("");
         let eos = bundle.eos_token.as_deref().unwrap_or("");
@@ -383,36 +454,34 @@ impl ChatSession {
         let new_tokens: Vec<u32> = enc.get_ids().to_vec();
 
         // Prefix reuse: keep the cache prefix that still matches.
-        let common = self
+        let common0 = self
             .prior_tokens
             .iter()
             .zip(new_tokens.iter())
             .take_while(|(a, b)| a == b)
             .count();
-        if common > self.cache.position as usize {
-            // Shouldn't happen — prior_tokens tracks what's in the cache —
-            // but be defensive. Roll back the just-pushed user turn so a
-            // failed turn doesn't leave a dangling message in the history.
-            self.messages.pop();
+        if common0 > self.cache.position as usize {
+            // Shouldn't happen — prior_tokens tracks what's in the cache.
             return Err(format!(
-                "cache/prior_tokens drift: common={common} cache.position={}",
+                "cache/prior_tokens drift: common={common0} cache.position={}",
                 self.cache.position
             )
             .into());
         }
+        // The divergent suffix to (re)feed. If the whole prompt is already
+        // cached (a `/regen`, or an identically-rendered turn) `delta` would be
+        // empty and we'd have no logits to sample from — rewind one position
+        // and re-feed the last prompt token instead.
+        let (common, delta): (usize, Vec<u32>) = if common0 < new_tokens.len() {
+            (common0, new_tokens[common0..].to_vec())
+        } else if let Some(&last) = new_tokens.last() {
+            (new_tokens.len() - 1, vec![last])
+        } else {
+            return Err("empty prompt — nothing to generate".into());
+        };
         self.cache.position = common as u32;
-        let delta: Vec<u32> = new_tokens[common..].to_vec();
-        if delta.is_empty() {
-            // Pathological: user typed nothing new after template render
-            // (e.g. empty content). Force at least the assistant opener
-            // by feeding one rendered token, otherwise the model has no
-            // logits to sample from.
-            self.messages.pop();
-            return Err("nothing new to feed after template render".into());
-        }
 
         if (common + delta.len()) as u32 > self.cache.config.max_seq_len {
-            self.messages.pop();
             return Err(format!(
                 "conversation length {} exceeds --ctx-size {}",
                 common + delta.len(),
@@ -447,7 +516,18 @@ impl ChatSession {
             .tokenizer()
             .tokenizer
             .decode_stream(/* skip_special_tokens = */ true);
+        // Clear any stale interrupt so only a Ctrl+C during *this* reply counts.
+        let mut cancelled = false;
+        GENERATION_CANCELLED.store(false, Ordering::SeqCst);
         loop {
+            // Ctrl+C during generation (interactive mode): stop here and keep
+            // whatever was produced so far as the reply. forward_sampled waits
+            // on its fence each call, so breaking between tokens leaves the
+            // cache/position consistent — the partial turn is stored normally.
+            if GENERATION_CANCELLED.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
             if (self.cache.position as usize + step_tokens.len() + 1) as u32
                 > self.cache.config.max_seq_len
             {
@@ -524,7 +604,13 @@ impl ChatSession {
         // `cache.position`, tripping the drift guard on every later turn and
         // wedging the session until `/clear`.
         if forwards == 0 {
-            self.messages.pop();
+            // No forward ran: either the prompt exactly filled the context
+            // window (the loop-top budget guard broke before the prefill) or
+            // the user interrupted in the instant before it started. Return
+            // Err so the caller rolls back; no partial turn is stored.
+            if cancelled {
+                return Err("interrupted before any output".into());
+            }
             return Err(format!(
                 "context window full: prompt is {} tokens but --ctx-size is {} \
                  (no room to generate) — use /clear or raise --ctx-size",
@@ -592,6 +678,7 @@ impl ChatSession {
             // The prefill forward emits the first token; the rest are decode.
             decode_tokens: forwards.saturating_sub(1),
             decode_secs,
+            interrupted: cancelled,
         })
     }
 
@@ -695,10 +782,12 @@ fn print_banner(gguf: &GgufFile, path: &Path) {
     println!("arch    : {}", format_arch_line(gguf));
     println!("ctx     : {}", format_ctx_line(gguf));
     println!();
-    println!("commands:");
-    println!("  /clear            clear conversation history and KV cache");
-    println!("  /read <path>      read a UTF-8 text file as a user message");
-    println!("  /exit, Ctrl+D     exit");
+    println!("available commands:");
+    println!("  /exit or Ctrl+C     stop or exit");
+    println!("  /regen              regenerate the last response");
+    println!("  /clear              clear the chat history");
+    println!("  /read <file>        add a text file");
+    println!("  /glob <pattern>     add text files using globbing pattern");
     println!();
 }
 
@@ -736,11 +825,15 @@ fn run_interactive(
                 if let Some(cmd) = line.strip_prefix('/') {
                     if cmd == "exit" {
                         break;
+                    } else if cmd == "regen" {
+                        emit_regen(session);
                     } else if cmd == "clear" {
                         session.clear();
                         println!("(conversation cleared)");
                     } else if let Some(arg) = cmd.strip_prefix("read") {
                         handle_read(session, arg.trim());
+                    } else if let Some(arg) = cmd.strip_prefix("glob") {
+                        handle_glob(session, arg.trim());
                     } else {
                         println!("unknown command: /{cmd}");
                     }
@@ -748,6 +841,9 @@ fn run_interactive(
                 }
                 emit_reply(session, line);
             }
+            // Ctrl+D, or Ctrl+C at the prompt, exits ("stop or exit"). A Ctrl+C
+            // *during* a reply is caught by the SIGINT watcher — it stops the
+            // reply and returns here — so it never surfaces as Interrupted.
             Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
             Err(e) => return Err(Box::new(e)),
         }
@@ -778,21 +874,41 @@ fn run_piped(session: &mut ChatSession) -> Result<(), Box<dyn Error>> {
 }
 
 fn emit_reply(session: &mut ChatSession, line: &str) {
+    run_turn(session, |s, cb| s.handle_user_message(line, cb));
+}
+
+fn emit_regen(session: &mut ChatSession) {
+    run_turn(session, |s, cb| s.regenerate(cb));
+}
+
+/// Shared streaming + stats/error reporting for a generated turn. `produce`
+/// runs the generation, streaming each token's text through the supplied
+/// callback (reasoning dimmed, final answer in the default color).
+fn run_turn(
+    session: &mut ChatSession,
+    produce: impl FnOnce(
+        &mut ChatSession,
+        &mut dyn FnMut(&str, Segment),
+    ) -> Result<ReplyStats, Box<dyn Error>>,
+) {
     println!(); // blank line between the input and the reply
     let _ = std::io::stdout().flush();
     let color = color_enabled();
-    let result = session.handle_user_message(line, |delta, seg| {
-        // Reasoning is dimmed; the final answer uses the normal default color.
+    let mut on_text = |delta: &str, seg: Segment| {
         if color && seg == Segment::Thinking {
             print!("{C_THINK}{delta}{C_RESET}");
         } else {
             print!("{delta}");
         }
         let _ = std::io::stdout().flush();
-    });
+    };
+    let result = produce(session, &mut on_text);
     match result {
         Ok(stats) => {
             println!(); // terminate the streamed reply line
+            if stats.interrupted {
+                println!("[interrupted]");
+            }
             println!(); // blank line between the reply and the stats
             print_stats(&stats);
             println!(); // blank line before the next prompt
@@ -834,6 +950,52 @@ fn handle_read(session: &mut ChatSession, path: &str) {
         }
         Err(e) => println!("/read failed: {e}"),
     }
+}
+
+/// `/glob <pattern>`: read every text file matching the shell glob, concatenate
+/// them (each under a `===== path =====` header), and submit the result as one
+/// user message — handy for dropping a directory of sources into the chat.
+/// Non-UTF-8 / unreadable matches are skipped with a note.
+fn handle_glob(session: &mut ChatSession, pattern: &str) {
+    if pattern.is_empty() {
+        println!("usage: /glob <pattern>");
+        return;
+    }
+    let paths = match glob::glob(pattern) {
+        Ok(paths) => paths,
+        Err(e) => {
+            println!("/glob: invalid pattern: {e}");
+            return;
+        }
+    };
+    let mut combined = String::new();
+    let mut n = 0usize;
+    for entry in paths {
+        let path = match entry {
+            Ok(p) if p.is_file() => p,
+            Ok(_) => continue, // directory match — skip
+            Err(e) => {
+                eprintln!("[glob skip: {e}]");
+                continue;
+            }
+        };
+        match fs::read_to_string(&path) {
+            Ok(content) if !content.trim().is_empty() => {
+                combined.push_str(&format!("===== {} =====\n", path.display()));
+                combined.push_str(content.trim_end());
+                combined.push_str("\n\n");
+                n += 1;
+            }
+            Ok(_) => {} // empty file — skip silently
+            Err(e) => eprintln!("[skip {}: {e}]", path.display()),
+        }
+    }
+    if n == 0 {
+        println!("(no readable text files matched: {pattern})");
+        return;
+    }
+    eprintln!("[{n} file(s), {} bytes from {pattern}]", combined.len());
+    emit_reply(session, combined.trim());
 }
 
 #[cfg(test)]

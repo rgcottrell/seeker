@@ -9,6 +9,7 @@ axum = { version = "0.8", features = ["macros"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 futures-util = "0.3"
+glob = "0.3"
 hf-hub = "0.5.0"
 indexmap = "2.14.0"
 memmap2 = "0.9.10"
@@ -19,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
