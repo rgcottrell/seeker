@@ -1,2 +1,6 @@
 /target
 .baselines/
+
+# Claude Code: ignore personal/local settings and worktrees, but keep shared config
+.claude/settings.local.json
+.claude/worktrees/
