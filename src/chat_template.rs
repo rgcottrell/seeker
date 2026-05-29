@@ -107,12 +107,19 @@ fn strip_str(s: &str, chars: Option<&Value>, left: bool, right: bool) -> String 
     s[start..end].to_string()
 }
 
-/// Minimal `strftime`-style formatter over the current UTC time. Chat
-/// templates (e.g. Llama-3.x) call `strftime_now("%d %b %Y")` to stamp
-/// "Today Date" into the system prompt; without it, those templates fall back
-/// to a hardcoded stale date. Supports the specifiers that appear in real
-/// templates; unknown ones pass through verbatim. UTC (not localtime) — close
-/// enough for a date stamp, and dependency-free.
+/// Minimal `strftime`-style formatter over the current time. Chat templates
+/// (e.g. Llama-3.x) call `strftime_now("%d %b %Y")` to stamp "Today Date" into
+/// the system prompt; without the function defined, those templates fall back
+/// to a hardcoded stale date (the real parity win is *defining* it). Supports
+/// the specifiers that appear in real templates; unknown ones pass through
+/// verbatim.
+///
+/// Deliberately uses **UTC**, not local time, to stay dependency-free (the
+/// Rust stdlib has no timezone support; local time would mean pulling in
+/// `libc`/`chrono`/`time`). This differs from llama.cpp / transformers, which
+/// format local wall-clock time: for a date stamp the only observable effect
+/// is that "Today Date" can read one day off for users far from UTC in the
+/// hours around local midnight. Accepted as a minor, documented divergence.
 fn strftime_now(fmt: &str) -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -270,10 +277,11 @@ pub fn render(
     // this; if a template later needs filters we don't ship, register
     // them here.
     //
-    // `strftime_now` matches llama.cpp / transformers: Llama-3.x templates
-    // gate the "Today Date" stamp on `strftime_now is defined`, so without it
-    // they fall back to a hardcoded 2024 date and the prompt drifts from what
-    // llama.cpp feeds the model.
+    // Defining `strftime_now` is the parity win: Llama-3.x templates gate the
+    // "Today Date" stamp on `strftime_now is defined`, so without it they fall
+    // back to a hardcoded 2024 date and the prompt drifts from what llama.cpp
+    // feeds the model. (Our impl is UTC rather than local time — see its doc
+    // for that minor, deliberate divergence.)
     env.add_function("strftime_now", |fmt: String| strftime_now(&fmt));
     // Python-style string methods (.startswith, .endswith, .split, .strip,
     // .lstrip, .rstrip, .replace) that Qwen3 / Llama / DeepSeek chat
