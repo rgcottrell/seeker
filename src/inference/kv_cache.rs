@@ -90,6 +90,9 @@ pub struct KvCache {
     pub ssm_max_snapshots: u32,
     pub ssm_conv_kernel: u32,
     pub ssm_conv_channels: u32,
+    /// Cloned device handle so `Drop` can free `region` + the SSM regions
+    /// without a `&Device` being threaded back in at teardown.
+    ash_device: ash::Device,
 }
 
 impl KvCache {
@@ -163,6 +166,7 @@ impl KvCache {
             ssm_max_snapshots: 0,
             ssm_conv_kernel: 0,
             ssm_conv_channels: 0,
+            ash_device: device.device.clone(),
         })
     }
 
@@ -306,16 +310,22 @@ impl KvCache {
     }
 
 
-    pub fn destroy(&mut self, device: &Device) {
-        self.region.destroy(device);
+}
+
+impl Drop for KvCache {
+    fn drop(&mut self) {
+        // Free the KV region + any SSM/snapshot regions. Forwards are
+        // synchronous (each fence-waits), so the GPU is idle by teardown.
+        let dev = self.ash_device.clone();
+        self.region.destroy(&dev);
         if let Some(mut r) = self.ssm_region.take() {
-            r.destroy(device);
+            r.destroy(&dev);
         }
         if let Some(mut r) = self.ssm_gdn_snap_region.take() {
-            r.destroy(device);
+            r.destroy(&dev);
         }
         if let Some(mut r) = self.ssm_conv_backup_region.take() {
-            r.destroy(device);
+            r.destroy(&dev);
         }
     }
 }

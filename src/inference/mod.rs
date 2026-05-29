@@ -1043,7 +1043,7 @@ impl Drop for Engine {
             self.device.device.destroy_fence(self.fence, None);
             self.device.device.destroy_command_pool(self.command_pool, None);
         }
-        self.scratch.destroy(&self.device);
+        self.scratch.destroy(&self.device.device);
         self.descriptors.destroy(&self.device);
         self.pipelines.destroy(&self.device);
     }

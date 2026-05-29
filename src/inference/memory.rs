@@ -108,14 +108,16 @@ impl Region {
         self.cursor = 0;
     }
 
-    pub fn destroy(&mut self, device: &Device) {
+    /// Takes the raw `ash::Device` (not the `Device` wrapper) so owners that
+    /// only hold a cloned device handle — e.g. `KvCache::drop` — can call it.
+    pub fn destroy(&mut self, device: &ash::Device) {
         unsafe {
             if self.host_ptr.is_some() {
-                device.device.unmap_memory(self.memory);
+                device.unmap_memory(self.memory);
                 self.host_ptr = None;
             }
-            device.device.destroy_buffer(self.buffer, None);
-            device.device.free_memory(self.memory, None);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
         }
     }
 }
