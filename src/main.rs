@@ -80,9 +80,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Rewrite single-dash multi-character shortcuts (`-hf`, `-hfr`, `-hff`, `-hft`) to
-/// their `--hf-*` equivalents before handing argv to clap, which only supports
-/// single-character shorts. Handles both `-hf foo` and `-hf=foo` forms.
+/// Rewrite single-dash multi-character shortcuts (`-hf`, `-hfr`, `-hff`, `-hft`,
+/// `-ub`) to their long equivalents before handing argv to clap, which only
+/// supports single-character shorts. Handles both `-hf foo` and `-hf=foo` forms.
 fn rewrite_shorts<I, S>(args: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -99,6 +99,7 @@ where
                 "-hf" | "-hfr" => Some("--hf-repo"),
                 "-hff" => Some("--hf-file"),
                 "-hft" => Some("--hf-token"),
+                "-ub" => Some("--ubatch-size"),
                 _ => None,
             };
             match (canonical, tail) {

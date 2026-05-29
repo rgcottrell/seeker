@@ -26,8 +26,6 @@ use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
 use crate::tokenizer::build_tokenizer;
 
-const SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
-
 #[derive(Args)]
 pub struct BenchArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]".
@@ -84,6 +82,18 @@ pub struct BenchArgs {
     /// KV cache V dtype.
     #[arg(long = "cache-type-v", default_value = "f16", value_parser = parse_dtype_arg)]
     cache_type_v: GgmlType,
+
+    // ─── Batch limits (llama.cpp parity) ────────────────────────────────
+    /// Logical batch size (max tokens per submit). Validation-only in this
+    /// single-sequence engine; `--ubatch-size` is the memory-relevant knob.
+    #[arg(short = 'b', long = "batch-size", default_value_t = 2048)]
+    batch_size: u32,
+
+    /// Physical micro-batch size: prefill is split into ≤ this many tokens
+    /// per GPU pass so scratch memory stays bounded on long prompts.
+    /// 0 = unbounded (single pass). (short: -ub)
+    #[arg(long = "ubatch-size", default_value_t = 512)]
+    ubatch_size: u32,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -115,7 +125,7 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         return Err("tokenized prompt is empty".into());
     }
 
-    let mut engine = Engine::new(SCRATCH_BYTES)?;
+    let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
     let weights = engine.upload_weights(&gguf)?;
     let model = crate::models::open(&gguf, weights, bundle)?;
@@ -123,6 +133,14 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
     let max_seq_len = (prefill_tokens as u32)
         .saturating_add(args.warmup)
         .saturating_add(args.decode_tokens);
+    // Size the scratch (compute buffer) for this model + n_ubatch before the
+    // prefill, replacing the Engine::new placeholder.
+    engine.allocate_scratch(model.scratch_bytes_estimate(
+        args.ubatch_size,
+        max_seq_len,
+        args.cache_type_k,
+        args.cache_type_v,
+    ))?;
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
         v_dtype: args.cache_type_v,
@@ -135,6 +153,19 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         dims.n_head_kv,
         cache_config,
     )?;
+    // Hybrid models (qwen35moe etc.) need persistent SSM/GDN recurrent state
+    // carried across forwards — including across chunked-prefill ubatches and
+    // decode steps. Without this the SSM state resets every forward (decode
+    // produces garbage; chunked prefill diverges from single-pass). Mirrors
+    // run.rs / chat.rs.
+    if let Some(ssm) = model.ssm_state_dims() {
+        cache.allocate_ssm_state(
+            &engine.device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
+    }
 
     // Greedy sampler — bench is for tok/s and golden-output stability, not
     // sampling behavior. Temperature 0, no penalties, no top-k/p/min-p.
@@ -153,18 +184,38 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
     // ── Prefill ─────────────────────────────────────────────────────────
     //
     // With --dump-logits we go through `engine.forward()` so we can read
-    // the full logits buffer back; we then greedy-sample on the CPU.
+    // the last-token logits buffer back; we then greedy-sample on the CPU.
     // Without it we go through `forward_sampled` (the path production
     // decode uses), which keeps the sampler chain on the GPU and reads
     // back just the chosen token id. Either way the model's `record_forward`
-    // emits identical compute work.
+    // emits identical compute work. The dumped logits are last-token-only
+    // (count == n_vocab) — the correct comparison point vs llama.cpp.
     let position_offset = cache.position;
     let t_prefill = Instant::now();
     let next_id = if args.dump_logits {
+        // Mirror forward_sampled's chunking so long --dump-logits prompts stay
+        // within the scratch budget: feed every ubatch but the last as a
+        // KV-only pass, then run the final chunk through engine.forward() for
+        // the last-token logits readback.
+        let ub = engine.n_ubatch as usize;
+        if ub != 0 {
+            let mut s = 0usize;
+            while s + ub < prompt_tokens.len() {
+                let pos = cache.position;
+                engine.forward_kv_only(&*model, &mut cache, &prompt_tokens[s..s + ub], pos)?;
+                s += ub;
+            }
+        }
+        let tail_start = cache.position as usize;
+        let tail = &prompt_tokens[tail_start..];
+        let tail_pos = cache.position;
         let logits = engine.forward(model.weights(), |ctx| {
             model
-                .record_forward(ctx, &mut cache, &prompt_tokens, position_offset)
-                .map(|view| view.range())
+                .record_forward(ctx, &mut cache, tail, tail_pos, /*compute_logits=*/ true)
+                .map(|view| {
+                    view.expect("compute_logits=true must return logits")
+                        .range()
+                })
         })?;
         let prefill_elapsed = t_prefill.elapsed();
         let mut stderr = std::io::stderr().lock();

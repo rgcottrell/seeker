@@ -106,6 +106,12 @@ pub fn record(
          heterogeneous combo.",
     );
 
+    // Length of the always-visible cached prefix preceding this batch's
+    // query tokens (= position_offset). The host builds only the within-chunk
+    // [L × L] causal mask and the scalar shader treats columns < prefix_len as
+    // visible; `kv_actual = prefix_len + L`.
+    let prefix_len = kv_actual.saturating_sub(q.dims[1] as u32);
+
     // Cooperative-matrix flash-attention path (`flash_attn_cm1.slang`).
     // Processes Br=16 query rows per workgroup using a 16×16 CoopMat
     // fragment for QK^T. F16 KV only — softmax + PV stay scalar. Gated
@@ -116,10 +122,17 @@ pub fn record(
     // Single-token decode passes `mask = None` and goes through the scalar
     // path below, which owns the split-K decode optimization; cm1 only runs
     // for the masked (prefill) batches it was designed for.
+    //
+    // cm1 still expects the legacy full `[kv_len, L]` mask layout, which only
+    // coincides with the new within-chunk `[L, L]` mask when there is no
+    // prefix (`prefix_len == 0`, i.e. the first/only ubatch). Fall back to the
+    // scalar path for chunked prefill at a non-zero offset until cm1 learns the
+    // within-chunk + offset contract.
     if ctx.device.coop_matrix
         && k.dtype == GgmlType::F16
         && v.dtype == GgmlType::F16
         && *crate::runtime_flags::FA_CM
+        && prefix_len == 0
     {
         if let Some(m) = mask {
             return record_cm1(ctx, q, k, v, m, out, params, kv_actual);
@@ -230,7 +243,7 @@ pub fn record(
     put_f(&mut push, &mut w, params.scale);
     put_f(&mut push, &mut w, 0.0); // max_bias
     put_f(&mut push, &mut w, 0.0); // logit_softcap
-    put_u(&mut push, &mut w, 0);   // mask_n_head_log2
+    put_u(&mut push, &mut w, prefix_len); // mask_kv_offset (was mask_n_head_log2)
     put_f(&mut push, &mut w, 0.0); // m0
     put_f(&mut push, &mut w, 0.0); // m1
     put_u(&mut push, &mut w, params.gqa_ratio);

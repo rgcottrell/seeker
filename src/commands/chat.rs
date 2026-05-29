@@ -23,8 +23,6 @@ use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
 use crate::tokenizer::build_tokenizer;
 
-const SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
-
 const BANNER: &str = r#"███████ ███████ ███████ ██  ██ ███████ ██████
 ██      ██      ██      ██ ██  ██      ██   ██
 ███████ █████   █████   ████   █████   ██████
@@ -69,6 +67,18 @@ pub struct ChatArgs {
     /// KV-cache budget for the whole conversation, in tokens.
     #[arg(long = "ctx-size", default_value_t = 4096)]
     ctx_size: u32,
+
+    // ─── Batch limits (llama.cpp parity) ────────────────────────────────
+    /// Logical batch size (max tokens per submit). Validation-only in this
+    /// single-sequence engine; `--ubatch-size` is the memory-relevant knob.
+    #[arg(short = 'b', long = "batch-size", default_value_t = 2048)]
+    batch_size: u32,
+
+    /// Physical micro-batch size: prefill is split into ≤ this many tokens
+    /// per GPU pass so scratch memory stays bounded on long prompts.
+    /// 0 = unbounded (single pass). (short: -ub)
+    #[arg(long = "ubatch-size", default_value_t = 512)]
+    ubatch_size: u32,
 
     /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1.
     #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
@@ -153,10 +163,20 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         "model has no `tokenizer.chat_template` — use `seeker run` for base completions".into()
     })?;
 
-    let engine = Engine::new(SCRATCH_BYTES)?;
+    let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
     let weights = engine.upload_weights(&gguf)?;
     let model = crate::models::open(&gguf, weights, bundle)?;
+
+    // Size the scratch (compute buffer) for this model + n_ubatch (and the
+    // full ctx for heterogeneous caches), replacing the Engine::new
+    // placeholder.
+    engine.allocate_scratch(model.scratch_bytes_estimate(
+        args.ubatch_size,
+        args.ctx_size,
+        args.cache_type_k,
+        args.cache_type_v,
+    ))?;
 
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,

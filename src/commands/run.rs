@@ -14,8 +14,6 @@ use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
 use crate::tokenizer::build_tokenizer;
 
-const SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
-
 #[derive(Args)]
 pub struct RunArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]". (short: -hf, -hfr)
@@ -92,6 +90,18 @@ pub struct RunArgs {
     /// RNG seed for stochastic sampling.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+
+    // ─── Batch limits (llama.cpp parity) ────────────────────────────────
+    /// Logical batch size (max tokens per submit). Validation-only in this
+    /// single-sequence engine; `--ubatch-size` is the memory-relevant knob.
+    #[arg(short = 'b', long = "batch-size", default_value_t = 2048)]
+    batch_size: u32,
+
+    /// Physical micro-batch size: prefill is split into ≤ this many tokens
+    /// per GPU pass so scratch memory stays bounded on long prompts.
+    /// 0 = unbounded (single pass). (short: -ub)
+    #[arg(long = "ubatch-size", default_value_t = 512)]
+    ubatch_size: u32,
 }
 
 impl RunArgs {
@@ -126,7 +136,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("tokenize failed: {e}"))?;
     let tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-    let mut engine = Engine::new(SCRATCH_BYTES)?;
+    let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
 
     let weights = engine.upload_weights(&gguf)?;
@@ -137,6 +147,21 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     );
 
     let model = crate::models::open(&gguf, weights, bundle)?;
+
+    // Size the scratch (compute buffer) for this model + n_ubatch before any
+    // forward (including the debug-dump paths below), replacing the placeholder
+    // from Engine::new. With the within-chunk mask this is context-independent
+    // for a homogeneous KV cache.
+    let max_seq_len = args
+        .max_tokens
+        .saturating_add(tokens.len() as u32)
+        .max(tokens.len() as u32);
+    engine.allocate_scratch(model.scratch_bytes_estimate(
+        args.ubatch_size,
+        max_seq_len,
+        args.cache_type_k,
+        args.cache_type_v,
+    ))?;
 
     // Op smoke-test harnesses — model bring-up scaffolding, gated behind
     // the `gpu_debug` feature. In production builds this whole dispatch
@@ -215,10 +240,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let max_seq_len = args
-        .max_tokens
-        .saturating_add(tokens.len() as u32)
-        .max(tokens.len() as u32);
+    // `max_seq_len` was computed above (used to size the scratch region).
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
         v_dtype: args.cache_type_v,

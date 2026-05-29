@@ -70,7 +70,11 @@ struct FaParams {
     float max_bias;
     float logit_softcap;
 
-    uint  mask_n_head_log2;
+    // Length of the always-visible cached prefix (= position_offset). The
+    // host-built mask covers only the within-chunk [N × N] causal triangle;
+    // KV columns < mask_kv_offset are unconditionally visible. (Repurposed
+    // from the unused ALiBi `mask_n_head_log2` slot — keeps push ≤ 128 B.)
+    uint  mask_kv_offset;
     float m0;
     float m1;
 
@@ -289,9 +293,12 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     float Lf = 0.0f;
     float Mf = -1.0e30f;
 
-    const uint m_off = (iq3 % p.nem3) * p.nem2 * p.nem1 * p_KV
-                     + (iq2 % p.nem2) * p.nem1 * p_KV
-                     + i_row * p_KV;
+    // Mask is the within-chunk [N × N] causal triangle (column stride = p.N),
+    // not the full [KV × N]: prefix columns (< mask_kv_offset) are always
+    // visible and carry no mask entry. See `write_causal_mask` (host side).
+    const uint m_off = (iq3 % p.nem3) * p.nem2 * p.nem1 * p.N
+                     + (iq2 % p.nem2) * p.nem1 * p.N
+                     + i_row * p.N;
 
     const uint num_blocks  = (p_KV + Bc - 1) / Bc;
     // This workgroup handles only its split's slice of the KV blocks.
@@ -312,8 +319,8 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                 [unroll] for (uint d = 0; d < HSK; ++d) {
                     s += Q_sh[d] * read_k_element(k_off + d);
                 }
-                if (MASK_ENABLE != 0) {
-                    s += data_m[m_off + kv_base + c];
+                if (MASK_ENABLE != 0 && kv_base + c >= p.mask_kv_offset) {
+                    s += data_m[m_off + (kv_base + c - p.mask_kv_offset)];
                 }
             } else {
                 s = -1.0e30f;

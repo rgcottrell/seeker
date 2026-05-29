@@ -319,13 +319,57 @@ impl Model for Qwen35MoeModel {
         Ok(())
     }
 
+    fn scratch_bytes_estimate(
+        &self,
+        n_ubatch: u32,
+        max_seq_len: u32,
+        k_dtype: GgmlType,
+        v_dtype: GgmlType,
+    ) -> u64 {
+        let p = &self.params;
+        // Per-pass token count: bounded by n_ubatch, or the whole context when
+        // chunking is disabled (n_ubatch == 0 ⇒ a single full-prompt pass).
+        let l = if n_ubatch == 0 { max_seq_len.max(1) } else { n_ubatch } as u64;
+        let hidden = p.n_embd as u64;
+        let vocab = p.n_vocab as u64;
+        let value_dim = (p.ssm_dt_rank * p.ssm_state) as u64;
+        let key_dim = (p.ssm_groups * p.ssm_state) as u64;
+        let conv_channels = 2 * key_dim + value_dim;
+        let expert_intermediate = 3 * (p.expert_ff as u64) * (p.n_expert_used as u64);
+        // Sum the widths of all [_, l] F32 buffers that can be live within a
+        // single layer. We add attention + SSM + MoE widths together — a safe
+        // over-count, since a given layer runs only one mixer type — so the
+        // estimate bounds every layer kind.
+        let summed_width = 7 * hidden                          // norms / proj / residual fan-out
+            + 2 * p.wq_out() as u64                            // attention Q + gate
+            + 3 * p.n_embd_v_gqa() as u64                      // attn_out / gated
+            + p.n_embd_k_gqa() as u64
+            + conv_channels + 3 * value_dim + key_dim          // SSM conv + GDN working set
+            + expert_intermediate + 2 * p.n_expert as u64      // MoE experts + routing
+            + p.shared_expert_ff as u64;
+        let per_layer = summed_width * l * 4;
+        let residual = hidden * l * 4;
+        let mask = l * l * 4;
+        let logits = vocab * 4;
+        // Heterogeneous K/V caches materialize the [0, ctx) prefix to F32 per
+        // layer; homogeneous caches bind directly.
+        let staging = if k_dtype != v_dtype {
+            2 * p.head_dim_k.max(p.head_dim_v) as u64 * p.n_head_kv as u64 * max_seq_len as u64 * 4
+        } else {
+            0
+        };
+        let raw = per_layer + residual + mask + logits + staging;
+        raw + raw / 3 + (32 << 20) // +33% headroom + 32 MiB slack
+    }
+
     fn record_forward(
         &self,
         ctx: &mut DispatchContext,
         cache: &mut KvCache,
         tokens: &[u32],
         position_offset: u32,
-    ) -> Result<TensorView, Box<dyn Error>> {
+        compute_logits: bool,
+    ) -> Result<Option<TensorView>, Box<dyn Error>> {
         let p = &self.params;
         let l = tokens.len() as u32;
         if l == 0 {
@@ -382,8 +426,11 @@ impl Model for Qwen35MoeModel {
         // causally visible, so flash_attn runs with MASK_ENABLE=0 and we skip
         // the O(total_len) host-side mask build per step. See llama.rs.
         let mask = if l > 1 {
-            let m = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
-            write_causal_mask(ctx, m, l, position_offset)?;
+            // Within-chunk mask only: [l × l] (not [kv_len × l]). The cached
+            // prefix [0, position_offset) is always visible and is handled
+            // shader-side via mask_kv_offset. See llama.rs.
+            let m = ctx.alloc_tensor([l as u64, l as u64, 1, 1], GgmlType::F32)?;
+            write_causal_mask(ctx, m, l)?;
             Some(m)
         } else {
             None
@@ -499,6 +546,14 @@ impl Model for Qwen35MoeModel {
             ctx.scratch_restore(layer_checkpoint);
         }
 
+        // Intermediate prefill ubatches only populate the KV / recurrent
+        // state — skip the epilogue (no logits needed until the last
+        // ubatch). cache.position is still advanced below.
+        if !compute_logits {
+            cache_io::advance(cache, l);
+            return Ok(None);
+        }
+
         // ─── Epilogue: final norm + lm_head ───
         // Only normalize + project the LAST token's residual: we sample
         // from the final position only, and full-batch logits would burn
@@ -527,7 +582,7 @@ impl Model for Qwen35MoeModel {
         matmul::record(ctx, lm_head, final_norm, last_logits)?;
 
         cache_io::advance(cache, l);
-        Ok(last_logits)
+        Ok(Some(last_logits))
     }
 }
 
@@ -1823,19 +1878,20 @@ fn write_causal_mask(
     ctx: &mut DispatchContext,
     mask: TensorView,
     l: u32,
-    position_offset: u32,
 ) -> Result<(), Box<dyn Error>> {
     let host_ptr = ctx
         .scratch
         .host_ptr
         .ok_or("scratch region not host-visible")?;
     let l = l as usize;
-    let pos = position_offset as usize;
-    let kv_len = pos + l;
-    let mut buf: Vec<f32> = vec![0.0; l * kv_len];
+    // Within-chunk causal mask only: [l × l] lower triangle (row-major
+    // [l rows][l cols]). Query row i attends to within-chunk kv column jc iff
+    // jc <= i. The cached prefix is always visible (handled shader-side via
+    // mask_kv_offset), so it carries no entries — O(l²) instead of O(kv·l).
+    let mut buf: Vec<f32> = vec![0.0; l * l];
     for i in 0..l {
-        for j in 0..kv_len {
-            buf[i * kv_len + j] = if j <= pos + i { 0.0 } else { f32::NEG_INFINITY };
+        for jc in 0..l {
+            buf[i * l + jc] = if jc <= i { 0.0 } else { f32::NEG_INFINITY };
         }
     }
     unsafe {
