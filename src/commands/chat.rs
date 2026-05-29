@@ -102,6 +102,19 @@ pub struct ChatArgs {
     #[arg(long = "ctx-size", default_value_t = 4096)]
     ctx_size: u32,
 
+    /// When the context fills, drop the oldest conversation turns and continue
+    /// instead of stopping (matches llama.cpp's opt-in context shift). Off by
+    /// default: the reply is truncated cleanly at the limit.
+    #[arg(long = "context-shift")]
+    context_shift: bool,
+
+    /// Conversation turns to pin (in addition to the system prompt) when
+    /// `--context-shift` drops old history. Counts whole user→assistant
+    /// exchanges, not raw tokens — seeker re-renders through the chat template
+    /// rather than slicing KV cells, so eviction is message-granular.
+    #[arg(long = "keep", default_value_t = 0)]
+    keep: u32,
+
     /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1.
     #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
     cache_type_k: GgmlType,
@@ -254,6 +267,8 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         think_open_id,
         think_close_id,
         max_tokens: args.max_tokens,
+        context_shift: args.context_shift,
+        keep_turns: args.keep,
         template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
     };
 
@@ -334,6 +349,11 @@ struct ChatSession {
     think_open_id: Option<u32>,
     think_close_id: Option<u32>,
     max_tokens: u32,
+    /// When true, evict the oldest turns to fit instead of stopping at the
+    /// context limit (`--context-shift`).
+    context_shift: bool,
+    /// Leading turns pinned from eviction, beyond the system prompt (`--keep`).
+    keep_turns: u32,
     /// Extra template-context variables from `--chat-template-kwargs`,
     /// merged into every render (override the built-in variables). Carries
     /// switches like `enable_thinking` when the user sets them.
@@ -351,6 +371,11 @@ struct ReplyStats {
     decode_secs: f64,
     /// True when the user interrupted the reply with Ctrl+C (partial output).
     interrupted: bool,
+    /// True when the reply was truncated by hitting the context limit (the
+    /// default no-`--context-shift` behavior).
+    ctx_full: bool,
+    /// Oldest turn pairs dropped by `--context-shift` before this reply.
+    shifted_turns: usize,
 }
 
 /// Which part of a streamed reply a piece belongs to — drives its color.
@@ -461,10 +486,11 @@ impl ChatSession {
     ///
     /// Callers own `messages` rollback: this never pops on error. The returned
     /// `ReplyStats` carries per-turn timing (and an `interrupted` flag).
-    fn generate(
-        &mut self,
-        mut on_text: impl FnMut(&str, Segment),
-    ) -> Result<ReplyStats, Box<dyn Error>> {
+    /// Render the current conversation with a generation prompt and tokenize
+    /// it (`add_special_tokens=false` — the template emits any BOS it wants).
+    /// Returns both the rendered string (the reasoning seed reads it) and the
+    /// token ids. Shared by `generate` and `evict_to_fit`.
+    fn render_prompt(&self) -> Result<(String, Vec<u32>), Box<dyn Error>> {
         let bundle = self.model.tokenizer();
         let bos = bundle.bos_token.as_deref().unwrap_or("");
         let eos = bundle.eos_token.as_deref().unwrap_or("");
@@ -476,14 +502,69 @@ impl ChatSession {
             eos,
             &self.template_kwargs,
         )?;
-
-        // Tokenize the full conversation. `add_special_tokens=false`: the
-        // template already includes any BOS markers it wants.
         let enc = bundle
             .tokenizer
             .encode(rendered.as_str(), false)
             .map_err(|e| format!("tokenize failed: {e}"))?;
-        let new_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let tokens = enc.get_ids().to_vec();
+        Ok((rendered, tokens))
+    }
+
+    /// `--context-shift`: drop the oldest *whole* user→assistant turn pairs
+    /// until the rendered prompt fits in `ctx_size - max_tokens` (the reply
+    /// needs that headroom, or it would just hit the limit immediately). A
+    /// leading system message plus the first `keep_turns` exchanges are pinned,
+    /// and the in-flight (last) user turn is never evicted. Whole-pair eviction
+    /// keeps the post-pin sequence starting on a user turn, so templates that
+    /// assert role alternation don't choke.
+    ///
+    /// On any drop, the cache + prior_tokens are reset so the next render
+    /// re-prefills the survivors from position 0 — the only SSM/GDN-safe rewind
+    /// (recurrent state has no per-position undo; see `KvCache::reset`).
+    /// Returns the number of turn pairs dropped; a no-op (and zero cost) when
+    /// the shift is off or the conversation already fits.
+    fn evict_to_fit(&mut self) -> Result<usize, Box<dyn Error>> {
+        if !self.context_shift {
+            return Ok(0);
+        }
+        let budget = self
+            .cache
+            .config
+            .max_seq_len
+            .saturating_sub(self.max_tokens) as usize;
+        let has_system = matches!(self.messages.first(), Some(m) if m.role == "system");
+        let pinned = has_system as usize + 2 * self.keep_turns as usize;
+        let mut dropped = 0usize;
+        loop {
+            if self.render_prompt()?.1.len() <= budget {
+                break;
+            }
+            // Need a full (user, assistant) pair after the pinned prefix that
+            // isn't the in-flight (last) user turn. If only the pinned prefix
+            // plus the current turn remain, we can't shrink further — fall
+            // through to the clean-stop guards in `generate`.
+            if pinned + 2 >= self.messages.len() {
+                break;
+            }
+            self.messages.drain(pinned..pinned + 2);
+            dropped += 1;
+        }
+        if dropped > 0 {
+            self.cache.reset();
+            self.prior_tokens.clear();
+        }
+        Ok(dropped)
+    }
+
+    fn generate(
+        &mut self,
+        mut on_text: impl FnMut(&str, Segment),
+    ) -> Result<ReplyStats, Box<dyn Error>> {
+        // `--context-shift`: drop the oldest turns to fit before rendering.
+        // When it drops anything it resets the cache + prior_tokens, so the
+        // render below re-prefills the survivors from scratch (SSM-safe).
+        let shifted_turns = self.evict_to_fit()?;
+        let (rendered, new_tokens) = self.render_prompt()?;
 
         // Prefix reuse: keep the cache prefix that still matches.
         let common0 = self
@@ -515,7 +596,8 @@ impl ChatSession {
 
         if (common + delta.len()) as u32 > self.cache.config.max_seq_len {
             return Err(format!(
-                "conversation length {} exceeds --ctx-size {}",
+                "conversation is {} tokens but --ctx-size is {} — /clear, raise \
+                 --ctx-size, or restart with --context-shift",
                 common + delta.len(),
                 self.cache.config.max_seq_len
             )
@@ -550,6 +632,7 @@ impl ChatSession {
             .decode_stream(/* skip_special_tokens = */ true);
         // Clear any stale interrupt so only a Ctrl+C during *this* reply counts.
         let mut cancelled = false;
+        let mut ctx_full = false;
         GENERATION_CANCELLED.store(false, Ordering::SeqCst);
         loop {
             // Ctrl+C during generation (interactive mode): stop here and keep
@@ -563,6 +646,10 @@ impl ChatSession {
             if (self.cache.position as usize + step_tokens.len() + 1) as u32
                 > self.cache.config.max_seq_len
             {
+                // Out of context room. forwards>0 → mid-reply truncation (a
+                // clean stop, partial reply kept); forwards==0 is the
+                // can't-even-start case handled after the loop.
+                ctx_full = forwards > 0;
                 break;
             }
             let cache = &mut self.cache;
@@ -644,8 +731,9 @@ impl ChatSession {
                 return Err("interrupted before any output".into());
             }
             return Err(format!(
-                "context window full: prompt is {} tokens but --ctx-size is {} \
-                 (no room to generate) — use /clear or raise --ctx-size",
+                "conversation is {} tokens but --ctx-size is {} (no room to \
+                 generate) — /clear, raise --ctx-size, or restart with \
+                 --context-shift",
                 common + prompt_tokens,
                 self.cache.config.max_seq_len
             )
@@ -711,6 +799,8 @@ impl ChatSession {
             decode_tokens: forwards.saturating_sub(1),
             decode_secs,
             interrupted: cancelled,
+            ctx_full,
+            shifted_turns,
         })
     }
 
@@ -978,8 +1068,14 @@ fn run_turn(
     match result {
         Ok(stats) => {
             println!(); // terminate the streamed reply line
+            if stats.shifted_turns > 0 {
+                println!("[context shift: dropped {} oldest turn(s)]", stats.shifted_turns);
+            }
             if stats.interrupted {
                 println!("[interrupted]");
+            }
+            if stats.ctx_full {
+                println!("[context full — reply truncated at --ctx-size; /clear, raise --ctx-size, or use --context-shift]");
             }
             println!(); // blank line between the reply and the stats
             print_stats(&stats);
