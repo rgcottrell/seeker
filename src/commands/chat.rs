@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Args;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
-use rustyline::{Completer, Editor, Helper, Hinter, Validator};
+use rustyline::validate::{ValidationContext, ValidationResult, Validator};
+use rustyline::{Completer, Editor, Helper, Hinter};
 
 use crate::chat_template::{self, ChatMessage};
 use crate::commands::download::{resolve_hf, HfResolveArgs};
@@ -88,6 +89,13 @@ pub struct ChatArgs {
     /// Skip reading and writing the line-history file.
     #[arg(long)]
     no_history: bool,
+
+    /// Multi-line input: Enter inserts a newline and a line ending with `\`
+    /// submits. Without this, the default is the inverse — a trailing `\`
+    /// continues to the next line and a bare Enter submits. (llama.cpp's
+    /// `--multiline-input`.)
+    #[arg(long = "multiline-input")]
+    multiline_input: bool,
 
     /// Override the history-file location. Defaults to an OS-appropriate
     /// path under the user's data directory.
@@ -337,7 +345,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     if std::io::stdin().is_terminal() {
         // Ctrl+C during a reply should stop that reply, not the program.
         spawn_interrupt_watcher();
-        run_interactive(&mut session, &gguf, &path, history.as_deref())
+        run_interactive(&mut session, &gguf, &path, history.as_deref(), args.multiline_input)
     } else {
         run_piped(&mut session)
     }
@@ -459,10 +467,28 @@ fn prompt_opens_think(rendered: &str) -> bool {
     }
 }
 
-/// rustyline line-editor helper: colors the prompt and the text being typed
-/// in the user color. Completion / hints / validation are the default no-ops.
-#[derive(Completer, Helper, Hinter, Validator)]
-struct ChatHelper;
+/// rustyline line-editor helper: colors the prompt/input and decides when a
+/// line is complete (multi-line input). Completion / hints are no-ops.
+#[derive(Completer, Helper, Hinter)]
+struct ChatHelper {
+    /// `--multiline-input`: when true Enter inserts a newline and a trailing
+    /// `\` submits; when false (default) a trailing `\` continues to the next
+    /// line and a bare Enter submits.
+    multiline: bool,
+}
+
+impl Validator for ChatHelper {
+    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        // XOR: default mode is "incomplete iff trailing backslash"; multiline
+        // mode flips it to "incomplete unless trailing backslash".
+        let incomplete = self.multiline ^ ctx.input().ends_with('\\');
+        Ok(if incomplete {
+            ValidationResult::Incomplete
+        } else {
+            ValidationResult::Valid(None)
+        })
+    }
+}
 
 impl Highlighter for ChatHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
@@ -488,6 +514,19 @@ impl Highlighter for ChatHelper {
     fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
         // Re-highlight on every edit so the whole input line stays colored.
         color_enabled()
+    }
+}
+
+/// Collapse line-continuation markers from a (possibly multi-line) raw readline
+/// result into the message text. In default mode a `\` right before a newline
+/// was a "continue" marker → drop the `\`, keep the newline. In multiline mode
+/// the single trailing `\` was the "submit" marker → drop it (intermediate
+/// newlines are real). Literal backslashes elsewhere are left untouched.
+fn join_continuations(raw: &str, multiline: bool) -> String {
+    if multiline {
+        raw.strip_suffix('\\').unwrap_or(raw).to_string()
+    } else {
+        raw.replace("\\\n", "\n")
     }
 }
 
@@ -1026,9 +1065,10 @@ fn run_interactive(
     gguf: &GgufFile,
     path: &Path,
     history: Option<&Path>,
+    multiline: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut editor = Editor::new()?;
-    editor.set_helper(Some(ChatHelper));
+    editor.set_helper(Some(ChatHelper { multiline }));
     if let Some(p) = history {
         if let Err(e) = editor.load_history(p) {
             tracing::debug!(path = %p.display(), error = %e, "history load");
@@ -1041,7 +1081,8 @@ fn run_interactive(
         match editor.readline("> ") {
             Ok(raw) => {
                 let _ = editor.add_history_entry(&raw);
-                let line = raw.trim();
+                let joined = join_continuations(&raw, multiline);
+                let line = joined.trim();
                 if line.is_empty() {
                     continue;
                 }
@@ -1240,7 +1281,26 @@ fn handle_glob(session: &mut ChatSession, pattern: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_logit_bias, prompt_opens_think};
+    use super::{join_continuations, parse_logit_bias, prompt_opens_think};
+
+    #[test]
+    fn join_continuations_default_mode() {
+        // A backslash right before a newline is a continue marker → drop it,
+        // keep the newline; other backslashes are literal.
+        assert_eq!(join_continuations("foo\\\nbar", false), "foo\nbar");
+        assert_eq!(join_continuations("a\\\nb\\\nc", false), "a\nb\nc");
+        assert_eq!(join_continuations("one line", false), "one line");
+        assert_eq!(join_continuations("C:\\path", false), "C:\\path");
+        assert_eq!(join_continuations("mid\\slash", false), "mid\\slash");
+    }
+
+    #[test]
+    fn join_continuations_multiline_mode() {
+        // Enter inserted the newlines; only the trailing submit-backslash drops.
+        assert_eq!(join_continuations("foo\nbar\nbaz\\", true), "foo\nbar\nbaz");
+        assert_eq!(join_continuations("just this\\", true), "just this");
+        assert_eq!(join_continuations("no marker", true), "no marker");
+    }
 
     #[test]
     fn parse_logit_bias_forms() {
