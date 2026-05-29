@@ -86,16 +86,40 @@ pub trait Model: Send + Sync {
     /// full prefix `[0, position_offset + tokens.len())` for attention,
     /// and on success advances `cache.position` by `tokens.len()`.
     ///
-    /// Returns the scratch tensor that, after submission, will hold the
-    /// next-token logits (`vocab_size` F32s) for the last token — shape
+    /// When `compute_logits` is true, returns `Some(view)` where `view`
+    /// is the scratch tensor that, after submission, holds the next-token
+    /// logits (`vocab_size` F32s) for the last token — shape
     /// `[vocab_size, 1, 1, 1]`, dtype F32.
+    ///
+    /// When `compute_logits` is false (intermediate prefill ubatches that
+    /// only need to populate the KV / recurrent state), the model skips
+    /// the final norm + lm_head epilogue entirely and returns `None`. The
+    /// K/V writes and `cache.position` advance still happen.
     fn record_forward(
         &self,
         ctx: &mut DispatchContext,
         cache: &mut KvCache,
         tokens: &[u32],
         position_offset: u32,
-    ) -> Result<TensorView, Box<dyn Error>>;
+        compute_logits: bool,
+    ) -> Result<Option<TensorView>, Box<dyn Error>>;
+
+    /// Conservative upper bound (in bytes) on the transient scratch one
+    /// forward pass of `≤ n_ubatch` tokens needs, used to size the engine's
+    /// scratch region (llama.cpp-style worst-case compute-buffer reservation).
+    ///
+    /// `max_seq_len` only affects the estimate for heterogeneous
+    /// (`k_dtype != v_dtype`) caches, which materialize the KV prefix to F32
+    /// scratch; with a homogeneous cache the estimate is context-independent.
+    /// The bump allocator's region-OOM error remains the precise backstop if
+    /// this under-estimates.
+    fn scratch_bytes_estimate(
+        &self,
+        n_ubatch: u32,
+        max_seq_len: u32,
+        k_dtype: crate::gguf::GgmlType,
+        v_dtype: crate::gguf::GgmlType,
+    ) -> u64;
 
     // ─── MTP speculative-decode hooks (optional; default unsupported) ───
 
@@ -180,9 +204,12 @@ pub trait Model: Send + Sync {
 
 /// Output of [`Model::record_forward_full`]: logits (last-position or all
 /// `L` positions depending on `full_logits`) plus the per-position
-/// pre-final-norm hidden state.
+/// pre-final-norm hidden state. `logits` is `None` only when the shared
+/// forward body was invoked with `compute_logits=false` (the chunked-prefill
+/// intermediate-ubatch path via `record_forward`); `record_forward_full`
+/// always populates it.
 pub struct ForwardFullOut {
-    pub logits: TensorView,
+    pub logits: Option<TensorView>,
     pub residual: TensorView,
 }
 

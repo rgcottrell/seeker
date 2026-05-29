@@ -354,15 +354,67 @@ impl Model for Qwen35MoeModel {
         Ok(())
     }
 
+    fn scratch_bytes_estimate(
+        &self,
+        n_ubatch: u32,
+        max_seq_len: u32,
+        k_dtype: GgmlType,
+        v_dtype: GgmlType,
+    ) -> u64 {
+        let p = &self.params;
+        // Per-pass token count: bounded by n_ubatch, or the whole context when
+        // chunking is disabled (n_ubatch == 0 ⇒ a single full-prompt pass).
+        let l = if n_ubatch == 0 { max_seq_len.max(1) } else { n_ubatch } as u64;
+        let hidden = p.n_embd as u64;
+        let vocab = p.n_vocab as u64;
+        let value_dim = (p.ssm_dt_rank * p.ssm_state) as u64;
+        let key_dim = (p.ssm_groups * p.ssm_state) as u64;
+        let conv_channels = 2 * key_dim + value_dim;
+        let expert_intermediate = 3 * (p.expert_ff as u64) * (p.n_expert_used as u64);
+        // Sum the widths of all [_, l] F32 buffers that can be live within a
+        // single layer. We add attention + SSM + MoE widths together — a safe
+        // over-count, since a given layer runs only one mixer type — so the
+        // estimate bounds every layer kind.
+        let summed_width = 7 * hidden                          // norms / proj / residual fan-out
+            + 2 * p.wq_out() as u64                            // attention Q + gate
+            + 3 * p.n_embd_v_gqa() as u64                      // attn_out / gated
+            + p.n_embd_k_gqa() as u64
+            + conv_channels + 3 * value_dim + key_dim          // SSM conv + GDN working set
+            + expert_intermediate + 2 * p.n_expert as u64      // MoE experts + routing
+            + p.shared_expert_ff as u64;
+        let per_layer = summed_width * l * 4;
+        let residual = hidden * l * 4;
+        let mask = l * l * 4;
+        let logits = vocab * 4;
+        // Heterogeneous K/V caches materialize the [0, ctx) prefix to F32 per
+        // layer; homogeneous caches bind directly.
+        let staging = if k_dtype != v_dtype {
+            2 * p.head_dim_k.max(p.head_dim_v) as u64 * p.n_head_kv as u64 * max_seq_len as u64 * 4
+        } else {
+            0
+        };
+        let raw = per_layer + residual + mask + logits + staging;
+        raw + raw / 3 + (32 << 20) // +33% headroom + 32 MiB slack
+    }
+
     fn record_forward(
         &self,
         ctx: &mut DispatchContext,
         cache: &mut KvCache,
         tokens: &[u32],
         position_offset: u32,
-    ) -> Result<TensorView, Box<dyn Error>> {
+        compute_logits: bool,
+    ) -> Result<Option<TensorView>, Box<dyn Error>> {
         Ok(self
-            .forward_impl(ctx, cache, tokens, position_offset, /*full_logits=*/ false, /*checkpoint=*/ false)?
+            .forward_impl(
+                ctx,
+                cache,
+                tokens,
+                position_offset,
+                compute_logits,
+                /*full_logits=*/ false,
+                /*checkpoint=*/ false,
+            )?
             .logits)
     }
 
@@ -375,7 +427,15 @@ impl Model for Qwen35MoeModel {
         full_logits: bool,
         checkpoint: bool,
     ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
-        self.forward_impl(ctx, cache, tokens, position_offset, full_logits, checkpoint)
+        self.forward_impl(
+            ctx,
+            cache,
+            tokens,
+            position_offset,
+            /*compute_logits=*/ true,
+            full_logits,
+            checkpoint,
+        )
     }
 
     fn record_ssm_finalize(
@@ -415,6 +475,10 @@ impl Qwen35MoeModel {
     /// logits) and [`Model::record_forward_full`] (all-position logits +
     /// hidden). Returns the logits tensor and the per-position
     /// pre-`output_norm` residual `[n_embd, L]`.
+    ///
+    /// `compute_logits=false` (chunked-prefill intermediate ubatch) runs the
+    /// layers to populate the KV / recurrent state but skips the epilogue;
+    /// the returned `logits` is then `None`.
     #[allow(clippy::too_many_arguments)]
     fn forward_impl(
         &self,
@@ -422,6 +486,7 @@ impl Qwen35MoeModel {
         cache: &mut KvCache,
         tokens: &[u32],
         position_offset: u32,
+        compute_logits: bool,
         full_logits: bool,
         checkpoint: bool,
     ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
@@ -481,8 +546,11 @@ impl Qwen35MoeModel {
         // causally visible, so flash_attn runs with MASK_ENABLE=0 and we skip
         // the O(total_len) host-side mask build per step. See llama.rs.
         let mask = if l > 1 {
-            let m = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
-            write_causal_mask(ctx, m, l, position_offset)?;
+            // Within-chunk mask only: [l × l] (not [kv_len × l]). The cached
+            // prefix [0, position_offset) is always visible and is handled
+            // shader-side via mask_kv_offset. See llama.rs.
+            let m = ctx.alloc_tensor([l as u64, l as u64, 1, 1], GgmlType::F32)?;
+            write_causal_mask(ctx, m, l)?;
             Some(m)
         } else {
             None
@@ -612,12 +680,23 @@ impl Qwen35MoeModel {
             ctx.scratch_restore(layer_checkpoint);
         }
 
+        // Intermediate prefill ubatches only populate the KV / recurrent
+        // state — skip the epilogue (no logits needed until the last
+        // ubatch). cache.position is still advanced.
+        if !compute_logits {
+            cache_io::advance(cache, l);
+            return Ok(crate::models::ForwardFullOut {
+                logits: None,
+                residual,
+            });
+        }
+
         // ─── Epilogue: final norm + lm_head ───
         let elem_size = 4u64;
         let vocab = p.n_vocab as u64;
         ctx.mark(crate::inference::profile::BlockClass::Epilogue);
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
-        let logits = if full_logits {
+        let logits = Some(if full_logits {
             // Batched verify path: final-norm + project ALL L positions.
             // n_vocab × L scratch is fine here because L = n_draft+1 is small.
             let final_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
@@ -646,7 +725,7 @@ impl Qwen35MoeModel {
             let last_logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
             matmul::record(ctx, lm_head, final_norm, last_logits)?;
             last_logits
-        };
+        });
 
         cache_io::advance(cache, l);
         Ok(crate::models::ForwardFullOut { logits, residual })
@@ -886,8 +965,12 @@ impl Qwen35MoeModel {
         let total_len = position_offset + l;
         let kv_len_u = total_len as u64;
         let mask = if l > 1 {
-            let m = ctx.alloc_tensor([kv_len_u, l_u, 1, 1], GgmlType::F32)?;
-            write_causal_mask(ctx, m, l, position_offset)?;
+            // Within-chunk mask [l × l]; the cached prefix [0, position_offset)
+            // is always visible and handled shader-side via mask_kv_offset
+            // (matches forward_impl + attention_block after the chunked-prefill
+            // mask change).
+            let m = ctx.alloc_tensor([l_u, l_u, 1, 1], GgmlType::F32)?;
+            write_causal_mask(ctx, m, l)?;
             Some(m)
         } else {
             None
@@ -2074,8 +2157,9 @@ fn moe_ffn(
     elementwise::record_swiglu_split(ctx, gate, up, ffn_h)?;
     ctx.tap(&format!("ffn_moe_swiglu-{layer_idx}"), ffn_h)?;
 
-    // Fused routing-weighted down. The Q4_K_XL checkpoint mixes Q5_K
-    // and Q6_K for `ffn_down_exps` — dispatch on dtype.
+    // Fused routing-weighted down. Checkpoints mix dtypes for
+    // `ffn_down_exps`: Q4_K_XL uses Q5_K/Q6_K; Q5_K_XL uses Q6_K/Q8_0.
+    // Dispatch on dtype.
     let routed = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     match w.ffn_down_exps.dtype {
         GgmlType::Q5_K => {
@@ -2084,11 +2168,14 @@ fn moe_ffn(
         GgmlType::Q6_K => {
             moe::record_moe_down_q6k(ctx, w.ffn_down_exps, ffn_h, ids, weights_buf, routed, n_used)?;
         }
+        GgmlType::Q8_0 => {
+            moe::record_moe_down_q8_0(ctx, w.ffn_down_exps, ffn_h, ids, weights_buf, routed, n_used)?;
+        }
         other => {
-            return Err(
-                format!("qwen35moe: ffn_down_exps dtype {other:?} not supported (need Q5_K or Q6_K)")
-                    .into(),
-            );
+            return Err(format!(
+                "qwen35moe: ffn_down_exps dtype {other:?} not supported (need Q5_K, Q6_K or Q8_0)"
+            )
+            .into());
         }
     }
     ctx.tap(&format!("ffn_moe_out-{layer_idx}"), routed)?;
@@ -2407,6 +2494,7 @@ fn dispatch_matvec_id(
     match a.dtype {
         GgmlType::Q4_K => moe::record_matvec_q4k_id(ctx, a, b, ids, dst, n_expert_used),
         GgmlType::Q5_K => moe::record_matvec_q5k_id(ctx, a, b, ids, dst, n_expert_used),
+        GgmlType::Q6_K => moe::record_matvec_q6k_id(ctx, a, b, ids, dst, n_expert_used),
         other => Err(format!("matvec_id: expert weight dtype {other:?} not yet wired").into()),
     }
 }
@@ -2423,6 +2511,7 @@ fn dispatch_matvec_id_nofence(
     match a.dtype {
         GgmlType::Q4_K => moe::record_matvec_q4k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
         GgmlType::Q5_K => moe::record_matvec_q5k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
+        GgmlType::Q6_K => moe::record_matvec_q6k_id_nofence(ctx, a, b, ids, dst, n_expert_used),
         other => Err(format!("matvec_id: expert weight dtype {other:?} not yet wired").into()),
     }
 }
@@ -2472,19 +2561,20 @@ fn write_causal_mask(
     ctx: &mut DispatchContext,
     mask: TensorView,
     l: u32,
-    position_offset: u32,
 ) -> Result<(), Box<dyn Error>> {
     let host_ptr = ctx
         .scratch
         .host_ptr
         .ok_or("scratch region not host-visible")?;
     let l = l as usize;
-    let pos = position_offset as usize;
-    let kv_len = pos + l;
-    let mut buf: Vec<f32> = vec![0.0; l * kv_len];
+    // Within-chunk causal mask only: [l × l] lower triangle (row-major
+    // [l rows][l cols]). Query row i attends to within-chunk kv column jc iff
+    // jc <= i. The cached prefix is always visible (handled shader-side via
+    // mask_kv_offset), so it carries no entries — O(l²) instead of O(kv·l).
+    let mut buf: Vec<f32> = vec![0.0; l * l];
     for i in 0..l {
-        for j in 0..kv_len {
-            buf[i * kv_len + j] = if j <= pos + i { 0.0 } else { f32::NEG_INFINITY };
+        for jc in 0..l {
+            buf[i * l + jc] = if jc <= i { 0.0 } else { f32::NEG_INFINITY };
         }
     }
     unsafe {

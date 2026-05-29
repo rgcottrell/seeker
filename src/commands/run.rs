@@ -14,8 +14,6 @@ use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
 use crate::tokenizer::build_tokenizer;
 
-const SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
-
 #[derive(Args)]
 pub struct RunArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]". (short: -hf, -hfr)
@@ -93,6 +91,18 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 0)]
     seed: u64,
 
+    // ─── Batch limits (llama.cpp parity) ────────────────────────────────
+    /// Logical batch size (max tokens per submit). Validation-only in this
+    /// single-sequence engine; `--ubatch-size` is the memory-relevant knob.
+    #[arg(short = 'b', long = "batch-size", default_value_t = 2048)]
+    batch_size: u32,
+
+    /// Physical micro-batch size: prefill is split into ≤ this many tokens
+    /// per GPU pass so scratch memory stays bounded on long prompts.
+    /// 0 = unbounded (single pass). (short: -ub)
+    #[arg(long = "ubatch-size", default_value_t = 512)]
+    ubatch_size: u32,
+
     /// Max MTP draft tokens per step for speculative decoding (llama.cpp's
     /// `--spec-draft-n-max`). 0 (default) disables it and uses the normal
     /// non-speculative decode loop. Only the qwen35moe model with NextN
@@ -134,17 +144,32 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("tokenize failed: {e}"))?;
     let tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-    let mut engine = Engine::new(SCRATCH_BYTES)?;
+    let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
 
     let weights = engine.upload_weights(&gguf)?;
     tracing::info!(
         tensors = weights.views.len(),
-        bytes = weights.region.cursor,
+        bytes = weights.total_bytes,
         "weights uploaded to GPU",
     );
 
     let model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
+
+    // Size the scratch (compute buffer) for this model + n_ubatch before any
+    // forward (including the debug-dump paths below), replacing the placeholder
+    // from Engine::new. With the within-chunk mask this is context-independent
+    // for a homogeneous KV cache.
+    let max_seq_len = args
+        .max_tokens
+        .saturating_add(tokens.len() as u32)
+        .max(tokens.len() as u32);
+    engine.allocate_scratch(model.scratch_bytes_estimate(
+        args.ubatch_size,
+        max_seq_len,
+        args.cache_type_k,
+        args.cache_type_v,
+    ))?;
 
     // Op smoke-test harnesses — model bring-up scaffolding, gated behind
     // the `gpu_debug` feature. In production builds this whole dispatch
@@ -223,10 +248,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let max_seq_len = args
-        .max_tokens
-        .saturating_add(tokens.len() as u32)
-        .max(tokens.len() as u32);
+    // `max_seq_len` was computed above (used to size the scratch region).
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
         v_dtype: args.cache_type_v,
@@ -474,14 +496,13 @@ fn ssm_conv_smoke_test(
 
     // Read kernel weights to host once so we can build the CPU reference.
     let kernel_host: Vec<f32> = {
-        let host_ptr = weights
-            .region
-            .host_ptr
-            .ok_or("weights region not host-visible")?;
+        let base = weights.debug_host_base(&kernel).ok_or(
+            "host-side weight reads unsupported (weights are device-local)",
+        )?;
         let total = (conv_kernel * conv_channels) as usize;
         let mut out = vec![0f32; total];
         unsafe {
-            let src = host_ptr.add(kernel.byte_offset as usize) as *const f32;
+            let src = base.add(kernel.byte_offset as usize) as *const f32;
             std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), total);
         }
         out
@@ -734,7 +755,6 @@ fn rms_norm_qwen_smoke(
     let eps: f32 = 1e-6;
     // Build a known input (embedding of token 9419 = "Hello") + known weight
     // (blk.0.attn_norm.weight). Compute CPU reference.
-    let host_ptr = weights.region.host_ptr.ok_or("weights not host-visible")?;
     let embed_view = weights.view("token_embd.weight")?;
     let weight_view = weights.view("blk.0.attn_norm.weight")?;
     // Read embed row for token 9419 (Q8_0 — need to dequantize)
@@ -757,8 +777,11 @@ fn rms_norm_qwen_smoke(
     println!("input head={:?}, max_abs={:.4}", &input[..5],
         input.iter().map(|v| v.abs()).fold(0.0, f32::max));
     let mut w_host = vec![0f32; n as usize];
+    let weight_base = weights.debug_host_base(&weight_view).ok_or(
+        "host-side weight reads unsupported (weights are device-local)",
+    )?;
     unsafe {
-        let p = host_ptr.add(weight_view.byte_offset as usize) as *const f32;
+        let p = weight_base.add(weight_view.byte_offset as usize) as *const f32;
         std::ptr::copy_nonoverlapping(p, w_host.as_mut_ptr(), n as usize);
     }
     // CPU reference
@@ -904,17 +927,19 @@ fn embed_norm_dump(
 fn norm_weights_dump(
     weights: &crate::inference::weights::WeightsHandle,
 ) -> Result<(), Box<dyn Error>> {
-    let host_ptr = weights.region.host_ptr.ok_or("weights not host-visible")?;
     for layer in [3u32, 7, 11, 15, 19, 23, 27, 31, 35, 39] {
         for kind in ["attn_q_norm", "attn_k_norm"] {
             let name = format!("blk.{layer}.{kind}.weight");
             let view = weights.view(&name)?;
             let n = view.dims[0] as usize;
+            let base = weights.debug_host_base(&view).ok_or(
+                "host-side weight reads unsupported (weights are device-local)",
+            )?;
             let mut sum_sq = 0f32;
             let mut max_abs = 0f32;
             let mut mean = 0f32;
             unsafe {
-                let p = host_ptr.add(view.byte_offset as usize) as *const f32;
+                let p = base.add(view.byte_offset as usize) as *const f32;
                 for i in 0..n {
                     let v = *p.add(i);
                     mean += v;

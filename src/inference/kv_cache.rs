@@ -4,12 +4,13 @@
 //! 9-entry list `{F32, F16, BF16, Q8_0, Q4_0, Q4_1, IQ4_NL, Q5_0, Q5_1}`.
 
 use std::error::Error;
+use std::sync::Arc;
 
 use ash::vk;
 
 use crate::gguf::GgmlType;
 
-use super::device::Device;
+use super::device::{Device, DeviceShared};
 use super::memory::Region;
 use super::weights::TensorView;
 
@@ -90,6 +91,10 @@ pub struct KvCache {
     pub ssm_max_snapshots: u32,
     pub ssm_conv_kernel: u32,
     pub ssm_conv_channels: u32,
+    /// Refcounted device owner so `Drop` can free `region` + the SSM
+    /// regions, keeping the logical device alive until it does — regardless
+    /// of whether the owning engine drops first.
+    device: Arc<DeviceShared>,
 }
 
 impl KvCache {
@@ -163,6 +168,7 @@ impl KvCache {
             ssm_max_snapshots: 0,
             ssm_conv_kernel: 0,
             ssm_conv_channels: 0,
+            device: device.shared(),
         })
     }
 
@@ -327,16 +333,23 @@ impl KvCache {
     }
 
 
-    pub fn destroy(&mut self, device: &Device) {
-        self.region.destroy(device);
+}
+
+impl Drop for KvCache {
+    fn drop(&mut self) {
+        // Free the KV region + any SSM/snapshot regions. The Arc keeps the
+        // logical device alive through this; forwards are synchronous (each
+        // fence-waits), so the GPU is idle by teardown.
+        let dev = self.device.raw();
+        self.region.destroy(dev);
         if let Some(mut r) = self.ssm_region.take() {
-            r.destroy(device);
+            r.destroy(dev);
         }
         if let Some(mut r) = self.ssm_gdn_snap_region.take() {
-            r.destroy(device);
+            r.destroy(dev);
         }
         if let Some(mut r) = self.ssm_conv_backup_region.take() {
-            r.destroy(device);
+            r.destroy(dev);
         }
     }
 }

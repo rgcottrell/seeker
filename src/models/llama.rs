@@ -110,13 +110,47 @@ impl Model for LlamaModel {
         &self.tokenizer
     }
 
+    fn scratch_bytes_estimate(
+        &self,
+        n_ubatch: u32,
+        max_seq_len: u32,
+        k_dtype: GgmlType,
+        v_dtype: GgmlType,
+    ) -> u64 {
+        let p = &self.params;
+        // Per-pass token count: bounded by n_ubatch, or the whole context when
+        // chunking is disabled (n_ubatch == 0 ⇒ a single full-prompt pass).
+        let l = if n_ubatch == 0 { max_seq_len.max(1) } else { n_ubatch } as u64;
+        let hidden = p.n_embd as u64;
+        let n_kv = p.n_embd_kv() as u64;
+        let n_ff = p.n_ff as u64;
+        let vocab = p.n_vocab as u64;
+        // Per-layer transient buffers accumulate within a layer (reclaimed only
+        // at the next layer's scratch_restore): ≈ 7×hidden + 3×n_kv + 4×n_ff
+        // columns, each [_, l] F32.
+        let per_layer = (7 * hidden + 3 * n_kv + 4 * n_ff) * l * 4;
+        let residual = hidden * l * 4; // persistent across the layer loop
+        let mask = l * l * 4; // within-chunk only
+        let logits = vocab * 4; // last token only
+        // Heterogeneous K/V caches materialize the [0, ctx) prefix to F32 per
+        // layer (cache_io::record_read); homogeneous caches bind directly.
+        let staging = if k_dtype != v_dtype {
+            2 * p.head_dim() as u64 * p.n_head_kv as u64 * max_seq_len as u64 * 4
+        } else {
+            0
+        };
+        let raw = per_layer + residual + mask + logits + staging;
+        raw + raw / 3 + (32 << 20) // +33% headroom + 32 MiB slack
+    }
+
     fn record_forward(
         &self,
         ctx: &mut DispatchContext,
         cache: &mut KvCache,
         tokens: &[u32],
         position_offset: u32,
-    ) -> Result<crate::inference::weights::TensorView, Box<dyn Error>> {
+        compute_logits: bool,
+    ) -> Result<Option<crate::inference::weights::TensorView>, Box<dyn Error>> {
         let p = &self.params;
         let l = tokens.len() as u32;
         if l == 0 {
@@ -158,8 +192,12 @@ impl Model for LlamaModel {
         // whole row is 0). Skip the O(total_len) host-side mask build per
         // step — flash_attn runs that case with MASK_ENABLE=0.
         let mask = if l > 1 {
-            let m = ctx.alloc_tensor([kv_len_u, l as u64, 1, 1], GgmlType::F32)?;
-            write_causal_mask(ctx, m, l, position_offset, GgmlType::F32)?;
+            // Within-chunk mask only: [l × l] (not [kv_len × l]). The cached
+            // prefix [0, position_offset) is always visible and is handled
+            // shader-side via mask_kv_offset, so the mask is O(l²) regardless
+            // of context length.
+            let m = ctx.alloc_tensor([l as u64, l as u64, 1, 1], GgmlType::F32)?;
+            write_causal_mask(ctx, m, l, GgmlType::F32)?;
             Some(m)
         } else {
             None
@@ -307,40 +345,44 @@ impl Model for LlamaModel {
         }
         ctx.scratch_restore(layer_checkpoint);
 
-        // ---- final norm + lm_head ----
-        let final_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
-        rms_norm::record(ctx, residual, self.weights.output_norm, final_norm, p.rms_eps)?;
+        // Intermediate prefill ubatches only populate the KV cache — skip the
+        // final norm + lm_head entirely (no logits needed until the last
+        // ubatch). cache.position is still advanced below.
+        if !compute_logits {
+            cache_io::advance(cache, l);
+            return Ok(None);
+        }
 
-        // Compute logits for all positions, then return the slice for the
-        // last token. (We could matmul only the last column by slicing
-        // final_norm into [hidden, 1], but it requires the dst byte_offset
-        // to be `min_storage_buffer_offset_alignment`-aligned and adds
-        // little for the small batch sizes the MVP supports.)
-        let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
-        let all_logits = ctx.alloc_tensor([p.n_vocab as u64, l as u64, 1, 1], GgmlType::F32)?;
-        matmul::record(ctx, lm_head, final_norm, all_logits)?;
-
-        // Slice out the [n_vocab, 1, 1, 1] row for the final position. We
-        // synthesize a TensorView pointing into the same scratch buffer at
-        // the byte offset of the last token's logits.
+        // ---- final norm + lm_head (last token only) ----
+        // We sample from the final position only, so normalize + project just
+        // the last token's residual. Full-batch logits would burn
+        // n_vocab × L bytes of scratch (~262MB at L=512, vocab=128k — exceeds
+        // the scratch region on its own, which is the long-prompt prefill OOM).
+        // Slicing residual to the last token via a strided TensorView lets both
+        // rms_norm and the lm_head matmul run with L=1. (Mirrors qwen35moe.rs.)
         let elem_size = 4u64;
         let vocab = p.n_vocab as u64;
-        let last_offset = all_logits.byte_offset + (l as u64 - 1) * vocab * elem_size;
-        let last_logits = crate::inference::weights::TensorView {
-            buffer: all_logits.buffer,
-            byte_offset: last_offset,
-            byte_size: vocab * elem_size,
-            dims: [vocab, 1, 1, 1],
-            byte_stride: [elem_size, vocab * elem_size, vocab * elem_size, vocab * elem_size],
-            element_stride: [1, vocab, vocab, vocab],
-            dtype: GgmlType::F32,
+        let residual_last = crate::inference::weights::TensorView {
+            buffer: residual.buffer,
+            byte_offset: residual.byte_offset + (l as u64 - 1) * hidden * elem_size,
+            byte_size: hidden * elem_size,
+            dims: [hidden, 1, 1, 1],
+            byte_stride: [elem_size, hidden * elem_size, hidden * elem_size, hidden * elem_size],
+            element_stride: [1, hidden, hidden, hidden],
+            dtype: residual.dtype,
         };
+        let final_norm = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
+        rms_norm::record(ctx, residual_last, self.weights.output_norm, final_norm, p.rms_eps)?;
+
+        let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
+        let last_logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, lm_head, final_norm, last_logits)?;
 
         // Advance cache position for the next call. (All cache writes were
         // already recorded above; the GPU executes them in order before the
         // logits readback.)
         cache_io::advance(cache, l);
-        Ok(last_logits)
+        Ok(Some(last_logits))
     }
 }
 
@@ -364,7 +406,6 @@ fn write_causal_mask(
     ctx: &mut DispatchContext,
     mask: TensorView,
     l: u32,
-    position_offset: u32,
     dtype: GgmlType,
 ) -> Result<(), Box<dyn Error>> {
     let host_ptr = ctx
@@ -372,17 +413,19 @@ fn write_causal_mask(
         .host_ptr
         .ok_or("scratch region not host-visible")?;
     let l = l as usize;
-    let pos = position_offset as usize;
-    let kv_len = pos + l;
-    let n = l * kv_len;
-
-    let unmasked = |i: usize, j: usize| j <= pos + i;
+    // Within-chunk causal mask only: an [l × l] lower triangle, row-major
+    // [l rows][l cols]. Query row i attends to within-chunk kv column jc iff
+    // jc <= i (both at absolute position position_offset + index, so the
+    // offset cancels). The always-visible cached prefix carries no entries —
+    // the shader treats columns < mask_kv_offset as visible.
+    let n = l * l;
+    let unmasked = |i: usize, jc: usize| jc <= i;
     match dtype {
         GgmlType::F32 => {
             let mut buf: Vec<f32> = vec![0.0; n];
             for i in 0..l {
-                for j in 0..kv_len {
-                    buf[i * kv_len + j] = if unmasked(i, j) { 0.0 } else { f32::NEG_INFINITY };
+                for jc in 0..l {
+                    buf[i * l + jc] = if unmasked(i, jc) { 0.0 } else { f32::NEG_INFINITY };
                 }
             }
             unsafe {
@@ -394,8 +437,8 @@ fn write_causal_mask(
             // F16 bit patterns: +0.0 = 0x0000, -inf = 0xFC00.
             let mut buf: Vec<u16> = vec![0u16; n];
             for i in 0..l {
-                for j in 0..kv_len {
-                    buf[i * kv_len + j] = if unmasked(i, j) { 0x0000 } else { 0xFC00 };
+                for jc in 0..l {
+                    buf[i * l + jc] = if unmasked(i, jc) { 0x0000 } else { 0xFC00 };
                 }
             }
             unsafe {

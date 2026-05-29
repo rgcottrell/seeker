@@ -64,6 +64,14 @@ pub struct Engine {
     /// `decode_command_buffer` stay valid. Prefill bumps the cache and
     /// resumes the normal reset-each-call behavior.
     pub decode_scratch_cursor: u64,
+    /// Physical micro-batch size (llama.cpp `n_ubatch`). Prefill is split
+    /// into `≤ n_ubatch`-token passes so the per-pass scratch working set
+    /// stays bounded regardless of prompt length. `0` ⇒ unbounded (legacy
+    /// single-pass behavior). See [`Engine::forward_sampled`].
+    pub n_ubatch: u32,
+    /// Logical batch size (llama.cpp `n_batch`). Validation-only in this
+    /// single-sequence engine — `n_ubatch` is the memory-relevant knob.
+    pub n_batch: u32,
 }
 
 /// State captured by the first decode recording so subsequent replays
@@ -83,6 +91,10 @@ pub struct DecodeCache {
     pub model_constants: decode_dyn::ModelReplayConstants,
 }
 
+/// Placeholder scratch size used between `Engine::new` and the first
+/// `allocate_scratch`. Kept tiny — the real region is sized from the model.
+const SCRATCH_PLACEHOLDER_BYTES: u64 = 1 << 20;
+
 /// Result of one MTP speculative-decode step ([`Engine::decode_speculative`]).
 pub struct SpecStepOut {
     /// Tokens accepted this step (`accept_len + 1`, always ≥ 1): the matched
@@ -100,7 +112,13 @@ pub struct SpecStepOut {
 }
 
 impl Engine {
-    pub fn new(scratch_bytes: u64) -> Result<Self, Box<dyn Error>> {
+    pub fn new(n_ubatch: u32, n_batch: u32) -> Result<Self, Box<dyn Error>> {
+        if n_ubatch != 0 && n_ubatch > n_batch {
+            return Err(format!(
+                "n_ubatch ({n_ubatch}) must be <= n_batch ({n_batch})"
+            )
+            .into());
+        }
         let device = Device::new()?;
         let pipelines = PipelineCache::new();
         let descriptors = DescriptorAllocator::new(&device)?;
@@ -111,9 +129,13 @@ impl Engine {
         // INDIRECT_BUFFER lets us point `vkCmdDispatchIndirect` at slots
         // inside scratch (flash_attn split-K grid lives here so the
         // recorded cmdbuf is replay-stable).
+        //
+        // This is a placeholder; callers must call `allocate_scratch` (sized
+        // from the model + n_ubatch) before running forwards. We allocate a
+        // tiny one up front so `scratch` is always a valid Region.
         let scratch = Region::new(
             &device,
-            scratch_bytes,
+            SCRATCH_PLACEHOLDER_BYTES,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
@@ -150,12 +172,47 @@ impl Engine {
             profile,
             decode_cache: None,
             decode_scratch_cursor: 0,
+            n_ubatch,
+            n_batch,
         })
+    }
+
+    /// (Re)allocate the scratch region to `bytes`, replacing the placeholder
+    /// from `new`. Sized by the caller from [`crate::models::Model::scratch_bytes_estimate`]
+    /// so the compute buffer fits the worst-case forward at the configured
+    /// `n_ubatch` / context — llama.cpp-style worst-case reservation. Must be
+    /// called once after the model is opened, before any forward.
+    pub fn allocate_scratch(&mut self, bytes: u64) -> Result<(), Box<dyn Error>> {
+        // No work can be in flight (scratch is replaced wholesale, and any
+        // cached decode recording binds the old buffer).
+        unsafe { self.device.device.device_wait_idle()? };
+        self.decode_cache = None;
+        self.scratch.destroy(&self.device.device);
+        let bytes = bytes.max(SCRATCH_PLACEHOLDER_BYTES);
+        self.scratch = Region::new(
+            &self.device,
+            bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        tracing::info!(
+            scratch_mib = bytes / (1 << 20),
+            "scratch region sized for model + n_ubatch",
+        );
+        Ok(())
     }
 
     /// Upload every tensor in `gguf` into a new dedicated weights region.
     pub fn upload_weights(&self, gguf: &GgufFile) -> Result<WeightsHandle, Box<dyn Error>> {
-        weights::upload(&self.device, gguf)
+        // The device-local upload path stages copies through the engine's
+        // command pool / queue / fence (no forward pass is in flight yet).
+        weights::upload(
+            &self.device,
+            gguf,
+            self.command_pool,
+            self.device.queue,
+            self.fence,
+        )
     }
 
     /// Allocate a KV cache sized for the given architecture. Caller picks
@@ -345,6 +402,14 @@ impl Engine {
         let l = tokens.len() as u32;
         if l == 0 {
             return Err("forward_sampled called with empty token list".into());
+        }
+        // Chunked prefill: a prompt longer than `n_ubatch` is fed in
+        // sequential `≤ n_ubatch`-token passes so the per-pass scratch
+        // working set stays bounded regardless of prompt length. Only the
+        // final chunk computes logits + samples. `n_ubatch == 0` disables
+        // chunking (legacy single-pass behavior).
+        if self.n_ubatch != 0 && l > self.n_ubatch {
+            return self.forward_sampled_chunked(model, cache, tokens, position_offset, sampler);
         }
         let is_decode = l == 1;
         let kv_after = position_offset + l;
@@ -536,8 +601,19 @@ impl Engine {
             self.device
                 .device
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // A cached decode recording is resubmitted across many tokens
+            // by `forward_sampled_replay` without re-recording, so it must
+            // NOT carry ONE_TIME_SUBMIT (which promises a single submit and
+            // trips the validation layer on every replay). Replays are
+            // serial and fence-synchronized, so empty flags suffice — no
+            // SIMULTANEOUS_USE. The non-cached path submits once: keep the
+            // ONE_TIME_SUBMIT hint so the driver can optimize.
+            let flags = if cache_recording {
+                vk::CommandBufferUsageFlags::empty()
+            } else {
+                vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
+            };
+            let begin = vk::CommandBufferBeginInfo::default().flags(flags);
             self.device.device.begin_command_buffer(cmd, &begin)?;
         }
         #[cfg(feature = "profile_gpu")]
@@ -574,7 +650,9 @@ impl Engine {
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
-            let logits = model.record_forward(&mut ctx, cache, tokens, position_offset)?;
+            let logits = model
+                .record_forward(&mut ctx, cache, tokens, position_offset, /*compute_logits=*/ true)?
+                .ok_or("record_forward(compute_logits=true) returned no logits")?;
             let r = sampler.record_chain(&mut ctx, logits)?;
             #[cfg(feature = "gpu_debug")]
             {
@@ -679,6 +757,142 @@ impl Engine {
             );
         }
         Ok(token)
+    }
+
+    /// Prefill a prompt longer than `n_ubatch` by feeding it in sequential
+    /// `≤ n_ubatch`-token chunks. Every chunk but the last is KV-only (no
+    /// logits / sampler — see [`Engine::forward_kv_only`]); the final chunk
+    /// runs the normal sampling path and returns the next token.
+    ///
+    /// Each chunk passes `position_offset = cache.position`, which the model
+    /// advances by the chunk length inside `record_forward`. Because the KV
+    /// writes, RoPE positions, causal mask, and persistent SSM/conv/GDN state
+    /// are all keyed off the absolute position, feeding ordered chunks is
+    /// numerically identical to a single full-prompt pass — only the peak
+    /// scratch differs (bounded to one chunk instead of the whole prompt).
+    fn forward_sampled_chunked(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        position_offset: u32,
+        sampler: &mut sample::Sampler,
+    ) -> Result<u32, Box<dyn Error>> {
+        if cache.position != position_offset {
+            return Err(format!(
+                "forward_sampled_chunked: cache.position {} != position_offset {position_offset}",
+                cache.position
+            )
+            .into());
+        }
+        let ub = self.n_ubatch as usize;
+        let n = tokens.len();
+        debug_assert!(ub > 0 && n > ub, "chunked path entered with n={n} ub={ub}");
+        let mut start = 0usize;
+        loop {
+            let end = (start + ub).min(n);
+            let chunk = &tokens[start..end];
+            let pos = cache.position; // advanced by each record_forward
+            if end == n {
+                // Final chunk: sample. Recurse — `chunk.len() <= n_ubatch`, so
+                // this never re-enters the chunking branch; and when the
+                // remainder is a single token it correctly takes the decode
+                // path and (re)builds the persistent-decode replay cache.
+                return self.forward_sampled(model, cache, chunk, pos, sampler);
+            }
+            self.forward_kv_only(model, cache, chunk, pos)?;
+            start = end;
+        }
+    }
+
+    /// Record + submit a KV-only prefill pass for one ubatch chunk: runs the
+    /// model with `compute_logits = false` (no final norm / lm_head / sampler /
+    /// readback), populating the KV + recurrent state for `tokens` at
+    /// `position_offset`. Used by [`Engine::forward_sampled_chunked`] for every
+    /// chunk except the last, and by `bench --dump-logits` for long prompts.
+    ///
+    /// Each call is its own submit + fence-wait: scratch is reused across
+    /// chunks, so the next chunk must not record until this chunk's GPU work
+    /// (including the persistent conv/GDN state copy-back) has completed.
+    pub(crate) fn forward_kv_only(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        // A stale cached decode recording would bind scratch ranges we're
+        // about to recycle.
+        self.decode_cache = None;
+        self.scratch.reset();
+        self.descriptors.reset(&self.device)?;
+
+        // Reserve the DecodeDyn slot first (stable offset), exactly like the
+        // record path — flash_attn reads `DecodeDyn::kv_len` from it, so it is
+        // required even though no sampler runs.
+        let decode_dyn_range = {
+            let off = self.scratch.alloc(decode_dyn::DecodeDyn::SIZE)?;
+            BufferRange {
+                buffer: self.scratch.buffer,
+                offset: off,
+                size: decode_dyn::DecodeDyn::SIZE,
+            }
+        };
+
+        let cmd = self.command_buffer;
+        unsafe {
+            self.device
+                .device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device.device.begin_command_buffer(cmd, &begin)?;
+        }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.reset(&self.device, cmd);
+
+        {
+            let mut ctx = DispatchContext {
+                device: &self.device,
+                weights: model.weights(),
+                scratch: &mut self.scratch,
+                pipelines: &mut self.pipelines,
+                descriptors: &self.descriptors,
+                cmd,
+                #[cfg(feature = "gpu_debug")]
+                taps: Vec::new(),
+                #[cfg(feature = "profile_gpu")]
+                n_dispatches: 0,
+                decode_dyn: decode_dyn_range,
+                replay_plan: None,
+                #[cfg(feature = "profile_gpu")]
+                profile: Some(&mut self.profile),
+            };
+            // KV-only: compute_logits = false ⇒ no epilogue, no sampler, no
+            // readback. Returns None.
+            let _ = model.record_forward(
+                &mut ctx,
+                cache,
+                tokens,
+                position_offset,
+                /*compute_logits=*/ false,
+            )?;
+        }
+
+        unsafe {
+            self.device.device.end_command_buffer(cmd)?;
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.readback_and_print(&self.device);
+        Ok(())
     }
 
     /// Write F32 data into a scratch slot via the mapped host pointer. Used
@@ -870,11 +1084,12 @@ impl Engine {
             let vocab_u = vocab as u64;
             let outs = self.run_spec_record(weights, |ctx| {
                 let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
+                let logits = o.logits.expect("record_forward_full computes logits");
                 let mut ranges = Vec::with_capacity(n + 2);
                 for i in 0..=n {
                     let col = crate::inference::weights::TensorView {
-                        buffer: o.logits.buffer,
-                        byte_offset: o.logits.byte_offset + i as u64 * vocab_u * 4,
+                        buffer: logits.buffer,
+                        byte_offset: logits.byte_offset + i as u64 * vocab_u * 4,
                         byte_size: vocab_u * 4,
                         dims: [vocab_u, 1, 1, 1],
                         byte_stride: [4, vocab_u * 4, vocab_u * 4, vocab_u * 4],
@@ -902,7 +1117,10 @@ impl Engine {
         } else {
             let outs = self.run_spec_record(weights, |ctx| {
                 let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
-                Ok(vec![o.logits.range(), o.residual.range()])
+                Ok(vec![
+                    o.logits.expect("record_forward_full computes logits").range(),
+                    o.residual.range(),
+                ])
             })?;
             let all_logits = &outs[0]; // [vocab, n+1] (row i at i*vocab)
             let logit_rows: Vec<Vec<f32>> = (0..=n)
@@ -972,7 +1190,10 @@ impl Engine {
         let weights = model.weights();
         let outs = self.run_spec_record(weights, |ctx| {
             let o = model.record_forward_full(ctx, cache, tokens, position, full_logits, false)?;
-            Ok(vec![o.logits.range(), o.residual.range()])
+            Ok(vec![
+                o.logits.expect("record_forward_full computes logits").range(),
+                o.residual.range(),
+            ])
         })?;
         let logits = outs[0].clone();
         let residual = outs[1].clone();
@@ -1024,7 +1245,7 @@ impl Drop for Engine {
             self.device.device.destroy_fence(self.fence, None);
             self.device.device.destroy_command_pool(self.command_pool, None);
         }
-        self.scratch.destroy(&self.device);
+        self.scratch.destroy(&self.device.device);
         self.descriptors.destroy(&self.device);
         self.pipelines.destroy(&self.device);
     }

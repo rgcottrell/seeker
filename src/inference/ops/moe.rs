@@ -174,6 +174,7 @@ pub fn record_matvec_q4k_id(
         "mul_mat_vec_q4_k_id",
         shaders::MUL_MAT_VEC_Q4_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ true,
+        /* has_packed32= */ true,
         /* fence= */ true,
     )
 }
@@ -192,6 +193,7 @@ pub fn record_matvec_q4k_id_nofence(
         "mul_mat_vec_q4_k_id",
         shaders::MUL_MAT_VEC_Q4_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ true,
+        /* has_packed32= */ true,
         /* fence= */ false,
     )
 }
@@ -213,6 +215,7 @@ pub fn record_matvec_q5k_id(
         "mul_mat_vec_q5_k_id",
         shaders::MUL_MAT_VEC_Q5_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ false, // Q5_K matvec uses B_TYPEV2 (binding 5)
+        /* has_packed32= */ true,
         /* fence= */ true,
     )
 }
@@ -231,6 +234,49 @@ pub fn record_matvec_q5k_id_nofence(
         "mul_mat_vec_q5_k_id",
         shaders::MUL_MAT_VEC_Q5_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ false,
+        /* has_packed32= */ true,
+        /* fence= */ false,
+    )
+}
+
+/// Per-expert matvec for Q6_K weights. Same contract as the Q4_K/Q5_K
+/// variants. Used for the rare blocks whose `ffn_gate_exps` /
+/// `ffn_up_exps` are Q6_K (blk.0 on the Unsloth UD-Q5_K_XL checkpoint).
+/// Q6_K is **packed16-only** — it has no packed32 alias, so binding slot
+/// 6 is dropped (`has_packed32 = false`); B is bound as float4 (slot 4).
+pub fn record_matvec_q6k_id(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    ids: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_matvec_kquant_id(
+        ctx, a, b, ids, dst, n_expert_used,
+        "mul_mat_vec_q6_k_id",
+        shaders::MUL_MAT_VEC_Q6_K_ID_SPV.as_bytes(),
+        /* b_alias_v4= */ true,
+        /* has_packed32= */ false,
+        /* fence= */ true,
+    )
+}
+
+/// As [`record_matvec_q6k_id`] but skips the trailing barrier — caller fences.
+pub fn record_matvec_q6k_id_nofence(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    ids: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_matvec_kquant_id(
+        ctx, a, b, ids, dst, n_expert_used,
+        "mul_mat_vec_q6_k_id",
+        shaders::MUL_MAT_VEC_Q6_K_ID_SPV.as_bytes(),
+        /* b_alias_v4= */ true,
+        /* has_packed32= */ false,
         /* fence= */ false,
     )
 }
@@ -245,6 +291,7 @@ fn record_matvec_kquant_id(
     name: &'static str,
     spv: &[u8],
     b_alias_v4: bool,
+    has_packed32: bool,
     fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     let ncols = a.dims[0] as u32;
@@ -265,10 +312,15 @@ fn record_matvec_kquant_id(
     let batch_stride_d = n_rows * n_expert_used;
 
     // Q4_K matvec binds B as both data_b and data_b_v4 (vec4) at slot 4;
-    // Q5_K binds B as data_b and data_b_v2 (vec2) at slot 5. The
-    // packed16 / packed32 A aliases sit at 3 / 6 either way.
+    // Q5_K binds B as data_b and data_b_v2 (vec2) at slot 5. The packed16
+    // A alias sits at 3; the packed32 alias at 6 exists for Q4_K/Q5_K but
+    // NOT Q6_K (packed16-only) — `has_packed32` drops slot 6 there.
     let b_alias_slot: u32 = if b_alias_v4 { 4 } else { 5 };
-    let bindings: Vec<u32> = vec![0, 1, 2, 3, b_alias_slot, 6, 7];
+    let bindings: Vec<u32> = if has_packed32 {
+        vec![0, 1, 2, 3, b_alias_slot, 6, 7]
+    } else {
+        vec![0, 1, 2, 3, b_alias_slot, 7]
+    };
 
     // Spec-const order on `mul_mat_vec_head.slang`: BLOCK_SIZE, NUM_ROWS,
     // ACCUMULATE. MoE matvec_id always writes a fresh dst slice, so
@@ -308,22 +360,21 @@ fn record_matvec_kquant_id(
         put_u(&mut push, &mut w, expert_i1); // expert_i1 = current token
         put_u(&mut push, &mut w, n_experts); // nbi1 — ids row stride (= n_experts)
 
-        super::bind_and_dispatch(
-            ctx,
-            &pipeline,
-            &bindings,
-            &[
-                a.range(),   // 0: data_a
-                b.range(),   // 1: data_b
-                dst.range(), // 2: data_d
-                a.range(),   // 3: data_a_packed16 (alias of A)
-                b.range(),   // 4 or 5: data_b_v4 / data_b_v2 (alias of B)
-                a.range(),   // 6: data_a_packed32 (alias of A)
-                ids,         // 7: data_ids
-            ],
-            &push,
-            workgroups,
-        )?;
+        // Bind array mirrors `bindings`: the packed32 alias (slot 6) is
+        // present only when `has_packed32` (Q4_K/Q5_K), absent for Q6_K.
+        let mut buffers: Vec<BufferRange> = vec![
+            a.range(),   // 0: data_a
+            b.range(),   // 1: data_b
+            dst.range(), // 2: data_d
+            a.range(),   // 3: data_a_packed16 (alias of A)
+            b.range(),   // 4 or 5: data_b_v4 / data_b_v2 (alias of B)
+        ];
+        if has_packed32 {
+            buffers.push(a.range()); // 6: data_a_packed32 (alias of A)
+        }
+        buffers.push(ids); // 7: data_ids
+
+        super::bind_and_dispatch(ctx, &pipeline, &bindings, &buffers, &push, workgroups)?;
     }
     if fence {
         record_compute_barrier(ctx.device, ctx.cmd, dst.range());
@@ -391,6 +442,33 @@ pub fn record_moe_down_q6k(
         n_expert_used,
         "moe_down_q6_k",
         shaders::MOE_DOWN_Q6_K_DEFAULT_SPV.as_bytes(),
+        /* bindings_with_b_v4= */ true,
+    )
+}
+
+/// Same shape contract as [`record_moe_down_q5k`] but for Q8_0 weights.
+/// The Unsloth UD-Q5_K_XL checkpoint quantizes a few blocks'
+/// `ffn_down_exps` as Q8_0 (the rest are Q6_K). Like the Q6_K path it
+/// binds `data_b_v4` (float4 view of ffn_h) at slot 4.
+pub fn record_moe_down_q8_0(
+    ctx: &mut DispatchContext,
+    down_exps: TensorView,
+    ffn_h: TensorView,
+    ids: BufferRange,
+    routing_weights: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_moe_down_impl(
+        ctx,
+        down_exps,
+        ffn_h,
+        ids,
+        routing_weights,
+        dst,
+        n_expert_used,
+        "moe_down_q8_0",
+        shaders::MOE_DOWN_Q8_0_DEFAULT_SPV.as_bytes(),
         /* bindings_with_b_v4= */ true,
     )
 }

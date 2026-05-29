@@ -725,11 +725,17 @@ fn record_mul_mat_vec_split_k(
     )?;
     record_compute_barrier(ctx.device, ctx.cmd, partials);
 
-    // Reduce: sum SPLIT_K partials per row into `d`.
+    // Reduce: sum SPLIT_K partials per row into `d`. The shader includes
+    // `generic_head.slang`, whose `GenericParams` push block is 24 bytes
+    // (KX, KY + 4 floats) even though this kernel only reads KX — the
+    // pipeline-layout push range must cover the whole declared block or
+    // the validation layer flags it (VUID-…-layout-10069). Only KX is set;
+    // the rest stay zero (unread).
+    const GENERIC_PARAMS_BYTES: u32 = 6 * 4;
     let reduce_key = PipelineKey::dense(
         "mul_mat_vec_split_k_reduce_f32",
         2,
-        8, // generic_head: KX + KY
+        GENERIC_PARAMS_BYTES,
         vec![split_k],
     );
     let reduce_pipeline = *ctx.pipelines.get(
@@ -737,7 +743,7 @@ fn record_mul_mat_vec_split_k(
         reduce_key,
         shaders::MUL_MAT_VEC_SPLIT_K_REDUCE_F32_SPV.as_bytes(),
     )?;
-    let mut reduce_push = [0u8; 8];
+    let mut reduce_push = [0u8; GENERIC_PARAMS_BYTES as usize];
     reduce_push[0..4].copy_from_slice(&m.to_ne_bytes()); // KX = M
     let reduce_workgroups = [m.div_ceil(512), 1, 1];
     super::bind_and_dispatch(
