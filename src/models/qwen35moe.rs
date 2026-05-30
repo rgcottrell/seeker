@@ -2668,3 +2668,146 @@ fn coerce_f32(v: &MetadataValue) -> Option<f32> {
         _ => return None,
     })
 }
+
+/// Placement of one image's merged tokens within a decoder token sequence
+/// (Phase 3). The `<|image_pad|>` placeholders occupy `n_tok = nx*ny`
+/// consecutive sequence slots starting at `start` (local index, i.e. relative
+/// to the start of the tokens passed to `forward_impl`). `nx`/`ny` are the
+/// **merged** grid dims (= patch grid / spatial_merge), so the vision encoder's
+/// raster-ordered output token `k` lands at merged-grid `(col=k%nx, row=k/nx)`.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageSpan {
+    pub start: usize,
+    pub n_tok: usize,
+    pub nx: usize,
+    pub ny: usize,
+}
+
+/// Build the 4-axis M-RoPE decoder positions for a token sequence that may
+/// contain image spans, in the axis-major layout `forward_impl` uploads
+/// (`out[axis*l + tok]`, read by the rope shader as `pos[tok + l*axis]`).
+///
+/// Exact port of llama's qwen-vl MROPE scheme (`mtmd.cpp
+/// mtmd_image_tokens_get_decoder_pos` + `mtmd-helper.cpp set_position_mrope_2d`
+/// / `set_position_normal`; advance from `mtmd_image_tokens_get_n_pos`):
+///
+/// * **Text** token at cursor `c`: all 4 axes = `c`; cursor advances by 1.
+/// * **Image** at base `B` (= cursor when the span begins), token `k` in
+///   `0..nx*ny`: `t=B`, `y(row)=B + k/nx`, `x(col)=B + k%nx`, `z=0`. The image
+///   advances the cursor by `max(nx, ny)` (NOT `n_tok`): text after the image
+///   resumes at `B + max(nx,ny)`.
+///
+/// `pos0` is the absolute position of the sequence's first token
+/// (`position_offset`). `is_imrope=1` should accompany these (set by the
+/// caller); for all-text sequences every axis is equal so imrope 0≡1.
+pub fn build_decoder_mrope_positions(l: usize, pos0: u32, images: &[ImageSpan]) -> Vec<u32> {
+    let mut out = vec![0u32; 4 * l];
+    let mut cursor = pos0;
+    let mut i = 0usize;
+    while i < l {
+        if let Some(img) = images.iter().find(|im| im.start == i) {
+            debug_assert_eq!(img.n_tok, img.nx * img.ny, "image span n_tok != nx*ny");
+            debug_assert!(i + img.n_tok <= l, "image span overruns sequence");
+            let base = cursor;
+            for k in 0..img.n_tok {
+                let tok = i + k;
+                out[tok] = base; // axis0 t
+                out[l + tok] = base + (k / img.nx) as u32; // axis1 y (row)
+                out[2 * l + tok] = base + (k % img.nx) as u32; // axis2 x (col)
+                out[3 * l + tok] = 0; // axis3 z (unused; llama writes 0)
+            }
+            cursor = base + img.nx.max(img.ny) as u32;
+            i += img.n_tok;
+        } else {
+            for axis in 0..4 {
+                out[axis * l + i] = cursor;
+            }
+            cursor += 1;
+            i += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod vision_pos_tests {
+    use super::{build_decoder_mrope_positions, ImageSpan};
+
+    /// Extract the four per-token axis values at a local token index.
+    fn at(p: &[u32], l: usize, tok: usize) -> (u32, u32, u32, u32) {
+        (p[tok], p[l + tok], p[2 * l + tok], p[3 * l + tok])
+    }
+
+    /// Text-only: every axis is the sequential position (so imrope 0≡1).
+    #[test]
+    fn text_only_is_sequential_on_all_axes() {
+        let l = 5;
+        let p = build_decoder_mrope_positions(l, 0, &[]);
+        for tok in 0..l {
+            assert_eq!(at(&p, l, tok), (tok as u32, tok as u32, tok as u32, tok as u32));
+        }
+        // With a non-zero base offset, everything shifts.
+        let p = build_decoder_mrope_positions(3, 100, &[]);
+        assert_eq!(at(&p, 3, 0), (100, 100, 100, 100));
+        assert_eq!(at(&p, 3, 2), (102, 102, 102, 102));
+    }
+
+    /// 2 text + (nx=3,ny=2) image + 2 text, base 0. Hand-derived from llama:
+    /// image tokens share t=2; y = 2 + k/3; x = 2 + k%3; z = 0; the image
+    /// advances the cursor by max(3,2)=3, so trailing text is at 5,6.
+    #[test]
+    fn single_image_3x2_hand_checked() {
+        let l = 2 + 6 + 2;
+        let img = ImageSpan { start: 2, n_tok: 6, nx: 3, ny: 2 };
+        let p = build_decoder_mrope_positions(l, 0, &[img]);
+        // leading text
+        assert_eq!(at(&p, l, 0), (0, 0, 0, 0));
+        assert_eq!(at(&p, l, 1), (1, 1, 1, 1));
+        // image (t,y,x,z)
+        assert_eq!(at(&p, l, 2), (2, 2, 2, 0)); // k=0
+        assert_eq!(at(&p, l, 3), (2, 2, 3, 0)); // k=1
+        assert_eq!(at(&p, l, 4), (2, 2, 4, 0)); // k=2
+        assert_eq!(at(&p, l, 5), (2, 3, 2, 0)); // k=3
+        assert_eq!(at(&p, l, 6), (2, 3, 3, 0)); // k=4
+        assert_eq!(at(&p, l, 7), (2, 3, 4, 0)); // k=5
+        // trailing text resumes at base(2) + max(nx,ny)(3) = 5
+        assert_eq!(at(&p, l, 8), (5, 5, 5, 5));
+        assert_eq!(at(&p, l, 9), (6, 6, 6, 6));
+    }
+
+    /// Tall image (ny>nx) advances by ny; non-zero base offset. The leading
+    /// text token advances the cursor, so the image base is pos0+1.
+    #[test]
+    fn tall_image_advances_by_ny() {
+        // 1 text + (nx=2,ny=3) image + 1 text, pos0=10. Image tokens are local
+        // indices 1..=6 (k=0..5); index 7 is the trailing text.
+        let l = 1 + 6 + 1;
+        let img = ImageSpan { start: 1, n_tok: 6, nx: 2, ny: 3 };
+        let p = build_decoder_mrope_positions(l, 10, &[img]);
+        assert_eq!(at(&p, l, 0), (10, 10, 10, 10)); // text -> cursor advances to 11
+        // image base = 11; k -> y=11+k/2, x=11+k%2, t=11, z=0
+        assert_eq!(at(&p, l, 1), (11, 11, 11, 0)); // k0
+        assert_eq!(at(&p, l, 2), (11, 11, 12, 0)); // k1
+        assert_eq!(at(&p, l, 3), (11, 12, 11, 0)); // k2
+        assert_eq!(at(&p, l, 4), (11, 12, 12, 0)); // k3
+        assert_eq!(at(&p, l, 5), (11, 13, 11, 0)); // k4
+        assert_eq!(at(&p, l, 6), (11, 13, 12, 0)); // k5
+        // advance by max(2,3)=3 -> trailing text at 11+3 = 14
+        assert_eq!(at(&p, l, 7), (14, 14, 14, 14));
+    }
+
+    /// The viz_test geometry: merged grid 6x5 (=30 tokens), preceded by one
+    /// text token (so image base = 1). Verifies the realistic span and the
+    /// +max(6,5)=6 advance.
+    #[test]
+    fn viz_test_geometry_6x5() {
+        let l = 1 + 30 + 1;
+        let img = ImageSpan { start: 1, n_tok: 30, nx: 6, ny: 5 };
+        let p = build_decoder_mrope_positions(l, 0, &[img]);
+        assert_eq!(at(&p, l, 0), (0, 0, 0, 0)); // leading text -> cursor 1
+        assert_eq!(at(&p, l, 1), (1, 1, 1, 0)); // first image tok, base 1
+        assert_eq!(at(&p, l, 7), (1, 2, 1, 0)); // k=6 -> row 1 col 0
+        assert_eq!(at(&p, l, 30), (1, 5, 6, 0)); // k=29 -> row 4 col 5 (1+4, 1+5)
+        assert_eq!(at(&p, l, 31), (7, 7, 7, 7)); // trailing text: 1 + max(6,5)
+    }
+}
