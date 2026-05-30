@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 
+use crate::commands::download;
 use crate::commands::download::{resolve_hf, HfResolveArgs};
 use crate::gguf::{GgmlType, GgufFile};
 use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
@@ -109,6 +110,10 @@ pub struct RunArgs {
     /// weights supports it; other models silently ignore the flag.
     #[arg(long = "spec-draft-n-max", default_value_t = 0)]
     spec_draft_n_max: u32,
+
+    /// Do not load the matching mmproj vision projector.
+    #[arg(long = "no-mmproj")]
+    no_mmproj: bool,
 }
 
 impl RunArgs {
@@ -133,8 +138,8 @@ fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
 }
 
 pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
-    let path = resolve_model_path(&args).await?;
-    let gguf = GgufFile::open(&path)?;
+    let resolved = resolve_model_path(&args).await?;
+    let gguf = GgufFile::open(&resolved.main)?;
     let bundle = build_tokenizer(&gguf)?;
 
     let add_special = bundle.add_bos_default || bundle.add_eos_default;
@@ -155,6 +160,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     );
 
     let model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
+
+    // Phase 1: load the mmproj vision projector alongside the model, if one was
+    // resolved and `--no-mmproj` wasn't passed. Not consumed yet (the encoder
+    // forward pass + decoder splice land in later phases); held in a local so it
+    // stays alive for the run. An absent sidecar or a load failure degrades to
+    // text-only.
+    let _vision = load_vision(&engine, &resolved, args.no_mmproj);
 
     // Size the scratch (compute buffer) for this model + n_ubatch before any
     // forward (including the debug-dump paths below), replacing the placeholder
@@ -1998,7 +2010,11 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     (sign << 15) | ((exp16 as u16) << 10) | mant16
 }
 
-async fn resolve_model_path(args: &RunArgs) -> Result<PathBuf, Box<dyn Error>> {
+/// Resolve the main model path (and any matching mmproj sidecar) from either a
+/// local `-m PATH` or an HF repo. For the local path, scans the model's
+/// directory for an mmproj GGUF (unless `--no-mmproj`); for HF, asks
+/// [`resolve_hf`] to fetch the sidecar too.
+async fn resolve_model_path(args: &RunArgs) -> Result<download::Resolved, Box<dyn Error>> {
     match (args.hf_repo.clone(), args.model.clone()) {
         (Some(repo), None) => Ok(resolve_hf(
             &HfResolveArgs {
@@ -2007,11 +2023,50 @@ async fn resolve_model_path(args: &RunArgs) -> Result<PathBuf, Box<dyn Error>> {
                 token: args.hf_token.clone(),
                 offline: args.offline,
             },
-            false,
+            !args.no_mmproj,
         )
-        .await?
-        .main),
-        (None, Some(model)) => Ok(model),
+        .await?),
+        (None, Some(model)) => {
+            let mmproj = if args.no_mmproj {
+                None
+            } else {
+                download::find_sidecar_mmproj(&model)
+            };
+            Ok(download::Resolved { main: model, mmproj })
+        }
         _ => unreachable!("clap group invariant"),
+    }
+}
+
+/// Load the resolved mmproj projector (if any) and return a `VisionModel`.
+///
+/// An absent mmproj or `--no-mmproj` yields `None` with no error. A load
+/// failure is logged as a warning and degrades to text-only, never failing the
+/// whole run. The mmproj tensors are uploaded into their own
+/// [`crate::inference::weights::WeightsHandle`] (the engine's `upload_weights`
+/// takes `&self`, so this works after the main weights moved into the model).
+fn load_vision(
+    engine: &Engine,
+    resolved: &download::Resolved,
+    no_mmproj: bool,
+) -> Option<crate::vision::VisionModel> {
+    if no_mmproj {
+        return None;
+    }
+    let mmproj_path = resolved.mmproj.as_ref()?;
+    tracing::info!(path = ?mmproj_path, "opening mmproj vision projector");
+
+    let result = (|| -> Result<crate::vision::VisionModel, Box<dyn Error>> {
+        let mmproj_gguf = GgufFile::open(mmproj_path)?;
+        let mmproj_weights = engine.upload_weights(&mmproj_gguf)?;
+        crate::vision::load(&mmproj_gguf, mmproj_weights)
+    })();
+
+    match result {
+        Ok(vision) => Some(vision),
+        Err(e) => {
+            tracing::warn!(path = ?mmproj_path, error = %e, "failed to load mmproj; continuing text-only");
+            None
+        }
     }
 }

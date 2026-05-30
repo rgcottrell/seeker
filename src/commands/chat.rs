@@ -19,6 +19,7 @@ use rustyline::{Completer, Editor, Helper, Hinter};
 
 use crate::chat_template::{self, ChatMessage};
 use crate::commands::chat_cache;
+use crate::commands::download;
 use crate::commands::download::{resolve_hf, HfResolveArgs};
 use crate::gguf::{GgmlType, GgufFile, MetadataValue};
 use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
@@ -221,6 +222,10 @@ pub struct ChatArgs {
     /// (short: -sysf)
     #[arg(long = "system-prompt-file", conflicts_with = "system_prompt")]
     system_prompt_file: Option<PathBuf>,
+
+    /// Do not load the matching mmproj vision projector.
+    #[arg(long = "no-mmproj")]
+    no_mmproj: bool,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -275,7 +280,8 @@ impl ChatArgs {
 }
 
 pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
-    let path = resolve_model_path(&args).await?;
+    let resolved = resolve_model_path(&args).await?;
+    let path = resolved.main.clone();
     let gguf = GgufFile::open(&path)?;
     let bundle = build_tokenizer(&gguf)?;
     let chat_template = bundle.chat_template.clone().ok_or_else(|| -> Box<dyn Error> {
@@ -286,6 +292,12 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
     let weights = engine.upload_weights(&gguf)?;
     let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
+
+    // Phase 1: load the mmproj vision projector alongside the model, if one was
+    // resolved and `--no-mmproj` wasn't passed. Not consumed yet (encoder +
+    // decoder integration land in later phases); held in a local so it stays
+    // alive for the session. Absent sidecar or load failure → text-only.
+    let _vision = load_vision(&engine, &resolved, args.no_mmproj);
 
     // Size the scratch (compute buffer) for this model + n_ubatch (and the
     // full ctx for heterogeneous caches), replacing the Engine::new
@@ -426,7 +438,11 @@ fn resolve_system_prompt(args: &ChatArgs) -> Result<Option<String>, Box<dyn Erro
     Ok(None)
 }
 
-async fn resolve_model_path(args: &ChatArgs) -> Result<PathBuf, Box<dyn Error>> {
+/// Resolve the main model path (and any matching mmproj sidecar) from either a
+/// local `-m PATH` or an HF repo. For the local path, scans the model's
+/// directory for an mmproj GGUF (unless `--no-mmproj`); for HF, asks
+/// [`resolve_hf`] to fetch the sidecar too.
+async fn resolve_model_path(args: &ChatArgs) -> Result<download::Resolved, Box<dyn Error>> {
     match (args.hf_repo.clone(), args.model.clone()) {
         (Some(repo), None) => Ok(resolve_hf(
             &HfResolveArgs {
@@ -435,12 +451,49 @@ async fn resolve_model_path(args: &ChatArgs) -> Result<PathBuf, Box<dyn Error>> 
                 token: args.hf_token.clone(),
                 offline: args.offline,
             },
-            false,
+            !args.no_mmproj,
         )
-        .await?
-        .main),
-        (None, Some(model)) => Ok(model),
+        .await?),
+        (None, Some(model)) => {
+            let mmproj = if args.no_mmproj {
+                None
+            } else {
+                download::find_sidecar_mmproj(&model)
+            };
+            Ok(download::Resolved { main: model, mmproj })
+        }
         _ => unreachable!("clap group invariant"),
+    }
+}
+
+/// Load the resolved mmproj projector (if any) and return a `VisionModel`.
+///
+/// An absent mmproj or `--no-mmproj` yields `None` with no error. A load
+/// failure is logged as a warning and degrades to text-only, never failing the
+/// whole session.
+fn load_vision(
+    engine: &Engine,
+    resolved: &download::Resolved,
+    no_mmproj: bool,
+) -> Option<crate::vision::VisionModel> {
+    if no_mmproj {
+        return None;
+    }
+    let mmproj_path = resolved.mmproj.as_ref()?;
+    tracing::info!(path = ?mmproj_path, "opening mmproj vision projector");
+
+    let result = (|| -> Result<crate::vision::VisionModel, Box<dyn Error>> {
+        let mmproj_gguf = GgufFile::open(mmproj_path)?;
+        let mmproj_weights = engine.upload_weights(&mmproj_gguf)?;
+        crate::vision::load(&mmproj_gguf, mmproj_weights)
+    })();
+
+    match result {
+        Ok(vision) => Some(vision),
+        Err(e) => {
+            tracing::warn!(path = ?mmproj_path, error = %e, "failed to load mmproj; continuing text-only");
+            None
+        }
     }
 }
 

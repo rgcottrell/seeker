@@ -25,6 +25,8 @@ mod models;
 #[allow(dead_code)]
 mod server;
 mod tokenizer;
+#[allow(dead_code)]
+mod vision;
 
 #[allow(dead_code)]
 mod shaders {

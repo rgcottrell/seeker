@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use hf_hub::api::tokio::{ApiBuilder, ApiRepo};
@@ -37,7 +37,7 @@ fn split_tokens(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn filename_contains_quant(filename: &str, quant: &str) -> bool {
+pub(crate) fn filename_contains_quant(filename: &str, quant: &str) -> bool {
     let file_tokens = split_tokens(filename);
     let quant_tokens = split_tokens(quant);
     if quant_tokens.is_empty() {
@@ -53,9 +53,57 @@ fn is_main_gguf(filename: &str) -> bool {
     lower.ends_with(".gguf") && !lower.contains("mmproj")
 }
 
-fn is_mmproj_gguf(filename: &str) -> bool {
+pub(crate) fn is_mmproj_gguf(filename: &str) -> bool {
     let lower = filename.to_ascii_lowercase();
     lower.ends_with(".gguf") && lower.contains("mmproj")
+}
+
+/// Extract a quant-like tag (e.g. `Q4_K_M`, `UD-Q4_K_XL`, `Q8_0`, `F16`) from a
+/// filename, returning the first matching token. Used to prefer an mmproj
+/// sidecar of the same quant as the local main model.
+pub(crate) fn quant_tag(filename: &str) -> Option<String> {
+    let stem = filename.strip_suffix(".gguf").unwrap_or(filename);
+    stem.split(['.', '-', '_']).find_map(|tok| {
+        let up = tok.to_ascii_uppercase();
+        let is_quant = (up.starts_with('Q') && up.chars().any(|c| c.is_ascii_digit()))
+            || up == "F16"
+            || up == "F32"
+            || up == "BF16";
+        is_quant.then(|| tok.to_string())
+    })
+}
+
+/// Scan the main model file's parent directory for a sibling mmproj GGUF,
+/// preferring one whose quant suffix matches the main file, else the first
+/// found. Used for local `-m PATH` runs (the HF path uses [`pick_mmproj`]).
+/// Returns `None` (no error) when the directory has no mmproj sidecar.
+pub(crate) fn find_sidecar_mmproj(main: &Path) -> Option<PathBuf> {
+    let dir = main.parent()?;
+    let main_name = main.file_name()?.to_str()?;
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) if is_mmproj_gguf(name) => candidates.push(path.clone()),
+            _ => {}
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Prefer a candidate sharing the main file's quant tag.
+    if let Some(quant) = quant_tag(main_name) {
+        if let Some(p) = candidates.iter().find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| filename_contains_quant(n, &quant))
+        }) {
+            return Some(p.clone());
+        }
+    }
+    candidates.into_iter().next()
 }
 
 fn pick_gguf_matching(files: &[String], quant: &str) -> Option<String> {
