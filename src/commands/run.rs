@@ -230,6 +230,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             fa_batch_smoke_test(&mut engine, model.weights())?;
             return Ok(());
         }
+        if std::env::var("SEEKER_GDN_BATCH_TEST").is_ok() {
+            gdn_batch_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
         if std::env::var("SEEKER_BATCH_DECODE_TEST").is_ok() {
             batch_decode_smoke_test(&mut engine, model.as_ref())?;
             return Ok(());
@@ -1320,6 +1324,190 @@ fn wq_dump_test(
     println!("  [0.3, 0.7) : {} ({:.1}%)", bins[2], 100.0 * bins[2] as f32 / (n_head * head_dim) as f32);
     println!("  [0.7, 0.9) : {} ({:.1}%)", bins[3], 100.0 * bins[3] as f32 / (n_head * head_dim) as f32);
     println!("  [0.9, 1.0] : {} ({:.1}%)", bins[4], 100.0 * bins[4] as f32 / (n_head * head_dim) as f32);
+    Ok(())
+}
+
+/// Batched gated-delta-net smoke test: B sequences, each with its own
+/// recurrent state, run through GDN at `n_seqs = B` in one dispatch, vs a
+/// per-sequence CPU reference. Proves the recurrent state batches correctly
+/// (`seq_id` indexing) — the linchpin of batched decode for the qwen35moe
+/// SSM hybrid (M2). Run with `SEEKER_GDN_BATCH_TEST=1 ... --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn gdn_batch_smoke_test(
+    engine: &mut Engine,
+    weights: &crate::inference::weights::WeightsHandle,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::ops::ssm::{record_gated_delta_net, GdnStrides};
+
+    let s_v: u64 = 128;
+    let num_v: u64 = 2; // heads
+    let l: u64 = 3; // tokens per sequence
+    let b: u64 = 3; // sequences (n_seqs)
+    let scale: f32 = 1.0;
+    let _ = weights;
+    let per_seq = (s_v * num_v * l) as usize; // q/k/v per sequence
+    let gb_per_seq = (num_v * l) as usize; // g/beta per sequence
+
+    println!("GDN batch smoke: B={b}, s_v={s_v}, num_v={num_v}, L={l}");
+
+    // Per-sequence synthetic inputs (vary by sequence `s`).
+    let mut q_host = vec![0f32; b as usize * per_seq];
+    let mut k_host = vec![0f32; b as usize * per_seq];
+    let mut v_host = vec![0f32; b as usize * per_seq];
+    let mut g_host = vec![0f32; b as usize * gb_per_seq];
+    let mut beta_host = vec![0f32; b as usize * gb_per_seq];
+    for s in 0..b as usize {
+        for t in 0..l as usize {
+            for h in 0..num_v as usize {
+                for i in 0..s_v as usize {
+                    let off = s * per_seq + t * (s_v * num_v) as usize + h * s_v as usize + i;
+                    q_host[off] = ((s * 13 + t * 7 + h * 3 + i) as f32 * 0.13).sin();
+                    k_host[off] = ((s * 17 + t * 11 + h * 5 + i) as f32 * 0.07).cos();
+                    v_host[off] = ((s * 19 + t * 5 + h * 2 + i) as f32 * 0.19).sin() * 0.5;
+                }
+                let gh = s * gb_per_seq + t * num_v as usize + h;
+                g_host[gh] = -0.1 * (s as f32 + 1.0) * (h as f32 + 1.0);
+                beta_host[gh] = 0.5 + 0.1 * t as f32 + 0.05 * s as f32;
+            }
+        }
+    }
+
+    // CPU reference: per-sequence recurrence (state resets per sequence).
+    let attn_per_seq = (l * num_v * s_v) as usize;
+    let mut ref_out = vec![0f32; b as usize * attn_per_seq];
+    for s in 0..b as usize {
+        for h in 0..num_v as usize {
+            let mut state = vec![0f32; (s_v * s_v) as usize]; // col-major [S_V*S_V]
+            for t in 0..l as usize {
+                let base = s * per_seq + t * (s_v * num_v) as usize + h * s_v as usize;
+                let q = &q_host[base..base + s_v as usize];
+                let k = &k_host[base..base + s_v as usize];
+                let v = &v_host[base..base + s_v as usize];
+                let g_val = g_host[s * gb_per_seq + t * num_v as usize + h].exp();
+                let beta = beta_host[s * gb_per_seq + t * num_v as usize + h];
+                let mut kv = vec![0f32; s_v as usize];
+                for c in 0..s_v as usize {
+                    let mut acc = 0f32;
+                    for r in 0..s_v as usize {
+                        acc += g_val * state[c * s_v as usize + r] * k[r];
+                    }
+                    kv[c] = acc;
+                }
+                for c in 0..s_v as usize {
+                    let delta = (v[c] - kv[c]) * beta;
+                    for r in 0..s_v as usize {
+                        state[c * s_v as usize + r] =
+                            g_val * state[c * s_v as usize + r] + k[r] * delta;
+                    }
+                }
+                for c in 0..s_v as usize {
+                    let mut acc = 0f32;
+                    for r in 0..s_v as usize {
+                        acc += state[c * s_v as usize + r] * q[r];
+                    }
+                    let out_idx =
+                        s * attn_per_seq + t * (num_v * s_v) as usize + h * s_v as usize + c;
+                    ref_out[out_idx] = acc * scale;
+                }
+            }
+        }
+    }
+
+    let gpu_out = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let elem = 4u64;
+            // q/k/v: [s_v, num_v, l, B]; g/beta: [num_v, l, B] (seq outermost).
+            let q = ctx.alloc_tensor([s_v, num_v, l, b], GgmlType::F32)?;
+            let k = ctx.alloc_tensor([s_v, num_v, l, b], GgmlType::F32)?;
+            let v = ctx.alloc_tensor([s_v, num_v, l, b], GgmlType::F32)?;
+            let g = ctx.alloc_tensor([num_v, l, b, 1], GgmlType::F32)?;
+            let beta = ctx.alloc_tensor([num_v, l, b, 1], GgmlType::F32)?;
+            let host_ptr = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
+            let cp = |dst: &crate::inference::weights::TensorView, src: &[f32]| unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    host_ptr.add(dst.byte_offset as usize) as *mut f32,
+                    src.len(),
+                );
+            };
+            cp(&q, &q_host);
+            cp(&k, &k_host);
+            cp(&v, &v_host);
+            cp(&g, &g_host);
+            cp(&beta, &beta_host);
+
+            let attn_floats = b * l * num_v * s_v;
+            let state_floats = b * num_v * s_v * s_v;
+            let gdn_total = attn_floats + state_floats;
+            let gdn_dst = ctx.alloc_scratch(gdn_total * elem)?;
+            let state_in = ctx.alloc_scratch(state_floats * elem)?;
+            unsafe {
+                std::ptr::write_bytes(
+                    host_ptr.add(state_in.offset as usize) as *mut u8,
+                    0,
+                    state_in.size as usize,
+                );
+            }
+
+            record_gated_delta_net(
+                ctx,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state_in,
+                gdn_dst,
+                num_v as u32,
+                num_v as u32,
+                l as u32,
+                b as u32, // n_seqs = B
+                attn_floats as u32, // s_off: state region starts after all B attn outputs
+                scale,
+                GdnStrides { s1: s_v as u32, s2: (s_v * num_v) as u32, s3: (s_v * num_v * l) as u32 },
+                GdnStrides { s1: s_v as u32, s2: (s_v * num_v) as u32, s3: (s_v * num_v * l) as u32 },
+                GdnStrides { s1: 1, s2: num_v as u32, s3: (num_v * l) as u32 },
+                s_v as u32,
+                1, // k_snapshots = 1
+            )?;
+            Ok(crate::inference::buffer::BufferRange {
+                buffer: gdn_dst.buffer,
+                offset: gdn_dst.offset,
+                size: attn_floats * elem,
+            })
+        },
+    )?;
+
+    // Relative error: the recurrent sums reach large magnitudes (~1e3), so an
+    // absolute threshold is meaningless — compare against |ref| (floored at 1).
+    let mut max_rel = 0f32;
+    let mut worst = (0usize, 0usize, 0usize, 0usize);
+    for s in 0..b as usize {
+        for t in 0..l as usize {
+            for h in 0..num_v as usize {
+                for c in 0..s_v as usize {
+                    let idx = s * attn_per_seq + t * (num_v * s_v) as usize + h * s_v as usize + c;
+                    let rel = (gpu_out[idx] - ref_out[idx]).abs() / ref_out[idx].abs().max(1.0);
+                    if rel > max_rel {
+                        max_rel = rel;
+                        worst = (s, t, h, c);
+                    }
+                }
+            }
+        }
+    }
+    let (ws, wt, wh, wc) = worst;
+    let widx = ws * attn_per_seq + wt * (num_v * s_v) as usize + wh * s_v as usize + wc;
+    println!(
+        "  max_rel_err = {max_rel:.3e} at (seq={ws}, t={wt}, head={wh}, c={wc}); gpu={:.5}, ref={:.5}",
+        gpu_out[widx], ref_out[widx]
+    );
+    if max_rel < 1e-4 {
+        println!("  RESULT: PASS (batched GDN recurrence matches per-sequence reference)");
+    } else {
+        println!("  RESULT: FAIL — batched GDN diverges from the per-sequence reference");
+    }
     Ok(())
 }
 
