@@ -45,11 +45,19 @@ use std::error::Error;
 
 use crate::gguf::GgmlType;
 use crate::inference::buffer::BufferRange;
+use crate::inference::command::record_compute_barrier;
 use crate::inference::context::DispatchContext;
-use crate::inference::ops::elementwise::record_add;
+use crate::inference::ops::bind_and_dispatch;
+use crate::inference::ops::elementwise::{record_add, record_mul};
 use crate::inference::ops::matmul;
+use crate::inference::pipeline::PipelineKey;
 use crate::inference::weights::{TensorView, WeightsHandle};
+use crate::shaders;
 use crate::vision::preprocess::PreprocessedImage;
+
+/// Byte size of `GenericParams` (`shaders/include/generic_head.slang`):
+/// 6 × 4 = 24 bytes (KX, KY, param1..4).
+const GENERIC_PARAMS_BYTES: u32 = 6 * 4;
 
 /// Number of input channels (RGB).
 pub const N_CHANNELS: usize = 3;
@@ -78,6 +86,101 @@ pub struct VisionEncoder {
     pub n_embd: usize,
     /// Patch size in pixels (= 16).
     pub patch_size: usize,
+    /// Attention head count (= 16).
+    pub n_head: usize,
+    /// Per-head dim (= n_embd / n_head = 72).
+    pub head_dim: usize,
+    /// Feed-forward hidden dim (= 4304).
+    pub n_ff: usize,
+    /// LayerNorm epsilon (= 1e-6).
+    pub eps: f32,
+    /// Per-block GPU weight views, indexed by layer 0..n_layer.
+    pub blocks: Vec<BlockWeights>,
+}
+
+/// GPU [`TensorView`]s for one ViT transformer block. The four matmul weights
+/// (`attn_qkv`/`attn_out`/`ffn_up`/`ffn_down`) are BF16 in the real
+/// `mmproj-BF16.gguf` (F16 in the F16 variant); biases + LN weight/bias pairs
+/// are F32. Both dtypes flow through the GPU path unchanged (`matmul::record`
+/// wires BF16/F16 A; biases/LN are F32).
+#[derive(Clone, Copy)]
+pub struct BlockWeights {
+    /// `v.blk.{i}.ln1.weight` `[n_embd]` F32.
+    pub ln1_w: TensorView,
+    /// `v.blk.{i}.ln1.bias` `[n_embd]` F32.
+    pub ln1_b: TensorView,
+    /// `v.blk.{i}.attn_qkv.weight` `[n_embd, 3*n_embd]` (GEMM A: K=n_embd,
+    /// M=3*n_embd) BF16/F16.
+    pub qkv_w: TensorView,
+    /// `v.blk.{i}.attn_qkv.bias` `[3*n_embd]` F32.
+    pub qkv_b: TensorView,
+    /// `v.blk.{i}.attn_out.weight` `[n_embd, n_embd]` BF16/F16.
+    pub out_w: TensorView,
+    /// `v.blk.{i}.attn_out.bias` `[n_embd]` F32.
+    pub out_b: TensorView,
+    /// `v.blk.{i}.ln2.weight` `[n_embd]` F32.
+    pub ln2_w: TensorView,
+    /// `v.blk.{i}.ln2.bias` `[n_embd]` F32.
+    pub ln2_b: TensorView,
+    /// `v.blk.{i}.ffn_up.weight` `[n_embd, n_ff]` BF16/F16.
+    pub ffn_up_w: TensorView,
+    /// `v.blk.{i}.ffn_up.bias` `[n_ff]` F32.
+    pub ffn_up_b: TensorView,
+    /// `v.blk.{i}.ffn_down.weight` `[n_ff, n_embd]` BF16/F16.
+    pub ffn_down_w: TensorView,
+    /// `v.blk.{i}.ffn_down.bias` `[n_embd]` F32.
+    pub ffn_down_b: TensorView,
+}
+
+/// Host-side F32 copies of one block's weights, up-converted from the mmproj
+/// GGUF (BF16/F16 matmul weights, F32 biases/LN). The numerical oracle
+/// ([`block_cpu`]) reads these. Matmul weights are stored as `[K, M]`
+/// row-major (idx = `k + K*m`), matching `read_tensor_as_f32`'s logical order
+/// and the GEMM contraction.
+#[derive(Clone)]
+pub struct BlockHostWeights {
+    pub ln1_w: Vec<f32>,
+    pub ln1_b: Vec<f32>,
+    /// `[K=n_embd, M=3*n_embd]` (idx = k + n_embd*m).
+    pub qkv_w: Vec<f32>,
+    pub qkv_b: Vec<f32>,
+    /// `[K=n_embd, M=n_embd]`.
+    pub out_w: Vec<f32>,
+    pub out_b: Vec<f32>,
+    pub ln2_w: Vec<f32>,
+    pub ln2_b: Vec<f32>,
+    /// `[K=n_embd, M=n_ff]`.
+    pub ffn_up_w: Vec<f32>,
+    pub ffn_up_b: Vec<f32>,
+    /// `[K=n_ff, M=n_embd]`.
+    pub ffn_down_w: Vec<f32>,
+    pub ffn_down_b: Vec<f32>,
+}
+
+impl BlockHostWeights {
+    /// Read all twelve tensors for block `layer_idx` from the mmproj GGUF and
+    /// up-convert to f32 (BF16/F16 -> f32 for the matmul weights, F32
+    /// passthrough for biases/LN).
+    pub fn from_gguf(
+        gguf: &crate::gguf::GgufFile,
+        layer_idx: u32,
+    ) -> Result<BlockHostWeights, Box<dyn Error>> {
+        let p = |s: &str| format!("v.blk.{layer_idx}.{s}");
+        Ok(BlockHostWeights {
+            ln1_w: read_tensor_as_f32(gguf, &p("ln1.weight"))?,
+            ln1_b: read_tensor_as_f32(gguf, &p("ln1.bias"))?,
+            qkv_w: read_tensor_as_f32(gguf, &p("attn_qkv.weight"))?,
+            qkv_b: read_tensor_as_f32(gguf, &p("attn_qkv.bias"))?,
+            out_w: read_tensor_as_f32(gguf, &p("attn_out.weight"))?,
+            out_b: read_tensor_as_f32(gguf, &p("attn_out.bias"))?,
+            ln2_w: read_tensor_as_f32(gguf, &p("ln2.weight"))?,
+            ln2_b: read_tensor_as_f32(gguf, &p("ln2.bias"))?,
+            ffn_up_w: read_tensor_as_f32(gguf, &p("ffn_up.weight"))?,
+            ffn_up_b: read_tensor_as_f32(gguf, &p("ffn_up.bias"))?,
+            ffn_down_w: read_tensor_as_f32(gguf, &p("ffn_down.weight"))?,
+            ffn_down_b: read_tensor_as_f32(gguf, &p("ffn_down.bias"))?,
+        })
+    }
 }
 
 impl VisionEncoder {
@@ -92,6 +195,10 @@ impl VisionEncoder {
         weights: &WeightsHandle,
         n_embd: usize,
         patch_size: usize,
+        n_head: usize,
+        n_ff: usize,
+        n_layer: usize,
+        eps: f32,
     ) -> Result<VisionEncoder, Box<dyn Error>> {
         let patch_embd_0 = weights.view("v.patch_embd.weight")?;
         let patch_embd_1 = weights.view("v.patch_embd.weight.1")?;
@@ -122,11 +229,60 @@ impl VisionEncoder {
             .into());
         }
 
+        // Parse the per-block weight views. Each block's four matmul weights
+        // (qkv/out/ffn_up/ffn_down) must be BF16/F16/F32 (the GEMM A side);
+        // biases + LN weight/bias must be F32. Validate loudly.
+        let head_dim = n_embd / n_head;
+        let mut blocks = Vec::with_capacity(n_layer);
+        for il in 0..n_layer {
+            let p = |s: &str| format!("v.blk.{il}.{s}");
+            let mat = |name: String| -> Result<TensorView, Box<dyn Error>> {
+                let v = weights.view(&name)?;
+                if v.dtype != GgmlType::BF16 && v.dtype != GgmlType::F16 && v.dtype != GgmlType::F32
+                {
+                    return Err(format!(
+                        "vision block {il}: expected BF16/F16/F32 {name}, got {:?}",
+                        v.dtype
+                    )
+                    .into());
+                }
+                Ok(v)
+            };
+            let f32v = |name: String| -> Result<TensorView, Box<dyn Error>> {
+                let v = weights.view(&name)?;
+                if v.dtype != GgmlType::F32 {
+                    return Err(
+                        format!("vision block {il}: expected F32 {name}, got {:?}", v.dtype).into(),
+                    );
+                }
+                Ok(v)
+            };
+            blocks.push(BlockWeights {
+                ln1_w: f32v(p("ln1.weight"))?,
+                ln1_b: f32v(p("ln1.bias"))?,
+                qkv_w: mat(p("attn_qkv.weight"))?,
+                qkv_b: f32v(p("attn_qkv.bias"))?,
+                out_w: mat(p("attn_out.weight"))?,
+                out_b: f32v(p("attn_out.bias"))?,
+                ln2_w: f32v(p("ln2.weight"))?,
+                ln2_b: f32v(p("ln2.bias"))?,
+                ffn_up_w: mat(p("ffn_up.weight"))?,
+                ffn_up_b: f32v(p("ffn_up.bias"))?,
+                ffn_down_w: mat(p("ffn_down.weight"))?,
+                ffn_down_b: f32v(p("ffn_down.bias"))?,
+            });
+        }
+
         Ok(VisionEncoder {
             patch_embd_0,
             patch_embd_1,
             n_embd,
             patch_size,
+            n_head,
+            head_dim,
+            n_ff,
+            eps,
+            blocks,
         })
     }
 
@@ -212,6 +368,814 @@ impl VisionEncoder {
 
         Ok(out_view)
     }
+
+    /// Record ONE Qwen3-VL ViT transformer block (layer `layer_idx`) on the
+    /// GPU. Input/output are both F32 `[n_embd, n_patches]` in the 2x2-block
+    /// token order Slice 2 produces. `grid_w`/`grid_h` are the patch grid dims
+    /// (before merge), needed for the 2D vision-RoPE positions (which must match
+    /// Slice 2's patch ordering).
+    ///
+    /// Faithful port of the per-block body of `clip_graph_qwen3vl::build`
+    /// (`/home/bob/tools/llama.cpp/src/tools/mtmd/models/qwen3vl.cpp:80-148`)
+    /// reusing `clip_graph::build_norm` / `build_attn` / `build_ffn`
+    /// (`clip.cpp:531-714`):
+    ///
+    /// * **LayerNorm-affine** (`build_norm`, NORM_TYPE_NORMAL, clip.cpp:539-551):
+    ///   `ggml_norm` (subtract row mean, divide by `sqrt(var+eps)` over the
+    ///   n_embd row) then `*ln.weight + ln.bias`. Composed from `norm.slang`
+    ///   (mean-subtract+inv_std, no affine) -> `record_mul` weight -> `record_add`
+    ///   bias (both broadcast over the n_pos columns). No new shader.
+    /// * **Fused QKV** (qwen3vl.cpp:88-104): `qkv = qkv_w @ h + qkv_b`,
+    ///   `[3*n_embd, n_pos]`. Q/K/V at row ranges 0/n_embd/2*n_embd, each
+    ///   `n_head x head_dim`.
+    /// * **Vision M-RoPE** (qwen3vl.cpp:111-116): `ggml_rope_multi(..., d_head/2,
+    ///   {18,18,18,18}, GGML_ROPE_TYPE_VISION, n_ctx=32768, freq_base=10000,
+    ///   ...)` on Q,K only. Positions built by [`build_vision_positions`]
+    ///   (clip.cpp:3705-3730), read by `rope_vision` (rope_funcs.slang:155) as
+    ///   `pos[i2]` (row) / `pos[i2+ne02]` (col).
+    /// * **Attention** (`build_attn`, clip.cpp:685-701): no mask
+    ///   (bidirectional), `scale = 1/sqrt(d_head)` (clip.cpp:253). Run via the
+    ///   project's `flash_attn` op with `mask=None`.
+    /// * **GELU FFN** (`build_ffn` FFN_GELU no-gate, clip.cpp:597-604): `ffn_down
+    ///   @ gelu(ffn_up @ h2 + ffn_up_b) + ffn_down_b`. `ggml_gelu` is the
+    ///   **tanh** approximation (gelu.slang).
+    pub fn record_block(
+        &self,
+        ctx: &mut DispatchContext,
+        x: TensorView,
+        layer_idx: u32,
+        grid_w: u32,
+        grid_h: u32,
+    ) -> Result<TensorView, Box<dyn Error>> {
+        let n_embd = self.n_embd;
+        let n_head = self.n_head;
+        let head_dim = self.head_dim;
+        let n_ff = self.n_ff;
+        let eps = self.eps;
+        let n_pos = x.dims[1] as usize;
+        let blk = self.blocks[layer_idx as usize];
+        let f32 = GgmlType::F32;
+        let nemb = n_embd as u64;
+        let np = n_pos as u64;
+
+        // Optional per-stage cutoff for the gpu_debug block smoke test: when
+        // `SEEKER_VISION_BLOCK_STAGE=<name>` is set, return that intermediate so
+        // the harness can localize a GPU-vs-CPU divergence.
+        #[cfg(feature = "gpu_debug")]
+        let stage = std::env::var("SEEKER_VISION_BLOCK_STAGE").ok();
+        #[cfg(not(feature = "gpu_debug"))]
+        let stage: Option<String> = None;
+        let want = |s: &str| stage.as_deref() == Some(s);
+
+        // --- 1. h = LayerNorm_affine(x, ln1) ---
+        let h = ctx.alloc_tensor([nemb, np, 1, 1], f32)?;
+        record_layernorm_affine(ctx, x, blk.ln1_w, blk.ln1_b, h, eps)?;
+        if want("ln1") {
+            return Ok(h);
+        }
+
+        // --- 2. qkv = qkv_w @ h + qkv_b   [3*n_embd, n_pos] ---
+        let qkv = ctx.alloc_tensor([3 * nemb, np, 1, 1], f32)?;
+        matmul::record(ctx, blk.qkv_w, h, qkv)?;
+        record_add_bias_broadcast(ctx, qkv, blk.qkv_b)?;
+        if want("qkv") {
+            return Ok(qkv);
+        }
+
+        // --- 3. vision M-RoPE on Q (rows 0..n_embd) and K (n_embd..2*n_embd) ---
+        let positions = build_vision_positions(grid_w as usize, grid_h as usize);
+        let pos_range = alloc_scratch_write(ctx, &i32_to_bytes(&positions))?;
+        let q_view = qkv_section_view(&qkv, head_dim, n_head, n_pos, 0);
+        let k_view = qkv_section_view(&qkv, head_dim, n_head, n_pos, n_embd);
+        record_vision_rope(ctx, q_view, pos_range, head_dim)?;
+        record_vision_rope(ctx, k_view, pos_range, head_dim)?;
+        if want("rope") {
+            return Ok(qkv);
+        }
+
+        // --- 4. Full/bidirectional attention via flash_attn (mask=None) ---
+        // flash_attn indexes Q/K/V as `data[d + i*nb01 + iq2*nb02]` with `i`
+        // = ne1 = the query/token row and `iq2` = ne2 = the head
+        // (flash_attn.slang:131-148), i.e. it wants the layout
+        // `[head_dim, n_pos, n_head]` (TOKEN in dim1, HEAD in dim2). It writes
+        // its output as `[hidden = head_dim*n_head, n_pos]` contiguous
+        // (head-major within hidden), which is exactly attn_concat's
+        // `[n_embd, n_pos]` (row = d + head_dim*head). Materialize Q/K/V into
+        // that token-major layout from the strided fused-qkv sections
+        // (copy.slang honors the source strides). Using flash_attn — the
+        // project's validated fused QKᵀ->softmax->V kernel.
+        let hd_pad = head_dim.next_multiple_of(32); // 72 -> 96
+        let fa_dims = [hd_pad as u64, np, n_head as u64, 1];
+        let q_c = ctx.alloc_tensor(fa_dims, f32)?;
+        let k_c = ctx.alloc_tensor(fa_dims, f32)?;
+        let v_c = ctx.alloc_tensor(fa_dims, f32)?;
+        record_fill_zero(ctx, q_c)?;
+        record_fill_zero(ctx, k_c)?;
+        record_fill_zero(ctx, v_c)?;
+        record_copy_pad_head(ctx, qkv_fa_view(&qkv, head_dim, n_head, n_pos, 0), &q_c, head_dim, hd_pad)?;
+        record_copy_pad_head(ctx, qkv_fa_view(&qkv, head_dim, n_head, n_pos, n_embd), &k_c, head_dim, hd_pad)?;
+        record_copy_pad_head(ctx, qkv_fa_view(&qkv, head_dim, n_head, n_pos, 2 * n_embd), &v_c, head_dim, hd_pad)?;
+        if want("qcopy") {
+            return Ok(q_c);
+        }
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let fa_out = ctx.alloc_tensor([(hd_pad * n_head) as u64, np, 1, 1], f32)?;
+        crate::inference::ops::flash_attn::record(
+            ctx,
+            q_c,
+            k_c,
+            v_c,
+            /*mask=*/ None,
+            fa_out,
+            crate::inference::ops::flash_attn::FlashAttnParams {
+                scale,
+                head_dim_k: hd_pad as u32,
+                head_dim_v: hd_pad as u32,
+                gqa_ratio: 1,
+            },
+            /*kv_actual=*/ n_pos as u32,
+        )?;
+        let attn_concat = ctx.alloc_tensor([nemb, np, 1, 1], f32)?;
+        record_gather_unpad_heads(ctx, &fa_out, &attn_concat, head_dim, hd_pad, n_head, n_pos)?;
+        if want("attn_concat") {
+            return Ok(attn_concat);
+        }
+
+        // --- 5. attn = out_w @ attn_concat + out_b ; x = x + attn ---
+        let attn = ctx.alloc_tensor([nemb, np, 1, 1], f32)?;
+        matmul::record(ctx, blk.out_w, attn_concat, attn)?;
+        record_add_bias_broadcast(ctx, attn, blk.out_b)?;
+        let resid1 = ctx.alloc_tensor([nemb, np, 1, 1], f32)?;
+        record_add(ctx, x, attn, resid1)?;
+
+        // --- 6. h2 = LayerNorm_affine(resid1, ln2) ---
+        let h2 = ctx.alloc_tensor([nemb, np, 1, 1], f32)?;
+        record_layernorm_affine(ctx, resid1, blk.ln2_w, blk.ln2_b, h2, eps)?;
+
+        // --- 7. ffn = ffn_down @ gelu(ffn_up @ h2 + ffn_up_b) + ffn_down_b ---
+        let up = ctx.alloc_tensor([n_ff as u64, np, 1, 1], f32)?;
+        matmul::record(ctx, blk.ffn_up_w, h2, up)?;
+        record_add_bias_broadcast(ctx, up, blk.ffn_up_b)?;
+        let act = ctx.alloc_tensor([n_ff as u64, np, 1, 1], f32)?;
+        record_gelu(ctx, up, act)?;
+        let ffn = ctx.alloc_tensor([nemb, np, 1, 1], f32)?;
+        matmul::record(ctx, blk.ffn_down_w, act, ffn)?;
+        record_add_bias_broadcast(ctx, ffn, blk.ffn_down_b)?;
+
+        // --- 8. x = resid1 + ffn ---
+        let out = ctx.alloc_tensor([nemb, np, 1, 1], f32)?;
+        record_add(ctx, resid1, ffn, out)?;
+        Ok(out)
+    }
+}
+
+/// View the Q/K/V section (base_row 0 / n_embd / 2*n_embd) of the fused `qkv`
+/// `[3*n_embd, n_pos]` tensor in the layout flash_attn wants:
+/// `[head_dim, n_pos, n_head]` (TOKEN in dim1, HEAD in dim2). Element strides:
+/// dim0 (head_dim) = 1, dim1 (token) = the full `3*n_embd` qkv row pitch,
+/// dim2 (head) = head_dim. flash_attn reads `data[d + token*nb01 + head*nb02]`.
+fn qkv_fa_view(
+    qkv: &TensorView,
+    head_dim: usize,
+    n_head: usize,
+    n_pos: usize,
+    base_row: usize,
+) -> TensorView {
+    let row_pitch = qkv.element_stride[1]; // = 3*n_embd
+    TensorView {
+        buffer: qkv.buffer,
+        byte_offset: qkv.byte_offset + (base_row as u64) * qkv.byte_stride[0],
+        byte_size: qkv.byte_size,
+        dims: [head_dim as u64, n_pos as u64, n_head as u64, 1],
+        byte_stride: [
+            qkv.byte_stride[0],
+            qkv.byte_stride[0] * row_pitch,
+            qkv.byte_stride[0] * head_dim as u64,
+            qkv.byte_stride[0] * head_dim as u64 * n_head as u64,
+        ],
+        element_stride: [1, row_pitch, head_dim as u64, head_dim as u64 * n_head as u64],
+        dtype: GgmlType::F32,
+    }
+}
+
+/// Fill an F32 tensor with zeros via `fill.slang` (`data_d[i] = param1`,
+/// i < KX). Used to zero the head-dim padding of the flash_attn Q/K/V buffers.
+fn record_fill_zero(ctx: &mut DispatchContext, dst: TensorView) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    let nelements: u32 = dst.dims.iter().product::<u64>() as u32;
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&nelements.to_ne_bytes()); // KX
+    // param1 (offset 8) = 0.0 -> already zero.
+    let key = PipelineKey::dense("fill_f32", 1, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::FILL_F32_SPV.as_bytes())?;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    bind_and_dispatch(ctx, &pipeline, &[0], &[dst.range()], &push, workgroups)?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+
+/// Gather the real `head_dim` channels of each head from the padded flash_attn
+/// output `fa_out` `[hd_pad*n_head, n_pos]` (row `head*hd_pad + d`) into
+/// `attn_concat` `[n_embd, n_pos]` (row `head*head_dim + d`). copy.slang reads
+/// the strided source (skipping the `head_dim..hd_pad` pad rows) and writes the
+/// contiguous dst.
+fn record_gather_unpad_heads(
+    ctx: &mut DispatchContext,
+    fa_out: &TensorView,
+    attn_concat: &TensorView,
+    head_dim: usize,
+    hd_pad: usize,
+    n_head: usize,
+    n_pos: usize,
+) -> Result<(), Box<dyn Error>> {
+    // Source view over fa_out as [head_dim, n_head, n_pos]: dim0 (d) stride 1,
+    // dim1 (head) stride hd_pad (skip pad rows), dim2 (token) stride
+    // hd_pad*n_head (full fa_out column pitch).
+    let pad_col = (hd_pad * n_head) as u64;
+    let src = TensorView {
+        buffer: fa_out.buffer,
+        byte_offset: fa_out.byte_offset,
+        byte_size: fa_out.byte_size,
+        dims: [head_dim as u64, n_head as u64, n_pos as u64, 1],
+        byte_stride: [4, 4 * hd_pad as u64, 4 * pad_col, 4 * pad_col * n_pos as u64],
+        element_stride: [1, hd_pad as u64, pad_col, pad_col * n_pos as u64],
+        dtype: GgmlType::F32,
+    };
+    // Dst is contiguous attn_concat reinterpreted as [head_dim, n_head, n_pos]
+    // (= [n_embd, n_pos], row = head*head_dim + d).
+    let dst = TensorView {
+        buffer: attn_concat.buffer,
+        byte_offset: attn_concat.byte_offset,
+        byte_size: attn_concat.byte_size,
+        dims: [head_dim as u64, n_head as u64, n_pos as u64, 1],
+        byte_stride: [
+            4,
+            4 * head_dim as u64,
+            4 * head_dim as u64 * n_head as u64,
+            4 * head_dim as u64 * n_head as u64 * n_pos as u64,
+        ],
+        element_stride: [
+            1,
+            head_dim as u64,
+            head_dim as u64 * n_head as u64,
+            head_dim as u64 * n_head as u64 * n_pos as u64,
+        ],
+        dtype: GgmlType::F32,
+    };
+    record_copy_contiguous(ctx, src, dst)
+}
+
+/// LayerNorm-affine on `[n_embd, n_pos]`: `ggml_norm` (subtract row mean,
+/// divide by `sqrt(var+eps)` over the n_embd row) -> `*weight` -> `+bias`.
+/// Composed from `norm.slang` (mean-subtract+inv_std, NO affine) + `record_mul`
+/// by `weight` + `record_add` by `bias`, both broadcast over the n_pos columns
+/// via `[n_embd, 1]` views. No new shader. `weight`/`bias` are `[n_embd]` F32.
+fn record_layernorm_affine(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    weight: TensorView,
+    bias: TensorView,
+    dst: TensorView,
+    eps: f32,
+) -> Result<(), Box<dyn Error>> {
+    let ne00 = src.dims[0] as u32; // n_embd (row length)
+    // norm.slang: GenericParams { KX, KY, param1=eps, ... }, one WG per row,
+    // row index decoded as z*262144 + y*512 + x.
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&ne00.to_ne_bytes()); // KX
+    push[8..12].copy_from_slice(&eps.to_ne_bytes()); // param1 = eps
+    let key = PipelineKey::dense("norm_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::NORM_F32_SPV.as_bytes())?;
+    let rows = (src.dims[1].max(1) * src.dims[2].max(1) * src.dims[3].max(1)) as u32;
+    let workgroups = row_workgroups(rows);
+    bind_and_dispatch(ctx, &pipeline, &[0, 1], &[src.range(), dst.range()], &push, workgroups)?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+
+    let w_bcast = broadcast_col_view(&weight, ne00 as u64);
+    record_mul(ctx, dst, w_bcast, dst)?;
+    let b_bcast = broadcast_col_view(&bias, ne00 as u64);
+    record_add(ctx, dst, b_bcast, dst)?;
+    Ok(())
+}
+
+/// Workgroup decomposition for a one-WG-per-row dispatch whose shader decodes
+/// `row = z*262144 + y*512 + x` (norm.slang, soft_max.slang).
+fn row_workgroups(rows: u32) -> [u32; 3] {
+    if rows <= 512 {
+        [rows, 1, 1]
+    } else if rows <= 512 * 512 {
+        [512, rows.div_ceil(512), 1]
+    } else {
+        [512, 512, rows.div_ceil(262144)]
+    }
+}
+
+/// View a `[n]` F32 weight/bias as `[n, 1, 1, 1]` so the binary add/mul shader
+/// broadcasts it across the dst's columns (dim1=1 folds the column index to 0
+/// via the fastdiv path).
+fn broadcast_col_view(v: &TensorView, n: u64) -> TensorView {
+    TensorView {
+        buffer: v.buffer,
+        byte_offset: v.byte_offset,
+        byte_size: v.byte_size,
+        dims: [n, 1, 1, 1],
+        byte_stride: [4, 4 * n, 4 * n, 4 * n],
+        element_stride: [1, n, n, n],
+        dtype: GgmlType::F32,
+    }
+}
+
+/// Add a per-row bias vector `[M]` to every column of a `[M, n_pos]` F32 tensor
+/// in place, via `record_add` with the bias presented as `[M, 1]`.
+fn record_add_bias_broadcast(
+    ctx: &mut DispatchContext,
+    dst: TensorView,
+    bias: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    let m = dst.dims[0];
+    let b = broadcast_col_view(&bias, m);
+    record_add(ctx, dst, b, dst)
+}
+
+/// Apply Qwen3-VL vision M-RoPE in place to a `[head_dim, n_head, n_pos]` F32
+/// view (Q or K). Thin wrapper over `rope_vision.slang`
+/// (`rope_funcs.slang::rope_vision`, GGML_ROPE_TYPE_VISION). Matches
+/// `ggml_rope_multi(..., d_head/2, {18,18,18,18}, VISION, 32768, 10000, 1, ...)`
+/// (qwen3vl.cpp:111-116). `n_dims = d_head/2`; the shader reads `sections[0]`/
+/// `[1]` only (`sect_dims = s0+s1`), uses `pos[i2]` for the first section
+/// (patch row) and `pos[i2+ne02]` for the second (patch col).
+fn record_vision_rope(
+    ctx: &mut DispatchContext,
+    qk: TensorView,
+    positions: BufferRange,
+    head_dim: usize,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(qk.dtype, GgmlType::F32);
+    let ne00 = qk.dims[0] as u32; // head_dim
+    let ne01 = qk.dims[1] as u32; // n_head
+    let ne02 = qk.dims[2] as u32; // n_pos
+    let nrows: u32 = ne01 * ne02 * qk.dims[3].max(1) as u32;
+    let n_dims = (head_dim / 2) as u32; // d_head/2 = 36
+    let sec = n_dims / 2; // 18 per (h,w) section
+    let freq_base = 10000.0f32;
+    let theta_scale = freq_base.powf(-2.0 / n_dims as f32);
+
+    // rope_params layout (rope_head.slang), 29 u32 slots = 116 bytes.
+    const ROPE_PARAMS_BYTES: u32 = 116;
+    let mut push = [0u8; ROPE_PARAMS_BYTES as usize];
+    let mut w = 0usize;
+    let put_u = |out: &mut [u8], w: &mut usize, v: u32| {
+        out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
+        *w += 4;
+    };
+    let put_f = |out: &mut [u8], w: &mut usize, v: f32| {
+        out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
+        *w += 4;
+    };
+    let put_i = |out: &mut [u8], w: &mut usize, v: i32| {
+        out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
+        *w += 4;
+    };
+    put_u(&mut push, &mut w, 0); // rope_mode (unused by rope_vision)
+    put_u(&mut push, &mut w, nrows);
+    put_u(&mut push, &mut w, n_dims);
+    put_f(&mut push, &mut w, 1.0); // freq_scale
+    put_f(&mut push, &mut w, freq_base);
+    put_f(&mut push, &mut w, 0.0); // ext_factor
+    put_f(&mut push, &mut w, 1.0); // attn_factor
+    put_f(&mut push, &mut w, 0.0); // corr_dims[0]
+    put_f(&mut push, &mut w, 0.0); // corr_dims[1]
+    put_f(&mut push, &mut w, theta_scale);
+    put_u(&mut push, &mut w, 0); // has_ff
+    put_i(&mut push, &mut w, sec as i32); // sections[0..4]
+    put_i(&mut push, &mut w, sec as i32);
+    put_i(&mut push, &mut w, sec as i32);
+    put_i(&mut push, &mut w, sec as i32);
+    put_u(&mut push, &mut w, 0); // is_imrope
+    put_u(&mut push, &mut w, 0); // is_back
+    put_u(&mut push, &mut w, 0); // set_rows_stride
+    put_u(&mut push, &mut w, ne00);
+    put_u(&mut push, &mut w, ne01);
+    put_u(&mut push, &mut w, ne02);
+    put_u(&mut push, &mut w, qk.element_stride[1] as u32); // nb01 (a)
+    put_u(&mut push, &mut w, qk.element_stride[2] as u32); // nb02 (a)
+    put_u(&mut push, &mut w, qk.element_stride[3] as u32); // nb03 (a)
+    put_u(&mut push, &mut w, qk.element_stride[1] as u32); // nb11 (d)
+    put_u(&mut push, &mut w, qk.element_stride[2] as u32); // nb12 (d)
+    put_u(&mut push, &mut w, qk.element_stride[3] as u32); // nb13 (d)
+    put_u(&mut push, &mut w, 0); // a_offset
+    put_u(&mut push, &mut w, 0); // d_offset
+    debug_assert_eq!(w, ROPE_PARAMS_BYTES as usize);
+
+    let key = PipelineKey::dense("rope_vision_f32", 4, ROPE_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::ROPE_VISION_F32_SPV.as_bytes())?;
+    // Shader: numthreads(1,256,1); i0 = 2*y so y spans n_dims/2 pairs; row = x +
+    // 32768*z. Bindings: 0=A, 1=pos, 2=freq_factor (unused; bind pos), 3=D.
+    let pairs = (ne00 / 2).max(1);
+    let workgroups = [nrows, pairs.div_ceil(256), 1];
+    bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2, 3],
+        &[qk.range(), positions, positions, qk.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, qk.range());
+    Ok(())
+}
+
+/// View the Q (base_row=0) / K (n_embd) / V (2*n_embd) section of the fused
+/// `qkv` `[3*n_embd, n_pos]` tensor as `[head_dim, n_head, n_pos]`. The
+/// section's `n_embd = head_dim*n_head` rows are reinterpreted as `head_dim`
+/// (dim0) × `n_head` (dim1); the token (dim2) stride is the full `3*n_embd`
+/// qkv row pitch. Used both for the in-place vision-RoPE (Q/K) and the
+/// flash_attn contiguous materialize (Q/K/V).
+fn qkv_section_view(
+    qkv: &TensorView,
+    head_dim: usize,
+    n_head: usize,
+    n_pos: usize,
+    base_row: usize,
+) -> TensorView {
+    let row_pitch = qkv.element_stride[1]; // = 3*n_embd
+    TensorView {
+        buffer: qkv.buffer,
+        byte_offset: qkv.byte_offset + (base_row as u64) * qkv.byte_stride[0],
+        byte_size: qkv.byte_size,
+        dims: [head_dim as u64, n_head as u64, n_pos as u64, 1],
+        byte_stride: [
+            qkv.byte_stride[0],
+            qkv.byte_stride[0] * head_dim as u64,
+            qkv.byte_stride[0] * row_pitch,
+            qkv.byte_stride[0] * row_pitch * n_pos as u64,
+        ],
+        element_stride: [1, head_dim as u64, row_pitch, row_pitch * n_pos as u64],
+        dtype: GgmlType::F32,
+    }
+}
+
+/// Copy a (possibly strided) F32 source into a contiguous F32 `dst` of the same
+/// logical shape. Reuses the generic-unary `copy.slang` (`f32` variant), which
+/// reads the source via its per-dim element strides (UnaryParams) and writes
+/// the dst contiguously.
+fn record_copy_contiguous(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    let push = crate::inference::ops::unary_params_bytes(&src, &dst, 0.0, 0.0);
+    let key = PipelineKey::dense(
+        "copy_f32",
+        2,
+        crate::inference::ops::UNARY_PARAMS_BYTES,
+        Vec::new(),
+    );
+    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::COPY_F32_SPV.as_bytes())?;
+    let nelements: u32 = dst.dims.iter().product::<u64>() as u32;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    bind_and_dispatch(ctx, &pipeline, &[0, 1], &[src.range(), dst.range()], &push, workgroups)?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// Copy a strided F32 `src` `[head_dim, n_pos, n_head]` into the first
+/// `head_dim` channels of a padded contiguous `dst_pad`
+/// `[hd_pad, n_pos, n_head]`, leaving channels `head_dim..hd_pad` (pre-zeroed)
+/// untouched. The dst is a strided `[head_dim, n_pos, n_head]` view whose
+/// dim1/dim2 strides step by `hd_pad` (skipping the pad rows).
+fn record_copy_pad_head(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst_pad: &TensorView,
+    head_dim: usize,
+    hd_pad: usize,
+) -> Result<(), Box<dyn Error>> {
+    let n_pos = src.dims[1];
+    let n_head = src.dims[2];
+    let dst_slice = TensorView {
+        buffer: dst_pad.buffer,
+        byte_offset: dst_pad.byte_offset,
+        byte_size: dst_pad.byte_size,
+        dims: [head_dim as u64, n_pos, n_head, 1],
+        byte_stride: [
+            4,
+            4 * hd_pad as u64,
+            4 * hd_pad as u64 * n_pos,
+            4 * hd_pad as u64 * n_pos * n_head,
+        ],
+        element_stride: [
+            1,
+            hd_pad as u64,
+            hd_pad as u64 * n_pos,
+            hd_pad as u64 * n_pos * n_head,
+        ],
+        dtype: GgmlType::F32,
+    };
+    record_copy_contiguous(ctx, src, dst_slice)
+}
+
+/// Element-wise GELU (tanh approximation) — matches `ggml_gelu` used by
+/// `build_ffn`'s `FFN_GELU` (clip.cpp:602). `gelu.slang` is the same
+/// tanh-approx kernel ggml-vulkan uses.
+fn record_gelu(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    let nelements: u32 = src.dims.iter().product::<u64>() as u32;
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&nelements.to_ne_bytes()); // KX
+    let key = PipelineKey::dense("gelu_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::GELU_F32_SPV.as_bytes())?;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    bind_and_dispatch(ctx, &pipeline, &[0, 1], &[src.range(), dst.range()], &push, workgroups)?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// Build the Qwen3-VL vision M-RoPE positions buffer: a flat `[n_pos*4]` i32
+/// array, axis-major. Faithful port of clip.cpp:3705-3730 (QWEN3VL):
+///
+/// ```text
+/// ptr = 0;
+/// for y in (0..ph step 2): for x in (0..pw step 2):
+///     for dy in 0..2: for dx in 0..2:
+///         positions[0*n_pos + ptr] = y + dy;   // axis 0 (patch ROW)
+///         positions[1*n_pos + ptr] = x + dx;   // axis 1 (patch COL)
+///         positions[2*n_pos + ptr] = y + dy;   // axis 2 (= row)
+///         positions[3*n_pos + ptr] = x + dx;   // axis 3 (= col)
+///         ptr++;
+/// ```
+///
+/// The 2x2-block iteration order matches Slice 2's `token_to_patch`.
+/// `rope_vision` reads axis0 (`pos[i2]`, row) and axis1 (`pos[i2+ne02]`, col).
+pub fn build_vision_positions(npx: usize, npy: usize) -> Vec<i32> {
+    let n_pos = npx * npy;
+    let mut positions = vec![0i32; n_pos * 4];
+    let merge = 2usize;
+    let mut ptr = 0usize;
+    let mut y = 0usize;
+    while y < npy {
+        let mut x = 0usize;
+        while x < npx {
+            for dy in 0..merge {
+                for dx in 0..merge {
+                    positions[ptr] = (y + dy) as i32;
+                    positions[n_pos + ptr] = (x + dx) as i32;
+                    positions[2 * n_pos + ptr] = (y + dy) as i32;
+                    positions[3 * n_pos + ptr] = (x + dx) as i32;
+                    ptr += 1;
+                }
+            }
+            x += merge;
+        }
+        y += merge;
+    }
+    positions
+}
+
+/// Reinterpret a `&[i32]` as native-endian bytes.
+fn i32_to_bytes(data: &[i32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * 4);
+    for &v in data {
+        out.extend_from_slice(&v.to_ne_bytes());
+    }
+    out
+}
+
+/// Pure CPU reference for [`VisionEncoder::record_block`] — the numerical
+/// oracle. Implements the SAME math from the (up-converted f32)
+/// [`BlockHostWeights`] with plain loops. `x` is `[n_embd, n_pos]`
+/// (idx = c + n_embd*t).
+pub fn block_cpu(
+    bw: &BlockHostWeights,
+    x: &[f32],
+    n_embd: usize,
+    n_head: usize,
+    n_ff: usize,
+    eps: f32,
+    grid_w: usize,
+    grid_h: usize,
+) -> Vec<f32> {
+    block_cpu_stage(bw, x, n_embd, n_head, n_ff, eps, grid_w, grid_h, None)
+}
+
+/// As [`block_cpu`] but returns the named intermediate stage instead of the
+/// final output, mirroring `record_block`'s `SEEKER_VISION_BLOCK_STAGE` hook.
+/// Stages: `"ln1"`, `"qkv"`, `"rope"`, `"qcopy"`, `"attn_concat"`. `None` =
+/// full block.
+#[allow(clippy::too_many_arguments)]
+pub fn block_cpu_stage(
+    bw: &BlockHostWeights,
+    x: &[f32],
+    n_embd: usize,
+    n_head: usize,
+    n_ff: usize,
+    eps: f32,
+    grid_w: usize,
+    grid_h: usize,
+    stage: Option<&str>,
+) -> Vec<f32> {
+    let n_pos = x.len() / n_embd;
+    let head_dim = n_embd / n_head;
+    debug_assert_eq!(grid_w * grid_h, n_pos);
+
+    // --- 1. h = LayerNorm_affine(x, ln1) ---
+    let h = layernorm_affine_cpu(x, &bw.ln1_w, &bw.ln1_b, n_embd, n_pos, eps);
+    if stage == Some("ln1") {
+        return h;
+    }
+
+    // --- 2. qkv = qkv_w @ h + qkv_b   [3*n_embd, n_pos] ---
+    let m3 = 3 * n_embd;
+    let mut qkv = vec![0f32; m3 * n_pos];
+    for t in 0..n_pos {
+        for mm in 0..m3 {
+            let mut acc = 0f32;
+            for k in 0..n_embd {
+                acc += bw.qkv_w[k + n_embd * mm] * h[k + n_embd * t];
+            }
+            qkv[mm + m3 * t] = acc + bw.qkv_b[mm];
+        }
+    }
+    if stage == Some("qkv") {
+        return qkv;
+    }
+
+    // --- 3. vision M-RoPE on Q (rows 0..n_embd) and K (n_embd..2n_embd) ---
+    let positions = build_vision_positions(grid_w, grid_h);
+    let n_dims = head_dim / 2; // 36
+    let sec = n_dims / 2; // 18
+    let freq_base = 10000.0f32;
+    let theta_scale = freq_base.powf(-2.0 / n_dims as f32);
+    for &base in &[0usize, n_embd] {
+        for t in 0..n_pos {
+            let pos_row = positions[t] as f32; // axis 0
+            let pos_col = positions[n_pos + t] as f32; // axis 1
+            for hd in 0..n_head {
+                let off = base + hd * head_dim + m3 * t;
+                for j in 0..n_dims {
+                    let theta_base = if j < sec {
+                        pos_row * theta_scale.powi(j as i32)
+                    } else {
+                        pos_col * theta_scale.powi((j - sec) as i32)
+                    };
+                    let cos_t = theta_base.cos();
+                    let sin_t = theta_base.sin();
+                    let x0 = qkv[off + j];
+                    let x1 = qkv[off + j + n_dims];
+                    qkv[off + j] = x0 * cos_t - x1 * sin_t;
+                    qkv[off + j + n_dims] = x0 * sin_t + x1 * cos_t;
+                }
+            }
+        }
+    }
+    if stage == Some("rope") {
+        return qkv;
+    }
+
+    // --- 4. bidirectional scaled-softmax attention per head ---
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    if stage == Some("qcopy") {
+        // q_c in the PADDED flash_attn layout [hd_pad, n_pos, n_head]: flat idx
+        // = d + hd_pad*token + hd_pad*n_pos*head, with channels head_dim..hd_pad
+        // zero. Matches the GPU's zero-filled + copied q_c exactly.
+        let hd_pad = head_dim.next_multiple_of(32);
+        let mut out = vec![0f32; hd_pad * n_pos * n_head];
+        for hd in 0..n_head {
+            for t in 0..n_pos {
+                for d in 0..head_dim {
+                    out[d + hd_pad * t + hd_pad * n_pos * hd] = qkv[hd * head_dim + d + m3 * t];
+                }
+            }
+        }
+        return out;
+    }
+    // attn_concat[c, t] with c = hd*head_dim + d.
+    let mut attn_concat = vec![0f32; n_embd * n_pos];
+    for hd in 0..n_head {
+        let q_base = hd * head_dim;
+        let k_base = n_embd + hd * head_dim;
+        let v_base = 2 * n_embd + hd * head_dim;
+        for qt in 0..n_pos {
+            let mut logits = vec![0f32; n_pos];
+            let mut maxv = f32::NEG_INFINITY;
+            for kt in 0..n_pos {
+                let mut dot = 0f32;
+                for d in 0..head_dim {
+                    dot += qkv[q_base + d + m3 * qt] * qkv[k_base + d + m3 * kt];
+                }
+                let s = dot * scale;
+                logits[kt] = s;
+                if s > maxv {
+                    maxv = s;
+                }
+            }
+            let mut sum = 0f32;
+            for l in logits.iter_mut() {
+                *l = (*l - maxv).exp();
+                sum += *l;
+            }
+            let inv = 1.0f32 / sum;
+            for d in 0..head_dim {
+                let mut acc = 0f32;
+                for kt in 0..n_pos {
+                    acc += logits[kt] * inv * qkv[v_base + d + m3 * kt];
+                }
+                attn_concat[hd * head_dim + d + n_embd * qt] = acc;
+            }
+        }
+    }
+    if stage == Some("attn_concat") {
+        return attn_concat;
+    }
+
+    // --- 5. attn = out_w @ attn_concat + out_b ; x = x + attn ---
+    let mut resid1 = vec![0f32; n_embd * n_pos];
+    for t in 0..n_pos {
+        for mm in 0..n_embd {
+            let mut acc = 0f32;
+            for k in 0..n_embd {
+                acc += bw.out_w[k + n_embd * mm] * attn_concat[k + n_embd * t];
+            }
+            resid1[mm + n_embd * t] = x[mm + n_embd * t] + acc + bw.out_b[mm];
+        }
+    }
+
+    // --- 6. h2 = LayerNorm_affine(resid1, ln2) ---
+    let h2 = layernorm_affine_cpu(&resid1, &bw.ln2_w, &bw.ln2_b, n_embd, n_pos, eps);
+
+    // --- 7. ffn = ffn_down @ gelu(ffn_up @ h2 + ffn_up_b) + ffn_down_b ---
+    let mut act = vec![0f32; n_ff * n_pos];
+    for t in 0..n_pos {
+        for mm in 0..n_ff {
+            let mut acc = 0f32;
+            for k in 0..n_embd {
+                acc += bw.ffn_up_w[k + n_embd * mm] * h2[k + n_embd * t];
+            }
+            act[mm + n_ff * t] = gelu_tanh(acc + bw.ffn_up_b[mm]);
+        }
+    }
+    let mut out = vec![0f32; n_embd * n_pos];
+    for t in 0..n_pos {
+        for mm in 0..n_embd {
+            let mut acc = 0f32;
+            for k in 0..n_ff {
+                acc += bw.ffn_down_w[k + n_ff * mm] * act[k + n_ff * t];
+            }
+            // --- 8. x = resid1 + ffn ---
+            out[mm + n_embd * t] = resid1[mm + n_embd * t] + acc + bw.ffn_down_b[mm];
+        }
+    }
+    out
+}
+
+/// CPU LayerNorm-affine over each `[n_embd]` column of `x` `[n_embd, n_pos]`:
+/// `(x - mean)/sqrt(var + eps) * w + b`. ggml_norm uses the **population**
+/// variance (`/n_embd`) — matching norm.slang:41.
+fn layernorm_affine_cpu(
+    x: &[f32],
+    w: &[f32],
+    b: &[f32],
+    n_embd: usize,
+    n_pos: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let mut out = vec![0f32; n_embd * n_pos];
+    for t in 0..n_pos {
+        let base = n_embd * t;
+        let mut mean = 0f32;
+        for c in 0..n_embd {
+            mean += x[base + c];
+        }
+        mean /= n_embd as f32;
+        let mut var = 0f32;
+        for c in 0..n_embd {
+            let d = x[base + c] - mean;
+            var += d * d;
+        }
+        var /= n_embd as f32;
+        let inv_std = 1.0f32 / (var + eps).sqrt();
+        for c in 0..n_embd {
+            out[base + c] = (x[base + c] - mean) * inv_std * w[c] + b[c];
+        }
+    }
+    out
+}
+
+/// Tanh-approximation GELU, matching `ggml_gelu` / `gelu.slang`:
+/// `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
+fn gelu_tanh(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+    const COEF_A: f32 = 0.044715;
+    let inner = SQRT_2_OVER_PI * (x + COEF_A * x * x * x);
+    0.5 * x * (1.0 + inner.tanh())
 }
 
 /// Host-side **F32** copies of the patch-embed weights, up-converted from the
@@ -281,8 +1245,24 @@ fn read_tensor_as_f32(
             }
             Ok(out)
         }
-        other => Err(format!("{name}: expected F16/F32, got {other:?}").into()),
+        GgmlType::BF16 => {
+            let n = bytes.len() / 2;
+            let mut out = vec![0f32; n];
+            for (i, o) in out.iter_mut().enumerate() {
+                let bits = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+                *o = bf16_to_f32(bits);
+            }
+            Ok(out)
+        }
+        other => Err(format!("{name}: expected BF16/F16/F32, got {other:?}").into()),
     }
+}
+
+/// bfloat16 (truncated IEEE-754 binary32 top 16 bits) -> f32. Exact: bf16 is
+/// the high half of an f32, so zero-extend into the mantissa. Matches
+/// `ggml_bf16_to_fp32`.
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
 }
 
 /// IEEE-754 half-precision (binary16) -> f32. Handles subnormals, inf, NaN.
@@ -694,5 +1674,166 @@ mod tests {
         // interior (1,1): xf=yf=0.25, bilinear of [[0,2],[8,10]]:
         //   = 0*0.75*0.75 + 2*0.25*0.75 + 8*0.75*0.25 + 10*0.25*0.25 = 2.5
         assert!((sample(1, 1) - 2.5).abs() < 1e-6, "got {}", sample(1, 1));
+    }
+
+    // ---- Slice 3 (ViT block) CPU unit tests ----
+
+    /// LayerNorm-affine on a hand-checkable row. For `x=[1,2,3,4]`: mean=2.5,
+    /// population var=1.25, normalized=[-1.5,-0.5,0.5,1.5]/sqrt(1.25). With
+    /// weight=2, bias=10 the output is `2*norm + 10`.
+    #[test]
+    fn layernorm_affine_hand_checked() {
+        let n_embd = 4;
+        let x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let w = vec![2.0f32; 4];
+        let b = vec![10.0f32; 4];
+        let out = layernorm_affine_cpu(&x, &w, &b, n_embd, 1, 0.0);
+        let inv = 1.0f32 / 1.25f32.sqrt();
+        let expect = [
+            2.0 * (-1.5 * inv) + 10.0,
+            2.0 * (-0.5 * inv) + 10.0,
+            2.0 * (0.5 * inv) + 10.0,
+            2.0 * (1.5 * inv) + 10.0,
+        ];
+        for (o, e) in out.iter().zip(expect.iter()) {
+            assert!((o - e).abs() < 1e-5, "got {o}, want {e}");
+        }
+        // Population variance: normalized is zero-mean.
+        let mean_norm: f32 = out.iter().map(|v| (v - 10.0) / 2.0).sum::<f32>() / 4.0;
+        assert!(mean_norm.abs() < 1e-5, "norm not zero-mean: {mean_norm}");
+    }
+
+    /// GELU (tanh approx) endpoints/anchors.
+    #[test]
+    fn gelu_tanh_endpoints() {
+        assert!(gelu_tanh(0.0).abs() < 1e-7);
+        assert!((gelu_tanh(10.0) - 10.0).abs() < 1e-3);
+        assert!(gelu_tanh(-10.0).abs() < 1e-4);
+        assert!((gelu_tanh(1.0) - 0.841_192).abs() < 1e-4, "got {}", gelu_tanh(1.0));
+        assert!(gelu_tanh(0.5) > gelu_tanh(-0.5));
+    }
+
+    /// bf16->f32 round-trips the high 16 bits of an f32 exactly.
+    #[test]
+    fn bf16_roundtrip_exact_when_representable() {
+        for &v in &[1.0f32, -2.0, 0.5, 0.0, 4.0] {
+            let bits = (v.to_bits() >> 16) as u16;
+            assert_eq!(bf16_to_f32(bits), v, "bf16 roundtrip failed for {v}");
+        }
+    }
+
+    /// The fused QKV split: Q rows `0..n_embd`, K `n_embd..2*n_embd`, V
+    /// `2*n_embd..3*n_embd`; head `hd` is `hd*head_dim..(hd+1)*head_dim`. Verify
+    /// the offset arithmetic block_cpu uses is a non-overlapping partition.
+    #[test]
+    fn qkv_split_offsets_partition() {
+        let n_embd = 1152;
+        let n_head = 16;
+        let head_dim = n_embd / n_head;
+        assert_eq!(head_dim, 72);
+        let mut seen = vec![0u8; 3 * n_embd];
+        for hd in 0..n_head {
+            for d in 0..head_dim {
+                for base in [hd * head_dim, n_embd + hd * head_dim, 2 * n_embd + hd * head_dim] {
+                    assert!(base + d < 3 * n_embd);
+                    seen[base + d] += 1;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&c| c == 1), "qkv split not a partition");
+    }
+
+    /// The vision-rope position map for a 4x4 patch grid. Asserts axis0[tok]=ph
+    /// and axis1[tok]=pw where `(pw,ph)=token_to_patch(tok, npx)`, i.e. the
+    /// positions match clip.cpp's 2x2-block iteration AND Slice 2's token order.
+    #[test]
+    fn vision_positions_match_token_order_4x4() {
+        let npx = 4;
+        let npy = 4;
+        let n_pos = npx * npy;
+        let pos = build_vision_positions(npx, npy);
+        assert_eq!(pos.len(), n_pos * 4);
+        for tok in 0..n_pos {
+            let (pw, ph) = token_to_patch(tok, npx);
+            assert_eq!(pos[tok], ph as i32, "tok {tok} axis0 (row)");
+            assert_eq!(pos[n_pos + tok], pw as i32, "tok {tok} axis1 (col)");
+            assert_eq!(pos[2 * n_pos + tok], ph as i32, "tok {tok} axis2");
+            assert_eq!(pos[3 * n_pos + tok], pw as i32, "tok {tok} axis3");
+        }
+        // First 2x2 block (clip.cpp:3713-3724, y=0,x=0; dy,dx in 0..2):
+        //   tok0=(r0,c0) tok1=(r0,c1) tok2=(r1,c0) tok3=(r1,c1).
+        assert_eq!((pos[0], pos[n_pos]), (0, 0));
+        assert_eq!((pos[1], pos[n_pos + 1]), (0, 1));
+        assert_eq!((pos[2], pos[n_pos + 2]), (1, 0));
+        assert_eq!((pos[3], pos[n_pos + 3]), (1, 1));
+    }
+
+    /// block_cpu with all matmul weights = 0 and biases = 0: LN1->qkv=0->attn=0
+    /// ->residual1=x; LN2->ffn(0)=0->out=residual1=x. A zero-weight block is the
+    /// identity on the residual stream.
+    #[test]
+    fn block_cpu_zero_weights_is_identity() {
+        let n_embd = 8;
+        let n_head = 2;
+        let n_ff = 16;
+        let (gw, gh) = (2usize, 2usize);
+        let n_pos = gw * gh;
+        let bw = BlockHostWeights {
+            ln1_w: vec![1.0; n_embd],
+            ln1_b: vec![0.0; n_embd],
+            qkv_w: vec![0.0; n_embd * 3 * n_embd],
+            qkv_b: vec![0.0; 3 * n_embd],
+            out_w: vec![0.0; n_embd * n_embd],
+            out_b: vec![0.0; n_embd],
+            ln2_w: vec![1.0; n_embd],
+            ln2_b: vec![0.0; n_embd],
+            ffn_up_w: vec![0.0; n_embd * n_ff],
+            ffn_up_b: vec![0.0; n_ff],
+            ffn_down_w: vec![0.0; n_ff * n_embd],
+            ffn_down_b: vec![0.0; n_embd],
+        };
+        let x: Vec<f32> = (0..n_embd * n_pos).map(|i| (i as f32) * 0.1 - 1.0).collect();
+        let out = block_cpu(&bw, &x, n_embd, n_head, n_ff, 1e-6, gw, gh);
+        for (o, xi) in out.iter().zip(x.iter()) {
+            assert!((o - xi).abs() < 1e-5, "zero-weight block not identity: {o} vs {xi}");
+        }
+    }
+
+    /// Full block_cpu pipeline on a valid 2x2 patch grid (n_pos=4) with identity
+    /// QKV, zero out-proj and zero FFN: attention and FFN contribute 0, so the
+    /// block is the residual identity `out = x`. Exercises the whole pipeline
+    /// (LN->QKV->rope->attention->residual->LN->FFN->residual) without panics.
+    #[test]
+    fn block_cpu_runs_2x2_grid() {
+        let n_embd = 8;
+        let n_head = 2;
+        let n_ff = 16;
+        let (gw, gh) = (2usize, 2usize);
+        let n_pos = gw * gh;
+        let mut qkv_w = vec![0.0f32; n_embd * 3 * n_embd];
+        for sec in 0..3 {
+            for c in 0..n_embd {
+                qkv_w[c + n_embd * (sec * n_embd + c)] = 1.0;
+            }
+        }
+        let bw = BlockHostWeights {
+            ln1_w: vec![1.0; n_embd],
+            ln1_b: vec![0.0; n_embd],
+            qkv_w,
+            qkv_b: vec![0.0; 3 * n_embd],
+            out_w: vec![0.0; n_embd * n_embd],
+            out_b: vec![0.0; n_embd],
+            ln2_w: vec![1.0; n_embd],
+            ln2_b: vec![0.0; n_embd],
+            ffn_up_w: vec![0.0; n_embd * n_ff],
+            ffn_up_b: vec![0.0; n_ff],
+            ffn_down_w: vec![0.0; n_ff * n_embd],
+            ffn_down_b: vec![0.0; n_embd],
+        };
+        let x: Vec<f32> = (0..n_embd * n_pos).map(|i| (i as f32) * 0.05 - 1.0).collect();
+        let out = block_cpu(&bw, &x, n_embd, n_head, n_ff, 1e-6, gw, gh);
+        for (o, xi) in out.iter().zip(x.iter()) {
+            assert!((o - xi).abs() < 1e-5, "2x2 residual mismatch: {o} vs {xi}");
+        }
     }
 }

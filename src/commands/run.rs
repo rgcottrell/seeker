@@ -150,6 +150,16 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    // Vision ViT-block smoke test (Phase 2, Slice 3): runs one ViT transformer
+    // block on the GPU and against the Rust CPU reference for layer 0, reporting
+    // max/mean error. Same self-contained mmproj-load rationale as above.
+    #[cfg(feature = "gpu_debug")]
+    if std::env::var("SEEKER_VISION_BLOCK_TEST").is_ok() {
+        let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
+        vision_block_smoke(&mut engine)?;
+        return Ok(());
+    }
+
     let resolved = resolve_model_path(&args).await?;
     let gguf = GgufFile::open(&resolved.main)?;
     let bundle = build_tokenizer(&gguf)?;
@@ -474,7 +484,15 @@ fn vision_patchembed_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
 
     let n_embd = config.n_embd as usize;
     let patch_size = config.patch_size as usize;
-    let encoder = VisionEncoder::new(&weights, n_embd, patch_size)?;
+    let encoder = VisionEncoder::new(
+        &weights,
+        n_embd,
+        patch_size,
+        config.n_head as usize,
+        config.n_ff as usize,
+        config.n_layer as usize,
+        config.eps,
+    )?;
 
     // Up-convert the patch-embed weights (F16 conv/pos, F32 bias) straight from
     // the mmap'd GGUF into host f32 — the uploaded GPU copy is device-local.
@@ -546,6 +564,197 @@ fn vision_patchembed_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
         return Err(
             format!("vision patch-embed GPU-vs-CPU max_abs {max_abs:.3e} > tol {tol:.0e}").into(),
         );
+    }
+    Ok(())
+}
+
+/// Vision ViT-block smoke test (Phase 2, Slice 3).
+///
+/// Loads the mmproj GGUF (path from `SEEKER_MMPROJ`, else the Qwen3.6 BF16
+/// snapshot), uploads its weights, preprocesses a small synthetic image, runs
+/// the Slice-2 patch-embed front-end to get the `[n_embd, n_patches]` block
+/// input, then runs ONE ViT transformer block (layer 0) on BOTH the GPU
+/// (`record_block`) and the Rust CPU reference (`block_cpu`) and reports
+/// max-abs / mean-abs error with PASS/FAIL.
+///
+/// The oracle is the Rust CPU reference (a faithful port of llama.cpp's
+/// per-block math; see `record_block`/`block_cpu` doc comments for the source
+/// citations). BF16 matmul weights make the tolerance looser than Slice 2 —
+/// gate at 2e-2 max_abs but REPORT the actual number. The gate hard-fails on
+/// any non-finite element (a NaN slips past a naive `d > max_abs` check since
+/// NaN compares false). An index bug (rope positions, qkv split, head layout)
+/// would show O(1) error, not ~1e-3.
+///
+/// `SEEKER_VISION_BLOCK_STAGE=<ln1|qkv|rope|qcopy|attn_concat>` returns that
+/// intermediate from both paths instead of the full block, to localize a diff.
+///
+/// Run with:
+///   SEEKER_VISION_BLOCK_TEST=1 SEEKER_MMPROJ=<mmproj.gguf> \
+///     cargo run --features gpu_debug --bin seeker -- run -m <mmproj.gguf>
+#[cfg(feature = "gpu_debug")]
+fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
+    use crate::vision::encoder::{
+        block_cpu_stage, patch_embed_cpu, BlockHostWeights, HostWeights, VisionEncoder,
+    };
+    use crate::vision::preprocess::{preprocess_rgb8, PreprocessConfig};
+
+    let mmproj_path = std::env::var("SEEKER_MMPROJ").unwrap_or_else(|_| {
+        "/models/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/\
+         5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/mmproj-BF16.gguf"
+            .to_string()
+    });
+    println!("VISION block smoke: loading mmproj {mmproj_path}");
+    let gguf = GgufFile::open(std::path::Path::new(&mmproj_path))?;
+    let config = crate::vision::parse_config(&gguf)?;
+    let n_embd = config.n_embd as usize;
+    let patch_size = config.patch_size as usize;
+    let n_head = config.n_head as usize;
+    let n_ff = config.n_ff as usize;
+    let n_layer = config.n_layer as usize;
+    let eps = config.eps;
+    println!(
+        "VISION config: n_embd={n_embd} n_head={n_head} head_dim={} n_ff={n_ff} \
+         n_layer={n_layer} eps={eps:e} patch={patch_size} merge={}",
+        n_embd / n_head,
+        config.spatial_merge_size
+    );
+
+    let weights = engine.upload_weights(&gguf)?;
+    let encoder =
+        VisionEncoder::new(&weights, n_embd, patch_size, n_head, n_ff, n_layer, eps)?;
+    let hw = HostWeights::from_gguf(&gguf)?;
+    let bw0 = BlockHostWeights::from_gguf(&gguf, 0)?;
+
+    // Small deterministic gradient image (64x64 raw → clamped up to 96x96 by
+    // min_pixels → 6x6 patch grid).
+    let (sw, sh) = (64u32, 64u32);
+    let mut buf = vec![0u8; (sw * sh * 3) as usize];
+    for y in 0..sh {
+        for x in 0..sw {
+            let i = (3 * (y * sw + x)) as usize;
+            buf[i] = (x % 256) as u8;
+            buf[i + 1] = (y % 256) as u8;
+            buf[i + 2] = ((x + y) % 256) as u8;
+        }
+    }
+    let pcfg = PreprocessConfig::qwen3vl_default(
+        config.patch_size,
+        config.spatial_merge_size,
+        config.image_mean,
+        config.image_std,
+    );
+    let img = preprocess_rgb8(&buf, sw, sh, &pcfg)?;
+    let grid_w = img.grid_w;
+    let grid_h = img.grid_h;
+    let n_patches = (grid_w * grid_h) as usize;
+    println!(
+        "VISION image: resized={}x{} grid={grid_w}x{grid_h} n_patches={n_patches}",
+        img.resized_w, img.resized_h
+    );
+
+    // The block records many F32 scratch tensors; size scratch generously for
+    // this small grid before the forward (the 1 MiB Engine::new default is too
+    // small for the n_ff FFN + flash_attn buffers).
+    let scratch_bytes = (n_embd * n_patches * 4 * 64).max(64 << 20) as u64;
+    engine.allocate_scratch(scratch_bytes)?;
+
+    // Block input = the Slice-2 patch-embed output (CPU reference, deterministic),
+    // staged to the GPU so both paths start from identical bytes.
+    let block_in = patch_embed_cpu(&hw, n_embd, patch_size, &img);
+    debug_assert_eq!(block_in.len(), n_embd * n_patches);
+
+    let gpu = engine.forward(
+        &weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let mut bytes = Vec::with_capacity(block_in.len() * 4);
+            for &v in &block_in {
+                bytes.extend_from_slice(&v.to_ne_bytes());
+            }
+            let range = ctx.alloc_scratch(bytes.len() as u64)?;
+            let base = ctx.scratch.host_ptr.ok_or("vision: scratch not host-visible")?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    base.add(range.offset as usize),
+                    bytes.len(),
+                );
+            }
+            let es = [
+                1u64,
+                n_embd as u64,
+                (n_embd * n_patches) as u64,
+                (n_embd * n_patches) as u64,
+            ];
+            let x = crate::inference::weights::TensorView {
+                buffer: range.buffer,
+                byte_offset: range.offset,
+                byte_size: range.size,
+                dims: [n_embd as u64, n_patches as u64, 1, 1],
+                byte_stride: [es[0] * 4, es[1] * 4, es[2] * 4, es[3] * 4],
+                element_stride: es,
+                dtype: crate::gguf::GgmlType::F32,
+            };
+            let out = encoder.record_block(ctx, x, 0, grid_w, grid_h)?;
+            Ok(out.range())
+        },
+    )?;
+
+    // CPU reference for layer 0 (matching the same stage cutoff if requested;
+    // `record_block` reads SEEKER_VISION_BLOCK_STAGE internally).
+    let stage = std::env::var("SEEKER_VISION_BLOCK_STAGE").ok();
+    let cpu = block_cpu_stage(
+        &bw0,
+        &block_in,
+        n_embd,
+        n_head,
+        n_ff,
+        eps,
+        grid_w as usize,
+        grid_h as usize,
+        stage.as_deref(),
+    );
+
+    if gpu.len() != cpu.len() {
+        return Err(format!("length mismatch: gpu {} vs cpu {}", gpu.len(), cpu.len()).into());
+    }
+    let mut max_abs = 0f64;
+    let mut sum_abs = 0f64;
+    let mut worst = 0usize;
+    let mut n_nonfinite = 0usize;
+    for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+        if !g.is_finite() || !c.is_finite() {
+            if n_nonfinite == 0 {
+                worst = i;
+            }
+            n_nonfinite += 1;
+            continue;
+        }
+        let d = (*g as f64 - *c as f64).abs();
+        if d > max_abs {
+            max_abs = d;
+            worst = i;
+        }
+        sum_abs += d;
+    }
+    let mean_abs = sum_abs / gpu.len() as f64;
+    let tol = 2e-2;
+    // NaN/Inf is a hard fail — `d > max_abs` is always false for NaN, so without
+    // this a NaN-poisoned output would slip through as a false PASS.
+    let pass = max_abs <= tol && n_nonfinite == 0;
+    if n_nonfinite > 0 {
+        println!("VISION block: {n_nonfinite} non-finite element(s); first at idx {worst}");
+    }
+    println!(
+        "VISION block{}: elements={} max_abs={max_abs:.3e} mean_abs={mean_abs:.3e} \
+         worst_idx={worst} gpu={:.6} cpu={:.6} -> {}",
+        stage.as_deref().map(|s| format!("({s})")).unwrap_or_else(|| "(layer 0)".to_string()),
+        gpu.len(),
+        gpu[worst],
+        cpu[worst],
+        if pass { "PASS" } else { "FAIL" }
+    );
+    if !pass {
+        return Err(format!("vision block GPU-vs-CPU max_abs {max_abs:.3e} > tol {tol:.0e}").into());
     }
     Ok(())
 }
