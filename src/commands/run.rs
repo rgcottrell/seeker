@@ -226,6 +226,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             gdn_smoke_test(&mut engine, model.weights())?;
             return Ok(());
         }
+        if std::env::var("SEEKER_FA_BATCH_TEST").is_ok() {
+            fa_batch_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
         if std::env::var("SEEKER_WQ_DUMP").is_ok() {
             wq_dump_test(&mut engine, model.weights())?;
             return Ok(());
@@ -407,6 +411,151 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         "timing:    prefill {prefill_tokens} tok in {:.3}s ({prefill_tps:.1} tok/s), decode {} tok in {:.3}s ({decode_tps:.1} tok/s)",
         prefill_secs, decode_steps as u32, decode_secs,
     );
+    Ok(())
+}
+
+/// Batched-decode flash-attention smoke test: B sequences, one query token
+/// each, each attending to its own KV slab over its own `kv_len`. Runs the
+/// batched dispatch (`flash_attn::record_batched`) on synthetic F32 Q/K/V and
+/// compares against a CPU reference (per-(seq, head) softmax attention). This
+/// proves the per-sequence `kv_len` keystone works for `n_seqs > 1` — the
+/// linchpin of continuous batching — independent of the slab-KV / forward
+/// plumbing. Run with `SEEKER_FA_BATCH_TEST=1 seeker run --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn fa_batch_smoke_test(
+    engine: &mut Engine,
+    weights: &crate::inference::weights::WeightsHandle,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::buffer::BufferRange;
+    use crate::inference::ops::flash_attn;
+
+    let head_dim: usize = 64; // multiple of 32 (HSV_PER_THREAD = HSV/32)
+    let n_head: usize = 4;
+    let n_head_kv: usize = 2; // gqa_ratio = 2
+    let gqa = (n_head / n_head_kv) as u32;
+    let hidden = head_dim * n_head;
+    let kv_lens: Vec<u32> = vec![5, 8, 3];
+    let b = kv_lens.len();
+    let max_kv = *kv_lens.iter().max().unwrap() as usize;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    println!(
+        "FA batch smoke: B={b}, head_dim={head_dim}, n_head={n_head}, n_head_kv={n_head_kv}, kv_lens={kv_lens:?}"
+    );
+
+    // Deterministic synthetic inputs (host-side, also drive the CPU reference).
+    let q_val = |s: usize, h: usize, d: usize| ((s * 7 + h * 3 + d) as f32 * 0.013).sin();
+    let k_val =
+        |s: usize, kh: usize, j: usize, d: usize| ((s * 5 + kh * 4 + j * 2 + d) as f32 * 0.021).cos();
+    let v_val = |s: usize, kh: usize, j: usize, d: usize| {
+        ((s * 9 + kh * 2 + j * 3 + d) as f32 * 0.017).sin() * 0.5
+    };
+
+    // CPU reference: out[s][h][d].
+    let mut reference = vec![0f32; b * hidden];
+    for s in 0..b {
+        for h in 0..n_head {
+            let kh = h / (gqa as usize);
+            let klen = kv_lens[s] as usize;
+            let mut scores = vec![0f32; klen];
+            let mut maxs = f32::NEG_INFINITY;
+            for j in 0..klen {
+                let mut dot = 0f32;
+                for d in 0..head_dim {
+                    dot += q_val(s, h, d) * k_val(s, kh, j, d);
+                }
+                scores[j] = dot * scale;
+                maxs = maxs.max(scores[j]);
+            }
+            let mut denom = 0f32;
+            for sj in scores.iter_mut() {
+                *sj = (*sj - maxs).exp();
+                denom += *sj;
+            }
+            for d in 0..head_dim {
+                let mut acc = 0f32;
+                for j in 0..klen {
+                    acc += scores[j] * v_val(s, kh, j, d);
+                }
+                reference[s * hidden + h * head_dim + d] = acc / denom;
+            }
+        }
+    }
+
+    // GPU batched dispatch on synthetic F32 Q/K/V laid out as the shader expects:
+    //   Q [head_dim, 1, n_head, B]   (contiguous: [B][n_head][head_dim])
+    //   K/V [head_dim, max_kv, n_head_kv, B]  ([B][n_head_kv][max_kv][head_dim])
+    let gpu_out = engine.forward(weights, |ctx| -> Result<BufferRange, Box<dyn Error>> {
+        let host = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
+        let q = ctx.alloc_tensor([head_dim as u64, 1, n_head as u64, b as u64], GgmlType::F32)?;
+        let k = ctx.alloc_tensor(
+            [head_dim as u64, max_kv as u64, n_head_kv as u64, b as u64],
+            GgmlType::F32,
+        )?;
+        let v = ctx.alloc_tensor(
+            [head_dim as u64, max_kv as u64, n_head_kv as u64, b as u64],
+            GgmlType::F32,
+        )?;
+        unsafe {
+            let qp = host.add(q.byte_offset as usize) as *mut f32;
+            for s in 0..b {
+                for h in 0..n_head {
+                    for d in 0..head_dim {
+                        *qp.add(s * hidden + h * head_dim + d) = q_val(s, h, d);
+                    }
+                }
+            }
+            let kp = host.add(k.byte_offset as usize) as *mut f32;
+            let vp = host.add(v.byte_offset as usize) as *mut f32;
+            let slab = n_head_kv * max_kv * head_dim;
+            for s in 0..b {
+                for kh in 0..n_head_kv {
+                    for j in 0..max_kv {
+                        for d in 0..head_dim {
+                            let idx = s * slab + kh * (max_kv * head_dim) + j * head_dim + d;
+                            *kp.add(idx) = k_val(s, kh, j, d);
+                            *vp.add(idx) = v_val(s, kh, j, d);
+                        }
+                    }
+                }
+            }
+        }
+        let out = ctx.alloc_tensor([hidden as u64, b as u64, 1, 1], GgmlType::F32)?;
+        let params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim as u32,
+            head_dim_v: head_dim as u32,
+            gqa_ratio: gqa,
+            scale,
+        };
+        flash_attn::record_batched(ctx, q, k, v, out, params, &kv_lens)?;
+        Ok(out.range())
+    })?;
+
+    let mut max_err = 0f32;
+    let mut worst = (0usize, 0usize, 0usize);
+    for s in 0..b {
+        for h in 0..n_head {
+            for d in 0..head_dim {
+                let idx = s * hidden + h * head_dim + d;
+                let e = (gpu_out[idx] - reference[idx]).abs();
+                if e > max_err {
+                    max_err = e;
+                    worst = (s, h, d);
+                }
+            }
+        }
+    }
+    let (ws, wh, wd) = worst;
+    let widx = ws * hidden + wh * head_dim + wd;
+    println!(
+        "  max_err = {max_err:.3e} at (seq={ws}, head={wh}, d={wd}); gpu={:.5}, ref={:.5}",
+        gpu_out[widx], reference[widx]
+    );
+    if max_err < 1e-4 {
+        println!("  RESULT: PASS (batched attention matches per-sequence CPU reference)");
+    } else {
+        println!("  RESULT: FAIL — batched attention diverges from the CPU reference");
+    }
     Ok(())
 }
 
@@ -1219,6 +1368,7 @@ fn gdn_smoke_test(
                     s3: (num_v * l) as u32,
                 },
                 s_v as u32,
+                1, // k_snapshots = 1 (normal mode: final state only, no checkpoint)
             )?;
             // Return only the attn portion (first attn_floats of gdn_dst).
             Ok(crate::inference::buffer::BufferRange {
@@ -1818,14 +1968,14 @@ fn kquant_matmul_test(
     let m = a.dims[1]; // output rows
     println!("kquant matmul test: {full_name} dtype={:?} K={k} M={m}", a.dtype);
 
-    // Raw quant bytes live in the (host-visible) weights region.
-    let host_ptr = weights
-        .region
-        .host_ptr
-        .ok_or("weights region not host-visible")?;
+    // Raw quant bytes — weights are per-tensor device-local now, so go through
+    // the debug host-base accessor (same as the other gpu_debug harnesses).
+    let base = weights
+        .debug_host_base(&a)
+        .ok_or("host-side weight reads unsupported (weights are device-local)")?;
     let raw: &[u8] = unsafe {
         std::slice::from_raw_parts(
-            host_ptr.add(a.byte_offset as usize),
+            base.add(a.byte_offset as usize),
             a.byte_size as usize,
         )
     };

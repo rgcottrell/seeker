@@ -380,6 +380,167 @@ pub fn record(
     Ok(())
 }
 
+/// Batched **decode** flash attention: B independent sequences, one query
+/// token each, each attending to its own KV slab over its own length.
+///
+/// `q` is `[head_dim, 1, n_head, B]`, `k`/`v` are `[head_dim, kv_pos, n_head_kv,
+/// B]` where the batch (dim 3, stride `element_stride[3]`) selects a sequence's
+/// slab. `kv_lens[b]` is sequence `b`'s cache length. `out` is `[hidden, B]`
+/// (`[HSV, n_head, B]`). No mask (a decode query attends to its whole cache).
+///
+/// v1 uses no split-K (`k_num = 1`): each (row, head, seq) workgroup walks its
+/// sequence's KV serially. `blocks_per_split` is sized from the longest
+/// sequence so every sequence's full range is covered; shorter sequences stop
+/// early via the per-element `kv_base + c < p_KV` guard (`p_KV = kv_lens[seq]`).
+/// Split-K for long-context batches is a later (M4) refinement.
+pub fn record_batched(
+    ctx: &mut DispatchContext,
+    q: TensorView,
+    k: TensorView,
+    v: TensorView,
+    out: TensorView,
+    params: FlashAttnParams,
+    kv_lens: &[u32],
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(q.dtype, GgmlType::F32);
+    debug_assert_eq!(out.dtype, GgmlType::F32);
+    debug_assert_eq!(k.dtype, v.dtype, "flash_attn requires K and V to share a dtype");
+    let b = kv_lens.len() as u32;
+    debug_assert!(b >= 1, "record_batched needs at least one sequence");
+    debug_assert_eq!(q.dims[3].max(1) as u32, b, "q batch dim must equal kv_lens.len()");
+
+    let (variant_name, variant_spv) = match k.dtype {
+        GgmlType::F32 => ("flash_attn_f32_f32", shaders::FLASH_ATTN_F32_F32_SPV.as_bytes()),
+        GgmlType::F16 => ("flash_attn_f32_f16", shaders::FLASH_ATTN_F32_F16_SPV.as_bytes()),
+        GgmlType::BF16 => ("flash_attn_f32_bf16", shaders::FLASH_ATTN_F32_BF16_SPV.as_bytes()),
+        GgmlType::Q4_0 => ("flash_attn_f32_q4_0", shaders::FLASH_ATTN_F32_Q4_0_SPV.as_bytes()),
+        GgmlType::Q4_1 => ("flash_attn_f32_q4_1", shaders::FLASH_ATTN_F32_Q4_1_SPV.as_bytes()),
+        GgmlType::Q5_0 => ("flash_attn_f32_q5_0", shaders::FLASH_ATTN_F32_Q5_0_SPV.as_bytes()),
+        GgmlType::Q5_1 => ("flash_attn_f32_q5_1", shaders::FLASH_ATTN_F32_Q5_1_SPV.as_bytes()),
+        GgmlType::Q8_0 => ("flash_attn_f32_q8_0", shaders::FLASH_ATTN_F32_Q8_0_SPV.as_bytes()),
+        GgmlType::IQ4_NL => (
+            "flash_attn_f32_iq4_nl",
+            shaders::FLASH_ATTN_F32_IQ4_NL_SPV.as_bytes(),
+        ),
+        other => return Err(format!("flash_attn: no shader variant for K/V dtype {other:?}").into()),
+    };
+
+    let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+    let num_blocks = max_kv.div_ceil(FA_BC).max(1);
+
+    // Per-sequence DecodeDyn array: entry b's kv_len bounds sequence b's KV
+    // loop; entry 0's k_num / blocks_per_split are read uniformly by every
+    // workgroup. Zero the rest so stale scratch never leaks into a field.
+    let dyn_range = crate::inference::decode_dyn::alloc_array(ctx, b)?;
+    {
+        let host_ptr = ctx
+            .scratch
+            .host_ptr
+            .ok_or("scratch not host-visible — record_batched requires mapped memory")?;
+        let mut entries = vec![crate::inference::decode_dyn::DecodeDyn::default(); b as usize];
+        for (i, e) in entries.iter_mut().enumerate() {
+            e.kv_len = kv_lens[i];
+        }
+        entries[0].k_num = 1;
+        entries[0].blocks_per_split = num_blocks;
+        unsafe {
+            let dst = host_ptr.add(dyn_range.offset as usize)
+                as *mut crate::inference::decode_dyn::DecodeDyn;
+            std::ptr::copy_nonoverlapping(entries.as_ptr(), dst, entries.len());
+        }
+    }
+
+    let n = 1u32; // one query row per head per sequence (decode)
+    let ne1 = n;
+    let ne2 = q.dims[2] as u32; // n_head
+    let ne3 = b;
+    let push_strides = [
+        n,
+        max_kv,
+        ne1,
+        ne2,
+        ne3,
+        q.dims[2] as u32,             // neq2
+        b,                            // neq3
+        k.dims[2] as u32,             // nek2
+        b,                            // nek3
+        v.dims[2] as u32,             // nev2
+        b,                            // nev3
+        1,                            // nem1 (mask disabled)
+        1,                            // nem2
+        1,                            // nem3
+        q.element_stride[1] as u32,   // nb01
+        q.element_stride[2] as u32,   // nb02
+        q.element_stride[3] as u32,   // nb03
+        k.element_stride[1] as u32,   // nb11
+        k.element_stride[2] as u32,   // nb12
+        k.element_stride[3] as u32,   // nb13
+        v.element_stride[1] as u32,   // nb21
+        v.element_stride[2] as u32,   // nb22
+        v.element_stride[3] as u32,   // nb23
+    ];
+
+    let mut push = [0u8; FA_PUSH_BYTES as usize];
+    let mut w = 0;
+    fn put_u(out: &mut [u8], w: &mut usize, v: u32) {
+        out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
+        *w += 4;
+    }
+    fn put_f(out: &mut [u8], w: &mut usize, v: f32) {
+        out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
+        *w += 4;
+    }
+    for s in push_strides {
+        put_u(&mut push, &mut w, s);
+    }
+    put_f(&mut push, &mut w, params.scale);
+    put_f(&mut push, &mut w, 0.0); // max_bias
+    put_f(&mut push, &mut w, 0.0); // logit_softcap
+    put_u(&mut push, &mut w, 0); // mask_kv_offset (no prefix mask on decode)
+    put_f(&mut push, &mut w, 0.0); // m0
+    put_f(&mut push, &mut w, 0.0); // m1
+    put_u(&mut push, &mut w, params.gqa_ratio);
+    put_u(&mut push, &mut w, num_blocks); // split_kv (blocks per split)
+    put_u(&mut push, &mut w, 1); // k_num
+
+    let spec_constants = vec![
+        FA_BC,
+        params.head_dim_k,
+        params.head_dim_v,
+        0, // MASK_ENABLE
+        0, // Clamp
+    ];
+    let key = PipelineKey {
+        name: variant_name.to_string(),
+        binding_indices: vec![0, 1, 2, 3, 4, 5, 6],
+        push_size: FA_PUSH_BYTES,
+        spec_constants,
+        required_subgroup_size: Some(32),
+    };
+    let pipeline = *ctx.pipelines.get(ctx.device, key, variant_spv)?;
+
+    // Single-pass grid: one workgroup per (query-row, head, sequence).
+    let workgroups = [n, ne2, ne3];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2, 3, 4, 5, 6],
+        &[
+            q.range(),
+            k.range(),
+            v.range(),
+            q.range(), // data_m stand-in (MASK_ENABLE=0 → never read)
+            out.range(), // data_o_split stand-in (k_num=1 → unused)
+            out.range(),
+            dyn_range,
+        ],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, out.range());
+    Ok(())
+}
+
 /// Pick the KV-split factor `(k_num, blocks_per_split)` for the main
 /// flash-attn dispatch, replicating llama.cpp's heuristic
 /// (`ggml_vk_flash_attn` in ggml-vulkan.cpp).
