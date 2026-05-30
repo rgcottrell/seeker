@@ -505,6 +505,17 @@ pub struct BatchKvCache {
     v_slab_stride: u64,
     /// Current write position (tokens) of each slot.
     pub positions: Vec<u32>,
+    /// Per-sequence SSM/GDN recurrent state (hybrid models), allocated by
+    /// [`Self::allocate_ssm_state`]. Per layer the GDN state is one contiguous
+    /// `B × gdn_state_floats` block (the GDN shader indexes seq as the
+    /// outermost state dim → dispatched at `n_seqs = B`); the conv state is
+    /// `B × conv_state_floats`, addressed per slot for the per-sequence
+    /// conv-input prefix + writeback.
+    ssm_region: Option<Region>,
+    ssm_conv_base: Vec<u64>,
+    ssm_gdn_base: Vec<u64>,
+    conv_slab_floats: u32,
+    gdn_slab_floats: u32,
     device: Arc<DeviceShared>,
 }
 
@@ -584,8 +595,85 @@ impl BatchKvCache {
             k_slab_stride,
             v_slab_stride,
             positions: vec![0; n_slots as usize],
+            ssm_region: None,
+            ssm_conv_base: Vec::new(),
+            ssm_gdn_base: Vec::new(),
+            conv_slab_floats: 0,
+            gdn_slab_floats: 0,
             device: device.shared(),
         })
+    }
+
+    /// Allocate per-sequence SSM recurrent state for a hybrid model. Per layer:
+    /// a contiguous `n_slots × gdn_state_floats` GDN block (seq-outermost, so a
+    /// single `n_seqs = n_slots` gated-delta-net dispatch reads/writes all
+    /// sequences) and an `n_slots × conv_state_floats` conv block (addressed per
+    /// slot). Zero-initialized. Layer blocks are storage-aligned.
+    pub fn allocate_ssm_state(
+        &mut self,
+        device: &Device,
+        n_ssm_layers: u32,
+        conv_state_floats: u32,
+        gdn_state_floats: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let n = self.n_slots as u64;
+        let conv_block = (conv_state_floats as u64) * n * 4;
+        let gdn_block = (gdn_state_floats as u64) * n * 4;
+        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+
+        let mut conv_base = Vec::with_capacity(n_ssm_layers as usize);
+        let mut gdn_base = Vec::with_capacity(n_ssm_layers as usize);
+        let mut cursor = 0u64;
+        for _ in 0..n_ssm_layers {
+            let cb = align_up(cursor, align);
+            cursor = cb + conv_block;
+            let gb = align_up(cursor, align);
+            cursor = gb + gdn_block;
+            conv_base.push(cb);
+            gdn_base.push(gb);
+        }
+        let total = cursor.max(1);
+
+        let region = Region::new(
+            device,
+            total,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        if let Some(p) = region.host_ptr {
+            unsafe { std::ptr::write_bytes(p, 0, total as usize) };
+        }
+        self.ssm_region = Some(region);
+        self.ssm_conv_base = conv_base;
+        self.ssm_gdn_base = gdn_base;
+        self.conv_slab_floats = conv_state_floats;
+        self.gdn_slab_floats = gdn_state_floats;
+        Ok(())
+    }
+
+    /// The contiguous `n_slots × gdn_state_floats` GDN state block for `layer`
+    /// (fed to a single `n_seqs = n_slots` gated-delta-net dispatch).
+    pub fn gdn_state_layer(&self, layer: u32) -> crate::inference::buffer::BufferRange {
+        let region = self.ssm_region.as_ref().expect("SSM state not allocated");
+        crate::inference::buffer::BufferRange {
+            buffer: region.buffer,
+            offset: self.ssm_gdn_base[layer as usize],
+            size: (self.gdn_slab_floats as u64) * (self.n_slots as u64) * 4,
+        }
+    }
+
+    /// Sequence `slot`'s conv state for `layer` (the per-sequence conv-input
+    /// prefix source and writeback target).
+    pub fn conv_state_slot(&self, layer: u32, slot: u32) -> crate::inference::buffer::BufferRange {
+        let region = self.ssm_region.as_ref().expect("SSM state not allocated");
+        let slab = (self.conv_slab_floats as u64) * 4;
+        crate::inference::buffer::BufferRange {
+            buffer: region.buffer,
+            offset: self.ssm_conv_base[layer as usize] + slot as u64 * slab,
+            size: slab,
+        }
     }
 
     /// Single-slot natural `[head_dim, n_head_kv, max_seq_len]` K view (slab
@@ -666,7 +754,11 @@ impl BatchKvCache {
 
 impl Drop for BatchKvCache {
     fn drop(&mut self) {
-        self.region.destroy(self.device.raw());
+        let dev = self.device.raw();
+        self.region.destroy(dev);
+        if let Some(mut r) = self.ssm_region.take() {
+            r.destroy(dev);
+        }
     }
 }
 
