@@ -60,3 +60,52 @@ pub fn build_router(cors: bool, state: AppState) -> Router {
     }
     app.layer(TraceLayer::new_for_http()).with_state(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // for `oneshot`
+
+    /// Drive one request through the no-model router and return the status.
+    async fn status(method: &str, uri: &str, body: &str) -> StatusCode {
+        let app = build_router(false, AppState::default());
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn health_and_models_ok_without_model() {
+        assert_eq!(status("GET", "/health", "").await, StatusCode::OK);
+        assert_eq!(status("GET", "/v1/models", "").await, StatusCode::OK);
+        assert_eq!(status("GET", "/props", "").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn generation_endpoints_503_without_model() {
+        for uri in ["/v1/chat/completions", "/v1/completions", "/completion", "/v1/messages"] {
+            assert_eq!(
+                status("POST", uri, "{}").await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri} should 503 without a model"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_endpoints_501() {
+        for uri in ["/v1/embeddings", "/embedding", "/v1/rerank", "/v1/audio/transcriptions"] {
+            assert_eq!(
+                status("POST", uri, "{}").await,
+                StatusCode::NOT_IMPLEMENTED,
+                "{uri} should 501"
+            );
+        }
+    }
+}

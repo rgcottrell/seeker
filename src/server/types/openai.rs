@@ -2,15 +2,12 @@
 //!
 //! Request types are deliberately permissive: unknown fields are accepted
 //! (via `#[serde(default)]` on every option) so callers can hand us their
-//! full payload and have it round-trip cleanly until inference is wired up.
+//! full payload and have it round-trip cleanly.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::common::Usage;
-
-pub const STUB_TEXT: &str = "[stub] seeker serve has no inference backend wired up yet";
-pub const STUB_MODEL: &str = "seeker-stub";
 
 // ---------------------------------------------------------------------------
 // /v1/chat/completions
@@ -65,23 +62,26 @@ pub struct ChatCompletionRequest {
 }
 
 impl ChatCompletionRequest {
-    /// Translate the request's sampling fields into a `SamplerConfig`,
-    /// filling unspecified fields from the Qwen3-recommended defaults.
+    /// Translate the request's sampling fields into a `SamplerConfig`, filling
+    /// unspecified fields from the server's CLI-provided `base` defaults.
     /// llama-server-flavored: presence/frequency penalties have llama.cpp
-    /// semantics, NOT OpenAI's additive [-2, 2] semantics.
-    pub fn sampler_config(&self) -> crate::inference::sample::SamplerConfig {
-        let d = crate::inference::sample::SamplerConfig::default();
+    /// semantics, NOT OpenAI's additive [-2, 2] semantics. `logit_bias` and the
+    /// EOS handling always inherit the CLI base (not exposed per-request).
+    pub fn sampler_config(
+        &self,
+        base: &crate::inference::sample::SamplerConfig,
+    ) -> crate::inference::sample::SamplerConfig {
         crate::inference::sample::SamplerConfig {
-            temperature: self.temperature.unwrap_or(d.temperature),
-            top_k: self.top_k.unwrap_or(d.top_k),
-            top_p: self.top_p.unwrap_or(d.top_p),
-            min_p: self.min_p.unwrap_or(d.min_p),
-            presence_penalty: self.presence_penalty.unwrap_or(d.presence_penalty),
-            frequency_penalty: self.frequency_penalty.unwrap_or(d.frequency_penalty),
-            repeat_penalty: self.repeat_penalty.unwrap_or(d.repeat_penalty),
-            penalty_last_n: self.repeat_last_n.unwrap_or(d.penalty_last_n),
-            seed: self.seed.unwrap_or(d.seed),
-            logit_bias: Vec::new(),
+            temperature: self.temperature.unwrap_or(base.temperature),
+            top_k: self.top_k.unwrap_or(base.top_k),
+            top_p: self.top_p.unwrap_or(base.top_p),
+            min_p: self.min_p.unwrap_or(base.min_p),
+            presence_penalty: self.presence_penalty.unwrap_or(base.presence_penalty),
+            frequency_penalty: self.frequency_penalty.unwrap_or(base.frequency_penalty),
+            repeat_penalty: self.repeat_penalty.unwrap_or(base.repeat_penalty),
+            penalty_last_n: self.repeat_last_n.unwrap_or(base.penalty_last_n),
+            seed: self.seed.unwrap_or(base.seed),
+            logit_bias: base.logit_bias.clone(),
         }
     }
 }
@@ -114,28 +114,6 @@ pub struct ChatChoice {
     pub finish_reason: &'static str,
 }
 
-impl ChatCompletionResponse {
-    pub fn stub(req: &ChatCompletionRequest) -> Self {
-        Self {
-            id: "chatcmpl-seeker-stub".to_string(),
-            object: "chat.completion",
-            created: 0,
-            model: req.model.clone().unwrap_or_else(|| STUB_MODEL.to_string()),
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Value::String(STUB_TEXT.to_string()),
-                    name: None,
-                    tool_call_id: None,
-                },
-                finish_reason: "stop",
-            }],
-            usage: Usage::default(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // /v1/completions
 // ---------------------------------------------------------------------------
@@ -160,6 +138,20 @@ pub struct CompletionRequest {
     pub suffix: Option<String>,
 }
 
+impl CompletionRequest {
+    /// Build a `SamplerConfig` from the CLI `base`, overriding only the fields
+    /// the OpenAI completion request exposes (temperature).
+    pub fn sampler_config(
+        &self,
+        base: &crate::inference::sample::SamplerConfig,
+    ) -> crate::inference::sample::SamplerConfig {
+        crate::inference::sample::SamplerConfig {
+            temperature: self.temperature.unwrap_or(base.temperature),
+            ..base.clone()
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
@@ -176,79 +168,6 @@ pub struct CompletionChoice {
     pub text: String,
     pub finish_reason: &'static str,
     pub logprobs: Option<Value>,
-}
-
-impl CompletionResponse {
-    pub fn stub(req: &CompletionRequest) -> Self {
-        Self {
-            id: "cmpl-seeker-stub".to_string(),
-            object: "text_completion",
-            created: 0,
-            model: req.model.clone().unwrap_or_else(|| STUB_MODEL.to_string()),
-            choices: vec![CompletionChoice {
-                index: 0,
-                text: STUB_TEXT.to_string(),
-                finish_reason: "stop",
-                logprobs: None,
-            }],
-            usage: Usage::default(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// /v1/embeddings
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Default, Deserialize)]
-pub struct EmbeddingRequest {
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub input: Option<Value>,
-    #[serde(default)]
-    pub encoding_format: Option<String>,
-    #[serde(default)]
-    pub dimensions: Option<u32>,
-    #[serde(default)]
-    pub user: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EmbeddingResponse {
-    pub object: &'static str,
-    pub data: Vec<EmbeddingItem>,
-    pub model: String,
-    pub usage: Usage,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EmbeddingItem {
-    pub object: &'static str,
-    pub index: u32,
-    pub embedding: Vec<f32>,
-}
-
-impl EmbeddingResponse {
-    pub fn stub(req: &EmbeddingRequest) -> Self {
-        let inputs = match &req.input {
-            Some(Value::Array(arr)) => arr.len().max(1),
-            _ => 1,
-        };
-        let data = (0..inputs as u32)
-            .map(|i| EmbeddingItem {
-                object: "embedding",
-                index: i,
-                embedding: vec![0.0; 8],
-            })
-            .collect();
-        Self {
-            object: "list",
-            data,
-            model: req.model.clone().unwrap_or_else(|| STUB_MODEL.to_string()),
-            usage: Usage::default(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,153 +188,53 @@ pub struct Model {
     pub owned_by: String,
 }
 
-impl ModelListResponse {
-    pub fn stub() -> Self {
-        Self {
-            object: "list",
-            data: vec![Model {
-                id: STUB_MODEL.to_string(),
-                object: "model",
-                created: 0,
-                owned_by: "seeker".to_string(),
-            }],
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::sample::SamplerConfig;
+
+    fn base() -> SamplerConfig {
+        SamplerConfig {
+            temperature: 0.3,
+            top_k: 11,
+            top_p: 0.5,
+            min_p: 0.1,
+            seed: 99,
+            logit_bias: vec![(7, 1.0)],
+            ..SamplerConfig::default()
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// /v1/rerank
-// ---------------------------------------------------------------------------
+    #[test]
+    fn chat_request_overrides_base_only_where_present() {
+        // Empty request → every field inherits the CLI base (incl. logit_bias).
+        let cfg = ChatCompletionRequest::default().sampler_config(&base());
+        assert_eq!(cfg.temperature, 0.3);
+        assert_eq!(cfg.top_k, 11);
+        assert_eq!(cfg.seed, 99);
+        assert_eq!(cfg.logit_bias, vec![(7, 1.0)]);
 
-#[derive(Debug, Default, Deserialize)]
-pub struct RerankRequest {
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub query: Option<String>,
-    #[serde(default)]
-    pub documents: Vec<Value>,
-    #[serde(default)]
-    pub top_n: Option<u32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RerankResponse {
-    pub model: String,
-    pub results: Vec<RerankItem>,
-    pub usage: Usage,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RerankItem {
-    pub index: u32,
-    pub relevance_score: f32,
-}
-
-impl RerankResponse {
-    pub fn stub(req: &RerankRequest) -> Self {
-        let results = req
-            .documents
-            .iter()
-            .enumerate()
-            .map(|(i, _)| RerankItem {
-                index: i as u32,
-                relevance_score: 0.0,
-            })
-            .collect();
-        Self {
-            model: req.model.clone().unwrap_or_else(|| STUB_MODEL.to_string()),
-            results,
-            usage: Usage::default(),
-        }
+        // A request value overrides just that field.
+        let req = ChatCompletionRequest {
+            temperature: Some(1.5),
+            seed: Some(42),
+            ..Default::default()
+        };
+        let cfg = req.sampler_config(&base());
+        assert_eq!(cfg.temperature, 1.5); // overridden
+        assert_eq!(cfg.seed, 42); // overridden
+        assert_eq!(cfg.top_p, 0.5); // inherited
+        assert_eq!(cfg.logit_bias, vec![(7, 1.0)]); // always inherited
     }
-}
 
-// ---------------------------------------------------------------------------
-// /v1/audio/transcriptions
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize)]
-pub struct TranscriptionResponse {
-    pub text: String,
-}
-
-impl TranscriptionResponse {
-    pub fn stub() -> Self {
-        Self {
-            text: STUB_TEXT.to_string(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// /v1/responses (OpenAI's newer "Responses" API)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Default, Deserialize)]
-pub struct ResponsesRequest {
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub input: Option<Value>,
-    #[serde(default)]
-    pub instructions: Option<String>,
-    #[serde(default)]
-    pub stream: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ResponsesResponse {
-    pub id: String,
-    pub object: &'static str,
-    pub created_at: i64,
-    pub model: String,
-    pub status: &'static str,
-    pub output: Vec<ResponsesOutputItem>,
-    pub usage: ResponsesUsage,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ResponsesOutputItem {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: &'static str,
-    pub role: &'static str,
-    pub content: Vec<ResponsesContentBlock>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ResponsesContentBlock {
-    #[serde(rename = "type")]
-    pub kind: &'static str,
-    pub text: String,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct ResponsesUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub total_tokens: u32,
-}
-
-impl ResponsesResponse {
-    pub fn stub(req: &ResponsesRequest) -> Self {
-        Self {
-            id: "resp_seeker_stub".to_string(),
-            object: "response",
-            created_at: 0,
-            model: req.model.clone().unwrap_or_else(|| STUB_MODEL.to_string()),
-            status: "completed",
-            output: vec![ResponsesOutputItem {
-                id: "msg_seeker_stub".to_string(),
-                kind: "message",
-                role: "assistant",
-                content: vec![ResponsesContentBlock {
-                    kind: "output_text",
-                    text: STUB_TEXT.to_string(),
-                }],
-            }],
-            usage: ResponsesUsage::default(),
-        }
+    #[test]
+    fn completion_request_overrides_temperature_only() {
+        let req = CompletionRequest {
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        let cfg = req.sampler_config(&base());
+        assert_eq!(cfg.temperature, 0.0);
+        assert_eq!(cfg.top_k, 11); // inherited from base
     }
 }
