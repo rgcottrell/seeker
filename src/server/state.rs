@@ -38,6 +38,8 @@ struct Inner {
     default_system_prompt: Option<String>,
     /// `--ctx-size`, reported in `/props`.
     ctx_size: u32,
+    /// Number of cache slots (`--parallel`), reported by `/props` + `/slots`.
+    n_slots: u32,
     /// Model id reported by `/models` and echoed in responses (file stem).
     model_id: String,
     /// Absolute model path, reported in `/props`.
@@ -55,6 +57,7 @@ pub struct AppStateInit {
     pub default_ignore_eos: bool,
     pub default_system_prompt: Option<String>,
     pub ctx_size: u32,
+    pub n_slots: u32,
     pub model_id: String,
     pub model_path: String,
 }
@@ -72,6 +75,7 @@ impl AppState {
                 default_ignore_eos: init.default_ignore_eos,
                 default_system_prompt: init.default_system_prompt,
                 ctx_size: init.ctx_size,
+                n_slots: init.n_slots,
                 model_id: init.model_id,
                 model_path: Some(init.model_path),
             }),
@@ -132,6 +136,11 @@ impl AppState {
 
     pub fn ctx_size(&self) -> u32 {
         self.inner.ctx_size
+    }
+
+    /// Number of KV-cache slots (`--parallel`); 0 when no model is loaded.
+    pub fn n_slots(&self) -> u32 {
+        self.inner.n_slots
     }
 
     pub fn model_id(&self) -> &str {

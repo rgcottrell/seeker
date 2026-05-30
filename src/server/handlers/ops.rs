@@ -14,7 +14,6 @@ pub async fn health() -> impl IntoResponse {
 }
 
 pub async fn props_get(State(state): State<AppState>) -> impl IntoResponse {
-    let loaded = state.tokenizer().is_some();
     let s = state.default_sampler();
     let default_generation_settings = json!({
         "temperature": s.temperature,
@@ -35,7 +34,7 @@ pub async fn props_get(State(state): State<AppState>) -> impl IntoResponse {
         chat_template: state.chat_template().map(|t| t.to_string()),
         build_info: env!("CARGO_PKG_VERSION"),
         default_generation_settings,
-        total_slots: if loaded { 1 } else { 0 },
+        total_slots: state.n_slots(),
     })
 }
 
@@ -43,8 +42,17 @@ pub async fn props_post(Json(_req): Json<PropsUpdateRequest>) -> impl IntoRespon
     (StatusCode::OK, Json(json!({"success": true})))
 }
 
-pub async fn slots() -> impl IntoResponse {
-    Json::<Vec<SlotState>>(Vec::new())
+pub async fn slots(State(state): State<AppState>) -> impl IntoResponse {
+    // One entry per configured slot. Live per-slot introspection (cached prefix,
+    // is_processing) would need a worker→handler snapshot; reported as idle here.
+    let slots: Vec<SlotState> = (0..state.n_slots())
+        .map(|id| SlotState {
+            id,
+            is_processing: false,
+            prompt: String::new(),
+        })
+        .collect();
+    Json(slots)
 }
 
 pub async fn metrics() -> impl IntoResponse {

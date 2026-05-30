@@ -40,6 +40,8 @@ pub async fn completion(State(state): State<AppState>, Json(req): Json<Completio
         max_tokens,
         stop: req.stop.clone().unwrap_or_default(),
         ignore_eos: state.default_ignore_eos(),
+        // llama-native `id_slot` pins the cache slot; negative → auto-select.
+        id_slot: req.id_slot.and_then(|s| usize::try_from(s).ok()),
     };
     let rx = match handle.start(tokens, config).await {
         Ok(rx) => rx,
@@ -113,6 +115,7 @@ pub async fn infill(State(state): State<AppState>, Json(req): Json<InfillRequest
         max_tokens,
         stop: Vec::new(),
         ignore_eos: state.default_ignore_eos(),
+        id_slot: None,
     };
     let rx = match handle.start(tokens, config).await {
         Ok(rx) => rx,

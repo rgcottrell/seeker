@@ -34,6 +34,10 @@ pub struct WorkerConfig {
     pub ctx_size: u32,
     pub cache_type_k: GgmlType,
     pub cache_type_v: GgmlType,
+    /// Number of independent KV-cache slots (llama.cpp `--parallel`). Each slot
+    /// is a full `ctx_size` cache, so total KV(+SSM) memory is `n_slots ×`
+    /// per-slot. `1` = single-cache behavior. Allocated eagerly at setup.
+    pub n_slots: u32,
 }
 
 /// Per-request generation parameters. The CLI sampling flags form the base
@@ -47,6 +51,10 @@ pub struct GenConfig {
     pub stop: Vec<String>,
     /// Never stop on an end-of-generation token (`--ignore-eos`).
     pub ignore_eos: bool,
+    /// Pin to a specific cache slot (llama-native `id_slot`). `None` →
+    /// auto-select by longest cached-prefix match / LRU. Out-of-range values
+    /// fall back to auto-select.
+    pub id_slot: Option<usize>,
 }
 
 /// One unit of work for the worker. The handler has already rendered the chat
@@ -203,18 +211,84 @@ pub async fn collect(mut rx: mpsc::Receiver<GenEvent>) -> Result<GenOutput, Stri
     Ok(out)
 }
 
-/// GPU-resident state owned by the worker thread for the whole process.
+/// One independent KV-cache slot. `prior_tokens` mirrors `cache.position` (the
+/// tokens whose K/V is live), so a request that extends this slot's prefix
+/// reuses it and prefills only the divergent suffix.
+struct Slot {
+    cache: KvCache,
+    prior_tokens: Vec<u32>,
+    /// Monotonic stamp of the last job that used this slot (LRU). `0` = cold.
+    last_used: u64,
+}
+
+/// GPU-resident state owned by the worker thread for the whole process. Holds a
+/// pool of N independent cache slots; the single-sequence engine processes one
+/// job at a time, so slots provide cross-request cache reuse, not parallelism.
 struct Worker {
     engine: Engine,
     model: Box<dyn crate::models::Model>,
-    cache: KvCache,
+    slots: Vec<Slot>,
     eog_ids: Vec<u32>,
-    /// Token ids currently in the KV cache, mirroring `cache.position`. Lets us
-    /// reuse the cached prefix across requests that strictly extend it.
-    prior_tokens: Vec<u32>,
+    /// Monotonic LRU clock (incremented per job; avoids wall-clock).
+    clock: u64,
+    /// Slot the previous job used — a switch must invalidate the engine's
+    /// decode-replay cmdbuf (it binds the prior slot's K/V buffers).
+    last_slot: Option<usize>,
 }
 
-/// Build the engine + model + cache, mirroring `seeker chat`'s load sequence.
+impl Worker {
+    /// Pick the slot to serve `new_tokens` from (see [`choose_slot`]).
+    fn select_slot(&self, new_tokens: &[u32], id_slot: Option<usize>) -> usize {
+        let view: Vec<(&[u32], u64)> = self
+            .slots
+            .iter()
+            .map(|s| (s.prior_tokens.as_slice(), s.last_used))
+            .collect();
+        choose_slot(&view, new_tokens, id_slot)
+    }
+}
+
+/// Length of the longest common prefix of two token sequences.
+fn lcp(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Pure slot-selection logic (testable without GPU state). `slots` is
+/// `(prior_tokens, last_used)` per slot. An explicit, in-range `id_slot` pins
+/// directly. Otherwise prefer the slot whose `prior_tokens` is a non-empty
+/// prefix of `new_tokens` (pure extension → SSM-safe in-place reuse), choosing
+/// the longest such prior (most reuse, least re-prefill); failing that, evict
+/// the least-recently-used slot (cold slots have `last_used == 0`, so they go
+/// first).
+fn choose_slot(slots: &[(&[u32], u64)], new_tokens: &[u32], id_slot: Option<usize>) -> usize {
+    if let Some(i) = id_slot
+        && i < slots.len()
+    {
+        return i;
+    }
+    let mut best: Option<(usize, usize)> = None; // (slot, prior_len)
+    for (i, (prior, _)) in slots.iter().enumerate() {
+        if prior.is_empty() {
+            continue;
+        }
+        let common = lcp(prior, new_tokens);
+        if common == prior.len() && best.is_none_or(|(_, blen)| prior.len() > blen) {
+            best = Some((i, prior.len()));
+        }
+    }
+    if let Some((i, _)) = best {
+        return i;
+    }
+    slots
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (_, last_used))| *last_used)
+        .map(|(i, _)| i)
+        .expect("at least one slot")
+}
+
+/// Build the engine + model + N cache slots, mirroring `seeker chat`'s load
+/// sequence. Slots are allocated eagerly (fail-fast if N×ctx doesn't fit).
 fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     let gguf = GgufFile::open(&cfg.model_path)?;
     let bundle = build_tokenizer(&gguf)?;
@@ -224,6 +298,8 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     let weights = engine.upload_weights(&gguf)?;
     let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
 
+    // Scratch is sized per-ubatch/ctx and shared across slots (one forward runs
+    // at a time), so it does not scale with the slot count.
     engine.allocate_scratch(model.scratch_bytes_estimate(
         cfg.n_ubatch,
         cfg.ctx_size,
@@ -237,24 +313,50 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         max_seq_len: cfg.ctx_size,
     };
     let dims = model.cache_dims();
-    let mut cache =
-        engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
-    if let Some(ssm) = model.ssm_state_dims() {
-        cache.allocate_ssm_state(
-            &engine.device,
-            ssm.n_ssm_layers,
-            ssm.conv_state_floats,
-            ssm.gdn_state_floats,
-        )?;
+    let ssm = model.ssm_state_dims();
+    let n_slots = cfg.n_slots.max(1);
+    let mut slots = Vec::with_capacity(n_slots as usize);
+    for _ in 0..n_slots {
+        let mut cache =
+            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
+        if let Some(ssm) = &ssm {
+            cache.allocate_ssm_state(
+                &engine.device,
+                ssm.n_ssm_layers,
+                ssm.conv_state_floats,
+                ssm.gdn_state_floats,
+            )?;
+        }
+        slots.push(Slot {
+            cache,
+            prior_tokens: Vec::new(),
+            last_used: 0,
+        });
     }
+
+    let per_slot = slots[0].cache.region.size
+        + slots[0]
+            .cache
+            .ssm_region
+            .as_ref()
+            .map_or(0, |r| r.size);
+    let mib = 1u64 << 20;
+    tracing::info!(
+        slots = n_slots,
+        ctx = cfg.ctx_size,
+        per_slot_mib = per_slot / mib,
+        total_mib = (per_slot * n_slots as u64) / mib,
+        "kv cache slots allocated",
+    );
 
     let eog_ids = model.tokenizer().eog_ids.clone();
     Ok(Worker {
         engine,
         model,
-        cache,
+        slots,
         eog_ids,
-        prior_tokens: Vec::new(),
+        clock: 0,
+        last_slot: None,
     })
 }
 
@@ -298,15 +400,28 @@ fn run_job(w: &mut Worker, job: GenJob) {
         max_tokens,
         stop,
         ignore_eos,
+        id_slot,
     } = config;
 
-    let ctx = w.cache.config.max_seq_len;
     let prompt_tokens = new_tokens.len() as u32;
-
     if new_tokens.is_empty() {
         let _ = reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
         return;
     }
+
+    // ── Slot selection ──────────────────────────────────────────────────
+    let idx = w.select_slot(&new_tokens, id_slot);
+    // The decode-replay cmdbuf is keyed only on sampler/grid, not on which
+    // cache recorded it — so a slot switch must invalidate it, or an L==1 first
+    // forward could replay against the previous slot's K/V buffers.
+    if w.last_slot != Some(idx) {
+        w.engine.decode_cache = None;
+        w.last_slot = Some(idx);
+    }
+    w.clock += 1;
+    w.slots[idx].last_used = w.clock;
+
+    let ctx = w.slots[idx].cache.config.max_seq_len;
     // Need room for the whole prompt plus at least one generated token.
     if new_tokens.len() as u32 >= ctx {
         let _ = reply.blocking_send(GenEvent::Error(format!(
@@ -317,19 +432,21 @@ fn run_job(w: &mut Worker, job: GenJob) {
         return;
     }
 
-    // ── Safe prefix-reuse ───────────────────────────────────────────────
-    // Reuse the cached prefix ONLY when this prompt strictly extends what is
-    // already in the cache (and `cache.position` agrees). Any divergence falls
-    // back to a full reset + prefill, the only SSM/GDN-safe rewind (recurrent
-    // state has no per-position undo — see `KvCache::reset`).
-    let common = w
+    let slot = &mut w.slots[idx];
+
+    // ── Safe prefix-reuse (per slot) ────────────────────────────────────
+    // Reuse the cached prefix ONLY when this prompt strictly extends what the
+    // slot holds (and `cache.position` agrees). Any divergence falls back to a
+    // full reset + prefill, the only SSM/GDN-safe rewind (recurrent state has no
+    // per-position undo — see `KvCache::reset`).
+    let common = slot
         .prior_tokens
         .iter()
         .zip(new_tokens.iter())
         .take_while(|(a, b)| a == b)
         .count();
     let pure_extension =
-        common > 0 && common == w.prior_tokens.len() && common == w.cache.position as usize;
+        common > 0 && common == slot.prior_tokens.len() && common == slot.cache.position as usize;
     let (start_pos, delta): (u32, Vec<u32>) = if pure_extension {
         if common < new_tokens.len() {
             (common as u32, new_tokens[common..].to_vec())
@@ -339,11 +456,12 @@ fn run_job(w: &mut Worker, job: GenJob) {
             (common as u32 - 1, vec![*new_tokens.last().unwrap()])
         }
     } else {
-        w.cache.reset();
+        slot.cache.reset();
         (0, new_tokens.clone())
     };
-    w.cache.position = start_pos;
+    slot.cache.position = start_pos;
     tracing::debug!(
+        slot = idx,
         prompt = new_tokens.len(),
         reused = start_pos,
         prefill = delta.len(),
@@ -362,21 +480,23 @@ fn run_job(w: &mut Worker, job: GenJob) {
 
     loop {
         // Context headroom for the next forward (chat parity).
-        if w.cache.position as usize + step.len() + 1 > ctx as usize {
+        if slot.cache.position as usize + step.len() + 1 > ctx as usize {
             terminal = Some(StopReason::ContextFull);
             break;
         }
-        let position = w.cache.position;
+        let position = slot.cache.position;
         let token = match w
             .engine
-            .forward_sampled(&*w.model, &mut w.cache, &step, position, &mut sampler)
+            .forward_sampled(&*w.model, &mut slot.cache, &step, position, &mut sampler)
         {
             Ok(t) => t,
             Err(e) => {
                 // Cache/prior may be inconsistent after a GPU error — reset so
-                // the next job full-prefills. Keep the worker alive.
-                w.cache.reset();
-                w.prior_tokens.clear();
+                // the next job full-prefills. Force the next job to re-record
+                // the decode cmdbuf (last_slot cleared). Keep the worker alive.
+                slot.cache.reset();
+                slot.prior_tokens.clear();
+                w.last_slot = None;
                 let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
                 return;
             }
@@ -436,7 +556,7 @@ fn run_job(w: &mut Worker, job: GenJob) {
         disconnected = true;
     }
 
-    // ── Commit prior_tokens to mirror the cache ─────────────────────────
+    // ── Commit prior_tokens to mirror the slot's cache ──────────────────
     // The cache holds the full rendered prompt plus every generated token we
     // fed back (all but the last — the last was an output, never an input).
     // This invariant (`prior_tokens.len() == cache.position`) holds on every
@@ -445,7 +565,7 @@ fn run_job(w: &mut Worker, job: GenJob) {
     if generated.len() > 1 {
         prior.extend_from_slice(&generated[..generated.len() - 1]);
     }
-    w.prior_tokens = prior;
+    slot.prior_tokens = prior;
 
     if !disconnected {
         let _ = reply.blocking_send(GenEvent::Done {
@@ -568,5 +688,57 @@ mod tests {
         // "caf" + "é" with stop "éxit": hold the "é" prefix.
         let n = emit("café", &["éxit"]);
         assert!("café".is_char_boundary(n), "cut at {n} is a char boundary");
+    }
+
+    #[test]
+    fn choose_slot_prefers_longest_pure_extension() {
+        // slot 0 holds [1,2] (a prefix of the request), slot 1 holds [1,2,3,4]
+        // (a longer prefix). The request [1,2,3,4,5] extends both; pick slot 1
+        // (most reuse). last_used is irrelevant when a match exists.
+        let s0: &[u32] = &[1, 2];
+        let s1: &[u32] = &[1, 2, 3, 4];
+        let slots = [(s0, 9), (s1, 1)];
+        assert_eq!(choose_slot(&slots, &[1, 2, 3, 4, 5], None), 1);
+    }
+
+    #[test]
+    fn choose_slot_skips_non_prefix_match() {
+        // slot 0 = [1,2,9] is NOT a prefix of [1,2,3] (diverges at index 2), so
+        // it's not reusable; fall through to the LRU (cold slot 1, last_used 0).
+        let s0: &[u32] = &[1, 2, 9];
+        let s1: &[u32] = &[];
+        let slots = [(s0, 5), (s1, 0)];
+        assert_eq!(choose_slot(&slots, &[1, 2, 3], None), 1);
+    }
+
+    #[test]
+    fn choose_slot_evicts_lru_when_no_match() {
+        // No slot is a prefix of the request → evict the least-recently-used
+        // (slot 1, last_used 2 < slot 0's 7).
+        let a: &[u32] = &[5, 5];
+        let b: &[u32] = &[6, 6];
+        let slots = [(a, 7), (b, 2)];
+        assert_eq!(choose_slot(&slots, &[9, 9], None), 1);
+    }
+
+    #[test]
+    fn choose_slot_cold_slot_first() {
+        // A cold slot (last_used 0) is the oldest, so a brand-new conversation
+        // claims it instead of evicting a warm slot.
+        let warm: &[u32] = &[1, 2, 3];
+        let cold: &[u32] = &[];
+        let slots = [(warm, 4), (cold, 0)];
+        assert_eq!(choose_slot(&slots, &[7, 8], None), 1);
+    }
+
+    #[test]
+    fn choose_slot_honors_valid_id_slot() {
+        let a: &[u32] = &[1, 2];
+        let b: &[u32] = &[];
+        let slots = [(a, 1), (b, 0)];
+        // In-range pin wins over prefix matching.
+        assert_eq!(choose_slot(&slots, &[1, 2, 3], Some(1)), 1);
+        // Out-of-range pin falls back to auto-select (slot 0 is a pure ext).
+        assert_eq!(choose_slot(&slots, &[1, 2, 3], Some(9)), 0);
     }
 }

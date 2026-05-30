@@ -76,6 +76,14 @@ pub struct ServeArgs {
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: u32,
 
+    /// Number of independent KV-cache slots (llama.cpp's `--parallel`). Each
+    /// slot is a full `--ctx-size` cache, so total KV(+SSM) memory is N× the
+    /// per-slot size (printed at startup). `1` = a single cache. Raise it so
+    /// interleaved sessions — e.g. concurrent subagents — each keep their cache
+    /// warm and reuse it instead of re-prefilling on every switch. (short: -np)
+    #[arg(long = "parallel", default_value_t = 1)]
+    parallel: u32,
+
     /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1.
     #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
     cache_type_k: GgmlType,
@@ -204,6 +212,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         "loaded tokenizer for serve",
     );
 
+    let n_slots = args.parallel.max(1);
     let (handle, ready) = InferenceHandle::spawn(WorkerConfig {
         model_path: path.clone(),
         n_ubatch: args.ubatch_size,
@@ -211,6 +220,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         ctx_size: args.ctx_size,
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
+        n_slots,
     });
     match ready.await {
         Ok(Ok(())) => {}
@@ -233,6 +243,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         default_ignore_eos: args.ignore_eos,
         default_system_prompt: resolve_system_prompt(args)?,
         ctx_size: args.ctx_size,
+        n_slots,
         model_id,
         model_path: path.display().to_string(),
     }))

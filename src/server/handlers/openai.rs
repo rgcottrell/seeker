@@ -42,6 +42,7 @@ pub async fn chat_completions(
         max_tokens: req.max_tokens.unwrap_or(state.default_max_tokens()),
         stop: parse_stop(&req.stop),
         ignore_eos: state.default_ignore_eos(),
+        id_slot: None,
     };
     let rx = match handle.start(tokens, config).await {
         Ok(rx) => rx,
@@ -104,6 +105,7 @@ pub async fn completions(
         max_tokens: req.max_tokens.unwrap_or(state.default_max_tokens()),
         stop: parse_stop(&req.stop),
         ignore_eos: state.default_ignore_eos(),
+        id_slot: None,
     };
     let rx = match handle.start(tokens, config).await {
         Ok(rx) => rx,

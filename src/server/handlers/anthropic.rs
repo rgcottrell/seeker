@@ -45,6 +45,7 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
         max_tokens: req.max_tokens.unwrap_or(state.default_max_tokens()),
         stop: req.stop_sequences.clone().unwrap_or_default(),
         ignore_eos: state.default_ignore_eos(),
+        id_slot: None,
     };
     let rx = match handle.start(tokens, config).await {
         Ok(rx) => rx,
