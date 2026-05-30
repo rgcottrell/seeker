@@ -384,6 +384,174 @@ impl Model for LlamaModel {
         cache_io::advance(cache, l);
         Ok(Some(last_logits))
     }
+
+    /// Batched decode: B sequences, one token each, in one forward. The dense
+    /// ops (embedding, RMSNorm, all matmuls, RoPE, FFN) process the `B`-wide
+    /// token dimension unchanged; only the attention is per-sequence (own KV
+    /// slab + length via `flash_attn::record_batched`) and the K/V writes fan
+    /// out one column per sequence into its slab.
+    fn record_forward_batch(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+    ) -> Result<crate::inference::weights::TensorView, Box<dyn Error>> {
+        use crate::inference::command::record_compute_barriers;
+        let p = &self.params;
+        let b = tokens.len() as u64;
+        if b == 0 {
+            return Err("record_forward_batch: empty batch".into());
+        }
+        if positions.len() != tokens.len() {
+            return Err("record_forward_batch: tokens/positions length mismatch".into());
+        }
+        let hidden = p.n_embd as u64;
+        let head_dim = p.head_dim() as u64;
+        let n_kv_embd = p.n_embd_kv() as u64;
+        let n_ff = p.n_ff as u64;
+        let n_head = p.n_head as u64;
+        let n_head_kv = p.n_head_kv as u64;
+        let vocab = p.n_vocab as u64;
+        let elem = 4u64;
+        // Each sequence attends over [0, position + 1).
+        let kv_lens: Vec<u32> = positions.iter().map(|&pos| pos + 1).collect();
+
+        // ---- prologue: B token ids + B positions (one per sequence) ----
+        let token_buf = ctx.alloc_scratch(b * 4)?;
+        write_u32(ctx, token_buf, tokens)?;
+        let positions_buf = ctx.alloc_scratch(b * 4)?;
+        write_u32(ctx, positions_buf, positions)?;
+
+        let residual = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, b as u32, residual)?;
+        let layer_checkpoint = ctx.scratch_checkpoint();
+
+        let rope_params = rope::RopeParams::llama_default(p.rope_dim, p.rope_freq_base);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = (p.n_head / p.n_head_kv).max(1);
+        let fa_params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim as u32,
+            head_dim_v: head_dim as u32,
+            gqa_ratio,
+            scale,
+        };
+
+        for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
+            ctx.scratch_restore(layer_checkpoint);
+
+            let x_norm = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, residual, block.attn_norm, x_norm, p.rms_eps)?;
+
+            let q = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.wq, x_norm, q)?;
+            let k = ctx.alloc_tensor([n_kv_embd, b, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.wk, x_norm, k)?;
+            let v = ctx.alloc_tensor([n_kv_embd, b, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.wv, x_norm, v)?;
+            record_compute_barriers(ctx.device, ctx.cmd, &[q.range(), k.range(), v.range()]);
+
+            let q_view = reshape_for_rope(q, head_dim, n_head, b);
+            let k_view = reshape_for_rope(k, head_dim, n_head_kv, b);
+            let q_roped = ctx.alloc_tensor(q_view.dims, GgmlType::F32)?;
+            let k_roped = ctx.alloc_tensor(k_view.dims, GgmlType::F32)?;
+            rope::record_nofence(ctx, q_view, positions_buf, q_roped, rope_params)?;
+            rope::record_nofence(ctx, k_view, positions_buf, k_roped, rope_params)?;
+            record_compute_barriers(ctx.device, ctx.cmd, &[q_roped.range(), k_roped.range()]);
+
+            // Per-sequence K/V cache writes: column s → slot s's slab at its position.
+            let k_natural = reshape_for_rope(k_roped, head_dim, n_head_kv, b);
+            let v_natural = reshape_for_rope(v, head_dim, n_head_kv, b);
+            let col_stride = head_dim * n_head_kv * elem; // bytes between sequence columns
+            for s in 0..tokens.len() {
+                let k_col = column_view(k_natural, s as u64, col_stride, head_dim, n_head_kv);
+                let v_col = column_view(v_natural, s as u64, col_stride, head_dim, n_head_kv);
+                cache_io::record_write(
+                    ctx,
+                    k_col,
+                    batch.slot_k_view(s as u32, layer_idx as u32),
+                    positions[s],
+                )?;
+                cache_io::record_write(
+                    ctx,
+                    v_col,
+                    batch.slot_v_view(s as u32, layer_idx as u32),
+                    positions[s],
+                )?;
+            }
+
+            // Batched attention: each sequence attends to its own slab/length.
+            let q_attn = batched_q_attn_view(q_roped, head_dim, n_head, b, hidden);
+            let k_attn = batch.batched_k_attn_view(layer_idx as u32, tokens.len() as u32);
+            let v_attn = batch.batched_v_attn_view(layer_idx as u32, tokens.len() as u32);
+            let attn_out = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            flash_attn::record_batched(ctx, q_attn, k_attn, v_attn, attn_out, fa_params, &kv_lens)?;
+
+            let proj = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, block.wo, attn_out, proj)?;
+            elementwise::record_add(ctx, residual, proj, residual)?;
+
+            let x_norm2 = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, residual, block.ffn_norm, x_norm2, p.rms_eps)?;
+            let gate = ctx.alloc_tensor([n_ff, b, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.ffn_gate, x_norm2, gate)?;
+            let up = ctx.alloc_tensor([n_ff, b, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.ffn_up, x_norm2, up)?;
+            record_compute_barriers(ctx.device, ctx.cmd, &[gate.range(), up.range()]);
+            let gate_silu = ctx.alloc_tensor([n_ff, b, 1, 1], GgmlType::F32)?;
+            elementwise::record_silu(ctx, gate, gate_silu)?;
+            let ffn_hidden = ctx.alloc_tensor([n_ff, b, 1, 1], GgmlType::F32)?;
+            elementwise::record_mul(ctx, gate_silu, up, ffn_hidden)?;
+            let down = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, block.ffn_down, ffn_hidden, down)?;
+            elementwise::record_add(ctx, residual, down, residual)?;
+        }
+        ctx.scratch_restore(layer_checkpoint);
+
+        // Final norm + lm_head over ALL B columns (each column is its
+        // sequence's last — and only — token this step).
+        let final_norm = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+        rms_norm::record(ctx, residual, self.weights.output_norm, final_norm, p.rms_eps)?;
+        let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
+        let logits = ctx.alloc_tensor([vocab, b, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, lm_head, final_norm, logits)?;
+
+        for (s, &pos) in positions.iter().enumerate() {
+            batch.positions[s] = pos + 1;
+        }
+        Ok(logits)
+    }
+}
+
+/// A single-column `[head_dim, n_head_kv, 1]` view of a `[head_dim, n_head_kv,
+/// B]` tensor (sequence `s`), for the per-sequence KV cache write.
+fn column_view(t: TensorView, s: u64, col_stride: u64, head_dim: u64, n_head_kv: u64) -> TensorView {
+    let elem = t.byte_stride[0];
+    TensorView {
+        buffer: t.buffer,
+        byte_offset: t.byte_offset + s * col_stride,
+        byte_size: head_dim * n_head_kv * elem,
+        dims: [head_dim, n_head_kv, 1, 1],
+        byte_stride: [elem, elem * head_dim, elem * head_dim * n_head_kv, elem * head_dim * n_head_kv],
+        element_stride: [1, head_dim, head_dim * n_head_kv, head_dim * n_head_kv],
+        dtype: t.dtype,
+    }
+}
+
+/// Reinterpret a contiguous `[head_dim, n_head, B]` (post-RoPE) Q as the
+/// `[head_dim, 1, n_head, B]` flash-attn batched-decode layout (one query row
+/// per head per sequence; batch stride = hidden).
+fn batched_q_attn_view(t: TensorView, head_dim: u64, n_head: u64, b: u64, hidden: u64) -> TensorView {
+    let elem = t.byte_stride[0];
+    TensorView {
+        buffer: t.buffer,
+        byte_offset: t.byte_offset,
+        byte_size: t.byte_size,
+        dims: [head_dim, 1, n_head, b],
+        byte_stride: [elem, elem * head_dim, elem * head_dim, elem * hidden],
+        element_stride: [1, head_dim, head_dim, hidden],
+        dtype: t.dtype,
+    }
 }
 
 fn write_u32(

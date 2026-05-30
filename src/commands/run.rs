@@ -230,6 +230,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             fa_batch_smoke_test(&mut engine, model.weights())?;
             return Ok(());
         }
+        if std::env::var("SEEKER_BATCH_DECODE_TEST").is_ok() {
+            batch_decode_smoke_test(&mut engine, model.as_ref())?;
+            return Ok(());
+        }
         if std::env::var("SEEKER_WQ_DUMP").is_ok() {
             wq_dump_test(&mut engine, model.weights())?;
             return Ok(());
@@ -410,6 +414,133 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     println!(
         "timing:    prefill {prefill_tokens} tok in {:.3}s ({prefill_tps:.1} tok/s), decode {} tok in {:.3}s ({decode_tps:.1} tok/s)",
         prefill_secs, decode_steps as u32, decode_secs,
+    );
+    Ok(())
+}
+
+/// End-to-end batched-decode correctness test: decode B distinct prompts both
+/// serially (each in its own KvCache) and as a batch (one BatchKvCache, one
+/// `forward_batch_decode` per step), with greedy sampling, and assert the token
+/// streams are **byte-identical** per sequence. This is M1's gate — proof that
+/// batching N sequences into one forward changes nothing about each sequence's
+/// output. Run with `SEEKER_BATCH_DECODE_TEST=1 seeker run --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn batch_decode_smoke_test(
+    engine: &mut Engine,
+    model: &dyn crate::models::Model,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
+    use crate::inference::sample::{Sampler, SamplerConfig};
+
+    let prompts = [
+        "The capital of France is",
+        "Once upon a time, in a land",
+        "Two plus two equals",
+    ];
+    let b = prompts.len();
+    let n_gen = 16usize; // tokens to generate per sequence (incl. the first)
+
+    let greedy = SamplerConfig {
+        temperature: 0.0,
+        ..SamplerConfig::default()
+    };
+
+    // Tokenize each prompt.
+    let bundle = model.tokenizer();
+    let add_special = bundle.add_bos_default || bundle.add_eos_default;
+    let prompts_tokens: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| {
+            bundle
+                .tokenizer
+                .encode(*p, add_special)
+                .map(|e| e.get_ids().to_vec())
+                .map_err(|e| format!("tokenize failed: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let max_prompt = prompts_tokens.iter().map(|t| t.len()).max().unwrap();
+    let max_seq_len = (max_prompt + n_gen + 4) as u32;
+    let config = KvCacheConfig {
+        k_dtype: GgmlType::F16,
+        v_dtype: GgmlType::F16,
+        max_seq_len,
+    };
+    let dims = model.cache_dims();
+
+    println!(
+        "Batch-decode test: B={b}, gen={n_gen}, prompts={:?}",
+        prompts_tokens.iter().map(|t| t.len()).collect::<Vec<_>>()
+    );
+
+    // ---- Serial reference: each prompt in its own cache ----
+    let mut serial: Vec<Vec<u32>> = Vec::with_capacity(b);
+    for tokens in &prompts_tokens {
+        let mut cache =
+            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, config)?;
+        let mut sampler = Sampler::new(greedy.clone());
+        // Prefill (samples the first token), then greedy decode the rest.
+        let first = engine.forward_sampled(model, &mut cache, tokens, 0, &mut sampler)?;
+        let mut stream = vec![first];
+        let mut last = first;
+        for _ in 1..n_gen {
+            let pos = cache.position;
+            last = engine.forward_sampled(model, &mut cache, &[last], pos, &mut sampler)?;
+            stream.push(last);
+        }
+        serial.push(stream);
+    }
+
+    // ---- Batched: all prompts in one BatchKvCache ----
+    let mut batch =
+        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, b as u32, config)?;
+    let mut samplers: Vec<Sampler> = (0..b).map(|_| Sampler::new(greedy.clone())).collect();
+    let mut last: Vec<u32> = vec![0; b];
+    let mut batched: Vec<Vec<u32>> = Vec::with_capacity(b);
+    // Prefill each sequence into its slab via the borrowed single-slot cache.
+    for (s, tokens) in prompts_tokens.iter().enumerate() {
+        let mut sc = batch.slot_kvcache(s as u32);
+        let first = engine.forward_sampled(model, &mut sc, tokens, 0, &mut samplers[s])?;
+        batch.positions[s] = sc.position;
+        last[s] = first;
+        batched.push(vec![first]);
+    }
+    // Batched decode steps.
+    for _ in 1..n_gen {
+        let positions = batch.positions.clone();
+        let toks = engine.forward_batch_decode(model, &mut batch, &last, &positions, &mut samplers)?;
+        for s in 0..b {
+            batched[s].push(toks[s]);
+            last[s] = toks[s];
+        }
+    }
+
+    // ---- Compare ----
+    let mut all_ok = true;
+    for s in 0..b {
+        let ok = serial[s] == batched[s];
+        all_ok &= ok;
+        let first_diff = serial[s]
+            .iter()
+            .zip(batched[s].iter())
+            .position(|(a, b)| a != b);
+        println!(
+            "  seq {s}: {} (serial={:?} batched={:?}{})",
+            if ok { "MATCH" } else { "DIVERGE" },
+            &serial[s][..serial[s].len().min(8)],
+            &batched[s][..batched[s].len().min(8)],
+            first_diff
+                .map(|i| format!(", first diff at token {i}"))
+                .unwrap_or_default(),
+        );
+    }
+    println!(
+        "  RESULT: {}",
+        if all_ok {
+            "PASS (batched decode is byte-identical to serial)"
+        } else {
+            "FAIL (batched decode diverged from serial)"
+        }
     );
     Ok(())
 }

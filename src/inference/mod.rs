@@ -361,6 +361,123 @@ impl Engine {
         Ok(out)
     }
 
+    /// Batched **decode** step: advance `B = tokens.len()` independent
+    /// sequences by one token each in a single forward + per-sequence sample.
+    /// `tokens[s]` / `positions[s]` / `samplers[s]` belong to slot `s` of
+    /// `batch`. Returns the `B` sampled tokens. The model's
+    /// `record_forward_batch` produces `[vocab, B]` logits; each column is
+    /// sampled by its own sampler chain and read back.
+    pub fn forward_batch_decode(
+        &mut self,
+        model: &dyn crate::models::Model,
+        batch: &mut kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        samplers: &mut [sample::Sampler],
+    ) -> Result<Vec<u32>, Box<dyn Error>> {
+        let b = tokens.len();
+        if b == 0 {
+            return Err("forward_batch_decode: empty batch".into());
+        }
+        if positions.len() != b || samplers.len() != b {
+            return Err("forward_batch_decode: tokens/positions/samplers length mismatch".into());
+        }
+        // The batched graph shape differs from the single-sequence decode
+        // cmdbuf; drop any cached recording (replay is single-sequence only).
+        self.decode_cache = None;
+
+        self.scratch.reset();
+        self.descriptors.reset(&self.device)?;
+        let decode_dyn_range = {
+            let off = self.scratch.alloc(decode_dyn::DecodeDyn::SIZE)?;
+            BufferRange {
+                buffer: self.scratch.buffer,
+                offset: off,
+                size: decode_dyn::DecodeDyn::SIZE,
+            }
+        };
+
+        unsafe {
+            self.device
+                .device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)?;
+        }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.reset(&self.device, self.command_buffer);
+
+        let token_ranges: Vec<BufferRange> = {
+            let mut ctx = DispatchContext {
+                device: &self.device,
+                weights: model.weights(),
+                scratch: &mut self.scratch,
+                pipelines: &mut self.pipelines,
+                descriptors: &self.descriptors,
+                cmd: self.command_buffer,
+                #[cfg(feature = "gpu_debug")]
+                taps: Vec::new(),
+                #[cfg(feature = "profile_gpu")]
+                n_dispatches: 0,
+                decode_dyn: decode_dyn_range,
+                replay_plan: None,
+                #[cfg(feature = "profile_gpu")]
+                profile: Some(&mut self.profile),
+            };
+            let logits = model.record_forward_batch(&mut ctx, batch, tokens, positions)?;
+            let vocab = logits.dims[0];
+            let elem = logits.byte_stride[0];
+            let mut ranges = Vec::with_capacity(b);
+            for (s, sampler) in samplers.iter_mut().enumerate() {
+                // Column s of the [vocab, B] logits = sequence s's logits.
+                let col = weights::TensorView {
+                    buffer: logits.buffer,
+                    byte_offset: logits.byte_offset + (s as u64) * vocab * elem,
+                    byte_size: vocab * elem,
+                    dims: [vocab, 1, 1, 1],
+                    byte_stride: [elem, vocab * elem, vocab * elem, vocab * elem],
+                    element_stride: [1, vocab, vocab, vocab],
+                    dtype: logits.dtype,
+                };
+                ranges.push(sampler.record_chain(&mut ctx, col)?);
+            }
+            ranges
+        };
+        #[cfg(feature = "profile_gpu")]
+        self.profile
+            .mark(&self.device, self.command_buffer, profile::BlockClass::Epilogue);
+
+        unsafe {
+            self.device.device.end_command_buffer(self.command_buffer)?;
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.readback_and_print(&self.device);
+
+        let host_ptr = self
+            .scratch
+            .host_ptr
+            .ok_or("scratch region not host-visible — readback requires mapped memory")?;
+        let mut out = Vec::with_capacity(b);
+        for (sampler, r) in samplers.iter_mut().zip(token_ranges.iter()) {
+            let token = unsafe { std::ptr::read(host_ptr.add(r.offset as usize) as *const u32) };
+            sampler.accept(token);
+            out.push(token);
+        }
+        Ok(out)
+    }
+
     /// Run a forward pass and sample a token, all on the GPU.
     ///
     /// Three execution paths, picked from `tokens.len()` and the

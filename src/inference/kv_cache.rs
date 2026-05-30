@@ -335,6 +335,46 @@ impl KvCache {
 
 }
 
+impl KvCache {
+    /// Build a non-owning `KvCache` over slab `byte_offset`s inside a shared
+    /// buffer (a [`BatchKvCache`] slot). The `region` is borrowed
+    /// ([`Region::borrowed`]) so Drop frees nothing — the `BatchKvCache` owns
+    /// the buffer. SSM state is left empty (attention-only; the batched SSM
+    /// path lands with qwen35moe in M2). Used to prefill one sequence into its
+    /// slab via the existing single-sequence forward path.
+    #[allow(clippy::too_many_arguments)]
+    fn borrowed_slot(
+        config: KvCacheConfig,
+        buffer: vk::Buffer,
+        host_ptr: Option<*mut u8>,
+        buffer_size: u64,
+        alignment: u64,
+        k_layers: Vec<TensorView>,
+        v_layers: Vec<TensorView>,
+        position: u32,
+        device: Arc<DeviceShared>,
+    ) -> Self {
+        Self {
+            config,
+            region: Region::borrowed(buffer, host_ptr, buffer_size, alignment),
+            k_layers,
+            v_layers,
+            position,
+            ssm_region: None,
+            ssm_conv_states: Vec::new(),
+            ssm_gdn_states: Vec::new(),
+            ssm_gdn_snap_region: None,
+            ssm_gdn_snapshots: Vec::new(),
+            ssm_conv_backup_region: None,
+            ssm_conv_backups: Vec::new(),
+            ssm_max_snapshots: 0,
+            ssm_conv_kernel: 0,
+            ssm_conv_channels: 0,
+            device,
+        }
+    }
+}
+
 impl Drop for KvCache {
     fn drop(&mut self) {
         // Free the KV region + any SSM/snapshot regions. The Arc keeps the
@@ -437,4 +477,228 @@ fn make_view(
 
 fn align_up(v: u64, alignment: u64) -> u64 {
     (v + alignment - 1) & !(alignment - 1)
+}
+
+/// A KV cache holding `n_slots` independent sequence slabs in one shared buffer
+/// per layer, so a batched decode can address all active sequences through the
+/// flash-attn batch stride (`nb13`/`nb23`). Each slab has the identical natural
+/// `[head_dim, n_head_kv, max_seq_len]` layout as a standalone [`KvCache`]
+/// layer; slabs are padded to the storage-buffer alignment so every slot's
+/// byte offset is bindable. Attention-only (F32/F16/BF16 caches) for now — the
+/// quant-cache and SSM-state slabs land later (M2/M4).
+pub struct BatchKvCache {
+    pub config: KvCacheConfig,
+    pub n_slots: u32,
+    pub n_layer: u32,
+    head_dim: u32,
+    n_head_kv: u32,
+    region: Region,
+    buffer: vk::Buffer,
+    host_ptr: Option<*mut u8>,
+    buffer_size: u64,
+    alignment: u64,
+    /// Byte offset of each layer's K slab-0 / V slab-0.
+    k_base: Vec<u64>,
+    v_base: Vec<u64>,
+    /// Per-slot slab stride in bytes (padded to `alignment`).
+    k_slab_stride: u64,
+    v_slab_stride: u64,
+    /// Current write position (tokens) of each slot.
+    pub positions: Vec<u32>,
+    device: Arc<DeviceShared>,
+}
+
+impl BatchKvCache {
+    pub fn new(
+        device: &Device,
+        n_layer: u32,
+        head_dim: u32,
+        n_head_kv: u32,
+        n_slots: u32,
+        config: KvCacheConfig,
+    ) -> Result<Self, Box<dyn Error>> {
+        validate_dtype(config.k_dtype, "K")?;
+        validate_dtype(config.v_dtype, "V")?;
+        validate_head_dim(head_dim, config.k_dtype, "K")?;
+        validate_head_dim(head_dim, config.v_dtype, "V")?;
+        for (ty, side) in [(config.k_dtype, "K"), (config.v_dtype, "V")] {
+            if ty.block_layout().0 != 1 {
+                return Err(format!(
+                    "BatchKvCache: quant {side} cache dtype {ty:?} not supported yet \
+                     (batched decode needs a flat per-element stride; use f16/bf16/f32)"
+                )
+                .into());
+            }
+        }
+
+        let max_seq_len = config.max_seq_len as u64;
+        let head_dim_u = head_dim as u64;
+        let n_head_kv_u = n_head_kv as u64;
+        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+
+        let k_slab = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, config.k_dtype);
+        let v_slab = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, config.v_dtype);
+        let k_slab_stride = align_up(k_slab, align);
+        let v_slab_stride = align_up(v_slab, align);
+        let k_block = k_slab_stride * n_slots as u64;
+        let v_block = v_slab_stride * n_slots as u64;
+
+        let mut k_base = Vec::with_capacity(n_layer as usize);
+        let mut v_base = Vec::with_capacity(n_layer as usize);
+        let mut cursor = 0u64;
+        for _ in 0..n_layer {
+            let kb = align_up(cursor, align);
+            cursor = kb + k_block;
+            let vb = align_up(cursor, align);
+            cursor = vb + v_block;
+            k_base.push(kb);
+            v_base.push(vb);
+        }
+        let total = cursor.max(1);
+
+        let region = Region::new(
+            device,
+            total,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        // Zero the whole buffer so no slot ever reads stale K/V on its first
+        // forward (mirrors KvCache's implicit zero-on-fresh-alloc reliance).
+        if let Some(p) = region.host_ptr {
+            unsafe { std::ptr::write_bytes(p, 0, total as usize) };
+        }
+
+        Ok(Self {
+            config,
+            n_slots,
+            n_layer,
+            head_dim,
+            n_head_kv,
+            buffer: region.buffer,
+            host_ptr: region.host_ptr,
+            buffer_size: region.size,
+            alignment: region.alignment,
+            region,
+            k_base,
+            v_base,
+            k_slab_stride,
+            v_slab_stride,
+            positions: vec![0; n_slots as usize],
+            device: device.shared(),
+        })
+    }
+
+    /// Single-slot natural `[head_dim, n_head_kv, max_seq_len]` K view (slab
+    /// `slot`, layer `layer`) — identical layout to `KvCache::k_layers[layer]`.
+    pub fn slot_k_view(&self, slot: u32, layer: u32) -> TensorView {
+        make_view(
+            self.buffer,
+            self.k_base[layer as usize] + slot as u64 * self.k_slab_stride,
+            self.head_dim as u64,
+            self.config.max_seq_len as u64,
+            self.n_head_kv as u64,
+            self.config.k_dtype,
+        )
+    }
+
+    pub fn slot_v_view(&self, slot: u32, layer: u32) -> TensorView {
+        make_view(
+            self.buffer,
+            self.v_base[layer as usize] + slot as u64 * self.v_slab_stride,
+            self.head_dim as u64,
+            self.config.max_seq_len as u64,
+            self.n_head_kv as u64,
+            self.config.v_dtype,
+        )
+    }
+
+    /// Batched flash-attn K view for `layer` over slots `[0, b)`: permuted
+    /// `[head_dim, max_seq_len, n_head_kv, B]` with the slot as the batch
+    /// dimension (stride = slab stride). The shader bounds each sequence's KV
+    /// loop by its own `kv_len` (passed to `record_batched`), so the unused
+    /// tail past each slot's position is never read.
+    pub fn batched_k_attn_view(&self, layer: u32, b: u32) -> TensorView {
+        batched_attn_view(
+            self.buffer,
+            self.k_base[layer as usize],
+            self.k_slab_stride,
+            self.head_dim as u64,
+            self.config.max_seq_len as u64,
+            self.n_head_kv as u64,
+            b,
+            self.config.k_dtype,
+        )
+    }
+
+    pub fn batched_v_attn_view(&self, layer: u32, b: u32) -> TensorView {
+        batched_attn_view(
+            self.buffer,
+            self.v_base[layer as usize],
+            self.v_slab_stride,
+            self.head_dim as u64,
+            self.config.max_seq_len as u64,
+            self.n_head_kv as u64,
+            b,
+            self.config.v_dtype,
+        )
+    }
+
+    /// A non-owning single-sequence `KvCache` over slot `slot` (its slabs +
+    /// current position). Use it to prefill one sequence into its slab via the
+    /// existing single-sequence forward path; afterwards copy its `position`
+    /// back into `self.positions[slot]`.
+    pub fn slot_kvcache(&self, slot: u32) -> KvCache {
+        let k_layers = (0..self.n_layer).map(|l| self.slot_k_view(slot, l)).collect();
+        let v_layers = (0..self.n_layer).map(|l| self.slot_v_view(slot, l)).collect();
+        KvCache::borrowed_slot(
+            self.config,
+            self.buffer,
+            self.host_ptr,
+            self.buffer_size,
+            self.alignment,
+            k_layers,
+            v_layers,
+            self.positions[slot as usize],
+            self.device.clone(),
+        )
+    }
+}
+
+impl Drop for BatchKvCache {
+    fn drop(&mut self) {
+        self.region.destroy(self.device.raw());
+    }
+}
+
+/// Build a batched flash-attn K/V view: permuted `[head_dim, max_seq_len,
+/// n_head_kv, B]` with the slot as the (stride `slab_stride` bytes) batch
+/// dimension. Assumes a flat per-element stride (block_size == 1).
+#[allow(clippy::too_many_arguments)]
+fn batched_attn_view(
+    buffer: vk::Buffer,
+    base: u64,
+    slab_stride_bytes: u64,
+    head_dim: u64,
+    max_seq_len: u64,
+    n_head_kv: u64,
+    b: u32,
+    dtype: GgmlType,
+) -> TensorView {
+    let ts = dtype.block_layout().1 as u64; // type_size (block_size == 1)
+    let element_stride = [1u64, head_dim * n_head_kv, head_dim, slab_stride_bytes / ts];
+    let byte_stride = [
+        element_stride[0] * ts,
+        element_stride[1] * ts,
+        element_stride[2] * ts,
+        element_stride[3] * ts,
+    ];
+    TensorView {
+        buffer,
+        byte_offset: base,
+        byte_size: slab_stride_bytes * b as u64,
+        dims: [head_dim, max_seq_len, n_head_kv, b as u64],
+        byte_stride,
+        element_stride,
+        dtype,
+    }
 }

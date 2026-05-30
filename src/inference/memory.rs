@@ -19,6 +19,10 @@ pub struct Region {
     pub host_ptr: Option<*mut u8>,
     pub host_visible: bool,
     pub device_ptr_dropper: Option<()>, // placeholder for future explicit cleanup
+    /// `false` for a non-owning view over another Region's buffer (e.g. a
+    /// per-slot `KvCache` view into a shared batched KV buffer): `destroy`
+    /// is then a no-op, leaving the real owner to free the resources.
+    owned: bool,
 }
 
 unsafe impl Send for Region {}
@@ -83,7 +87,26 @@ impl Region {
             host_ptr,
             host_visible,
             device_ptr_dropper: None,
+            owned: true,
         })
+    }
+
+    /// A non-owning view over an existing `buffer` (and its mapped pointer).
+    /// `destroy` is a no-op; the real owner frees the buffer + memory. Used to
+    /// hand a per-slot `KvCache` a `Region` that aliases a shared batched KV
+    /// buffer without double-freeing it.
+    pub fn borrowed(buffer: vk::Buffer, host_ptr: Option<*mut u8>, size: u64, alignment: u64) -> Self {
+        Self {
+            buffer,
+            memory: vk::DeviceMemory::null(),
+            size,
+            cursor: 0,
+            alignment: alignment.max(1),
+            host_ptr,
+            host_visible: host_ptr.is_some(),
+            device_ptr_dropper: None,
+            owned: false,
+        }
     }
 
     /// Reserve a `size`-byte slot aligned up to `self.alignment`. Returns the
@@ -111,6 +134,11 @@ impl Region {
     /// Takes the raw `ash::Device` (not the `Device` wrapper) so owners that
     /// only hold a cloned device handle — e.g. `KvCache::drop` — can call it.
     pub fn destroy(&mut self, device: &ash::Device) {
+        // Non-owning view: the real owner frees the buffer + memory.
+        if !self.owned {
+            self.host_ptr = None;
+            return;
+        }
         unsafe {
             if self.host_ptr.is_some() {
                 device.unmap_memory(self.memory);
