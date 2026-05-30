@@ -9,6 +9,7 @@ use std::error::Error;
 use crate::gguf::{GgufFile, MetadataValue};
 use crate::inference::weights::WeightsHandle;
 
+pub mod encoder;
 pub mod preprocess;
 
 /// The kind of vision projector shipped in an mmproj GGUF

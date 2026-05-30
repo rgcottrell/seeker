@@ -138,6 +138,18 @@ fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
 }
 
 pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
+    // Vision patch-embed smoke test (Phase 2, Slice 2). Runs at the very top of
+    // `run()`, before the tokenizer / text-model load, because it loads its own
+    // mmproj GGUF directly — the `-m` arg may itself be an mmproj, which carries
+    // no tokenizer metadata or `token_embd.weight`, so those later steps would
+    // error first. Gated behind `gpu_debug`.
+    #[cfg(feature = "gpu_debug")]
+    if std::env::var("SEEKER_VISION_PATCHEMBED_TEST").is_ok() {
+        let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
+        vision_patchembed_smoke(&mut engine)?;
+        return Ok(());
+    }
+
     let resolved = resolve_model_path(&args).await?;
     let gguf = GgufFile::open(&resolved.main)?;
     let bundle = build_tokenizer(&gguf)?;
@@ -429,6 +441,115 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
 /// but in-place it double-applied the op nondeterministically (the root cause
 /// of run-to-run nondeterminism in the residual stream). We size N to span
 /// several blocks and deliberately straddle the 512 boundary.
+/// Vision patch-embed front-end smoke test (Phase 2, Slice 2).
+///
+/// Loads the mmproj GGUF (path from `SEEKER_MMPROJ`, else the known
+/// Qwen3.6 snapshot), uploads its weights, preprocesses a deterministic
+/// synthetic gradient image at a small size so the patch grid is tiny, runs
+/// BOTH the GPU `record_patch_embed` and the CPU `patch_embed_cpu`, and reports
+/// max-abs / mean-abs error between them with PASS/FAIL at tol 1e-3.
+///
+/// Loads the mmproj **as the model weights directly** (the test only needs the
+/// engine + the mmproj WeightsHandle), avoiding the 27 GB main model. Run with:
+///   SEEKER_VISION_PATCHEMBED_TEST=1 SEEKER_MMPROJ=<mmproj.gguf> \
+///     cargo run --features gpu_debug --bin seeker -- run -m <mmproj.gguf> ""
+#[cfg(feature = "gpu_debug")]
+fn vision_patchembed_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
+    use crate::vision::encoder::{patch_embed_cpu, HostWeights, VisionEncoder};
+    use crate::vision::preprocess::{preprocess_rgb8, PreprocessConfig};
+
+    let mmproj_path = std::env::var("SEEKER_MMPROJ").unwrap_or_else(|_| {
+        "/models/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/\
+         5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/mmproj-BF16.gguf"
+            .to_string()
+    });
+    println!("VISION patch-embed smoke: loading mmproj {mmproj_path}");
+    let gguf = GgufFile::open(std::path::Path::new(&mmproj_path))?;
+    let config = crate::vision::parse_config(&gguf)?;
+    println!(
+        "VISION config: n_embd={} patch_size={} merge={}",
+        config.n_embd, config.patch_size, config.spatial_merge_size
+    );
+    let weights = engine.upload_weights(&gguf)?;
+
+    let n_embd = config.n_embd as usize;
+    let patch_size = config.patch_size as usize;
+    let encoder = VisionEncoder::new(&weights, n_embd, patch_size)?;
+
+    // Up-convert the patch-embed weights (F16 conv/pos, F32 bias) straight from
+    // the mmap'd GGUF into host f32 — the uploaded GPU copy is device-local.
+    let hw = HostWeights::from_gguf(&gguf)?;
+
+    // Deterministic synthetic gradient at 64x96 (raw). With patch=16, merge=2,
+    // smart-resize keeps multiples of 32 -> small patch grid.
+    let (sw, sh) = (64u32, 96u32);
+    let mut buf = vec![0u8; (sw * sh * 3) as usize];
+    for y in 0..sh {
+        for x in 0..sw {
+            let i = (3 * (y * sw + x)) as usize;
+            buf[i] = (x % 256) as u8;
+            buf[i + 1] = (y % 256) as u8;
+            buf[i + 2] = ((x + y) % 256) as u8;
+        }
+    }
+    let pcfg = PreprocessConfig::qwen3vl_default(
+        config.patch_size,
+        config.spatial_merge_size,
+        config.image_mean,
+        config.image_std,
+    );
+    let img = preprocess_rgb8(&buf, sw, sh, &pcfg)?;
+    println!(
+        "VISION image: resized={}x{} grid={}x{} n_patches={} n_tokens={}",
+        img.resized_w,
+        img.resized_h,
+        img.grid_w,
+        img.grid_h,
+        img.grid_w * img.grid_h,
+        img.n_tokens
+    );
+
+    // GPU path.
+    let gpu = engine.forward(
+        &weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let out = encoder.record_patch_embed(ctx, &img, &hw)?;
+            Ok(out.range())
+        },
+    )?;
+
+    // CPU reference.
+    let cpu = patch_embed_cpu(&hw, n_embd, patch_size, &img);
+
+    if gpu.len() != cpu.len() {
+        return Err(format!("length mismatch: gpu {} vs cpu {}", gpu.len(), cpu.len()).into());
+    }
+    let mut max_abs = 0f64;
+    let mut sum_abs = 0f64;
+    for (g, c) in gpu.iter().zip(cpu.iter()) {
+        let d = (*g as f64 - *c as f64).abs();
+        max_abs = max_abs.max(d);
+        sum_abs += d;
+    }
+    let mean_abs = sum_abs / gpu.len() as f64;
+    let tol = 1e-3;
+    let pass = max_abs <= tol;
+    println!(
+        "VISION patch-embed: elements={} max_abs={max_abs:.3e} mean_abs={mean_abs:.3e} \
+         gpu[0]={:.6} cpu[0]={:.6} -> {}",
+        gpu.len(),
+        gpu.first().copied().unwrap_or(0.0),
+        cpu.first().copied().unwrap_or(0.0),
+        if pass { "PASS" } else { "FAIL" }
+    );
+    if !pass {
+        return Err(
+            format!("vision patch-embed GPU-vs-CPU max_abs {max_abs:.3e} > tol {tol:.0e}").into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(feature = "gpu_debug")]
 fn inplace_binary_smoke_test(
     engine: &mut Engine,
@@ -1231,6 +1352,12 @@ fn gdn_smoke_test(
                     s3: (num_v * l) as u32,
                 },
                 s_v as u32,
+                // k_snapshots: 0 = no per-position K snapshotting (the
+                // MTP-spec-decode path); this diagnostic smoke test runs the
+                // plain single-pass GDN. Added when the spec-decode K-snapshot
+                // arg landed and this test wasn't updated (pre-existing breakage
+                // surfaced once the vision smoke test made gpu_debug compile).
+                0,
             )?;
             // Return only the attn portion (first attn_floats of gdn_dst).
             Ok(crate::inference::buffer::BufferRange {
@@ -1830,17 +1957,15 @@ fn kquant_matmul_test(
     let m = a.dims[1]; // output rows
     println!("kquant matmul test: {full_name} dtype={:?} K={k} M={m}", a.dtype);
 
-    // Raw quant bytes live in the (host-visible) weights region.
+    // Raw quant bytes. Weights are now per-tensor device-local buffers (each
+    // tensor at offset 0 in its own buffer), so read via `debug_host_base`
+    // rather than the old single host-visible `weights.region` (which no longer
+    // exists after the per-tensor device-local refactor). Returns None for true
+    // device-local memory; this diagnostic test then can't run.
     let host_ptr = weights
-        .region
-        .host_ptr
-        .ok_or("weights region not host-visible")?;
-    let raw: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            host_ptr.add(a.byte_offset as usize),
-            a.byte_size as usize,
-        )
-    };
+        .debug_host_base(&a)
+        .ok_or("weights are device-local; kquant host readback unavailable")?;
+    let raw: &[u8] = unsafe { std::slice::from_raw_parts(host_ptr, a.byte_size as usize) };
 
     // Deterministic input vector b[i] = sin(i * 0.01) — varied, bounded.
     let b_host: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01).sin()).collect();
