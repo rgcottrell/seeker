@@ -11,6 +11,13 @@ dirs = "5"
 futures-util = "0.3"
 glob = "0.3"
 hf-hub = "0.5.0"
+# Image decode for vision (mmproj) preprocessing. Default features pull every
+# codec; we only need the common still formats, so trim to keep the dep tree
+# small. Used purely for *decoding* to interleaved RGB8 — the smart-resize is
+# hand-rolled in `src/vision/preprocess.rs` to byte-match llama.cpp's
+# corner-aligned bilinear (the `image` crate's resampling filters use a
+# different convention).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
 indexmap = "2.14.0"
 jiff = "0.2"
 memmap2 = "0.9.10"

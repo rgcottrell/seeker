@@ -9,6 +9,8 @@ use std::error::Error;
 use crate::gguf::{GgufFile, MetadataValue};
 use crate::inference::weights::WeightsHandle;
 
+pub mod preprocess;
+
 /// The kind of vision projector shipped in an mmproj GGUF
 /// (`clip.projector_type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
