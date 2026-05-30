@@ -96,6 +96,34 @@ pub struct VisionEncoder {
     pub eps: f32,
     /// Per-block GPU weight views, indexed by layer 0..n_layer.
     pub blocks: Vec<BlockWeights>,
+    /// Post-encoder LayerNorm-affine + merger MLP weight views.
+    pub merger: MergerWeights,
+    /// Merger output dim = text n_embd (= clip.vision.projection_dim = 2048),
+    /// derived from `mm.2.weight`'s M dim.
+    pub projection_dim: usize,
+}
+
+/// GPU [`TensorView`]s for the post-encoder norm + merger MLP
+/// (`qwen3vl_merger`): `post_ln` (LayerNorm-affine, weight+bias F32) then
+/// `mm.0` `[4*n_embd -> 4*n_embd]` -> GELU -> `mm.2` `[4*n_embd -> proj_dim]`
+/// (matmul weights BF16/F16, biases F32). The `4*n_embd` input is the 2x2
+/// spatial-merge group, formed by a contiguous reshape of the post_ln output
+/// (Slice 2 already made the 4 patches of each 2x2 block consecutive tokens).
+/// `mm.1` is the GELU between the two linears (hence the `mm.0`/`mm.2` naming).
+#[derive(Clone, Copy)]
+pub struct MergerWeights {
+    /// `v.post_ln.weight` `[n_embd]` F32.
+    pub post_ln_w: TensorView,
+    /// `v.post_ln.bias` `[n_embd]` F32.
+    pub post_ln_b: TensorView,
+    /// `mm.0.weight` `[K=4*n_embd, M=4*n_embd]` BF16/F16.
+    pub mm0_w: TensorView,
+    /// `mm.0.bias` `[4*n_embd]` F32.
+    pub mm0_b: TensorView,
+    /// `mm.2.weight` `[K=4*n_embd, M=proj_dim]` BF16/F16.
+    pub mm2_w: TensorView,
+    /// `mm.2.bias` `[proj_dim]` F32.
+    pub mm2_b: TensorView,
 }
 
 /// GPU [`TensorView`]s for one ViT transformer block. The four matmul weights
@@ -273,6 +301,45 @@ impl VisionEncoder {
             });
         }
 
+        // Post-encoder norm + merger MLP. mm.0/mm.2 weights are BF16/F16/F32
+        // (GEMM A side); post_ln + biases are F32. Validate loudly, mirroring
+        // the per-block parsing above.
+        let mat = |name: &str| -> Result<TensorView, Box<dyn Error>> {
+            let v = weights.view(name)?;
+            if v.dtype != GgmlType::BF16 && v.dtype != GgmlType::F16 && v.dtype != GgmlType::F32 {
+                return Err(
+                    format!("vision merger: expected BF16/F16/F32 {name}, got {:?}", v.dtype).into(),
+                );
+            }
+            Ok(v)
+        };
+        let f32v = |name: &str| -> Result<TensorView, Box<dyn Error>> {
+            let v = weights.view(name)?;
+            if v.dtype != GgmlType::F32 {
+                return Err(format!("vision merger: expected F32 {name}, got {:?}", v.dtype).into());
+            }
+            Ok(v)
+        };
+        let merger = MergerWeights {
+            post_ln_w: f32v("v.post_ln.weight")?,
+            post_ln_b: f32v("v.post_ln.bias")?,
+            mm0_w: mat("mm.0.weight")?,
+            mm0_b: f32v("mm.0.bias")?,
+            mm2_w: mat("mm.2.weight")?,
+            mm2_b: f32v("mm.2.bias")?,
+        };
+        // proj_dim = mm.2.weight's M (output) dim. Sanity-check the merger input
+        // dim equals 4*n_embd (the 2x2 spatial-merge group).
+        let projection_dim = merger.mm2_w.dims[1] as usize;
+        let merge_in = merger.mm0_w.dims[0] as usize;
+        if merge_in != 4 * n_embd {
+            return Err(format!(
+                "vision merger: mm.0 input dim {merge_in} != 4*n_embd {}",
+                4 * n_embd
+            )
+            .into());
+        }
+
         Ok(VisionEncoder {
             patch_embd_0,
             patch_embd_1,
@@ -283,6 +350,8 @@ impl VisionEncoder {
             n_ff,
             eps,
             blocks,
+            merger,
+            projection_dim,
         })
     }
 
@@ -526,6 +595,82 @@ impl VisionEncoder {
         let out = ctx.alloc_tensor([nemb, np, 1, 1], f32)?;
         record_add(ctx, resid1, ffn, out)?;
         Ok(out)
+    }
+
+    /// Record the post-encoder LayerNorm + merger MLP on the GPU. Input `x` is
+    /// the final block output `[n_embd, n_pos]` (F32, 2x2-block token order);
+    /// output is the image embeddings `[proj_dim, n_pos/4]` (F32) — one token
+    /// per 2x2 merged patch, in text n_embd.
+    ///
+    /// Faithful port of the merger tail of `clip_graph_qwen3vl::build`
+    /// (`/home/bob/tools/llama.cpp/src/tools/mtmd/models/qwen3vl.cpp`, the
+    /// post-block section) + `clip.cpp build_norm`/`build_ffn`:
+    /// * `post_ln`: LayerNorm-affine (`build_norm` NORM_TYPE_NORMAL), reusing
+    ///   [`record_layernorm_affine`].
+    /// * **2x2 merge**: `ggml_reshape(emb, n_embd*4, n_pos/4)` — a pure
+    ///   contiguous reinterpret, since Slice 2 already placed each 2x2 block's
+    ///   four patches at consecutive tokens (so the 4*n_embd row = the 4
+    ///   stacked patch vectors). No data movement.
+    /// * `mm.0` `@ x + mm.0.bias` -> **GELU** (`mm.1`) -> `mm.2 @ · + mm.2.bias`
+    ///   (`build_ffn` FFN_GELU, no gate). Output dim = `proj_dim`.
+    ///
+    /// Deepstack is disabled in this mmproj (no `v.deepstack.*` tensors); a
+    /// deepstack-enabled file would concat its features onto this output here.
+    pub fn record_merger(
+        &self,
+        ctx: &mut DispatchContext,
+        x: TensorView,
+    ) -> Result<TensorView, Box<dyn Error>> {
+        let n_embd = self.n_embd;
+        let n_pos = x.dims[1] as usize;
+        debug_assert_eq!(n_pos % 4, 0, "merger needs n_pos divisible by 4 (2x2 merge)");
+        let n_merged = n_pos / 4;
+        let merge_in = 4 * n_embd;
+        let proj = self.projection_dim;
+        let f32 = GgmlType::F32;
+        let nm = n_merged as u64;
+        let m = self.merger;
+
+        // post_ln (affine) over the [n_embd, n_pos] rows.
+        let pln = ctx.alloc_tensor([n_embd as u64, n_pos as u64, 1, 1], f32)?;
+        record_layernorm_affine(ctx, x, m.post_ln_w, m.post_ln_b, pln, self.eps)?;
+
+        // 2x2 merge = contiguous reshape [n_embd, n_pos] -> [4*n_embd, n_pos/4].
+        let merged = dense_view(&pln.range(), [merge_in as u64, nm, 1, 1]);
+
+        // fc1: out0 = mm0_w @ merged + mm0_b   [4*n_embd, n_merged]
+        let out0 = ctx.alloc_tensor([merge_in as u64, nm, 1, 1], f32)?;
+        matmul::record(ctx, m.mm0_w, merged, out0)?;
+        record_add_bias_broadcast(ctx, out0, m.mm0_b)?;
+
+        // gelu
+        let act = ctx.alloc_tensor([merge_in as u64, nm, 1, 1], f32)?;
+        record_gelu(ctx, out0, act)?;
+
+        // fc2: out = mm2_w @ act + mm2_b   [proj_dim, n_merged]
+        let out = ctx.alloc_tensor([proj as u64, nm, 1, 1], f32)?;
+        matmul::record(ctx, m.mm2_w, act, out)?;
+        record_add_bias_broadcast(ctx, out, m.mm2_b)?;
+        Ok(out)
+    }
+
+    /// Record the FULL Qwen3-VL vision tower on the GPU: patch-embed -> 27 ViT
+    /// blocks -> post_ln -> merger. Returns the image embeddings
+    /// `[proj_dim, n_tokens]` (F32) ready to splice into the LLM decoder
+    /// residual stream (Phase 3). `host_weights` supplies the host-side
+    /// patch-embed conv/pos/bias (the device-local GPU copies aren't
+    /// host-readable for the pos-embd resize).
+    pub fn encode_image(
+        &self,
+        ctx: &mut DispatchContext,
+        img: &PreprocessedImage,
+        host_weights: &HostWeights,
+    ) -> Result<TensorView, Box<dyn Error>> {
+        let mut x = self.record_patch_embed(ctx, img, host_weights)?;
+        for il in 0..self.blocks.len() as u32 {
+            x = self.record_block(ctx, x, il, img.grid_w, img.grid_h)?;
+        }
+        self.record_merger(ctx, x)
     }
 }
 
@@ -1208,6 +1353,100 @@ impl HostWeights {
     }
 }
 
+/// Host-side **F32** copies of the post-encoder norm + merger MLP weights
+/// (up-converted from the mmproj GGUF). The numerical oracle ([`merger_cpu`])
+/// reads these. Matmul weights are stored `[K, M]` row-major (idx = `k + K*m`).
+#[derive(Clone)]
+pub struct MergerHostWeights {
+    pub post_ln_w: Vec<f32>,
+    pub post_ln_b: Vec<f32>,
+    /// `[K=4*n_embd, M=4*n_embd]`.
+    pub mm0_w: Vec<f32>,
+    pub mm0_b: Vec<f32>,
+    /// `[K=4*n_embd, M=proj_dim]`.
+    pub mm2_w: Vec<f32>,
+    pub mm2_b: Vec<f32>,
+}
+
+impl MergerHostWeights {
+    pub fn from_gguf(gguf: &crate::gguf::GgufFile) -> Result<MergerHostWeights, Box<dyn Error>> {
+        Ok(MergerHostWeights {
+            post_ln_w: read_tensor_as_f32(gguf, "v.post_ln.weight")?,
+            post_ln_b: read_tensor_as_f32(gguf, "v.post_ln.bias")?,
+            mm0_w: read_tensor_as_f32(gguf, "mm.0.weight")?,
+            mm0_b: read_tensor_as_f32(gguf, "mm.0.bias")?,
+            mm2_w: read_tensor_as_f32(gguf, "mm.2.weight")?,
+            mm2_b: read_tensor_as_f32(gguf, "mm.2.bias")?,
+        })
+    }
+}
+
+/// Pure CPU reference for [`VisionEncoder::record_merger`]. `x` is the final
+/// block output `[n_embd, n_pos]` (idx = c + n_embd*t); returns
+/// `[proj_dim, n_pos/4]` (idx = m + proj_dim*b).
+pub fn merger_cpu(mh: &MergerHostWeights, x: &[f32], n_embd: usize, eps: f32) -> Vec<f32> {
+    let n_pos = x.len() / n_embd;
+    debug_assert_eq!(n_pos % 4, 0);
+    let n_merged = n_pos / 4;
+    let merge_in = 4 * n_embd;
+    let proj = mh.mm2_b.len();
+
+    // post_ln (affine), then the 2x2 merge is a no-op reinterpret: the
+    // contiguous [n_embd, n_pos] f32 buffer IS the [4*n_embd, n_pos/4] buffer
+    // (idx c + n_embd*t == idx (c + n_embd*(t%4)) + 4*n_embd*(t/4)).
+    let merged = layernorm_affine_cpu(x, &mh.post_ln_w, &mh.post_ln_b, n_embd, n_pos, eps);
+
+    // fc1 + bias -> GELU
+    let mut act = vec![0f32; merge_in * n_merged];
+    for b in 0..n_merged {
+        for m in 0..merge_in {
+            let mut acc = 0f32;
+            for k in 0..merge_in {
+                acc += mh.mm0_w[k + merge_in * m] * merged[k + merge_in * b];
+            }
+            act[m + merge_in * b] = gelu_tanh(acc + mh.mm0_b[m]);
+        }
+    }
+
+    // fc2 + bias
+    let mut out = vec![0f32; proj * n_merged];
+    for b in 0..n_merged {
+        for m in 0..proj {
+            let mut acc = 0f32;
+            for k in 0..merge_in {
+                acc += mh.mm2_w[k + merge_in * m] * act[k + merge_in * b];
+            }
+            out[m + proj * b] = acc + mh.mm2_b[m];
+        }
+    }
+    out
+}
+
+/// Pure CPU reference for the FULL vision tower ([`VisionEncoder::encode_image`]):
+/// patch-embed -> 27 blocks -> post_ln -> merger. Returns `[proj_dim, n_tokens]`
+/// (idx = m + proj_dim*tok). The numerical oracle the GPU path is diffed
+/// against, and the faithful llama.cpp port the Slice-4 anchor checks.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_image_cpu(
+    hw: &HostWeights,
+    blocks: &[BlockHostWeights],
+    mh: &MergerHostWeights,
+    n_embd: usize,
+    n_head: usize,
+    n_ff: usize,
+    eps: f32,
+    patch_size: usize,
+    img: &PreprocessedImage,
+) -> Vec<f32> {
+    let gw = img.grid_w as usize;
+    let gh = img.grid_h as usize;
+    let mut x = patch_embed_cpu(hw, n_embd, patch_size, img);
+    for bw in blocks {
+        x = block_cpu(bw, &x, n_embd, n_head, n_ff, eps, gw, gh);
+    }
+    merger_cpu(mh, &x, n_embd, eps)
+}
+
 /// Read a named F16/F32 tensor from the GGUF, returning its elements as a
 /// contiguous `Vec<f32>` (logical order, F16 up-converted via [`f16_to_f32`]).
 fn read_tensor_as_f32(
@@ -1425,57 +1664,91 @@ pub fn build_im2col_reordered(img: &PreprocessedImage, patch_size: usize) -> Vec
 /// 2x2-block token order, returning `[n_embd, n_patches]` row-major
 /// (index = `c + n_embd*tok`).
 ///
-/// Faithful port of `clip_graph::resize_position_embeddings` (clip.cpp:278-298)
+/// Faithful port of `clip_graph::resize_position_embeddings` (clip.cpp:278-296)
 /// followed by the same merge reorder. `pos_base` is the raw `[n_embd, 2304]`
-/// weight (row = channel, col = `gx + 48*gy`). The bilinear resize uses ggml's
-/// non-align-corners formula (ggml-cpu/ops.cpp `ggml_compute_forward_upscale_f32`,
-/// `GGML_SCALE_MODE_BILINEAR`, lines 7683-7723): pixel_offset=0.5,
-/// `sf = dst/src`, `x = (i+0.5)/sf - 0.5`, floor + clamp, 4-tap blend.
+/// weight (row = channel, col = `gx + 48*gy`, gx = width/x index, gy =
+/// height/y index — matching the `ggml_reshape_3d(n_embd, 48, 48)` +
+/// `permute(2,0,1)` that feeds `ggml_interpolate`).
+///
+/// **Antialiased** bilinear: the default mode is
+/// `GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS` (clip-graph.h:12), NOT
+/// plain bilinear. For the typical >1x downscale (48 -> ~10..14) this is a wide
+/// triangle-filter low-pass, not a 4-tap blend — using plain bilinear here adds
+/// a wrong positional bias to every patch that then compounds through all 27
+/// ViT blocks. Exact port of the antialias branch of
+/// `ggml_compute_forward_upscale_f32` (ggml-cpu/ops.cpp:7624-7680), itself
+/// modeled on `F.interpolate(mode="bilinear", align_corners=False,
+/// antialias=True)`: `pixel_offset=0.5`, `sf=dst/src`,
+/// `support=max(1, 1/sf)`, `invscale=1/support`, source coord
+/// `x=(i+0.5)/sf`, and a normalized sum of `triangle((s - x + 0.5)*invscale)`
+/// weights over `s in [x-support+0.5, x+support+0.5) ∩ [0, src)`.
 pub fn resize_position_embeddings_reordered(
     pos_base: &[f32],
     n_embd: usize,
     npx: usize,
     npy: usize,
 ) -> Vec<f32> {
-    let side = POS_EMBD_BASE_SIDE; // 48
+    let side = POS_EMBD_BASE_SIDE; // 48 (= sqrt(2304))
     debug_assert_eq!(pos_base.len(), n_embd * side * side);
     let n_patches = npx * npy;
     let mut out = vec![0f32; n_embd * n_patches];
 
-    // resize_position_embeddings short-circuits when no resize is needed.
-    let need_resize = !(npx == side && npy == side);
+    // resize_position_embeddings short-circuits when no resize is needed
+    // (height == n_per_side && width == n_per_side); only the 2x2 reorder runs.
+    if npx == side && npy == side {
+        for tok in 0..n_patches {
+            let (pw, ph) = token_to_patch(tok, npx);
+            for c in 0..n_embd {
+                out[c + n_embd * tok] = pos_base[c + n_embd * (pw + side * ph)];
+            }
+        }
+        return out;
+    }
 
-    // ggml sf = dst/src (NOT align-corners): sf0 over width, sf1 over height.
-    let sf0 = npx as f32 / side as f32;
-    let sf1 = npy as f32 / side as f32;
+    // ggml antialiased bilinear. sf = dst/src; pixel_offset = 0.5.
+    let sf0 = npx as f32 / side as f32; // width  (x)
+    let sf1 = npy as f32 / side as f32; // height (y)
     let po = 0.5f32;
+    let support0 = (1.0f32 / sf0).max(1.0);
+    let support1 = (1.0f32 / sf1).max(1.0);
+    let invscale0 = 1.0 / support0;
+    let invscale1 = 1.0 / support1;
+    let tri = |t: f32| (1.0 - t.abs()).max(0.0);
 
     for tok in 0..n_patches {
-        let (pw, ph) = token_to_patch(tok, npx);
-        let (dx, dy) = (pw, ph); // raster grid coords in the npx x npy grid.
+        let (dx, dy) = token_to_patch(tok, npx); // dst x (col), dst y (row)
+        let x = (dx as f32 + po) / sf0;
+        let y = (dy as f32 + po) / sf1;
+        // Contributing source range (int64 trunc-toward-zero then clamp, as ggml).
+        let x_min = ((x - support0 + po) as i64).max(0) as usize;
+        let x_max = ((x + support0 + po) as i64).min(side as i64) as usize;
+        let y_min = ((y - support1 + po) as i64).max(0) as usize;
+        let y_max = ((y + support1 + po) as i64).min(side as i64) as usize;
+        // Precompute the per-axis triangle weights (independent of channel).
+        let xs: Vec<(usize, f32)> = (x_min..x_max)
+            .map(|sx| (sx, tri((sx as f32 - x + po) * invscale0)))
+            .collect();
+        let ys: Vec<(usize, f32)> = (y_min..y_max)
+            .map(|sy| (sy, tri((sy as f32 - y + po) * invscale1)))
+            .collect();
         for c in 0..n_embd {
-            let val = if need_resize {
-                // bilinear sample base 48x48 grid at the dst pixel (dx, dy).
-                let xf = (dx as f32 + po) / sf0 - po;
-                let yf = (dy as f32 + po) / sf1 - po;
-                let x0 = (xf.floor() as i64).clamp(0, side as i64 - 1) as usize;
-                let x1 = ((xf.floor() as i64) + 1).clamp(0, side as i64 - 1) as usize;
-                let y0 = (yf.floor() as i64).clamp(0, side as i64 - 1) as usize;
-                let y1 = ((yf.floor() as i64) + 1).clamp(0, side as i64 - 1) as usize;
-                let dx_frac = (xf - xf.floor()).clamp(0.0, 1.0);
-                let dy_frac = (yf - yf.floor()).clamp(0.0, 1.0);
-                let at = |gx: usize, gy: usize| pos_base[c + n_embd * (gx + side * gy)];
-                let a = at(x0, y0);
-                let b = at(x1, y0);
-                let cc = at(x0, y1);
-                let d = at(x1, y1);
-                a * (1.0 - dx_frac) * (1.0 - dy_frac)
-                    + b * dx_frac * (1.0 - dy_frac)
-                    + cc * (1.0 - dx_frac) * dy_frac
-                    + d * dx_frac * dy_frac
-            } else {
-                pos_base[c + n_embd * (dx + side * dy)]
-            };
+            // Accumulate val + total_weight in ggml's (sy outer, sx inner) order,
+            // skipping non-positive weights, then normalize.
+            let mut val = 0f32;
+            let mut tw = 0f32;
+            for &(sy, wy) in &ys {
+                for &(sx, wx) in &xs {
+                    let w = wx * wy;
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    val += pos_base[c + n_embd * (sx + side * sy)] * w;
+                    tw += w;
+                }
+            }
+            if tw > 0.0 {
+                val /= tw;
+            }
             out[c + n_embd * tok] = val;
         }
     }
@@ -1630,50 +1903,47 @@ mod tests {
         }
     }
 
-    /// Exact ggml half-pixel bilinear sampler on a hand-checkable 2x2 -> 4x4
-    /// upscale of a single channel. Re-derives the same arithmetic as the
-    /// production inner loop with a local `side=2` so the values are tiny and
-    /// hand-verifiable. (The production path always uses side=48; the formula
-    /// is identical.)
+    /// Hand-checked ggml **antialiased** bilinear downscale (the production
+    /// path; `GGML_SCALE_FLAG_ANTIALIAS`) on a 4x1 -> 2x1 single-channel row.
+    /// Re-derives the same arithmetic as the production inner loop on a tiny
+    /// case so the weights and normalization are hand-verifiable.
+    ///
+    /// src = [10,20,30,40], sf0 = 2/4 = 0.5, support0 = max(1,1/0.5)=2,
+    /// invscale0 = 0.5, po = 0.5. triangle(t) = max(1-|t|,0).
+    ///   dst 0: x=(0+.5)/.5=1.0; src sx∈{0,1,2}; wx=tri((sx-1+.5)*.5)=
+    ///          {.75,.75,.25}; val=(10*.75+20*.75+30*.25)/1.75 = 30/1.75
+    ///   dst 1: x=(1+.5)/.5=3.0; src sx∈{1,2,3}; wx={.25,.75,.75};
+    ///          val=(20*.25+30*.75+40*.75)/1.75 = 57.5/1.75
     #[test]
-    fn bilinear_sampler_2x2_to_4x4() {
-        // base 2x2, channel 0: values (gx,gy): (0,0)=0 (1,0)=2 (0,1)=8 (1,1)=10.
-        let side = 2usize;
-        let base = vec![0.0f32, 2.0, 8.0, 10.0];
-        let n = 4usize;
-        let sf = n as f32 / side as f32; // 2.0
+    fn antialias_bilinear_downscale_4_to_2() {
+        let src = [10.0f32, 20.0, 30.0, 40.0];
+        let (src_w, dst_w) = (4usize, 2usize);
+        let sf0 = dst_w as f32 / src_w as f32;
         let po = 0.5f32;
-        let sample = |dx: usize, dy: usize| -> f32 {
-            let xf = (dx as f32 + po) / sf - po;
-            let yf = (dy as f32 + po) / sf - po;
-            let x0 = (xf.floor() as i64).clamp(0, side as i64 - 1) as usize;
-            let x1 = ((xf.floor() as i64) + 1).clamp(0, side as i64 - 1) as usize;
-            let y0 = (yf.floor() as i64).clamp(0, side as i64 - 1) as usize;
-            let y1 = ((yf.floor() as i64) + 1).clamp(0, side as i64 - 1) as usize;
-            let dxf = (xf - xf.floor()).clamp(0.0, 1.0);
-            let dyf = (yf - yf.floor()).clamp(0.0, 1.0);
-            let at = |gx: usize, gy: usize| base[gx + side * gy];
-            at(x0, y0) * (1.0 - dxf) * (1.0 - dyf)
-                + at(x1, y0) * dxf * (1.0 - dyf)
-                + at(x0, y1) * (1.0 - dxf) * dyf
-                + at(x1, y1) * dxf * dyf
+        let support0 = (1.0f32 / sf0).max(1.0);
+        let invscale0 = 1.0 / support0;
+        let tri = |t: f32| (1.0f32 - t.abs()).max(0.0);
+        let sample = |i0: usize| -> f32 {
+            let x = (i0 as f32 + po) / sf0;
+            let x_min = ((x - support0 + po) as i64).max(0) as usize;
+            let x_max = ((x + support0 + po) as i64).min(src_w as i64) as usize;
+            let (mut val, mut tw) = (0f32, 0f32);
+            for sx in x_min..x_max {
+                let w = tri((sx as f32 - x + po) * invscale0);
+                if w <= 0.0 {
+                    continue;
+                }
+                val += src[sx] * w;
+                tw += w;
+            }
+            if tw > 0.0 {
+                val / tw
+            } else {
+                0.0
+            }
         };
-        // dst pixel i -> src (i+0.5)/2 - 0.5:
-        //   i=0 -> -0.25 floor -1 clamp0, dx 0 effectively -> col0
-        //   i=1 ->  0.25 -> x0=0,x1=1, dx=0.25
-        //   i=3 ->  1.25 -> x0=1,x1=1 (clamp), dx=0.25 (but x0==x1 -> col1)
-        assert!((sample(0, 0) - 0.0).abs() < 1e-6, "got {}", sample(0, 0));
-        // (1,0): xf=0.25 over row0 [0,2] -> 0.5.
-        assert!((sample(1, 0) - 0.5).abs() < 1e-6, "got {}", sample(1, 0));
-        // (3,0): x clamps to col1 -> 2.0.
-        assert!((sample(3, 0) - 2.0).abs() < 1e-6, "got {}", sample(3, 0));
-        // (0,3): y clamps to row1, col0 -> 8.0.
-        assert!((sample(0, 3) - 8.0).abs() < 1e-6, "got {}", sample(0, 3));
-        // (3,3): clamps to (1,1) -> 10.0.
-        assert!((sample(3, 3) - 10.0).abs() < 1e-6, "got {}", sample(3, 3));
-        // interior (1,1): xf=yf=0.25, bilinear of [[0,2],[8,10]]:
-        //   = 0*0.75*0.75 + 2*0.25*0.75 + 8*0.75*0.25 + 10*0.25*0.25 = 2.5
-        assert!((sample(1, 1) - 2.5).abs() < 1e-6, "got {}", sample(1, 1));
+        assert!((sample(0) - 30.0 / 1.75).abs() < 1e-5, "dst0 got {}", sample(0));
+        assert!((sample(1) - 57.5 / 1.75).abs() < 1e-5, "dst1 got {}", sample(1));
     }
 
     // ---- Slice 3 (ViT block) CPU unit tests ----
@@ -1796,6 +2066,43 @@ mod tests {
         let out = block_cpu(&bw, &x, n_embd, n_head, n_ff, 1e-6, gw, gh);
         for (o, xi) in out.iter().zip(x.iter()) {
             assert!((o - xi).abs() < 1e-5, "zero-weight block not identity: {o} vs {xi}");
+        }
+    }
+
+    /// merger_cpu shape + bias invariant: with both matmul weights zeroed, the
+    /// merger collapses to a constant — fc1 = mm0_b, gelu(mm0_b), fc2 = mm2_b —
+    /// so every output token equals `mm2_b` regardless of the input or post_ln,
+    /// and the output is `[proj, n_pos/4]`. Catches a wrong output shape, a
+    /// mis-broadcast bias, or a 2x2-merge stride bug (which would still have to
+    /// reproduce mm2_b exactly, so it pins the bias path).
+    #[test]
+    fn merger_cpu_shape_and_bias() {
+        let n_embd = 8;
+        let proj = 4;
+        let merge_in = 4 * n_embd; // 32
+        let n_pos = 12; // -> n_merged = 3
+        let n_merged = n_pos / 4;
+        let mh = MergerHostWeights {
+            post_ln_w: (0..n_embd).map(|i| 1.0 + 0.1 * i as f32).collect(),
+            post_ln_b: (0..n_embd).map(|i| -0.2 * i as f32).collect(),
+            mm0_w: vec![0.0; merge_in * merge_in],
+            mm0_b: (0..merge_in).map(|i| 0.3 * i as f32 - 1.0).collect(),
+            mm2_w: vec![0.0; merge_in * proj],
+            mm2_b: vec![10.0, 20.0, 30.0, 40.0],
+        };
+        // Arbitrary, non-degenerate input — output must NOT depend on it.
+        let x: Vec<f32> = (0..n_embd * n_pos).map(|i| (i as f32) * 0.07 - 1.3).collect();
+        let out = merger_cpu(&mh, &x, n_embd, 1e-6);
+        assert_eq!(out.len(), proj * n_merged, "merger output shape");
+        for b in 0..n_merged {
+            for m in 0..proj {
+                let v = out[m + proj * b];
+                assert!(
+                    (v - mh.mm2_b[m]).abs() < 1e-5,
+                    "tok {b} ch {m}: got {v}, want mm2_b {}",
+                    mh.mm2_b[m]
+                );
+            }
         }
     }
 

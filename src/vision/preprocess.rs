@@ -187,9 +187,10 @@ pub fn smart_resize(w: u32, h: u32, cfg: &PreprocessConfig) -> (u32, u32) {
 /// Exact port of llama.cpp `img_tool::resize_bilinear` (mtmd-image.cpp:212-243).
 /// `src` is `src_w*src_h*3` bytes interleaved RGB; returns `dst_w*dst_h*3`
 /// interleaved RGB. Uses `x_ratio = (src_w-1)/(dst_w-1)` (corner alignment) and
-/// rounds the interpolated value half-away-from-zero (`std::lround`) — this
-/// differs from the half-pixel convention in most image libraries, hence the
-/// hand-rolled loop. All arithmetic is in `f32` to byte-match the C++.
+/// **truncates** the interpolated value toward zero (C++ `static_cast<uint8_t>`,
+/// NOT rounding) — this differs from the half-pixel convention in most image
+/// libraries, hence the hand-rolled loop. All arithmetic is in `f32` to
+/// byte-match the C++.
 fn resize_bilinear_u8(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     let sw = src_w as i64;
     let sh = src_h as i64;
@@ -232,11 +233,52 @@ fn resize_bilinear_u8(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
             for c in 0..3 {
                 let top = lerp(src[i00 + c] as f32, src[i01 + c] as f32, xf);
                 let bot = lerp(src[i10 + c] as f32, src[i11 + c] as f32, xf);
-                // std::lround: round half away from zero, then clamp to u8.
-                let v = lerp(top, bot, yf).round();
+                // llama.cpp writes the result via `static_cast<uint8_t>(...)`,
+                // i.e. **truncation** toward zero — NOT rounding. Rounding here
+                // shifts ~half the resampled pixels by 1, a systematic bias that
+                // propagates through the 27-block tower. `f32 as u8` in Rust is a
+                // saturating, truncating cast (matches the C++ cast on [0,255]).
+                let v = lerp(top, bot, yf);
                 dst[idst + c] = v.clamp(0.0, 255.0) as u8;
             }
         }
+    }
+    dst
+}
+
+/// llama.cpp's **PAD_CEIL** resize (`img_tool::resize` padding branch): scale the
+/// source to fit *within* `(dst_w, dst_h)` preserving aspect ratio (ceil-rounded
+/// and clamped to the target), bilinear-resample to that inner size, then center
+/// it on a `dst_w x dst_h` **black** canvas. This is the qwen2vl/qwen3vl path
+/// (`image_resize_pad=PAD_CEIL`, `image_pad_color={0,0,0}`). When the source
+/// already equals the target it degenerates to a copy (llama's "no resize
+/// needed" short-circuit), which we take explicitly.
+///
+/// All scale/size arithmetic mirrors the C++ exactly: `scale =
+/// min(dst_w/src_w, dst_h/src_h)` in f32, `new = min(ceil(src*scale), dst)`,
+/// integer-floor centering offsets `(dst - new)/2`.
+fn resize_pad_ceil(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    if src_w == dst_w && src_h == dst_h {
+        return src.to_vec();
+    }
+    let scale_w = dst_w as f32 / src_w as f32;
+    let scale_h = dst_h as f32 / src_h as f32;
+    let scale = scale_w.min(scale_h);
+    let new_w = ((src_w as f32 * scale).ceil() as u32).min(dst_w).max(1);
+    let new_h = ((src_h as f32 * scale).ceil() as u32).min(dst_h).max(1);
+
+    let inner = resize_bilinear_u8(src, src_w, src_h, new_w, new_h);
+
+    // Black canvas, inner image centered (integer-floor offsets, as llama).
+    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 3];
+    let off_x = ((dst_w - new_w) / 2) as usize;
+    let off_y = ((dst_h - new_h) / 2) as usize;
+    let dw = dst_w as usize;
+    let nw = new_w as usize;
+    for y in 0..new_h as usize {
+        let drow = 3 * ((y + off_y) * dw + off_x);
+        let srow = 3 * (y * nw);
+        dst[drow..drow + 3 * nw].copy_from_slice(&inner[srow..srow + 3 * nw]);
     }
     dst
 }
@@ -277,8 +319,15 @@ pub fn preprocess_rgb8(
         .into());
     }
 
+    // Target (grid-aligned, aspect-aware) size — llama's calc_size_preserved_ratio.
     let (rw, rh) = smart_resize(src_w, src_h, cfg);
-    let resized = resize_bilinear_u8(src, src_w, src_h, rw, rh);
+    // llama.cpp resizes qwen3vl images with **PAD_CEIL**, NOT a direct stretch:
+    // scale-to-fit preserving aspect (ceil-rounded, clamped to target), then
+    // center the result on a black `rw x rh` canvas (`img_tool::resize`,
+    // mtmd-image.cpp; qwen2vl/qwen3vl use image_resize_pad=PAD_CEIL,
+    // image_pad_color={0,0,0}). A plain stretch only coincides when the source
+    // already equals the target.
+    let resized = resize_pad_ceil(src, src_w, src_h, rw, rh);
 
     let n = (rw as usize) * (rh as usize);
     let mut pixels = vec![0f32; n * 3];
@@ -352,6 +401,35 @@ mod tests {
         let (w, h) = smart_resize(300, 1000, &cfg);
         assert_aligned(w, h, &cfg);
         assert_eq!((w, h), (288, 992));
+    }
+
+    /// PAD_CEIL resize: a 4x2 source into a 4x4 target. scale =
+    /// min(4/4, 4/2) = 1, so new = (4, 2) (no upscale), centered with
+    /// offset_y = (4-2)/2 = 1: rows 0 and 3 are black padding, rows 1-2 are
+    /// the source verbatim. Locks in the qwen3vl pad-not-stretch behavior.
+    #[test]
+    fn resize_pad_ceil_centers_and_pads_black() {
+        // src 4x2, each pixel a distinct value so a stretch would be visible.
+        let mut src = vec![0u8; 4 * 2 * 3];
+        for (i, p) in src.iter_mut().enumerate() {
+            *p = (i + 1) as u8; // 1..=24
+        }
+        let dst = resize_pad_ceil(&src, 4, 2, 4, 4);
+        assert_eq!(dst.len(), 4 * 4 * 3);
+        // Row 0 and row 3 (12 bytes each) are black padding.
+        assert!(dst[0..12].iter().all(|&v| v == 0), "row0 not padded");
+        assert!(dst[36..48].iter().all(|&v| v == 0), "row3 not padded");
+        // Rows 1-2 are the source verbatim (scale 1, offset_x 0).
+        assert_eq!(&dst[12..36], &src[..], "inner image not copied centered");
+    }
+
+    /// PAD_CEIL with src already equal to target is a plain copy (no padding,
+    /// no resampling) — matching llama's "no resize needed" short-circuit.
+    #[test]
+    fn resize_pad_ceil_equal_size_is_copy() {
+        let src: Vec<u8> = (0..(3 * 3 * 3)).map(|i| (i * 7 % 251) as u8).collect();
+        let dst = resize_pad_ceil(&src, 3, 3, 3, 3);
+        assert_eq!(dst, src);
     }
 
     #[test]

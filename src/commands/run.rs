@@ -160,6 +160,20 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    // Vision full-tower smoke test (Phase 2, Slice 4): runs the whole Qwen3-VL
+    // vision tower (patch-embed -> N ViT blocks -> post_ln -> merger) on the GPU
+    // and against the Rust CPU reference, reporting max-abs + per-token cosine,
+    // with an optional external (llama.cpp) anchor. Same self-contained
+    // mmproj-load rationale as the slice 2/3 tests above (the mmproj carries no
+    // tokenizer or `token_embd.weight`, so the later text-model steps would
+    // error first). Gated behind `gpu_debug`.
+    #[cfg(feature = "gpu_debug")]
+    if std::env::var("SEEKER_VISION_ENCODE_TEST").is_ok() {
+        let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
+        vision_encode_smoke(&mut engine)?;
+        return Ok(());
+    }
+
     let resolved = resolve_model_path(&args).await?;
     let gguf = GgufFile::open(&resolved.main)?;
     let bundle = build_tokenizer(&gguf)?;
@@ -757,6 +771,357 @@ fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
         return Err(format!("vision block GPU-vs-CPU max_abs {max_abs:.3e} > tol {tol:.0e}").into());
     }
     Ok(())
+}
+
+/// Vision FULL-TOWER smoke test (Phase 2, Slice 4).
+///
+/// Loads the mmproj GGUF (path from `SEEKER_MMPROJ`, else the Qwen3.6 BF16
+/// snapshot), uploads its weights, preprocesses an image, then runs the WHOLE
+/// vision tower — patch-embed -> N ViT blocks -> post_ln -> merger — on BOTH
+/// the GPU (`record_patch_embed` + `record_block`×N + `record_merger`) and the
+/// Rust CPU reference (`patch_embed_cpu` + `block_cpu`×N + `merger_cpu`),
+/// reporting max-abs error AND per-token cosine, plus an optional external
+/// (llama.cpp) anchor.
+///
+/// Oracle note: the project GPU matmul stages F32 activations to **F16** in the
+/// cooperative-matrix prefill path (`mul_mm_cm.slang`, taken when
+/// `n_pos >= 32 && n_pos % 16 == 0`), so across 27 residual blocks the exact-f32
+/// CPU reference drifts by a benign amount — the SCALE-ROBUST per-token cosine
+/// is the gate, not max-abs. A grid whose `n_pos` is NOT a multiple of 16
+/// instead takes the per-column `mul_mat_vec` path (`FLOAT_TYPE=float`, f32
+/// accumulate), where the CPU is a tight oracle (~1e-3). Either way an indexing
+/// bug (rope positions, 2x2 interleave, head layout) yields cosine far below 1.
+///
+/// Env knobs:
+///   SEEKER_VISION_IMG=<png/jpg>   real image (else a synthetic gradient)
+///   SEEKER_VISION_IMGSIZE=WxH     synthetic raw size (default 96x96)
+///   SEEKER_VISION_NLAYERS=<n>     run only the first n ViT blocks (bisection)
+///   SEEKER_VISION_NO_MERGER=1     skip the post_ln + merger tail
+///   SEEKER_VISION_ANCHOR=<f32bin> external embeddings, token-major [n_tok][feat]
+///   SEEKER_VISION_COS_TOL=<f>     min per-token cosine gate (default 0.99 self / 0.999 anchor)
+///
+/// Run with:
+///   SEEKER_VISION_ENCODE_TEST=1 SEEKER_MMPROJ=<mmproj.gguf> \
+///     cargo run --features gpu_debug --bin seeker -- run -m <mmproj.gguf>
+#[cfg(feature = "gpu_debug")]
+fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
+    use crate::vision::encoder::{
+        block_cpu, merger_cpu, patch_embed_cpu, BlockHostWeights, HostWeights, MergerHostWeights,
+        VisionEncoder,
+    };
+    use crate::vision::preprocess::{preprocess, preprocess_rgb8, PreprocessConfig};
+
+    let mmproj_path = std::env::var("SEEKER_MMPROJ").unwrap_or_else(|_| {
+        "/models/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/\
+         5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/mmproj-BF16.gguf"
+            .to_string()
+    });
+    println!("VISION encode smoke: loading mmproj {mmproj_path}");
+    let gguf = GgufFile::open(std::path::Path::new(&mmproj_path))?;
+    let config = crate::vision::parse_config(&gguf)?;
+    let n_embd = config.n_embd as usize;
+    let patch_size = config.patch_size as usize;
+    let n_head = config.n_head as usize;
+    let n_ff = config.n_ff as usize;
+    let n_layer = config.n_layer as usize;
+    let eps = config.eps;
+
+    let nlayers = std::env::var("SEEKER_VISION_NLAYERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.min(n_layer))
+        .unwrap_or(n_layer);
+    let run_merger = nlayers == n_layer && std::env::var("SEEKER_VISION_NO_MERGER").is_err();
+    println!(
+        "VISION config: n_embd={n_embd} n_head={n_head} head_dim={} n_ff={n_ff} \
+         n_layer={n_layer} (running {nlayers}) merger={run_merger} eps={eps:e} \
+         patch={patch_size} merge={}",
+        n_embd / n_head,
+        config.spatial_merge_size
+    );
+
+    let pcfg = PreprocessConfig::qwen3vl_default(
+        config.patch_size,
+        config.spatial_merge_size,
+        config.image_mean,
+        config.image_std,
+    );
+
+    // Image: a real file (SEEKER_VISION_IMG) for the anchor, else a
+    // deterministic synthetic gradient at SEEKER_VISION_IMGSIZE (default 96x96).
+    let img = match std::env::var("SEEKER_VISION_IMG") {
+        Ok(path) => {
+            println!("VISION image: decoding {path}");
+            preprocess(std::path::Path::new(&path), &pcfg)?
+        }
+        Err(_) => {
+            let (sw, sh) = std::env::var("SEEKER_VISION_IMGSIZE")
+                .ok()
+                .and_then(|s| {
+                    let (a, b) = s.split_once('x')?;
+                    Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))
+                })
+                .unwrap_or((96, 96));
+            let mut buf = vec![0u8; (sw * sh * 3) as usize];
+            for y in 0..sh {
+                for x in 0..sw {
+                    let i = (3 * (y * sw + x)) as usize;
+                    buf[i] = (x % 256) as u8;
+                    buf[i + 1] = (y % 256) as u8;
+                    buf[i + 2] = ((x + y) % 256) as u8;
+                }
+            }
+            preprocess_rgb8(&buf, sw, sh, &pcfg)?
+        }
+    };
+    let grid_w = img.grid_w;
+    let grid_h = img.grid_h;
+    let n_pos = (grid_w * grid_h) as usize;
+    let coop_path = n_pos >= 32 && n_pos % 16 == 0;
+    println!(
+        "VISION image: resized={}x{} grid={grid_w}x{grid_h} n_patches={n_pos} \
+         n_tokens={} matmul_path={}",
+        img.resized_w,
+        img.resized_h,
+        img.n_tokens,
+        if coop_path { "coop-matrix (f16-staged)" } else { "mul_mat_vec (f32-acc)" }
+    );
+
+    let weights = engine.upload_weights(&gguf)?;
+    let encoder = VisionEncoder::new(&weights, n_embd, patch_size, n_head, n_ff, n_layer, eps)?;
+    let hw = HostWeights::from_gguf(&gguf)?;
+    let blocks: Vec<BlockHostWeights> = (0..nlayers)
+        .map(|il| BlockHostWeights::from_gguf(&gguf, il as u32))
+        .collect::<Result<_, _>>()?;
+    let mh = MergerHostWeights::from_gguf(&gguf)?;
+
+    // Scratch is a per-forward bump allocator (not reclaimed between ops), so
+    // the whole tower's intermediate tensors must fit at once. Each block
+    // allocates ~26.3k floats/token (h + fused-qkv + padded q/k/v/fa_out + the
+    // six n_embd residual buffers + n_ff up/act); budget 28k with headroom plus
+    // two extra "blocks" for the patch-embed and merger stages.
+    let per_tok_per_block = 28_000u64;
+    let est = per_tok_per_block * n_pos as u64 * (nlayers as u64 + 2) * 4;
+    let scratch_bytes = est.max(64 << 20);
+    println!(
+        "VISION scratch: {:.1} MiB ({nlayers} blocks x {n_pos} patches)",
+        scratch_bytes as f64 / (1024.0 * 1024.0),
+    );
+    engine.allocate_scratch(scratch_bytes)?;
+
+    // GPU: patch-embed -> nlayers blocks -> optional merger.
+    let gpu = engine.forward(
+        &weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let mut x = encoder.record_patch_embed(ctx, &img, &hw)?;
+            for il in 0..nlayers as u32 {
+                x = encoder.record_block(ctx, x, il, grid_w, grid_h)?;
+            }
+            if run_merger {
+                x = encoder.record_merger(ctx, x)?;
+            }
+            Ok(x.range())
+        },
+    )?;
+
+    // CPU reference (exact f32).
+    let mut cpu = patch_embed_cpu(&hw, n_embd, patch_size, &img);
+    for bw in &blocks {
+        cpu = block_cpu(bw, &cpu, n_embd, n_head, n_ff, eps, grid_w as usize, grid_h as usize);
+    }
+    if run_merger {
+        cpu = merger_cpu(&mh, &cpu, n_embd, eps);
+    }
+
+    if gpu.len() != cpu.len() {
+        return Err(format!("length mismatch: gpu {} vs cpu {}", gpu.len(), cpu.len()).into());
+    }
+
+    let feat = if run_merger { encoder.projection_dim } else { n_embd };
+    debug_assert_eq!(gpu.len() % feat, 0, "output not a whole number of tokens");
+    let n_tok = gpu.len() / feat;
+
+    // Mirror llama.cpp's `MTMD_DEBUG_EMBEDDINGS` log (clip.cpp:4143) so the
+    // token-0 sample + global stats can be diffed directly against
+    // `MTMD_DEBUG_EMBEDDINGS=1 llama-mtmd-cli --image <same.png>`. These are
+    // order-independent (token 0 = the top-left 2x2 block in both; stats span
+    // every element), so they gate *systematic* math/preprocessing errors even
+    // if a later-token ordering convention were to differ.
+    print_embedding_fingerprint(&gpu, feat, n_tok);
+
+    // Optional raw f32 dump (token-major [n_tok][feat]) for a full external
+    // cosine anchor.
+    if let Ok(dump) = std::env::var("SEEKER_VISION_DUMP") {
+        let mut bytes = Vec::with_capacity(gpu.len() * 4);
+        for &v in &gpu {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(&dump, &bytes)?;
+        println!("VISION wrote {} f32 ({} bytes) to {dump}", gpu.len(), gpu.len() * 4);
+    }
+
+    // GPU-vs-CPU: max-abs/mean-abs (informational) + per-token cosine (gate).
+    let (max_abs, mean_abs, n_nonfinite, worst_idx) = abs_error_stats(&gpu, &cpu);
+    let (min_cos, mean_cos, worst_tok) = per_token_cosine(&gpu, &cpu, feat, n_tok);
+    if n_nonfinite > 0 {
+        println!("VISION encode: {n_nonfinite} non-finite element(s); first at idx {worst_idx}");
+    }
+    println!(
+        "VISION encode GPU-vs-CPU: feat={feat} n_tok={n_tok} max_abs={max_abs:.3e} \
+         mean_abs={mean_abs:.3e} (worst idx {worst_idx}: gpu={:.5} cpu={:.5}) | \
+         per-token cosine min={min_cos:.6} mean={mean_cos:.6} (worst tok {worst_tok})",
+        gpu[worst_idx], cpu[worst_idx],
+    );
+
+    let self_tol: f64 = std::env::var("SEEKER_VISION_COS_TOL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.99);
+    let mut ok = n_nonfinite == 0 && min_cos >= self_tol;
+    println!(
+        "VISION encode self-test: min_cos {min_cos:.6} >= tol {self_tol} && finite -> {}",
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    // Optional external anchor (llama.cpp embeddings dump): raw f32, token-major
+    // [n_tok][feat]. Per-token cosine vs the GPU output (meaningful only for the
+    // full tower + merger, which produces the final [proj, n_tok] embeddings).
+    if let Ok(anchor_path) = std::env::var("SEEKER_VISION_ANCHOR") {
+        let bytes = std::fs::read(&anchor_path)?;
+        if bytes.len() % 4 != 0 {
+            return Err(
+                format!("anchor {anchor_path}: {} bytes, not f32-aligned", bytes.len()).into(),
+            );
+        }
+        let anchor: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        if anchor.len() != gpu.len() {
+            return Err(format!(
+                "anchor {anchor_path}: {} f32 != gpu output {} (feat={feat} n_tok={n_tok})",
+                anchor.len(),
+                gpu.len()
+            )
+            .into());
+        }
+        let (a_min_cos, a_mean_cos, a_worst) = per_token_cosine(&gpu, &anchor, feat, n_tok);
+        let (a_max_abs, a_mean_abs, _, _) = abs_error_stats(&gpu, &anchor);
+        let anchor_tol: f64 = std::env::var("SEEKER_VISION_COS_TOL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.999);
+        let anchor_ok = a_min_cos >= anchor_tol;
+        ok = ok && anchor_ok;
+        println!(
+            "VISION encode ANCHOR ({anchor_path}): per-token cosine min={a_min_cos:.6} \
+             mean={a_mean_cos:.6} (worst tok {a_worst}) max_abs={a_max_abs:.3e} \
+             mean_abs={a_mean_abs:.3e} -> min_cos >= {anchor_tol} -> {}",
+            if anchor_ok { "PASS" } else { "FAIL" }
+        );
+    }
+
+    if !ok {
+        return Err("vision encode smoke test FAILED (see cosine/finite gates above)".into());
+    }
+    Ok(())
+}
+
+/// Print a token-0 sample + global statistics fingerprint of a `[feat, n_tok]`
+/// embeddings buffer, byte-for-byte matching the format and arithmetic of
+/// llama.cpp's `MTMD_DEBUG_EMBEDDINGS` block (clip.cpp:4143) — same f32
+/// accumulation and `var = sum_sq/n - mean^2` — so the two logs line-diff.
+#[cfg(feature = "gpu_debug")]
+fn print_embedding_fingerprint(emb: &[f32], n_embd: usize, n_tok: usize) {
+    println!("=== SEEKER_VISION_EMBEDDINGS ===");
+    println!("Shape: [{n_embd}, {n_tok}]");
+    let mut line = String::from("Token 0 (first 16 values): ");
+    for v in emb.iter().take(n_embd.min(16)) {
+        line.push_str(&format!("{v:.6} "));
+    }
+    println!("{line}");
+    if n_embd > 16 {
+        let mut line = String::from("Token 0 (last 16 values):  ");
+        for v in &emb[n_embd - 16..n_embd] {
+            line.push_str(&format!("{v:.6} "));
+        }
+        println!("{line}");
+    }
+    let (mut sum, mut sum_sq) = (0f32, 0f32);
+    let (mut mn, mut mx) = (emb[0], emb[0]);
+    for &v in emb {
+        sum += v;
+        sum_sq += v * v;
+        mn = mn.min(v);
+        mx = mx.max(v);
+    }
+    let mean = sum / emb.len() as f32;
+    let variance = (sum_sq / emb.len() as f32) - mean * mean;
+    println!(
+        "Stats: mean={mean:.6}, std={:.6}, min={mn:.6}, max={mx:.6}, sum={sum:.6}",
+        variance.sqrt()
+    );
+    println!("=== END SEEKER_VISION_EMBEDDINGS ===");
+}
+
+/// max-abs / mean-abs error between two equal-length f32 slices, plus the
+/// non-finite count and the index of the worst (largest finite) deviation.
+/// NaN/Inf in either slice is counted, never silently treated as small.
+#[cfg(feature = "gpu_debug")]
+fn abs_error_stats(a: &[f32], b: &[f32]) -> (f64, f64, usize, usize) {
+    let mut max_abs = 0f64;
+    let mut sum_abs = 0f64;
+    let mut worst = 0usize;
+    let mut n_nonfinite = 0usize;
+    for (i, (g, c)) in a.iter().zip(b.iter()).enumerate() {
+        if !g.is_finite() || !c.is_finite() {
+            if n_nonfinite == 0 {
+                worst = i;
+            }
+            n_nonfinite += 1;
+            continue;
+        }
+        let d = (*g as f64 - *c as f64).abs();
+        if d > max_abs {
+            max_abs = d;
+            worst = i;
+        }
+        sum_abs += d;
+    }
+    (max_abs, sum_abs / a.len().max(1) as f64, n_nonfinite, worst)
+}
+
+/// Per-token cosine similarity between two `[feat, n_tok]` outputs (token t's
+/// vector is the contiguous slice `[feat*t .. feat*(t+1)]`). Returns
+/// `(min_cos, mean_cos, worst_token)`. A zero-norm token on either side
+/// contributes cosine 0 (and is flagged as the worst).
+#[cfg(feature = "gpu_debug")]
+fn per_token_cosine(a: &[f32], b: &[f32], feat: usize, n_tok: usize) -> (f64, f64, usize) {
+    let mut min_cos = f64::INFINITY;
+    let mut sum_cos = 0f64;
+    let mut worst = 0usize;
+    for t in 0..n_tok {
+        let s = feat * t;
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for k in 0..feat {
+            let (x, y) = (a[s + k] as f64, b[s + k] as f64);
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        let cos = if na > 0.0 && nb > 0.0 {
+            dot / (na.sqrt() * nb.sqrt())
+        } else {
+            0.0
+        };
+        if cos < min_cos {
+            min_cos = cos;
+            worst = t;
+        }
+        sum_cos += cos;
+    }
+    let mean = if n_tok > 0 { sum_cos / n_tok as f64 } else { 0.0 };
+    (if n_tok > 0 { min_cos } else { 0.0 }, mean, worst)
 }
 
 #[cfg(feature = "gpu_debug")]
