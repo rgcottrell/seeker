@@ -255,11 +255,19 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
 
     const uint tid    = gl_LocalInvocationID.x;
     const uint i_row  = gl_WorkGroupID.x;
+    const uint iq3    = gl_WorkGroupID.z;
     // Per-forward dynamic params (kv_len, k_num, blocks_per_split)
     // override the corresponding push fields. The push struct still
     // carries the fields for binary compat with the dispatcher but the
     // values are stale at decode-replay time — read from `data_dyn`.
-    const uint p_KV       = data_dyn[0].kv_len;
+    //
+    // `kv_len` is indexed by the batch element `iq3`: batched decode packs
+    // one DecodeDyn entry per sequence so each query attends to its own
+    // cache length. `k_num` / `blocks_per_split` stay uniform across the
+    // batch (sized from the longest sequence; over-long splits run zero
+    // iterations and the combine kernel weights them to ~0). With a single
+    // sequence (iq3 == 0) this reads entry 0 exactly as before.
+    const uint p_KV       = data_dyn[iq3].kv_len;
     const uint p_k_num    = data_dyn[0].k_num;
     const uint p_split_kv = data_dyn[0].blocks_per_split;
     // grid.y packs (head, split): head = y / k_num, split = y % k_num.
@@ -267,7 +275,6 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     // the pre-split-K dispatch.
     const uint iq2    = gl_WorkGroupID.y / p_k_num;
     const uint split  = gl_WorkGroupID.y % p_k_num;
-    const uint iq3    = gl_WorkGroupID.z;
 
     if (i_row >= p.N) { return; }
 

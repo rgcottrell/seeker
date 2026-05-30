@@ -53,6 +53,32 @@ pub fn alloc(ctx: &mut DispatchContext) -> Result<BufferRange, Box<dyn Error>> {
     ctx.alloc_scratch(DecodeDyn::SIZE)
 }
 
+/// Allocate a contiguous array of `n_seqs` DecodeDyn entries for batched
+/// decode — one entry per sequence (batch element). The flash-attn kernel
+/// indexes `data_dyn[iq3].kv_len` by batch element, so each sequence attends
+/// to its own cache length; `n_seqs == 1` is byte-identical to [`alloc`].
+pub fn alloc_array(ctx: &mut DispatchContext, n_seqs: u32) -> Result<BufferRange, Box<dyn Error>> {
+    ctx.alloc_scratch(DecodeDyn::SIZE * (n_seqs.max(1) as u64))
+}
+
+/// Host-write a single field of entry `seq_idx` within a DecodeDyn array
+/// allocated by [`alloc_array`]. Offsets past entry 0 by `seq_idx * SIZE`.
+pub fn write_field_indexed<T: Copy>(
+    ctx: &DispatchContext,
+    range: BufferRange,
+    seq_idx: u32,
+    field_offset: usize,
+    value: T,
+) -> Result<(), Box<dyn Error>> {
+    let host_ptr = ctx
+        .scratch
+        .host_ptr
+        .ok_or("scratch not host-visible — DecodeDyn requires mapped memory")?;
+    let entry_offset = range.offset + (seq_idx as u64) * DecodeDyn::SIZE;
+    write_field(host_ptr, entry_offset, field_offset, value);
+    Ok(())
+}
+
 /// Write a populated `DecodeDyn` into the scratch slot via the mapped
 /// pointer. Cheaper than recording a transfer; the buffer becomes visible
 /// to the next submit immediately (scratch is HOST_COHERENT).
