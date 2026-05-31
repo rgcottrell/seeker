@@ -373,14 +373,17 @@ impl Engine {
         batch: &mut kv_cache::BatchKvCache,
         tokens: &[u32],
         positions: &[u32],
-        samplers: &mut [sample::Sampler],
+        slots: &[u32],
+        samplers: &mut [&mut sample::Sampler],
     ) -> Result<Vec<u32>, Box<dyn Error>> {
         let b = tokens.len();
         if b == 0 {
             return Err("forward_batch_decode: empty batch".into());
         }
-        if positions.len() != b || samplers.len() != b {
-            return Err("forward_batch_decode: tokens/positions/samplers length mismatch".into());
+        if positions.len() != b || samplers.len() != b || slots.len() != b {
+            return Err(
+                "forward_batch_decode: tokens/positions/slots/samplers length mismatch".into(),
+            );
         }
         // The batched graph shape differs from the single-sequence decode
         // cmdbuf; drop any cached recording (replay is single-sequence only).
@@ -427,7 +430,7 @@ impl Engine {
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
-            let logits = model.record_forward_batch(&mut ctx, batch, tokens, positions)?;
+            let logits = model.record_forward_batch(&mut ctx, batch, tokens, positions, slots)?;
             let vocab = logits.dims[0];
             let elem = logits.byte_stride[0];
             let mut ranges = Vec::with_capacity(b);

@@ -353,16 +353,26 @@ impl KvCache {
         v_layers: Vec<TensorView>,
         position: u32,
         device: Arc<DeviceShared>,
+        // Per-slot SSM recurrent state (empty for attention-only models). When
+        // present, the borrowed cache points at the owning BatchKvCache's
+        // per-sequence state slices so a single-sequence prefill writes its
+        // final conv/GDN state where the batched decode reads it. The region is
+        // borrowed (Drop frees nothing — the BatchKvCache owns it).
+        ssm_conv_states: Vec<crate::inference::buffer::BufferRange>,
+        ssm_gdn_states: Vec<crate::inference::buffer::BufferRange>,
+        ssm_region: Option<(vk::Buffer, Option<*mut u8>, u64)>,
     ) -> Self {
+        let ssm_region = ssm_region
+            .map(|(buf, hp, size)| Region::borrowed(buf, hp, size, alignment));
         Self {
             config,
             region: Region::borrowed(buffer, host_ptr, buffer_size, alignment),
             k_layers,
             v_layers,
             position,
-            ssm_region: None,
-            ssm_conv_states: Vec::new(),
-            ssm_gdn_states: Vec::new(),
+            ssm_region,
+            ssm_conv_states,
+            ssm_gdn_states,
             ssm_gdn_snap_region: None,
             ssm_gdn_snapshots: Vec::new(),
             ssm_conv_backup_region: None,
@@ -664,6 +674,17 @@ impl BatchKvCache {
         }
     }
 
+    /// The contiguous `n_slots × conv_state_floats` conv state block for
+    /// `layer` (seq-outermost) — for batched conv-input prefix + writeback casts.
+    pub fn conv_state_layer(&self, layer: u32) -> crate::inference::buffer::BufferRange {
+        let region = self.ssm_region.as_ref().expect("SSM state not allocated");
+        crate::inference::buffer::BufferRange {
+            buffer: region.buffer,
+            offset: self.ssm_conv_base[layer as usize],
+            size: (self.conv_slab_floats as u64) * (self.n_slots as u64) * 4,
+        }
+    }
+
     /// Sequence `slot`'s conv state for `layer` (the per-sequence conv-input
     /// prefix source and writeback target).
     pub fn conv_state_slot(&self, layer: u32, slot: u32) -> crate::inference::buffer::BufferRange {
@@ -674,6 +695,61 @@ impl BatchKvCache {
             offset: self.ssm_conv_base[layer as usize] + slot as u64 * slab,
             size: slab,
         }
+    }
+
+    /// Sequence `slot`'s GDN state for `layer` — a single-sequence `gdn_floats`
+    /// slice of the seq-outermost block. Used to point a borrowed single-slot
+    /// prefill cache at this slot's state so the prefill persists its final
+    /// recurrent state where the batched decode will pick it up.
+    pub fn gdn_state_slot(&self, layer: u32, slot: u32) -> crate::inference::buffer::BufferRange {
+        let region = self.ssm_region.as_ref().expect("SSM state not allocated");
+        let slab = (self.gdn_slab_floats as u64) * 4;
+        crate::inference::buffer::BufferRange {
+            buffer: region.buffer,
+            offset: self.ssm_gdn_base[layer as usize] + slot as u64 * slab,
+            size: slab,
+        }
+    }
+
+    /// Number of SSM layers with allocated per-slot state (0 if none).
+    pub fn n_ssm_layers(&self) -> usize {
+        self.ssm_conv_base.len()
+    }
+
+    /// Total device memory (K/V slabs + SSM state) backing all slots, in bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.region.size + self.ssm_region.as_ref().map_or(0, |r| r.size)
+    }
+
+    /// Zero just slot `slot`'s recurrent SSM state (all layers), leaving every
+    /// other slab untouched. Use before re-prefilling a reused slab on a
+    /// divergent prompt — the recurrent state has no per-position undo, so a
+    /// non-extension must start from a fresh (zero) state. The attention K/V
+    /// needs no zeroing: the prefill overwrites `[0, len)` and reads are bounded
+    /// by the position cursor. (The whole-region [`KvCache::reset`] is unsafe
+    /// here — it would clobber the other slabs' live state.)
+    pub fn reset_slot(&self, slot: u32) {
+        let Some(host) = self.ssm_region.as_ref().and_then(|r| r.host_ptr) else {
+            return;
+        };
+        for layer in 0..self.n_ssm_layers() as u32 {
+            for r in [self.conv_state_slot(layer, slot), self.gdn_state_slot(layer, slot)] {
+                // SAFETY: `r` is a sub-range of the HOST_VISIBLE|HOST_COHERENT
+                // ssm_region that `host` maps from offset 0.
+                unsafe {
+                    std::ptr::write_bytes(host.add(r.offset as usize), 0, r.size as usize);
+                }
+            }
+        }
+    }
+
+    /// Per-slot conv / GDN recurrent-state lengths (floats), for gathering an
+    /// active batch's state out of the seq-outermost per-layer blocks.
+    pub fn conv_slot_floats(&self) -> u64 {
+        self.conv_slab_floats as u64
+    }
+    pub fn gdn_slot_floats(&self) -> u64 {
+        self.gdn_slab_floats as u64
     }
 
     /// Single-slot natural `[head_dim, n_head_kv, max_seq_len]` K view (slab
@@ -700,12 +776,13 @@ impl BatchKvCache {
         )
     }
 
-    /// Batched flash-attn K view for `layer` over slots `[0, b)`: permuted
-    /// `[head_dim, max_seq_len, n_head_kv, B]` with the slot as the batch
-    /// dimension (stride = slab stride). The shader bounds each sequence's KV
-    /// loop by its own `kv_len` (passed to `record_batched`), so the unused
-    /// tail past each slot's position is never read.
-    pub fn batched_k_attn_view(&self, layer: u32, b: u32) -> TensorView {
+    /// Batched flash-attn K view for `layer`: permuted `[head_dim, max_seq_len,
+    /// n_head_kv, n_slots]` with the slot as the batch dimension (stride = slab
+    /// stride). Binds the **whole** per-layer K block (all slots) so the kernel
+    /// can read any slab via `DecodeDyn::slot` — a gathered batch addresses
+    /// non-contiguous slots. The shader bounds each sequence's KV loop by its
+    /// own `kv_len`, so the unused tail past each slot's position is never read.
+    pub fn batched_k_attn_view(&self, layer: u32) -> TensorView {
         batched_attn_view(
             self.buffer,
             self.k_base[layer as usize],
@@ -713,12 +790,12 @@ impl BatchKvCache {
             self.head_dim as u64,
             self.config.max_seq_len as u64,
             self.n_head_kv as u64,
-            b,
+            self.n_slots,
             self.config.k_dtype,
         )
     }
 
-    pub fn batched_v_attn_view(&self, layer: u32, b: u32) -> TensorView {
+    pub fn batched_v_attn_view(&self, layer: u32) -> TensorView {
         batched_attn_view(
             self.buffer,
             self.v_base[layer as usize],
@@ -726,7 +803,7 @@ impl BatchKvCache {
             self.head_dim as u64,
             self.config.max_seq_len as u64,
             self.n_head_kv as u64,
-            b,
+            self.n_slots,
             self.config.v_dtype,
         )
     }
@@ -738,6 +815,19 @@ impl BatchKvCache {
     pub fn slot_kvcache(&self, slot: u32) -> KvCache {
         let k_layers = (0..self.n_layer).map(|l| self.slot_k_view(slot, l)).collect();
         let v_layers = (0..self.n_layer).map(|l| self.slot_v_view(slot, l)).collect();
+        // Point the borrowed cache at this slot's per-sequence SSM state so a
+        // hybrid prefill persists its final conv/GDN state into the batch slab
+        // (the batched decode continues from it). Zero-initialized by
+        // allocate_ssm_state, so the prefill still starts from a fresh state.
+        let n_ssm = self.n_ssm_layers();
+        let (ssm_conv_states, ssm_gdn_states, ssm_region) = if n_ssm > 0 {
+            let conv = (0..n_ssm as u32).map(|l| self.conv_state_slot(l, slot)).collect();
+            let gdn = (0..n_ssm as u32).map(|l| self.gdn_state_slot(l, slot)).collect();
+            let r = self.ssm_region.as_ref().expect("SSM state allocated");
+            (conv, gdn, Some((r.buffer, r.host_ptr, r.size)))
+        } else {
+            (Vec::new(), Vec::new(), None)
+        };
         KvCache::borrowed_slot(
             self.config,
             self.buffer,
@@ -748,6 +838,9 @@ impl BatchKvCache {
             v_layers,
             self.positions[slot as usize],
             self.device.clone(),
+            ssm_conv_states,
+            ssm_gdn_states,
+            ssm_region,
         )
     }
 }

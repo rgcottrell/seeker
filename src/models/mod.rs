@@ -108,20 +108,23 @@ pub trait Model: Send + Sync {
     /// sequences by one token each in a single pass. `tokens[s]` is sequence
     /// `s`'s input token and `positions[s]` is its current cache position
     /// (its new K/V lands there; it attends over `[0, positions[s] + 1)`).
-    /// Each sequence uses slot `s` of `batch`. Returns the next-token logits
-    /// for all sequences — shape `[vocab_size, B]`, dtype F32, column `s` being
-    /// sequence `s`'s logits.
+    /// `slots[s]` is the `BatchKvCache` slab that sequence `s`'s K/V and
+    /// recurrent state live in — the batch can gather arbitrary, non-contiguous
+    /// slabs (so prefix-reuse can park a conversation in any slab and still join
+    /// the batch). Returns the next-token logits for all sequences — shape
+    /// `[vocab_size, B]`, dtype F32, column `s` being sequence `s`'s logits.
     ///
-    /// Default: unimplemented. Implemented per-architecture (llama in M1,
-    /// qwen35moe in M2). The dense ops already process the `B`-wide token
-    /// dimension; the per-sequence work is attention (own KV slab + length)
-    /// and, for hybrids, the recurrent state.
+    /// Default: unimplemented. Implemented per-architecture (llama, qwen35moe).
+    /// The dense ops already process the `B`-wide token dimension; the
+    /// per-sequence work is attention (own KV slab + length) and, for hybrids,
+    /// the recurrent state.
     fn record_forward_batch(
         &self,
         _ctx: &mut DispatchContext,
         _batch: &mut crate::inference::kv_cache::BatchKvCache,
         _tokens: &[u32],
         _positions: &[u32],
+        _slots: &[u32],
     ) -> Result<TensorView, Box<dyn Error>> {
         Err("record_forward_batch (batched decode) not implemented for this model".into())
     }

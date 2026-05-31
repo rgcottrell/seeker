@@ -40,7 +40,11 @@ pub struct DecodeDyn {
     /// dyn-offset V-cache write shader so the cmdbuf binds the *full*
     /// cache layer instead of a position-baked slice.
     pub v_cache_d_offset: u32,
-    pub _pad1: u32,
+    /// KV-cache slab index for batched/continuous decode — the flash-attn
+    /// kernel reads K/V from `slot * nb13` / `slot * nb23`, so a gathered batch
+    /// can address arbitrary (non-contiguous) `BatchKvCache` slabs. `0` (slab 0)
+    /// for single-sequence decode, byte-identical to the old `iq3`-strided read.
+    pub slot: u32,
 }
 
 impl DecodeDyn {
@@ -142,6 +146,7 @@ pub const OFFSET_ROPE_D_OFFSET: usize = 12;
 pub const OFFSET_UNIFORM_RNG: usize = 16;
 pub const OFFSET_PENALTY_COUNT: usize = 20;
 pub const OFFSET_V_CACHE_D_OFFSET: usize = 24;
+pub const OFFSET_SLOT: usize = 28;
 
 /// Snapshot of the scratch offsets and small constants captured during
 /// the first decode recording. Lets the host re-populate the same slots

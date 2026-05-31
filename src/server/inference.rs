@@ -20,10 +20,10 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::gguf::{GgmlType, GgufFile};
-use crate::inference::kv_cache::{KvCache, KvCacheConfig};
+use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
 use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
-use crate::tokenizer::build_tokenizer;
+use crate::tokenizer::{build_tokenizer, Tokenizer};
 
 /// Immutable per-process model/runtime config. All `Send` — built by the CLI
 /// and moved into the worker thread, which constructs the `Engine` from it.
@@ -145,6 +145,12 @@ impl InferenceHandle {
         let (ready_tx, ready_rx) = oneshot::channel();
         std::thread::Builder::new()
             .name("seeker-inference".into())
+            // The default 2 MiB thread stack overflows while loading a large
+            // model (the GGUF metadata + per-tensor setup is stack-heavy — a
+            // multi-GB checkpoint SIGSTKFLTs on the 2 MiB default, while the
+            // 8 MiB main-thread stack of `seeker run` survives). Match a roomy
+            // main-thread-sized budget.
+            .stack_size(64 * 1024 * 1024)
             .spawn(move || worker_main(cfg, jobs_rx, ready_tx))
             .expect("spawn inference worker thread");
         (InferenceHandle { jobs: jobs_tx }, ready_rx)
@@ -211,41 +217,63 @@ pub async fn collect(mut rx: mpsc::Receiver<GenEvent>) -> Result<GenOutput, Stri
     Ok(out)
 }
 
-/// One independent KV-cache slot. `prior_tokens` mirrors `cache.position` (the
-/// tokens whose K/V is live), so a request that extends this slot's prefix
-/// reuses it and prefills only the divergent suffix.
-struct Slot {
-    cache: KvCache,
+/// Per-slab persistent metadata for cross-request prefix reuse. `prior_tokens`
+/// mirrors the slab's live cache when idle (`len == batch.positions[slab]`), so
+/// a request that extends this prefix reuses it and prefills only the divergent
+/// suffix. `active` marks the slab as owned by an in-flight [`ActiveSeq`] —
+/// admission never reuses a busy slab.
+struct SlotMeta {
     prior_tokens: Vec<u32>,
-    /// Monotonic stamp of the last job that used this slot (LRU). `0` = cold.
+    /// Monotonic stamp of the last job that used this slab (LRU). `0` = cold.
     last_used: u64,
+    active: bool,
 }
 
-/// GPU-resident state owned by the worker thread for the whole process. Holds a
-/// pool of N independent cache slots; the single-sequence engine processes one
-/// job at a time, so slots provide cross-request cache reuse, not parallelism.
+/// One in-flight generation, occupying slab `slab`. Holds everything needed to
+/// advance it one token per batched decode step and to stream / stop it
+/// independently of the other sequences sharing the GPU forward.
+struct ActiveSeq {
+    slab: u32,
+    sampler: Sampler,
+    /// Rendered prompt — committed to the slab's `prior_tokens` on eviction.
+    prompt: Vec<u32>,
+    /// Tokens generated so far (each fed back as the next input, bar the last).
+    generated: Vec<u32>,
+    prompt_tokens: u32,
+    stop: Vec<String>,
+    ignore_eos: bool,
+    max_tokens: u32,
+    reply: mpsc::Sender<GenEvent>,
+    // `tokenizers` DecodeStream state, driven via `step_decode_stream` so no
+    // borrow of the tokenizer is stored across decode steps.
+    stream_ids: Vec<u32>,
+    stream_prefix: String,
+    stream_prefix_index: usize,
+    /// Decoded-but-held-back tail (stop-sequence matching).
+    pending: String,
+    /// Token to feed at the next batched decode step.
+    last_token: u32,
+    /// This slab's context length (`max_seq_len`).
+    ctx: u32,
+    terminal: Option<StopReason>,
+    disconnected: bool,
+}
+
+/// GPU-resident state owned by the worker thread for the whole process. A
+/// single [`BatchKvCache`] holds N slabs; idle slabs keep their conversation's
+/// prefix (cross-request reuse), while the active subset advances together in
+/// one batched forward (continuous batching). The batched forward gathers each
+/// active sequence's (arbitrary, possibly non-contiguous) slab via its
+/// per-sequence slot index, so reuse and batching coexist.
 struct Worker {
     engine: Engine,
     model: Box<dyn crate::models::Model>,
-    slots: Vec<Slot>,
+    batch: BatchKvCache,
+    slots: Vec<SlotMeta>,
+    active: Vec<ActiveSeq>,
     eog_ids: Vec<u32>,
-    /// Monotonic LRU clock (incremented per job; avoids wall-clock).
+    /// Monotonic LRU clock (incremented per admission; avoids wall-clock).
     clock: u64,
-    /// Slot the previous job used — a switch must invalidate the engine's
-    /// decode-replay cmdbuf (it binds the prior slot's K/V buffers).
-    last_slot: Option<usize>,
-}
-
-impl Worker {
-    /// Pick the slot to serve `new_tokens` from (see [`choose_slot`]).
-    fn select_slot(&self, new_tokens: &[u32], id_slot: Option<usize>) -> usize {
-        let view: Vec<(&[u32], u64)> = self
-            .slots
-            .iter()
-            .map(|s| (s.prior_tokens.as_slice(), s.last_used))
-            .collect();
-        choose_slot(&view, new_tokens, id_slot)
-    }
 }
 
 /// Length of the longest common prefix of two token sequences.
@@ -313,55 +341,56 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         max_seq_len: cfg.ctx_size,
     };
     let dims = model.cache_dims();
-    let ssm = model.ssm_state_dims();
     let n_slots = cfg.n_slots.max(1);
-    let mut slots = Vec::with_capacity(n_slots as usize);
-    for _ in 0..n_slots {
-        let mut cache =
-            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
-        if let Some(ssm) = &ssm {
-            cache.allocate_ssm_state(
-                &engine.device,
-                ssm.n_ssm_layers,
-                ssm.conv_state_floats,
-                ssm.gdn_state_floats,
-            )?;
-        }
-        slots.push(Slot {
-            cache,
-            prior_tokens: Vec::new(),
-            last_used: 0,
-        });
+    // One BatchKvCache with N slabs: idle slabs keep their conversation's
+    // prefix (reuse); the active subset batches in one forward. Allocated
+    // eagerly (fail-fast if N×ctx doesn't fit).
+    let mut batch = BatchKvCache::new(
+        &engine.device,
+        dims.n_layer,
+        dims.head_dim,
+        dims.n_head_kv,
+        n_slots,
+        cache_config,
+    )?;
+    if let Some(ssm) = model.ssm_state_dims() {
+        batch.allocate_ssm_state(
+            &engine.device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
     }
 
-    let per_slot = slots[0].cache.region.size
-        + slots[0]
-            .cache
-            .ssm_region
-            .as_ref()
-            .map_or(0, |r| r.size);
     let mib = 1u64 << 20;
     tracing::info!(
         slots = n_slots,
         ctx = cfg.ctx_size,
-        per_slot_mib = per_slot / mib,
-        total_mib = (per_slot * n_slots as u64) / mib,
-        "kv cache slots allocated",
+        total_mib = batch.total_bytes() / mib,
+        "batched kv cache allocated",
     );
 
     let eog_ids = model.tokenizer().eog_ids.clone();
+    let slots = (0..n_slots)
+        .map(|_| SlotMeta {
+            prior_tokens: Vec::new(),
+            last_used: 0,
+            active: false,
+        })
+        .collect();
     Ok(Worker {
         engine,
         model,
+        batch,
         slots,
+        active: Vec::new(),
         eog_ids,
         clock: 0,
-        last_slot: None,
     })
 }
 
-/// Worker entry point. Loads the model, signals readiness, then serves jobs
-/// until every `InferenceHandle` is dropped (server shutdown).
+/// Worker entry point. Loads the model, signals readiness, then runs the
+/// continuous-batching scheduler until every `InferenceHandle` is dropped.
 fn worker_main(
     cfg: WorkerConfig,
     mut jobs: mpsc::Receiver<GenJob>,
@@ -379,200 +408,368 @@ fn worker_main(
         return;
     }
 
-    // `blocking_recv` is safe here: this is a plain OS thread, not inside the
-    // tokio runtime. `None` ⇒ all senders dropped ⇒ shut down (Engine drops).
-    while let Some(job) = jobs.blocking_recv() {
-        run_job(&mut worker, job);
+    // Scheduler loop: admit + prefill queued jobs onto free slabs, advance the
+    // whole active set one token in a single batched forward, stream + reap
+    // finishers. `blocking_recv` is safe here (plain OS thread, not in tokio);
+    // `None` ⇒ all senders dropped ⇒ shut down (Engine drops on return).
+    loop {
+        if worker.active.is_empty() {
+            // Idle: block for the next job (or shutdown).
+            match jobs.blocking_recv() {
+                Some(job) => worker.admit(job),
+                None => return,
+            }
+        }
+        // Drain queued jobs into any free slabs without blocking the decode.
+        while worker.free_slabs() > 0 {
+            match jobs.try_recv() {
+                Ok(job) => worker.admit(job),
+                Err(_) => break, // empty or all-senders-dropped
+            }
+        }
+        if !worker.active.is_empty() {
+            worker.decode_step();
+            worker.evict_finished();
+        }
     }
 }
 
-/// Run one generation job to completion, streaming `GenEvent`s. Never panics on
-/// inference error (converts to `GenEvent::Error`) and never propagates out, so
-/// the worker survives a bad job and serves the next one.
-fn run_job(w: &mut Worker, job: GenJob) {
-    let GenJob {
-        tokens: new_tokens,
-        config,
-        reply,
-    } = job;
-    let GenConfig {
-        sampler: cfg,
-        max_tokens,
-        stop,
-        ignore_eos,
-        id_slot,
-    } = config;
-
-    let prompt_tokens = new_tokens.len() as u32;
-    if new_tokens.is_empty() {
-        let _ = reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
-        return;
+impl Worker {
+    /// Number of slabs not currently owned by an active sequence.
+    fn free_slabs(&self) -> usize {
+        self.slots.iter().filter(|s| !s.active).count()
     }
 
-    // ── Slot selection ──────────────────────────────────────────────────
-    let idx = w.select_slot(&new_tokens, id_slot);
-    // The decode-replay cmdbuf is keyed only on sampler/grid, not on which
-    // cache recorded it — so a slot switch must invalidate it, or an L==1 first
-    // forward could replay against the previous slot's K/V buffers.
-    if w.last_slot != Some(idx) {
-        w.engine.decode_cache = None;
-        w.last_slot = Some(idx);
-    }
-    w.clock += 1;
-    w.slots[idx].last_used = w.clock;
-
-    let ctx = w.slots[idx].cache.config.max_seq_len;
-    // Need room for the whole prompt plus at least one generated token.
-    if new_tokens.len() as u32 >= ctx {
-        let _ = reply.blocking_send(GenEvent::Error(format!(
-            "prompt is {} tokens but --ctx-size is {ctx} (no room to generate) — \
-             raise --ctx-size or shorten the prompt",
-            new_tokens.len()
-        )));
-        return;
-    }
-
-    let slot = &mut w.slots[idx];
-
-    // ── Safe prefix-reuse (per slot) ────────────────────────────────────
-    // Reuse the cached prefix ONLY when this prompt strictly extends what the
-    // slot holds (and `cache.position` agrees). Any divergence falls back to a
-    // full reset + prefill, the only SSM/GDN-safe rewind (recurrent state has no
-    // per-position undo — see `KvCache::reset`).
-    let common = slot
-        .prior_tokens
-        .iter()
-        .zip(new_tokens.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let pure_extension =
-        common > 0 && common == slot.prior_tokens.len() && common == slot.cache.position as usize;
-    let (start_pos, delta): (u32, Vec<u32>) = if pure_extension {
-        if common < new_tokens.len() {
-            (common as u32, new_tokens[common..].to_vec())
-        } else {
-            // Whole prompt already cached (identical re-request): rewind one
-            // and re-feed the last token so there are logits to sample from.
-            (common as u32 - 1, vec![*new_tokens.last().unwrap()])
-        }
-    } else {
-        slot.cache.reset();
-        (0, new_tokens.clone())
-    };
-    slot.cache.position = start_pos;
-    tracing::debug!(
-        slot = idx,
-        prompt = new_tokens.len(),
-        reused = start_pos,
-        prefill = delta.len(),
-        "serve: prefix reuse",
-    );
-
-    // ── Prefill + decode ────────────────────────────────────────────────
-    let mut sampler = Sampler::new(cfg);
-    let mut generated: Vec<u32> = Vec::new();
-    let mut step: Vec<u32> = delta;
-    let mut stream = w.model.tokenizer().tokenizer.decode_stream(/*skip_special=*/ true);
-    let mut pending = String::new(); // decoded-but-held-back tail (stop matching)
-    let mut forwards = 0usize;
-    let mut disconnected = false;
-    let mut terminal: Option<StopReason> = None;
-
-    loop {
-        // Context headroom for the next forward (chat parity).
-        if slot.cache.position as usize + step.len() + 1 > ctx as usize {
-            terminal = Some(StopReason::ContextFull);
-            break;
-        }
-        let position = slot.cache.position;
-        let token = match w
-            .engine
-            .forward_sampled(&*w.model, &mut slot.cache, &step, position, &mut sampler)
+    /// Pick a *free* slab to serve `new_tokens` — prefix-reuse, else LRU (see
+    /// [`choose_slot`]) — or `None` if every slab is busy. An in-range, free
+    /// `id_slot` pins directly.
+    fn select_free_slab(&self, new_tokens: &[u32], id_slot: Option<usize>) -> Option<usize> {
+        if let Some(i) = id_slot
+            && i < self.slots.len()
+            && !self.slots[i].active
         {
+            return Some(i);
+        }
+        let free: Vec<(usize, &[u32], u64)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.active)
+            .map(|(i, s)| (i, s.prior_tokens.as_slice(), s.last_used))
+            .collect();
+        if free.is_empty() {
+            return None;
+        }
+        let view: Vec<(&[u32], u64)> = free.iter().map(|&(_, p, l)| (p, l)).collect();
+        let pick = choose_slot(&view, new_tokens, None);
+        Some(free[pick].0)
+    }
+
+    /// Admit one job: select a free slab, prefill it (with prefix-reuse), and
+    /// push it to the active set with its first sampled token. Any failure
+    /// (no slab / oversized prompt / GPU error) sends a terminal frame and
+    /// releases the slab; the worker stays alive for the next job.
+    fn admit(&mut self, job: GenJob) {
+        let GenJob {
+            tokens: new_tokens,
+            config,
+            reply,
+        } = job;
+        let GenConfig {
+            sampler: cfg,
+            max_tokens,
+            stop,
+            ignore_eos,
+            id_slot,
+        } = config;
+
+        let prompt_tokens = new_tokens.len() as u32;
+        if new_tokens.is_empty() {
+            let _ =
+                reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
+            return;
+        }
+        let Some(idx) = self.select_free_slab(&new_tokens, id_slot) else {
+            // Caller guards on free_slabs(), so this is defensive only.
+            let _ = reply.blocking_send(GenEvent::Error("no free cache slot available".into()));
+            return;
+        };
+        let ctx = self.batch.config.max_seq_len;
+        if new_tokens.len() as u32 >= ctx {
+            let _ = reply.blocking_send(GenEvent::Error(format!(
+                "prompt is {} tokens but --ctx-size is {ctx} (no room to generate) — \
+                 raise --ctx-size or shorten the prompt",
+                new_tokens.len()
+            )));
+            return;
+        }
+        self.clock += 1;
+        self.slots[idx].last_used = self.clock;
+
+        // ── Safe prefix-reuse (per slab) ───────────────────────────────────
+        // Reuse the cached prefix ONLY when this prompt strictly extends what
+        // the slab holds (and the slab position agrees). Any divergence falls
+        // back to a full reset + prefill — the only SSM/GDN-safe rewind.
+        let common = lcp(&self.slots[idx].prior_tokens, &new_tokens);
+        let cache_pos = self.batch.positions[idx];
+        let pure_extension = common > 0
+            && common == self.slots[idx].prior_tokens.len()
+            && common == cache_pos as usize;
+        let (start_pos, delta): (u32, Vec<u32>) = if pure_extension {
+            if common < new_tokens.len() {
+                (common as u32, new_tokens[common..].to_vec())
+            } else {
+                // Whole prompt already cached: rewind one and re-feed the last
+                // token so there are logits to sample from.
+                (common as u32 - 1, vec![*new_tokens.last().unwrap()])
+            }
+        } else {
+            // Divergent → fresh prefill: zero just this slab's SSM state.
+            self.batch.reset_slot(idx as u32);
+            self.batch.positions[idx] = 0;
+            (0, new_tokens.clone())
+        };
+        tracing::debug!(
+            slab = idx,
+            prompt = new_tokens.len(),
+            reused = start_pos,
+            prefill = delta.len(),
+            "serve: admit + prefix reuse",
+        );
+
+        // ── Prefill via the borrowed single-slab cache ─────────────────────
+        // Invalidate the engine's single-seq decode-replay cmdbuf — it binds a
+        // specific slab's buffers, and the next batched forward drops it too.
+        self.engine.decode_cache = None;
+        let mut sampler = Sampler::new(cfg);
+        let first = {
+            let mut sc = self.batch.slot_kvcache(idx as u32);
+            sc.position = start_pos;
+            match self
+                .engine
+                .forward_sampled(&*self.model, &mut sc, &delta, start_pos, &mut sampler)
+            {
+                Ok(t) => {
+                    self.batch.positions[idx] = sc.position;
+                    t
+                }
+                Err(e) => {
+                    // Slab/prior may be inconsistent after a GPU error — reset.
+                    self.batch.reset_slot(idx as u32);
+                    self.batch.positions[idx] = 0;
+                    self.slots[idx].prior_tokens.clear();
+                    let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                    return;
+                }
+            }
+        };
+        self.slots[idx].active = true;
+
+        if reply
+            .blocking_send(GenEvent::Started { prompt_tokens })
+            .is_err()
+        {
+            // Client gone before we streamed anything — release the slab but
+            // keep its cache for a future prefix-reuse.
+            self.slots[idx].active = false;
+            self.slots[idx].prior_tokens = new_tokens;
+            return;
+        }
+
+        let mut seq = ActiveSeq {
+            slab: idx as u32,
+            sampler,
+            prompt: new_tokens,
+            generated: Vec::new(),
+            prompt_tokens,
+            stop,
+            ignore_eos,
+            max_tokens,
+            reply,
+            stream_ids: Vec::new(),
+            stream_prefix: String::new(),
+            stream_prefix_index: 0,
+            pending: String::new(),
+            last_token: first,
+            ctx,
+            terminal: None,
+            disconnected: false,
+        };
+        // Stream the first (prefill) token now; it's fed back at the first
+        // batched step. The rest advance in `decode_step`.
+        process_token(&self.model.tokenizer().tokenizer, &self.eog_ids, &mut seq, first);
+        self.active.push(seq);
+    }
+
+    /// One batched decode step: gather the active sequences that still have
+    /// context room, run a single forward, then stream + stop-check each.
+    fn decode_step(&mut self) {
+        let ctx = self.batch.config.max_seq_len;
+        // Participants (ascending `active` index). Mark ctx-full ones terminal.
+        let mut parts: Vec<usize> = Vec::with_capacity(self.active.len());
+        for (i, seq) in self.active.iter_mut().enumerate() {
+            if seq.terminal.is_some() || seq.disconnected {
+                continue;
+            }
+            if self.batch.positions[seq.slab as usize] + 1 >= ctx {
+                seq.terminal = Some(StopReason::ContextFull);
+                continue;
+            }
+            parts.push(i);
+        }
+        if parts.is_empty() {
+            return;
+        }
+
+        // Advance every active sequence in one batched forward — even a lone
+        // sequence (B=1). Routing B=1 through the single-sequence path (decode
+        // replay + split-K flash) would be faster per token, but the single-seq
+        // flash's split-K reduction order differs from the batched `k_num=1`
+        // single-pass, so a sequence alternating paths as load changes could see
+        // its greedy output drift. Keeping one path makes output independent of
+        // concurrency. (The plan accepts disabling replay on the batched path as
+        // the throughput-for-latency trade — see M4 notes.)
+        let tokens: Vec<u32> = parts.iter().map(|&i| self.active[i].last_token).collect();
+        let positions: Vec<u32> = parts
+            .iter()
+            .map(|&i| self.batch.positions[self.active[i].slab as usize])
+            .collect();
+        let slots: Vec<u32> = parts.iter().map(|&i| self.active[i].slab).collect();
+        // Gather participant samplers (iter_mut + same ascending order as parts).
+        let part_set: std::collections::HashSet<usize> = parts.iter().copied().collect();
+        let mut samplers: Vec<&mut Sampler> = self
+            .active
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| part_set.contains(i))
+            .map(|(_, seq)| &mut seq.sampler)
+            .collect();
+
+        let toks = match self.engine.forward_batch_decode(
+            &*self.model,
+            &mut self.batch,
+            &tokens,
+            &positions,
+            &slots,
+            &mut samplers,
+        ) {
             Ok(t) => t,
             Err(e) => {
-                // Cache/prior may be inconsistent after a GPU error — reset so
-                // the next job full-prefills. Force the next job to re-record
-                // the decode cmdbuf (last_slot cleared). Keep the worker alive.
-                slot.cache.reset();
-                slot.prior_tokens.clear();
-                w.last_slot = None;
-                let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                // A batched GPU error is fatal to every participant — fail them
+                // all and let eviction reset their slabs.
+                let msg = e.to_string();
+                for &i in &parts {
+                    let _ = self.active[i].reply.blocking_send(GenEvent::Error(msg.clone()));
+                    self.active[i].disconnected = true; // suppress a duplicate Done
+                    self.active[i].terminal = Some(StopReason::ContextFull);
+                }
                 return;
             }
         };
+        drop(samplers);
 
-        if forwards == 0 && reply.blocking_send(GenEvent::Started { prompt_tokens }).is_err() {
-            disconnected = true;
-            break;
+        for (k, &i) in parts.iter().enumerate() {
+            let token = toks[k];
+            process_token(
+                &self.model.tokenizer().tokenizer,
+                &self.eog_ids,
+                &mut self.active[i],
+                token,
+            );
+            self.active[i].last_token = token;
         }
-        forwards += 1;
+    }
 
-        if !ignore_eos && w.eog_ids.contains(&token) {
-            // EOS is now in the cache (K/V written) but not emitted.
-            generated.push(token);
-            terminal = Some(StopReason::Eos);
-            break;
-        }
-        generated.push(token);
+    /// Reap finished / cancelled sequences: flush any held-back text, send the
+    /// terminal `Done`, commit the slab's `prior_tokens`, and free the slab.
+    fn evict_finished(&mut self) {
+        let mut i = 0;
+        while i < self.active.len() {
+            if self.active[i].terminal.is_none() && !self.active[i].disconnected {
+                i += 1;
+                continue;
+            }
+            let mut seq = self.active.remove(i);
+            let slab = seq.slab as usize;
 
-        if let Ok(Some(piece)) = stream.step(token) {
-            pending.push_str(&piece);
-            match scan_stop(&pending, &stop) {
-                StopScan::Hit { upto, seq } => {
-                    if upto > 0 && reply.blocking_send(GenEvent::Delta(pending[..upto].to_string())).is_err() {
-                        disconnected = true;
-                        break;
-                    }
-                    terminal = Some(StopReason::StopSequence(seq));
-                    break;
+            if !seq.disconnected && !seq.pending.is_empty() {
+                let tail = std::mem::take(&mut seq.pending);
+                if seq.reply.blocking_send(GenEvent::Delta(tail)).is_err() {
+                    seq.disconnected = true;
                 }
-                StopScan::Emit(n) => {
-                    if n > 0 {
-                        let chunk: String = pending.drain(..n).collect();
-                        if reply.blocking_send(GenEvent::Delta(chunk)).is_err() {
-                            disconnected = true;
-                            break;
-                        }
+            }
+            if !seq.disconnected {
+                let _ = seq.reply.blocking_send(GenEvent::Done {
+                    stop_reason: seq.terminal.clone().unwrap_or(StopReason::MaxTokens),
+                    prompt_tokens: seq.prompt_tokens,
+                    completion_tokens: seq.generated.len() as u32,
+                });
+            }
+
+            // The slab's cache holds the prompt plus every generated token we
+            // fed back (all but the last — an output, never an input), so
+            // `prior_tokens.len() == batch.positions[slab]`.
+            let mut prior = std::mem::take(&mut seq.prompt);
+            if seq.generated.len() > 1 {
+                prior.extend_from_slice(&seq.generated[..seq.generated.len() - 1]);
+            }
+            self.slots[slab].prior_tokens = prior;
+            self.slots[slab].active = false;
+        }
+    }
+}
+
+/// Advance one sequence by `token`: EOS check, append, streaming-decode, stop
+/// matching, and the max-token bound — setting `seq.terminal` / `seq.pending` /
+/// `seq.disconnected`. Mirrors the single-sequence decode loop body, but for one
+/// member of a batch. Streaming uses `step_decode_stream` over the sequence's
+/// own `DecodeStream` state, so no tokenizer borrow is held across steps.
+fn process_token(tokenizer: &Tokenizer, eog_ids: &[u32], seq: &mut ActiveSeq, token: u32) {
+    if !seq.ignore_eos && eog_ids.contains(&token) {
+        // EOS is now in the cache (K/V written) but never emitted.
+        seq.generated.push(token);
+        seq.terminal = Some(StopReason::Eos);
+        return;
+    }
+    seq.generated.push(token);
+
+    if let Ok(Some(piece)) = tokenizers::step_decode_stream(
+        tokenizer,
+        vec![token],
+        /*skip_special_tokens=*/ true,
+        &mut seq.stream_ids,
+        &mut seq.stream_prefix,
+        &mut seq.stream_prefix_index,
+    ) {
+        seq.pending.push_str(&piece);
+        match scan_stop(&seq.pending, &seq.stop) {
+            StopScan::Hit { upto, seq: matched } => {
+                if upto > 0
+                    && seq
+                        .reply
+                        .blocking_send(GenEvent::Delta(seq.pending[..upto].to_string()))
+                        .is_err()
+                {
+                    seq.disconnected = true;
+                } else {
+                    seq.terminal = Some(StopReason::StopSequence(matched));
+                }
+                return;
+            }
+            StopScan::Emit(n) => {
+                if n > 0 {
+                    let chunk: String = seq.pending.drain(..n).collect();
+                    if seq.reply.blocking_send(GenEvent::Delta(chunk)).is_err() {
+                        seq.disconnected = true;
+                        return;
                     }
                 }
             }
         }
-
-        if generated.len() as u32 >= max_tokens {
-            terminal = Some(StopReason::MaxTokens);
-            break;
-        }
-        step = vec![token];
     }
 
-    // Flush any text still buffered for stop matching (no stop matched).
-    if !disconnected
-        && !pending.is_empty()
-        && reply
-            .blocking_send(GenEvent::Delta(std::mem::take(&mut pending)))
-            .is_err()
-    {
-        disconnected = true;
-    }
-
-    // ── Commit prior_tokens to mirror the slot's cache ──────────────────
-    // The cache holds the full rendered prompt plus every generated token we
-    // fed back (all but the last — the last was an output, never an input).
-    // This invariant (`prior_tokens.len() == cache.position`) holds on every
-    // exit because the prefill forward always ran (guarded above).
-    let mut prior = new_tokens;
-    if generated.len() > 1 {
-        prior.extend_from_slice(&generated[..generated.len() - 1]);
-    }
-    slot.prior_tokens = prior;
-
-    if !disconnected {
-        let _ = reply.blocking_send(GenEvent::Done {
-            stop_reason: terminal.unwrap_or(StopReason::MaxTokens),
-            prompt_tokens,
-            completion_tokens: generated.len() as u32,
-        });
+    if seq.generated.len() as u32 >= seq.max_tokens {
+        seq.terminal = Some(StopReason::MaxTokens);
     }
 }
 

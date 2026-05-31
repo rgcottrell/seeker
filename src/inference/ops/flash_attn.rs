@@ -401,6 +401,12 @@ pub fn record_batched(
     out: TensorView,
     params: FlashAttnParams,
     kv_lens: &[u32],
+    dyn_range: crate::inference::buffer::BufferRange,
+    // Per-sequence KV slab index (which `BatchKvCache` slab each sequence's K/V
+    // lives in). `None` → identity (sequence `b` reads slab `b`), the
+    // contiguous layout. `Some` lets a gathered batch read non-contiguous slabs
+    // (continuous-batching with prefix-reuse parking). Must be `kv_lens.len()`.
+    slots: Option<&[u32]>,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(q.dtype, GgmlType::F32);
     debug_assert_eq!(out.dtype, GgmlType::F32);
@@ -431,7 +437,19 @@ pub fn record_batched(
     // Per-sequence DecodeDyn array: entry b's kv_len bounds sequence b's KV
     // loop; entry 0's k_num / blocks_per_split are read uniformly by every
     // workgroup. Zero the rest so stale scratch never leaks into a field.
-    let dyn_range = crate::inference::decode_dyn::alloc_array(ctx, b)?;
+    //
+    // CRITICAL: `dyn_range` is caller-provided and MUST live in scratch that
+    // is NOT reclaimed by `scratch_restore` before the submit. The host writes
+    // these fields now (record time) but the shader reads them at execute time
+    // (after submit); if a later layer's host-write reuses this offset, the
+    // shader reads a garbage `kv_len` → unbounded KV loop → GPU hang. (The
+    // qwen hybrid hit exactly this: per-layer scratch reuse across SSM/attn
+    // layers corrupted the length. Allocate once per forward, before the
+    // layer checkpoint.)
+    debug_assert!(
+        dyn_range.size >= crate::inference::decode_dyn::DecodeDyn::SIZE * b as u64,
+        "record_batched: dyn_range too small for {b} sequences"
+    );
     {
         let host_ptr = ctx
             .scratch
@@ -440,6 +458,7 @@ pub fn record_batched(
         let mut entries = vec![crate::inference::decode_dyn::DecodeDyn::default(); b as usize];
         for (i, e) in entries.iter_mut().enumerate() {
             e.kv_len = kv_lens[i];
+            e.slot = slots.map_or(i as u32, |s| s[i]);
         }
         entries[0].k_num = 1;
         entries[0].blocks_per_split = num_blocks;

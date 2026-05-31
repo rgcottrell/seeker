@@ -270,6 +270,12 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     const uint p_KV       = data_dyn[iq3].kv_len;
     const uint p_k_num    = data_dyn[0].k_num;
     const uint p_split_kv = data_dyn[0].blocks_per_split;
+    // K/V slab index for this sequence — batched/continuous decode packs one
+    // DecodeDyn entry per sequence, each naming the BatchKvCache slab its cache
+    // lives in (so a gathered batch can read non-contiguous slabs). The query
+    // and output stay packed by `iq3`; only the cache reads are slab-indexed.
+    // Single-sequence decode sets slot 0 → identical to the old `iq3 * nb`.
+    const uint kv_slot    = data_dyn[iq3].slot;
     // grid.y packs (head, split): head = y / k_num, split = y % k_num.
     // With k_num == 1 this collapses to head = y, split = 0 — identical to
     // the pre-split-K dispatch.
@@ -322,7 +328,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
             const uint c = c0 + tid;
             float s = 0.0f;
             if (c < Bc && kv_base + c < p_KV) {
-                const uint k_off = iq3 * p.nb13 + ik2 * p.nb12 + (kv_base + c) * p.nb11;
+                const uint k_off = kv_slot * p.nb13 + ik2 * p.nb12 + (kv_base + c) * p.nb11;
                 [unroll] for (uint d = 0; d < HSK; ++d) {
                     s += Q_sh[d] * read_k_element(k_off + d);
                 }
@@ -352,7 +358,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
             if (kv_base + c >= p_KV) { break; }
             const float p_c = exp(S_sh[c] - M_new);
             Lf += p_c;
-            const uint v_off = iq3 * p.nb23 + iv2 * p.nb22 + (kv_base + c) * p.nb21;
+            const uint v_off = kv_slot * p.nb23 + iv2 * p.nb22 + (kv_base + c) * p.nb21;
             [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
                 const uint d_global = d * WORKGROUP_SIZE + tid;
                 Of[d] += p_c * read_v_element(v_off + d_global);

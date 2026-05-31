@@ -396,6 +396,7 @@ impl Model for LlamaModel {
         batch: &mut crate::inference::kv_cache::BatchKvCache,
         tokens: &[u32],
         positions: &[u32],
+        slots: &[u32],
     ) -> Result<crate::inference::weights::TensorView, Box<dyn Error>> {
         use crate::inference::command::record_compute_barriers;
         let p = &self.params;
@@ -403,8 +404,8 @@ impl Model for LlamaModel {
         if b == 0 {
             return Err("record_forward_batch: empty batch".into());
         }
-        if positions.len() != tokens.len() {
-            return Err("record_forward_batch: tokens/positions length mismatch".into());
+        if positions.len() != tokens.len() || slots.len() != tokens.len() {
+            return Err("record_forward_batch: tokens/positions/slots length mismatch".into());
         }
         let hidden = p.n_embd as u64;
         let head_dim = p.head_dim() as u64;
@@ -425,6 +426,10 @@ impl Model for LlamaModel {
 
         let residual = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
         elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, b as u32, residual)?;
+        // Persistent per-forward DecodeDyn array for batched flash-attn — must
+        // live above `layer_checkpoint` so per-layer `scratch_restore` cannot
+        // reclaim it (the shader reads `kv_len` at execute time, after submit).
+        let fa_dyn_range = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
         let layer_checkpoint = ctx.scratch_checkpoint();
 
         let rope_params = rope::RopeParams::llama_default(p.rope_dim, p.rope_freq_base);
@@ -469,23 +474,28 @@ impl Model for LlamaModel {
                 cache_io::record_write(
                     ctx,
                     k_col,
-                    batch.slot_k_view(s as u32, layer_idx as u32),
+                    batch.slot_k_view(slots[s], layer_idx as u32),
                     positions[s],
                 )?;
                 cache_io::record_write(
                     ctx,
                     v_col,
-                    batch.slot_v_view(s as u32, layer_idx as u32),
+                    batch.slot_v_view(slots[s], layer_idx as u32),
                     positions[s],
                 )?;
             }
 
-            // Batched attention: each sequence attends to its own slab/length.
+            // Batched attention: each sequence attends to its own slab (slots[s])
+            // and length; the K/V views bind all slabs, the flash picks per
+            // sequence via DecodeDyn::slot.
             let q_attn = batched_q_attn_view(q_roped, head_dim, n_head, b, hidden);
-            let k_attn = batch.batched_k_attn_view(layer_idx as u32, tokens.len() as u32);
-            let v_attn = batch.batched_v_attn_view(layer_idx as u32, tokens.len() as u32);
+            let k_attn = batch.batched_k_attn_view(layer_idx as u32);
+            let v_attn = batch.batched_v_attn_view(layer_idx as u32);
             let attn_out = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
-            flash_attn::record_batched(ctx, q_attn, k_attn, v_attn, attn_out, fa_params, &kv_lens)?;
+            flash_attn::record_batched(
+                ctx, q_attn, k_attn, v_attn, attn_out, fa_params, &kv_lens, fa_dyn_range,
+                Some(slots),
+            )?;
 
             let proj = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
             matmul::record(ctx, block.wo, attn_out, proj)?;
@@ -517,7 +527,7 @@ impl Model for LlamaModel {
         matmul::record(ctx, lm_head, final_norm, logits)?;
 
         for (s, &pos) in positions.iter().enumerate() {
-            batch.positions[s] = pos + 1;
+            batch.positions[slots[s] as usize] = pos + 1;
         }
         Ok(logits)
     }

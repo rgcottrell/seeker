@@ -260,6 +260,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Throughput benchmark — outside the `gpu_debug` gate so it runs in a
+    // release build (no validation-layer overhead skewing the numbers).
+    if std::env::var("SEEKER_BATCH_BENCH").is_ok() {
+        batch_decode_bench(&mut engine, model.as_ref())?;
+        return Ok(());
+    }
+
     // `max_seq_len` was computed above (used to size the scratch region).
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
@@ -436,11 +443,21 @@ fn batch_decode_smoke_test(
     use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
     use crate::inference::sample::{Sampler, SamplerConfig};
 
-    let prompts = [
-        "The capital of France is",
-        "Once upon a time, in a land",
-        "Two plus two equals",
-    ];
+    let prompts: Vec<&str> = if std::env::var("SEEKER_BATCH_B1").is_ok() {
+        vec!["The capital of France is"]
+    } else if std::env::var("SEEKER_BATCH_SAME").is_ok() {
+        vec![
+            "The capital of France is",
+            "The capital of France is",
+            "The capital of France is",
+        ]
+    } else {
+        vec![
+            "The capital of France is",
+            "Once upon a time, in a land",
+            "Two plus two equals",
+        ]
+    };
     let b = prompts.len();
     let n_gen = 16usize; // tokens to generate per sequence (incl. the first)
 
@@ -482,6 +499,14 @@ fn batch_decode_smoke_test(
     for tokens in &prompts_tokens {
         let mut cache =
             engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, config)?;
+        if let Some(ssm) = model.ssm_state_dims() {
+            cache.allocate_ssm_state(
+                &engine.device,
+                ssm.n_ssm_layers,
+                ssm.conv_state_floats,
+                ssm.gdn_state_floats,
+            )?;
+        }
         let mut sampler = Sampler::new(greedy.clone());
         // Prefill (samples the first token), then greedy decode the rest.
         let first = engine.forward_sampled(model, &mut cache, tokens, 0, &mut sampler)?;
@@ -494,25 +519,52 @@ fn batch_decode_smoke_test(
         }
         serial.push(stream);
     }
+    eprintln!("[batch test] serial reference done ({} streams)", serial.len());
 
     // ---- Batched: all prompts in one BatchKvCache ----
+    // `SEEKER_BATCH_PERM` parks sequence `s` in a *non-contiguous* slab
+    // (`2*s+1`, leaving even slabs empty) to exercise the gathered, slot-indexed
+    // batched decode (continuous-batching with prefix-reuse parking). The
+    // per-sequence result must be independent of which slab it lives in.
+    let perm: Vec<u32> = if std::env::var("SEEKER_BATCH_PERM").is_ok() {
+        (0..b as u32).map(|s| 2 * s + 1).collect()
+    } else {
+        (0..b as u32).collect()
+    };
+    let n_slots = perm.iter().copied().max().unwrap_or(0) + 1;
+    println!("Batched slab assignment (slot per seq): {perm:?}, n_slots={n_slots}");
     let mut batch =
-        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, b as u32, config)?;
+        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, n_slots, config)?;
+    if let Some(ssm) = model.ssm_state_dims() {
+        batch.allocate_ssm_state(
+            &engine.device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
+    }
     let mut samplers: Vec<Sampler> = (0..b).map(|_| Sampler::new(greedy.clone())).collect();
     let mut last: Vec<u32> = vec![0; b];
     let mut batched: Vec<Vec<u32>> = Vec::with_capacity(b);
-    // Prefill each sequence into its slab via the borrowed single-slot cache.
+    // Prefill each sequence into its (possibly non-contiguous) slab.
     for (s, tokens) in prompts_tokens.iter().enumerate() {
-        let mut sc = batch.slot_kvcache(s as u32);
+        let mut sc = batch.slot_kvcache(perm[s]);
         let first = engine.forward_sampled(model, &mut sc, tokens, 0, &mut samplers[s])?;
-        batch.positions[s] = sc.position;
+        batch.positions[perm[s] as usize] = sc.position;
         last[s] = first;
         batched.push(vec![first]);
+        eprintln!("[batch test] prefill seq {s} done (slab {}, first token {first})", perm[s]);
     }
     // Batched decode steps.
-    for _ in 1..n_gen {
-        let positions = batch.positions.clone();
-        let toks = engine.forward_batch_decode(model, &mut batch, &last, &positions, &mut samplers)?;
+    for step in 1..n_gen {
+        let positions: Vec<u32> = (0..b).map(|s| batch.positions[perm[s] as usize]).collect();
+        let mut srefs: Vec<&mut Sampler> = samplers.iter_mut().collect();
+        let toks = engine
+            .forward_batch_decode(model, &mut batch, &last, &positions, &perm, &mut srefs)?;
+        let matches: Vec<bool> = (0..b)
+            .map(|s| serial[s].get(step).map(|&t| t == toks[s]).unwrap_or(false))
+            .collect();
+        eprintln!("[batch step {step}] toks={toks:?} match={matches:?}");
         for s in 0..b {
             batched[s].push(toks[s]);
             last[s] = toks[s];
@@ -549,6 +601,116 @@ fn batch_decode_smoke_test(
     Ok(())
 }
 
+/// Aggregate decode-throughput benchmark for batched decode. Decode is
+/// bandwidth-bound (each token re-reads the whole weight set), so batching B
+/// sequences into one forward amortizes that read across B tokens — aggregate
+/// tok/s should scale up with B until the path turns compute-bound. Prefills B
+/// contiguous slabs with a fixed prompt, times `n_decode` batched steps per
+/// batch size, and prints aggregate / per-sequence tok/s. The B=1 row is the
+/// single-stream baseline. Run with `SEEKER_BATCH_BENCH=1 seeker run`. Override
+/// with `SEEKER_BENCH_BATCHES=1,2,4,8`, `SEEKER_BENCH_PROMPT=128`,
+/// `SEEKER_BENCH_DECODE=128`.
+fn batch_decode_bench(
+    engine: &mut Engine,
+    model: &dyn crate::models::Model,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
+    use crate::inference::sample::{Sampler, SamplerConfig};
+    use std::time::Instant;
+
+    let env_usize = |k: &str, d: usize| {
+        std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    };
+    let prompt_len = env_usize("SEEKER_BENCH_PROMPT", 128);
+    let n_decode = env_usize("SEEKER_BENCH_DECODE", 128);
+    let warmup = 4usize;
+    let batches: Vec<usize> = std::env::var("SEEKER_BENCH_BATCHES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 2, 4, 8]);
+
+    let greedy = SamplerConfig {
+        temperature: 0.0,
+        ..SamplerConfig::default()
+    };
+    // A real prompt tokenized then padded (by repetition) to `prompt_len`, so
+    // every sequence carries the same realistic-length cache.
+    let bundle = model.tokenizer();
+    let seed = bundle
+        .tokenizer
+        .encode("The history of computing began long before the invention of", true)
+        .map(|e| e.get_ids().to_vec())
+        .map_err(|e| format!("tokenize failed: {e}"))?;
+    let prompt: Vec<u32> = (0..prompt_len).map(|i| seed[i % seed.len()]).collect();
+
+    let dims = model.cache_dims();
+    let max_seq = (prompt_len + n_decode + warmup + 8) as u32;
+    let config = KvCacheConfig {
+        k_dtype: GgmlType::F16,
+        v_dtype: GgmlType::F16,
+        max_seq_len: max_seq,
+    };
+
+    println!(
+        "Batch-decode throughput: prompt_len={prompt_len}, decode_steps={n_decode}, model dims n_layer={}",
+        dims.n_layer
+    );
+    println!("  B   aggregate tok/s   per-seq tok/s   ms/step   speedup");
+    let mut baseline = 0f64;
+    for &b in &batches {
+        let mut batch = BatchKvCache::new(
+            &engine.device,
+            dims.n_layer,
+            dims.head_dim,
+            dims.n_head_kv,
+            b as u32,
+            config,
+        )?;
+        if let Some(ssm) = model.ssm_state_dims() {
+            batch.allocate_ssm_state(
+                &engine.device,
+                ssm.n_ssm_layers,
+                ssm.conv_state_floats,
+                ssm.gdn_state_floats,
+            )?;
+        }
+        let mut samplers: Vec<Sampler> = (0..b).map(|_| Sampler::new(greedy.clone())).collect();
+        let mut last: Vec<u32> = vec![0; b];
+        for s in 0..b {
+            let mut sc = batch.slot_kvcache(s as u32);
+            last[s] = engine.forward_sampled(model, &mut sc, &prompt, 0, &mut samplers[s])?;
+            batch.positions[s] = sc.position;
+        }
+        let slot_ids: Vec<u32> = (0..b as u32).collect();
+        let step = |engine: &mut Engine, batch: &mut BatchKvCache, last: &mut Vec<u32>, samplers: &mut [Sampler]| -> Result<(), Box<dyn Error>> {
+            let positions: Vec<u32> = (0..b).map(|s| batch.positions[s]).collect();
+            let mut srefs: Vec<&mut Sampler> = samplers.iter_mut().collect();
+            *last = engine
+                .forward_batch_decode(model, batch, last, &positions, &slot_ids, &mut srefs)?;
+            Ok(())
+        };
+        for _ in 0..warmup {
+            step(engine, &mut batch, &mut last, &mut samplers)?;
+        }
+        let t0 = Instant::now();
+        for _ in 0..n_decode {
+            step(engine, &mut batch, &mut last, &mut samplers)?;
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let agg = (b as f64 * n_decode as f64) / elapsed;
+        let per_seq = n_decode as f64 / elapsed;
+        let ms_step = elapsed * 1000.0 / n_decode as f64;
+        if b == batches[0] {
+            baseline = agg;
+        }
+        println!(
+            "  {b:<3} {agg:>14.1}   {per_seq:>13.1}   {ms_step:>7.2}   {:>5.2}x",
+            agg / baseline.max(1e-9)
+        );
+    }
+    Ok(())
+}
+
 /// Batched-decode flash-attention smoke test: B sequences, one query token
 /// each, each attending to its own KV slab over its own `kv_len`. Runs the
 /// batched dispatch (`flash_attn::record_batched`) on synthetic F32 Q/K/V and
@@ -564,9 +726,18 @@ fn fa_batch_smoke_test(
     use crate::inference::buffer::BufferRange;
     use crate::inference::ops::flash_attn;
 
-    let head_dim: usize = 64; // multiple of 32 (HSV_PER_THREAD = HSV/32)
-    let n_head: usize = 4;
-    let n_head_kv: usize = 2; // gqa_ratio = 2
+    let head_dim: usize = std::env::var("SEEKER_FA_HEAD_DIM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64); // multiple of 32 (HSV_PER_THREAD = HSV/32)
+    let n_head: usize = std::env::var("SEEKER_FA_N_HEAD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let n_head_kv: usize = std::env::var("SEEKER_FA_N_HEAD_KV")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2); // gqa_ratio = n_head / n_head_kv
     let gqa = (n_head / n_head_kv) as u32;
     let hidden = head_dim * n_head;
     let kv_lens: Vec<u32> = vec![5, 8, 3];
@@ -662,7 +833,8 @@ fn fa_batch_smoke_test(
             gqa_ratio: gqa,
             scale,
         };
-        flash_attn::record_batched(ctx, q, k, v, out, params, &kv_lens)?;
+        let fa_dyn = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
+        flash_attn::record_batched(ctx, q, k, v, out, params, &kv_lens, fa_dyn, None)?;
         Ok(out.range())
     })?;
 

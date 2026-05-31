@@ -10,5 +10,10 @@ struct DecodeDyn {
     float uniform_rng;        // 16
     uint  penalty_count;      // 20
     uint  v_cache_d_offset;   // 24
-    uint  _pad1;              // 28
+    // Per-sequence KV-cache slab index for batched/continuous decode. The
+    // flash-attn kernel reads its K/V from `slot * nb13` / `slot * nb23`,
+    // letting a batch gather arbitrary (non-contiguous) BatchKvCache slabs —
+    // so prefix-reuse can park a conversation in any slab and still join the
+    // batch. Single-sequence decode leaves it 0 (slab 0). // 28
+    uint  slot;
 };
