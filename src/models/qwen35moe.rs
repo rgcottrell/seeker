@@ -481,14 +481,7 @@ impl Model for Qwen35MoeModel {
     }
 
     fn supports_unified(&self) -> bool {
-        // The unified varlen forward (forward_unified_impl) is implemented and
-        // gpu_debug-validated byte-identical to serial (unified_forward_smoke_test),
-        // but exhibits a release-only nondeterminism (intermittent garbage) —
-        // a GPU read-before-write race localized to the attention/SSM blocks
-        // that gpu_debug's serialization masks. Until that barrier is found,
-        // serve qwen via the validated, deterministic legacy path. Opt in for
-        // debugging with SEEKER_QWEN_UNIFIED=1.
-        std::env::var("SEEKER_QWEN_UNIFIED").is_ok()
+        true
     }
 
     fn record_forward_unified(
@@ -1389,7 +1382,11 @@ impl Qwen35MoeModel {
                     }
                 }
             }
+            // Release-capable dump: snapshot the residual after the block (attn
+            // /ssm) and after MoE. No-op unless ctx.dump is set (debug harness).
+            ctx.dump(&format!("L{layer_idx:02}-block"), residual);
             moe_ffn(ctx, block.moe(), block.post_attn_norm(), residual, p, hidden, n_total as u32, layer_idx as u32)?;
+            ctx.dump(&format!("L{layer_idx:02}-moe"), residual);
         }
         ctx.scratch_restore(layer_checkpoint);
 

@@ -284,6 +284,7 @@ impl Engine {
                 n_dispatches: 0,
                 decode_dyn: decode_dyn_range,
                 replay_plan: None,
+                dump: None,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
@@ -427,6 +428,7 @@ impl Engine {
                 n_dispatches: 0,
                 decode_dyn: decode_dyn_range,
                 replay_plan: None,
+                dump: None,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
@@ -547,6 +549,7 @@ impl Engine {
                 n_dispatches: 0,
                 decode_dyn: decode_dyn_range,
                 replay_plan: None,
+                dump: None,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
@@ -597,6 +600,103 @@ impl Engine {
             let token = unsafe { std::ptr::read(host_ptr.add(r.offset as usize) as *const u32) };
             sampler.accept(token);
             out.push(token);
+        }
+        Ok(out)
+    }
+
+    /// Debug: run [`crate::models::Model::record_forward_unified`] with the
+    /// release-capable per-op dump enabled, and return `(label, hash)` for each
+    /// dumped buffer (FNV-1a over the raw bytes). Run the same input twice and
+    /// diff the hashes to find the first op whose output is nondeterministic
+    /// across runs — the tool for bisecting the qwen unified release race.
+    /// No sampling; the logits are discarded.
+    pub fn forward_unified_dump(
+        &mut self,
+        model: &dyn crate::models::Model,
+        batch: &mut kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        seq_lens: &[u32],
+        slots: &[u32],
+    ) -> Result<Vec<(String, u64)>, Box<dyn Error>> {
+        // Host-visible sink for the dumped buffers (kept alive across submit).
+        let cap: u64 = 512 << 20;
+        let dump_region = Region::new(
+            &self.device,
+            cap,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let dump_host = dump_region.host_ptr.ok_or("dump region not host-visible")?;
+
+        self.decode_cache = None;
+        self.scratch.reset();
+        self.descriptors.reset(&self.device)?;
+        let decode_dyn_range = {
+            let off = self.scratch.alloc(decode_dyn::DecodeDyn::SIZE)?;
+            BufferRange { buffer: self.scratch.buffer, offset: off, size: decode_dyn::DecodeDyn::SIZE }
+        };
+
+        unsafe {
+            self.device
+                .device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device.device.begin_command_buffer(self.command_buffer, &begin)?;
+        }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.reset(&self.device, self.command_buffer);
+
+        let records = {
+            let mut ctx = DispatchContext {
+                device: &self.device,
+                weights: model.weights(),
+                scratch: &mut self.scratch,
+                pipelines: &mut self.pipelines,
+                descriptors: &self.descriptors,
+                cmd: self.command_buffer,
+                #[cfg(feature = "gpu_debug")]
+                taps: Vec::new(),
+                #[cfg(feature = "profile_gpu")]
+                n_dispatches: 0,
+                decode_dyn: decode_dyn_range,
+                replay_plan: None,
+                dump: Some(crate::inference::context::DumpState {
+                    buffer: dump_region.buffer,
+                    host_ptr: dump_host,
+                    capacity: cap,
+                    cursor: 0,
+                    records: Vec::new(),
+                }),
+                #[cfg(feature = "profile_gpu")]
+                profile: Some(&mut self.profile),
+            };
+            let _ = model.record_forward_unified(&mut ctx, batch, tokens, positions, seq_lens, slots)?;
+            ctx.dump.take().expect("dump set").records
+        };
+
+        unsafe {
+            self.device.device.end_command_buffer(self.command_buffer)?;
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+
+        // FNV-1a over each record's raw bytes.
+        let mut out = Vec::with_capacity(records.len());
+        for (label, off, size) in records {
+            let bytes = unsafe { std::slice::from_raw_parts(dump_host.add(off as usize), size as usize) };
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            out.push((label, h));
         }
         Ok(out)
     }
@@ -887,6 +987,7 @@ impl Engine {
                 n_dispatches: 0,
                 decode_dyn: decode_dyn_range,
                 replay_plan: replay_plan_init,
+                dump: None,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
@@ -1105,6 +1206,7 @@ impl Engine {
                 n_dispatches: 0,
                 decode_dyn: decode_dyn_range,
                 replay_plan: None,
+                dump: None,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
@@ -1210,6 +1312,7 @@ impl Engine {
                 n_dispatches: 0,
                 decode_dyn: decode_dyn_range,
                 replay_plan: None,
+                dump: None,
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };

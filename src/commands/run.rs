@@ -274,6 +274,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         batch_decode_bench(&mut engine, model.as_ref())?;
         return Ok(());
     }
+    // Release-capable per-layer divergence dump — bisects the qwen unified
+    // release race by running the same unified forward N times and reporting
+    // the first dumped record whose hash differs across runs.
+    if std::env::var("SEEKER_UNIFIED_DUMP").is_ok() {
+        unified_dump_test(&mut engine, model.as_ref())?;
+        return Ok(());
+    }
 
     // `max_seq_len` was computed above (used to size the scratch region).
     let cache_config = KvCacheConfig {
@@ -762,6 +769,90 @@ fn unified_forward_smoke_test(
             "FAIL (unified varlen forward diverged from serial)"
         }
     );
+    Ok(())
+}
+
+/// Release-capable per-layer divergence dump (NOT gpu_debug-gated) for bisecting
+/// the qwen unified release-only nondeterminism. Runs `record_forward_unified`
+/// `N` times on the SAME single-sequence prefill (resetting the slab's SSM state
+/// between runs), dumping the residual after each block + MoE, and reports the
+/// first dumped record whose hash differs across runs — the offending op. Run
+/// with `SEEKER_UNIFIED_DUMP=1 seeker run -m <qwen>` (override runs/prompt via
+/// `SEEKER_DUMP_RUNS`, `SEEKER_DUMP_PROMPT`).
+fn unified_dump_test(
+    engine: &mut Engine,
+    model: &dyn crate::models::Model,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
+
+    let env_usize = |k: &str, d: usize| {
+        std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    };
+    let runs = env_usize("SEEKER_DUMP_RUNS", 4);
+    let prompt_len = env_usize("SEEKER_DUMP_PROMPT", 80);
+
+    let bundle = model.tokenizer();
+    let seed = bundle
+        .tokenizer
+        .encode("The history of computing began long before the invention of", true)
+        .map(|e| e.get_ids().to_vec())
+        .map_err(|e| format!("tokenize failed: {e}"))?;
+    let prompt: Vec<u32> = (0..prompt_len).map(|i| seed[i % seed.len()]).collect();
+    let positions: Vec<u32> = (0..prompt.len() as u32).collect();
+    let seq_lens = vec![prompt.len() as u32];
+    let slots = vec![0u32];
+
+    let dims = model.cache_dims();
+    let config = KvCacheConfig {
+        k_dtype: GgmlType::F16,
+        v_dtype: GgmlType::F16,
+        max_seq_len: (prompt.len() + 16) as u32,
+    };
+    let mut batch =
+        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, 1, config)?;
+    if let Some(ssm) = model.ssm_state_dims() {
+        batch.allocate_ssm_state(
+            &engine.device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
+    }
+
+    println!("Unified dump: prompt_len={}, runs={runs} (same input each run)", prompt.len());
+    let mut reference: Option<Vec<(String, u64)>> = None;
+    for run in 0..runs {
+        // Fresh start each run: zero the slab's SSM state, rewind position. The
+        // prefill overwrites K/V [0, len). So each run begins identically →
+        // any cross-run difference is the bug.
+        batch.reset_slot(0);
+        batch.positions[0] = 0;
+        let h = engine
+            .forward_unified_dump(model, &mut batch, &prompt, &positions, &seq_lens, &slots)?;
+        match &reference {
+            None => {
+                println!("  run {run}: captured {} dump records (reference)", h.len());
+                reference = Some(h);
+            }
+            Some(r) => {
+                let first = r
+                    .iter()
+                    .zip(h.iter())
+                    .enumerate()
+                    .find(|(_, ((_, h1), (_, h2)))| h1 != h2);
+                match first {
+                    Some((i, ((label, h1), (_, h2)))) => {
+                        let n_diff = r.iter().zip(h.iter()).filter(|((_, a), (_, b))| a != b).count();
+                        println!(
+                            "  run {run}: FIRST DIVERGENCE at record {i} '{label}': {h1:016x} vs {h2:016x}  ({n_diff}/{} records differ)",
+                            r.len()
+                        );
+                    }
+                    None => println!("  run {run}: identical to reference (all {} records match)", r.len()),
+                }
+            }
+        }
+    }
     Ok(())
 }
 
