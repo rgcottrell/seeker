@@ -44,6 +44,10 @@ struct Inner {
     model_id: String,
     /// Absolute model path, reported in `/props`.
     model_path: Option<String>,
+    /// Vision projector config (when an mmproj was resolved). The chat handler
+    /// CPU-preprocesses image content with it; the worker holds the encoder.
+    /// `None` ⇒ image requests are rejected.
+    vision_config: Option<crate::vision::VisionConfig>,
 }
 
 /// Everything needed to build an `AppState` with a loaded model. Built by
@@ -60,6 +64,7 @@ pub struct AppStateInit {
     pub n_slots: u32,
     pub model_id: String,
     pub model_path: String,
+    pub vision_config: Option<crate::vision::VisionConfig>,
 }
 
 impl AppState {
@@ -78,8 +83,14 @@ impl AppState {
                 n_slots: init.n_slots,
                 model_id: init.model_id,
                 model_path: Some(init.model_path),
+                vision_config: init.vision_config,
             }),
         }
+    }
+
+    /// The vision projector config, if an mmproj was loaded (image input).
+    pub fn vision_config(&self) -> Option<&crate::vision::VisionConfig> {
+        self.inner.vision_config.as_ref()
     }
 
     /// The loaded tokenizer bundle, if any (`/tokenize`, `/detokenize`,

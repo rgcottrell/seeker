@@ -8,9 +8,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::Value;
 
-use crate::server::convert::{self, openai_messages_to_chat, parse_stop, prompt_value_to_tokens};
+use crate::server::convert::{self, openai_messages_to_chat_mm, parse_stop, prompt_value_to_tokens};
 use crate::server::error;
-use crate::server::inference::{collect, GenConfig, GenOutput};
+use crate::server::inference::{collect, GenConfig, GenOutput, ServeImage};
 use crate::server::state::AppState;
 use crate::server::stream::{gen_id, openai_chat_stream, openai_completion_stream, unix_now};
 use crate::server::types::common::Usage;
@@ -29,14 +29,23 @@ pub async fn chat_completions(
     if req.n.unwrap_or(1) > 1 {
         return error::bad_request("`n` > 1 is not supported (single-sequence engine)");
     }
-    let messages = match openai_messages_to_chat(&req.messages) {
+    // Multimodal-aware: collect any `image_url` content (the message text keeps
+    // the `<__media__>` marker where each image sat) and render+splice the
+    // vision block. `image` is `None` for a text-only request.
+    let (messages, images) = match openai_messages_to_chat_mm(&req.messages) {
         Ok(m) => m,
         Err(e) => return error::bad_request(e),
     };
-    let tokens = match convert::render_and_encode(&state, messages) {
+    let (tokens, image_parts) = match convert::render_and_encode_mm(&state, messages, &images) {
         Ok(t) => t,
         Err(e) => return error::bad_request(e),
     };
+    let image = image_parts.map(|(pimg, image_start, nx, ny)| ServeImage {
+        pimg,
+        image_start,
+        nx,
+        ny,
+    });
     let config = GenConfig {
         sampler: req.sampler_config(state.default_sampler()),
         max_tokens: req.max_tokens.unwrap_or(state.default_max_tokens()),
@@ -44,7 +53,7 @@ pub async fn chat_completions(
         ignore_eos: state.default_ignore_eos(),
         id_slot: None,
     };
-    let rx = match handle.start(tokens, config).await {
+    let rx = match handle.start_mm(tokens, config, image).await {
         Ok(rx) => rx,
         Err(e) => return error::internal(e),
     };

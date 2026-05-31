@@ -15,7 +15,7 @@
 //! decode loop bails — freeing the GPU for the next request.
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -24,11 +24,17 @@ use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
 use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
 use crate::tokenizer::{build_tokenizer, Tokenizer};
+use crate::vision::encoder::{HostWeights, VisionEncoder};
+use crate::vision::preprocess::PreprocessedImage;
 
 /// Immutable per-process model/runtime config. All `Send` — built by the CLI
 /// and moved into the worker thread, which constructs the `Engine` from it.
 pub struct WorkerConfig {
     pub model_path: PathBuf,
+    /// Path to the mmproj vision sidecar, if one was resolved (and not
+    /// `--no-mmproj`). The worker builds the vision tower from it so chat
+    /// requests can carry images. `None` → text-only serving.
+    pub mmproj_path: Option<PathBuf>,
     pub n_ubatch: u32,
     pub n_batch: u32,
     pub ctx_size: u32,
@@ -57,15 +63,41 @@ pub struct GenConfig {
     pub id_slot: Option<usize>,
 }
 
+/// One image attached to a chat request, carried to the worker — the only
+/// thread with the GPU. The handler CPU-preprocesses it (it holds the
+/// `VisionConfig`) and records where the vision block sits in `tokens`; the
+/// worker encodes it through the vision tower and splices the embeddings during
+/// that request's prefill. `PreprocessedImage` is `Send` (Vec<f32> + u32s).
+pub struct ServeImage {
+    pub pimg: PreprocessedImage,
+    /// Local index of the first `<|image_pad|>` token in `GenJob::tokens`.
+    pub image_start: usize,
+    /// Merged-grid dims (`n_tok = nx*ny`).
+    pub nx: usize,
+    pub ny: usize,
+}
+
 /// One unit of work for the worker. The handler has already rendered the chat
 /// template and encoded it, so only `Send` data crosses the thread boundary.
 pub struct GenJob {
     pub tokens: Vec<u32>,
     pub config: GenConfig,
+    /// An attached image (chat requests with `image_url` content). `None` for
+    /// the text path. Prefilled single-pass with the vision splice in the worker.
+    pub image: Option<ServeImage>,
     /// Reply sink. Bounded so the worker back-pressures on a slow client; a
     /// *dropped* receiver (client disconnect) makes `blocking_send` return Err,
     /// which the decode loop treats as cancellation.
     pub reply: mpsc::Sender<GenEvent>,
+}
+
+/// The vision tower built once in the worker thread (when an mmproj was
+/// resolved) and kept for the process. `vision` owns the uploaded mmproj weights
+/// (the encoder's tensor views hold GPU buffer handles kept valid by it).
+struct VisionCtx {
+    vision: crate::vision::VisionModel,
+    encoder: VisionEncoder,
+    host_weights: HostWeights,
 }
 
 /// Why generation stopped — maps to each API's finish/stop-reason field.
@@ -169,10 +201,21 @@ impl InferenceHandle {
         tokens: Vec<u32>,
         config: GenConfig,
     ) -> Result<mpsc::Receiver<GenEvent>, String> {
+        self.start_mm(tokens, config, None).await
+    }
+
+    /// As [`Self::start`] but with an optional attached image (multimodal chat).
+    pub async fn start_mm(
+        &self,
+        tokens: Vec<u32>,
+        config: GenConfig,
+        image: Option<ServeImage>,
+    ) -> Result<mpsc::Receiver<GenEvent>, String> {
         let (tx, rx) = mpsc::channel(32);
         self.submit(GenJob {
             tokens,
             config,
+            image,
             reply: tx,
         })
         .await
@@ -292,6 +335,12 @@ struct Worker {
     /// scheduler uses the token-budget / chunked-prefill loop; otherwise it
     /// falls back to serial-prefill + batched-decode.
     unified: bool,
+    /// The vision tower (when an mmproj was resolved) — lets chat requests carry
+    /// images. `None` → text-only serving.
+    vision: Option<VisionCtx>,
+    /// Bytes the scratch region is sized for, so an image prefill (single-pass,
+    /// plus the vision tower's working set) can grow it on demand.
+    scratch_bytes: u64,
 }
 
 /// Length of the longest common prefix of two token sequences.
@@ -346,12 +395,13 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
 
     // Scratch is sized per-ubatch/ctx and shared across slots (one forward runs
     // at a time), so it does not scale with the slot count.
-    engine.allocate_scratch(model.scratch_bytes_estimate(
+    let scratch_bytes = model.scratch_bytes_estimate(
         cfg.n_ubatch,
         cfg.ctx_size,
         cfg.cache_type_k,
         cfg.cache_type_v,
-    ))?;
+    );
+    engine.allocate_scratch(scratch_bytes)?;
 
     let cache_config = KvCacheConfig {
         k_dtype: cfg.cache_type_k,
@@ -401,6 +451,22 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         max_batch_tokens,
         "scheduler mode (unified = token-budget chunked prefill + decode mixing)"
     );
+    // Build the vision tower if an mmproj sidecar was resolved (chat image
+    // input). A load failure degrades to text-only rather than failing serve.
+    let vision = match &cfg.mmproj_path {
+        Some(path) => match build_vision(&engine, path) {
+            Ok(v) => {
+                tracing::info!(path = ?path, "vision tower loaded for serve (image input enabled)");
+                Some(v)
+            }
+            Err(e) => {
+                tracing::warn!(path = ?path, error = %e, "failed to load mmproj; serving text-only");
+                None
+            }
+        },
+        None => None,
+    };
+
     let slots = (0..n_slots)
         .map(|_| SlotMeta {
             prior_tokens: Vec::new(),
@@ -418,7 +484,29 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         clock: 0,
         max_batch_tokens,
         unified,
+        vision,
+        scratch_bytes,
     })
+}
+
+/// Build the vision tower from an mmproj GGUF (upload weights, build encoder +
+/// host-side patch-embed copies). Mirrors `seeker chat`'s lazy `/image` build.
+fn build_vision(engine: &Engine, mmproj_path: &Path) -> Result<VisionCtx, Box<dyn Error>> {
+    let gguf = GgufFile::open(mmproj_path)?;
+    let weights = engine.upload_weights(&gguf)?;
+    let cfg = crate::vision::parse_config(&gguf)?;
+    let encoder = VisionEncoder::new(
+        &weights,
+        cfg.n_embd as usize,
+        cfg.patch_size as usize,
+        cfg.n_head as usize,
+        cfg.n_ff as usize,
+        cfg.n_layer as usize,
+        cfg.eps,
+    )?;
+    let host_weights = HostWeights::from_gguf(&gguf)?;
+    let vision = crate::vision::VisionModel { config: cfg, weights };
+    Ok(VisionCtx { vision, encoder, host_weights })
 }
 
 /// Worker entry point. Loads the model, signals readiness, then runs the
@@ -449,6 +537,9 @@ fn worker_main(
         if worker.active.is_empty() {
             // Idle: block for the next job (or shutdown).
             match jobs.blocking_recv() {
+                // Image jobs prefill single-pass (the vision splice can't be
+                // chunked), regardless of the global unified flag.
+                Some(job) if job.image.is_some() => worker.admit_image(job),
                 Some(job) if unified => worker.admit_unified(job),
                 Some(job) => worker.admit(job),
                 None => return,
@@ -457,6 +548,7 @@ fn worker_main(
         // Drain queued jobs into any free slabs without blocking the step.
         while worker.free_slabs() > 0 {
             match jobs.try_recv() {
+                Ok(job) if job.image.is_some() => worker.admit_image(job),
                 Ok(job) if unified => worker.admit_unified(job),
                 Ok(job) => worker.admit(job),
                 Err(_) => break, // empty or all-senders-dropped
@@ -512,6 +604,7 @@ impl Worker {
         let GenJob {
             tokens: new_tokens,
             config,
+            image: _, // text path: image jobs are routed to admit_image
             reply,
         } = job;
         let GenConfig {
@@ -651,7 +744,7 @@ impl Worker {
     /// [`Self::schedule_step`] alongside other requests' decode, so a long
     /// prompt never blocks the worker. Failure → terminal frame + slab released.
     fn admit_unified(&mut self, job: GenJob) {
-        let GenJob { tokens: new_tokens, config, reply } = job;
+        let GenJob { tokens: new_tokens, config, image: _, reply } = job;
         let GenConfig { sampler: cfg, max_tokens, stop, ignore_eos, id_slot } = config;
         let prompt_tokens = new_tokens.len() as u32;
         if new_tokens.is_empty() {
@@ -713,6 +806,165 @@ impl Worker {
             num_computed,
             started: false,
         });
+    }
+
+    /// Encode an image through the vision tower (GPU) → `[proj_dim, n_tok]` host
+    /// f32 (column = merged token). Grows the scratch for the tower's working
+    /// set first. Errors if no vision tower is loaded.
+    fn encode_image(&mut self, image: &ServeImage) -> Result<Vec<f32>, Box<dyn Error>> {
+        let vc = self
+            .vision
+            .as_ref()
+            .ok_or("no vision model loaded (mmproj)")?;
+        let n_pos = (image.pimg.grid_w as u64) * (image.pimg.grid_h as u64);
+        let nlayers = vc.vision.config.n_layer as u64;
+        // Mirror `vision_scratch_estimate` (commands::run / chat).
+        let need = (28_000u64 * n_pos * (nlayers + 2) * 4).max(64 << 20);
+        if need > self.scratch_bytes {
+            self.engine.allocate_scratch(need)?;
+            self.scratch_bytes = need;
+        }
+        let vc = self.vision.as_ref().expect("vision present (checked above)");
+        let (encoder, host_weights, weights) = (&vc.encoder, &vc.host_weights, &vc.vision.weights);
+        let pimg = &image.pimg;
+        self.engine.forward(weights, |ctx| {
+            let mut x = encoder.record_patch_embed(ctx, pimg, host_weights)?;
+            for il in 0..encoder.blocks.len() as u32 {
+                x = encoder.record_block(ctx, x, il, pimg.grid_w, pimg.grid_h)?;
+            }
+            Ok(encoder.record_merger(ctx, x)?.range())
+        })
+    }
+
+    /// Admit an image chat request: encode the image, prefill the whole prompt
+    /// single-pass with the embeddings spliced (`forward_image_sampled`), record
+    /// the slab's M-RoPE lag, sample the first token, and push it to the active
+    /// set. Decode then proceeds in the normal batched/unified step — the
+    /// per-slab `rope_lag` keeps its positions continuous past the image. No
+    /// prefix-reuse (always a fresh prefill) for image turns in this first cut.
+    fn admit_image(&mut self, job: GenJob) {
+        let GenJob { tokens: new_tokens, config, image, reply } = job;
+        let GenConfig { sampler: cfg, max_tokens, stop, ignore_eos, id_slot } = config;
+        let Some(image) = image else { return }; // only routed here when Some
+        if self.vision.is_none() {
+            let _ = reply.blocking_send(GenEvent::Error(
+                "this server has no vision model (mmproj); image requests are unsupported".into(),
+            ));
+            return;
+        }
+        let prompt_tokens = new_tokens.len() as u32;
+        if new_tokens.is_empty() {
+            let _ = reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
+            return;
+        }
+        let ctx = self.batch.config.max_seq_len;
+        if prompt_tokens >= ctx {
+            let _ = reply.blocking_send(GenEvent::Error(format!(
+                "prompt is {prompt_tokens} tokens but --ctx-size is {ctx} (no room to generate) — \
+                 raise --ctx-size or shorten the prompt"
+            )));
+            return;
+        }
+        if image.image_start + image.nx * image.ny > new_tokens.len() {
+            let _ = reply.blocking_send(GenEvent::Error("image span overruns the prompt".into()));
+            return;
+        }
+        let Some(idx) = self.select_free_slab(&new_tokens, id_slot) else {
+            let _ = reply.blocking_send(GenEvent::Error("no free cache slot available".into()));
+            return;
+        };
+        self.clock += 1;
+        self.slots[idx].last_used = self.clock;
+
+        // Encode the image (grows scratch for the tower), then ensure scratch
+        // fits the single-pass decoder prefill over the whole prompt.
+        let embeddings = match self.encode_image(&image) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        let need = self.model.scratch_bytes_estimate(
+            /*n_ubatch=*/ 0,
+            prompt_tokens,
+            self.batch.config.k_dtype,
+            self.batch.config.v_dtype,
+        );
+        if need > self.scratch_bytes {
+            if let Err(e) = self.engine.allocate_scratch(need) {
+                let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                return;
+            }
+            self.scratch_bytes = need;
+        }
+
+        // Fresh full prefill (no prefix reuse for images).
+        self.batch.reset_slot(idx as u32);
+        self.batch.positions[idx] = 0;
+        self.batch.rope_lag[idx] = 0;
+        self.engine.decode_cache = None;
+
+        let mut sampler = Sampler::new(cfg);
+        let first = {
+            let mut sc = self.batch.slot_kvcache(idx as u32);
+            sc.position = 0;
+            match self.engine.forward_image_sampled(
+                &*self.model,
+                &mut sc,
+                &new_tokens,
+                &embeddings,
+                image.image_start,
+                image.nx,
+                image.ny,
+                &mut sampler,
+            ) {
+                Ok(t) => {
+                    self.batch.positions[idx] = sc.position;
+                    self.batch.rope_lag[idx] = sc.rope_position_lag;
+                    t
+                }
+                Err(e) => {
+                    self.batch.reset_slot(idx as u32);
+                    self.batch.positions[idx] = 0;
+                    self.batch.rope_lag[idx] = 0;
+                    self.slots[idx].prior_tokens.clear();
+                    let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                    return;
+                }
+            }
+        };
+        self.slots[idx].active = true;
+
+        if reply.blocking_send(GenEvent::Started { prompt_tokens }).is_err() {
+            self.slots[idx].active = false;
+            self.slots[idx].prior_tokens = new_tokens;
+            return;
+        }
+
+        let mut seq = ActiveSeq {
+            slab: idx as u32,
+            sampler,
+            prompt: new_tokens,
+            generated: Vec::new(),
+            prompt_tokens,
+            stop,
+            ignore_eos,
+            max_tokens,
+            reply,
+            stream_ids: Vec::new(),
+            stream_prefix: String::new(),
+            stream_prefix_index: 0,
+            pending: String::new(),
+            last_token: first,
+            ctx,
+            terminal: None,
+            disconnected: false,
+            num_computed: self.batch.positions[idx],
+            started: true,
+        };
+        process_token(&self.model.tokenizer().tokenizer, &self.eog_ids, &mut seq, first);
+        self.active.push(seq);
     }
 
     /// One unified scheduler step: assign each active sequence a slice of the
@@ -778,7 +1030,13 @@ impl Worker {
                     seq.generated[li - seq.prompt.len()]
                 };
                 tokens.push(tok);
-                positions.push(seq.num_computed + off);
+                // The `positions` arg is the M-RoPE rope base; the forward takes
+                // KV write offset + kv_len from `batch.positions[slot]` instead.
+                // For an image slot the rope cursor trails the KV-slot count by
+                // `rope_lag`; text slots have lag 0 (unchanged).
+                positions.push(
+                    (seq.num_computed + off).saturating_sub(self.batch.rope_lag[seq.slab as usize]),
+                );
             }
             seq_lens.push(nn);
             slots.push(seq.slab);

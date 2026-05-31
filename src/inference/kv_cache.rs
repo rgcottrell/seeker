@@ -528,6 +528,14 @@ pub struct BatchKvCache {
     v_slab_stride: u64,
     /// Current write position (tokens) of each slot.
     pub positions: Vec<u32>,
+    /// Per-slot M-RoPE position lag — how far the rope cursor trails
+    /// `positions[slot]` (the KV-slot count) after an image was prefilled into
+    /// that slot (`Σ n_tok − max(nx,ny)`; see [`KvCache::rope_position_lag`]).
+    /// Zero for text-only slots, so the batched/unified forward's rope is the
+    /// raw position there (unchanged). The scheduler feeds the forward
+    /// `positions[slot] − rope_lag[slot]` for the rope while KV writes / kv_len
+    /// keep using `positions[slot]`. Reset with the slot.
+    pub rope_lag: Vec<u32>,
     /// Per-sequence SSM/GDN recurrent state (hybrid models), allocated by
     /// [`Self::allocate_ssm_state`]. Per layer the GDN state is one contiguous
     /// `B × gdn_state_floats` block (the GDN shader indexes seq as the
@@ -618,6 +626,7 @@ impl BatchKvCache {
             k_slab_stride,
             v_slab_stride,
             positions: vec![0; n_slots as usize],
+            rope_lag: vec![0; n_slots as usize],
             ssm_region: None,
             ssm_conv_base: Vec::new(),
             ssm_gdn_base: Vec::new(),
@@ -841,7 +850,7 @@ impl BatchKvCache {
         } else {
             (Vec::new(), Vec::new(), None)
         };
-        KvCache::borrowed_slot(
+        let mut sc = KvCache::borrowed_slot(
             self.config,
             self.buffer,
             self.host_ptr,
@@ -854,7 +863,12 @@ impl BatchKvCache {
             ssm_conv_states,
             ssm_gdn_states,
             ssm_region,
-        )
+        );
+        // Carry the slot's M-RoPE lag so a single-seq op on the borrowed cache
+        // (e.g. an image prefill) continues with the right rope base. The caller
+        // copies any updated lag back into `self.rope_lag[slot]`.
+        sc.rope_position_lag = self.rope_lag[slot as usize];
+        sc
     }
 }
 

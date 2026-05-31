@@ -157,6 +157,12 @@ pub struct ServeArgs {
     /// llama.cpp's `--chat-template-kwargs`.
     #[arg(long = "chat-template-kwargs", value_parser = crate::chat_template::parse_template_kwargs)]
     chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// Do not load the matching mmproj vision projector (serve text-only even
+    /// for a VL model). By default the sidecar is loaded so chat requests can
+    /// carry images (OpenAI `image_url` content).
+    #[arg(long = "no-mmproj")]
+    no_mmproj: bool,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -212,9 +218,30 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         "loaded tokenizer for serve",
     );
 
+    // Resolve the mmproj vision sidecar (unless --no-mmproj). The worker builds
+    // the encoder from `mmproj_path`; the handler CPU-preprocesses with
+    // `vision_config`. A sidecar that fails to parse degrades to text-only.
+    let mmproj_path = if args.no_mmproj {
+        None
+    } else {
+        crate::commands::download::find_sidecar_mmproj(&path)
+    };
+    let vision_config = mmproj_path.as_ref().and_then(|p| {
+        match GgufFile::open(p).map_err(|e| e.to_string()).and_then(|g| crate::vision::parse_config(&g).map_err(|e| e.to_string())) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(path = ?p, error = %e, "mmproj present but unparseable; serving text-only");
+                None
+            }
+        }
+    });
+    // If the config didn't parse, don't hand the worker a path it can't use.
+    let mmproj_path = vision_config.as_ref().and(mmproj_path);
+
     let n_slots = args.parallel.max(1);
     let (handle, ready) = InferenceHandle::spawn(WorkerConfig {
         model_path: path.clone(),
+        mmproj_path,
         n_ubatch: args.ubatch_size,
         n_batch: args.batch_size,
         ctx_size: args.ctx_size,
@@ -246,6 +273,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         n_slots,
         model_id,
         model_path: path.display().to_string(),
+        vision_config,
     }))
 }
 
@@ -261,7 +289,7 @@ async fn resolve_model_path(args: &ServeArgs) -> Result<Option<PathBuf>, Box<dyn
                     token: args.hf_token.clone(),
                     offline: args.offline,
                 },
-                false,
+                !args.no_mmproj,
             )
             .await?
             .main,

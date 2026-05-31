@@ -1409,8 +1409,14 @@ impl Qwen35MoeModel {
             .iter()
             .scan(0u64, |a, &l| { let s = *a; *a += l as u64; Some(s) })
             .collect();
+        // KV write base + attention length come from the slab's cache position
+        // (the KV-slot count), NOT the `positions` arg. They are equal for text
+        // (the scheduler sets positions[q_start[s]] = batch.positions[slot]), so
+        // this is byte-identical there; decoupling them lets `positions` carry
+        // the M-RoPE rope base (= cache_pos − rope_lag) for image sequences,
+        // whose rope cursor trails their KV-slot count. See the rope buffer below.
         let kv_lens: Vec<u32> = (0..b)
-            .map(|s| positions[q_starts[s] as usize] + seq_lens[s])
+            .map(|s| batch.positions[slots[s] as usize] + seq_lens[s])
             .collect();
 
         // Prologue: flat token ids, M-RoPE positions ([4 axes × N_total], each

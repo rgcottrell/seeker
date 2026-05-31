@@ -10,6 +10,7 @@ use crate::server::state::AppState;
 use crate::server::types::anthropic::MessagesInputMessage;
 use crate::server::types::openai::ChatMessage as OpenAiMessage;
 use crate::tokenizer::TokenizerBundle;
+use crate::vision::preprocess::{PreprocessConfig, PreprocessedImage};
 
 /// Flatten a message `content` field into plain text. Accepts a bare string or
 /// the structured array form (`[{type:"text", text:"…"}, …]`) that OpenAI and
@@ -292,6 +293,70 @@ pub fn render_and_encode(state: &AppState, mut messages: Vec<ChatMessage>) -> Re
     )
     .map_err(|e| e.to_string())?;
     encode(bundle, &rendered, false)
+}
+
+/// As [`render_and_encode`] but for a chat request that may carry images: the
+/// rendered prompt has a [`MEDIA_MARKER`] where each image sits, which we replace
+/// with the vision block (`<|vision_start|><|image_pad|>×n_tok<|vision_end|>`).
+/// Returns the token ids plus, for an image request, the preprocessed image +
+/// its placement `(image, image_start, nx, ny)` (the worker encodes + splices
+/// it). First cut: at most one image per request.
+#[allow(clippy::type_complexity)]
+pub fn render_and_encode_mm(
+    state: &AppState,
+    mut messages: Vec<ChatMessage>,
+    images: &[Vec<u8>],
+) -> Result<(Vec<u32>, Option<(PreprocessedImage, usize, usize, usize)>), String> {
+    let template = state
+        .chat_template()
+        .ok_or("this model has no chat template — use the completion endpoints")?;
+    let bundle = state.tokenizer().ok_or("no tokenizer loaded")?;
+    apply_default_system(&mut messages, state.default_system_prompt());
+    let rendered = crate::chat_template::render(
+        template,
+        &messages,
+        /* add_generation_prompt = */ true,
+        state.bos_token().unwrap_or(""),
+        state.eos_token().unwrap_or(""),
+        state.template_kwargs(),
+    )
+    .map_err(|e| e.to_string())?;
+    if images.is_empty() {
+        return Ok((encode(bundle, &rendered, false)?, None));
+    }
+    if images.len() > 1 {
+        return Err("only one image per request is supported".into());
+    }
+    let vcfg = state.vision_config().ok_or(
+        "this server has no vision model (mmproj); image input is unsupported",
+    )?;
+    let pcfg = PreprocessConfig::qwen3vl_default(
+        vcfg.patch_size,
+        vcfg.spatial_merge_size,
+        vcfg.image_mean,
+        vcfg.image_std,
+    );
+    let pimg = crate::vision::preprocess::preprocess_bytes(&images[0], &pcfg)
+        .map_err(|e| format!("image preprocess failed: {e}"))?;
+    let merge = vcfg.spatial_merge_size as usize;
+    let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
+    let n_tok = pimg.n_tokens as usize;
+    let (before, after) = rendered
+        .split_once(MEDIA_MARKER)
+        .ok_or("rendered chat prompt lost the <__media__> marker")?;
+    let tid = |s: &str| -> Result<u32, String> {
+        bundle
+            .tokenizer
+            .token_to_id(s)
+            .ok_or_else(|| format!("tokenizer has no {s} token — this model is not vision-capable"))
+    };
+    let mut tokens = encode(bundle, before, false)?;
+    tokens.push(tid("<|vision_start|>")?);
+    let image_start = tokens.len();
+    tokens.resize(tokens.len() + n_tok, tid("<|image_pad|>")?);
+    tokens.push(tid("<|vision_end|>")?);
+    tokens.extend(encode(bundle, after, false)?);
+    Ok((tokens, Some((pimg, image_start, nx, ny))))
 }
 
 #[cfg(test)]
