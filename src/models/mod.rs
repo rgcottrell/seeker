@@ -104,6 +104,28 @@ pub trait Model: Send + Sync {
         compute_logits: bool,
     ) -> Result<Option<TensorView>, Box<dyn Error>>;
 
+    /// Record a prefill forward for a token sequence that contains one image,
+    /// splicing the vision-tower embeddings into the residual at the
+    /// `<|image_pad|>` rows and using the qwen-vl M-RoPE decoder positions
+    /// (interleaved). `image_embeddings` is the encoder output `[n_embd, n_tok]`
+    /// (column = merged token, n_embd contiguous), `image_start` is the local
+    /// index of the first image-pad token, and `image_nx`/`image_ny` are the
+    /// merged grid dims (`n_tok = nx*ny`). Returns the last-token logits.
+    /// Default unsupported (text-only / non-VL models).
+    fn record_forward_image(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _tokens: &[u32],
+        _position_offset: u32,
+        _image_embeddings: &[f32],
+        _image_start: usize,
+        _image_nx: usize,
+        _image_ny: usize,
+    ) -> Result<Option<TensorView>, Box<dyn Error>> {
+        Err("model does not support image input".into())
+    }
+
     /// Conservative upper bound (in bytes) on the transient scratch one
     /// forward pass of `≤ n_ubatch` tokens needs, used to size the engine's
     /// scratch region (llama.cpp-style worst-case compute-buffer reservation).

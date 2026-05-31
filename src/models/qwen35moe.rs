@@ -414,6 +414,38 @@ impl Model for Qwen35MoeModel {
                 compute_logits,
                 /*full_logits=*/ false,
                 /*checkpoint=*/ false,
+                /*image=*/ None,
+            )?
+            .logits)
+    }
+
+    fn record_forward_image(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        position_offset: u32,
+        image_embeddings: &[f32],
+        image_start: usize,
+        image_nx: usize,
+        image_ny: usize,
+    ) -> Result<Option<TensorView>, Box<dyn Error>> {
+        let span = ImageSpan {
+            start: image_start,
+            n_tok: image_nx * image_ny,
+            nx: image_nx,
+            ny: image_ny,
+        };
+        Ok(self
+            .forward_impl(
+                ctx,
+                cache,
+                tokens,
+                position_offset,
+                /*compute_logits=*/ true,
+                /*full_logits=*/ false,
+                /*checkpoint=*/ false,
+                Some(DecoderImage { embeddings: image_embeddings, span }),
             )?
             .logits)
     }
@@ -435,6 +467,7 @@ impl Model for Qwen35MoeModel {
             /*compute_logits=*/ true,
             full_logits,
             checkpoint,
+            /*image=*/ None,
         )
     }
 
@@ -489,11 +522,22 @@ impl Qwen35MoeModel {
         compute_logits: bool,
         full_logits: bool,
         checkpoint: bool,
+        image: Option<DecoderImage<'_>>,
     ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
         let p = &self.params;
         let l = tokens.len() as u32;
         if l == 0 {
             return Err("empty prompt".into());
+        }
+        if let Some(img) = image.as_ref() {
+            debug_assert_eq!(
+                img.embeddings.len(),
+                p.n_embd as usize * img.span.n_tok,
+                "image embeddings len != n_embd * n_tok"
+            );
+            if img.span.start + img.span.n_tok > tokens.len() {
+                return Err("image span overruns the token sequence".into());
+            }
         }
 
         let hidden = p.n_embd as u64;
@@ -526,12 +570,16 @@ impl Qwen35MoeModel {
         // same position sequence to all 4 sub-arrays so any axis read
         // resolves to the linear text position.
         let positions_buf = ctx.alloc_scratch(4 * (l as u64) * 4)?;
-        let mut positions: Vec<u32> = Vec::with_capacity(4 * l as usize);
-        for _axis in 0..4 {
-            for pos in position_offset..position_offset + l {
-                positions.push(pos);
-            }
-        }
+        // M-RoPE positions, axis-major `pos[axis*l + tok]`. For text-only this
+        // is the linear position replicated to all 4 axes (so imrope 0≡1); when
+        // an image is present each image token gets its (t, y, x, z) grid
+        // position and trailing text resumes at base+max(nx,ny). See
+        // `build_decoder_mrope_positions`.
+        let image_spans: &[ImageSpan] = match image.as_ref() {
+            Some(img) => std::slice::from_ref(&img.span),
+            None => &[],
+        };
+        let positions = build_decoder_mrope_positions(l as usize, position_offset, image_spans);
         write_u32(ctx, positions_buf, &positions)?;
 
         // Snapshot the replay-input offsets so the persistent-decode-cmdbuf
@@ -558,6 +606,35 @@ impl Qwen35MoeModel {
 
         let residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
         elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, l, residual)?;
+        // Splice the vision embeddings over the `<|image_pad|>` rows. The image
+        // tokens are `n_tok` consecutive columns from `span.start`, and both the
+        // vision output and the residual are n_embd-contiguous per column, so
+        // this is a contiguous F32 block copy over `residual`'s sub-columns
+        // (get_rows already barriered `residual`, so the overwrite is ordered).
+        if let Some(img) = image.as_ref() {
+            let n_tok = img.span.n_tok as u64;
+            let emb_buf = ctx.alloc_scratch((img.embeddings.len() as u64) * 4)?;
+            write_f32(ctx, emb_buf, img.embeddings)?;
+            let img_src = TensorView {
+                buffer: emb_buf.buffer,
+                byte_offset: emb_buf.offset,
+                byte_size: emb_buf.size,
+                dims: [hidden, n_tok, 1, 1],
+                byte_stride: [4, hidden * 4, hidden * n_tok * 4, hidden * n_tok * 4],
+                element_stride: [1, hidden, hidden * n_tok, hidden * n_tok],
+                dtype: GgmlType::F32,
+            };
+            let img_dst = TensorView {
+                buffer: residual.buffer,
+                byte_offset: residual.byte_offset + (img.span.start as u64) * hidden * 4,
+                byte_size: n_tok * hidden * 4,
+                dims: [hidden, n_tok, 1, 1],
+                byte_stride: [4, hidden * 4, hidden * n_tok * 4, hidden * n_tok * 4],
+                element_stride: [1, hidden, hidden * n_tok, hidden * n_tok],
+                dtype: GgmlType::F32,
+            };
+            cast::record_cast(ctx, img_src, img_dst)?;
+        }
         ctx.tap("input_embed", residual)?;
         // Boundary marker: everything emitted from here until the
         // next `mark(…)` is attributed to BlockClass::Embed. No-op
@@ -566,8 +643,14 @@ impl Qwen35MoeModel {
 
         let layer_checkpoint = ctx.scratch_checkpoint();
 
-        let rope_params =
+        let mut rope_params =
             rope_multi::RopeMultiParams::qwen_default(p.rope_dim, p.rope_freq_base, p.rope_sections);
+        // Qwen3-VL text decoder uses interleaved M-RoPE. For text-only every
+        // axis is equal so is_imrope 0≡1 (kept 0 to preserve the validated text
+        // path); when an image is present the axes differ, so enable it.
+        if image.is_some() {
+            rope_params.is_imrope = 1;
+        }
         let scale = 1.0 / (head_dim_k as f32).sqrt();
         let fa_params = flash_attn::FlashAttnParams {
             head_dim_k: head_dim_k as u32,
@@ -2539,7 +2622,8 @@ fn write_u32(
 }
 
 /// Host-write a `[N]` array of `f32` into a scratch slot via the mapped
-/// pointer. Used by the MTP draft path to upload the seed hidden state.
+/// pointer. Used by the MTP draft path to upload the seed hidden state, and by
+/// the Phase-3 image splice to upload the vision embeddings.
 fn write_f32(
     ctx: &mut DispatchContext,
     range: crate::inference::buffer::BufferRange,
@@ -2681,6 +2765,17 @@ pub struct ImageSpan {
     pub n_tok: usize,
     pub nx: usize,
     pub ny: usize,
+}
+
+/// One image's contribution to a decoder prefill: the vision-tower output
+/// `[n_embd, n_tok]` (host f32, column = merged token, n_embd contiguous per
+/// column — same layout as the get_rows residual) plus its [`ImageSpan`] in the
+/// token sequence. Threaded into [`Qwen35MoeModel::forward_impl`] as
+/// `Option<DecoderImage>`; `None` is the unchanged text path.
+#[derive(Clone, Copy)]
+pub struct DecoderImage<'a> {
+    pub embeddings: &'a [f32],
+    pub span: ImageSpan,
 }
 
 /// Build the 4-axis M-RoPE decoder positions for a token sequence that may
