@@ -2142,6 +2142,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "axum",
+ "base64 0.22.1",
  "clap",
  "dirs 5.0.1",
  "futures-util",

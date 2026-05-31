@@ -18,6 +18,9 @@ hf-hub = "0.5.0"
 # corner-aligned bilinear (the `image` crate's resampling filters use a
 # different convention).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
+# Decode base64 image data URLs in `seeker serve` chat requests (OpenAI
+# `image_url` content parts arrive as `data:image/...;base64,<...>`).
+base64 = "0.22"
 indexmap = "2.14.0"
 jiff = "0.2"
 memmap2 = "0.9.10"

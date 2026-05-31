@@ -299,6 +299,19 @@ pub fn preprocess(
     preprocess_rgb8(rgb.as_raw(), src_w, src_h, cfg)
 }
 
+/// As [`preprocess`] but from already-read encoded image bytes (PNG/JPEG/…),
+/// decoding the format from the byte content. Used by `seeker serve`, where the
+/// image arrives as a base64 data URL in the request body rather than a file.
+pub fn preprocess_bytes(
+    bytes: &[u8],
+    cfg: &PreprocessConfig,
+) -> Result<PreprocessedImage, Box<dyn Error>> {
+    let dyn_img = image::load_from_memory(bytes)?;
+    let rgb = dyn_img.to_rgb8();
+    let (src_w, src_h) = rgb.dimensions();
+    preprocess_rgb8(rgb.as_raw(), src_w, src_h, cfg)
+}
+
 /// Core preprocessing on an already-decoded interleaved RGB8 buffer. Factored
 /// out so tests (and cross-validation) can feed deterministic raw pixels
 /// without round-tripping through a file decoder.

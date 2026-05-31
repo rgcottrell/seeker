@@ -44,6 +44,93 @@ pub fn content_to_text(content: &Value) -> Result<String, String> {
     }
 }
 
+/// The media placeholder the chat template embeds; the worker later replaces it
+/// with the vision block (`<|vision_start|><|image_pad|>×n_tok<|vision_end|>`).
+/// Same marker llama.cpp's mtmd uses; matches `commands::run` / chat `/image`.
+pub const MEDIA_MARKER: &str = "<__media__>";
+
+/// Decode an OpenAI `image_url` value into raw encoded image bytes. Accepts a
+/// `data:<mime>;base64,<…>` data URL (the common local case). Remote `http(s)`
+/// URLs are rejected — the server does not fetch external resources.
+pub fn decode_image_url(url: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let rest = url.strip_prefix("data:").ok_or_else(|| {
+        "image_url must be a base64 data URL (data:<mime>;base64,…); remote URLs are not fetched"
+            .to_string()
+    })?;
+    let comma = rest
+        .find(',')
+        .ok_or("malformed image_url data URL: missing comma")?;
+    if !rest[..comma].contains("base64") {
+        return Err("image_url data URL must be base64-encoded".into());
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(rest[comma + 1..].trim())
+        .map_err(|e| format!("image_url base64 decode failed: {e}"))
+}
+
+/// Like [`content_to_text`] but also extracts images: each `image_url` part
+/// emits the [`MEDIA_MARKER`] into the text (where the image sits in the turn)
+/// and its decoded bytes are collected, in order. Used by the vision-capable
+/// chat path; `decode_image_url` rejects anything but base64 data URLs.
+pub fn content_to_text_and_images(content: &Value) -> Result<(String, Vec<Vec<u8>>), String> {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    match content {
+        Value::Null => {}
+        Value::String(s) => text.push_str(s),
+        Value::Array(parts) => {
+            for part in parts {
+                match part.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        let t = part
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .ok_or("content text part missing string `text`")?;
+                        text.push_str(t);
+                    }
+                    Some("image_url") => {
+                        let url = part
+                            .get("image_url")
+                            .and_then(|o| o.get("url"))
+                            .and_then(|u| u.as_str())
+                            .ok_or("image_url part missing string `image_url.url`")?;
+                        images.push(decode_image_url(url)?);
+                        text.push_str(MEDIA_MARKER);
+                    }
+                    Some(other) => {
+                        return Err(format!("unsupported content part type {other:?}"))
+                    }
+                    None => return Err("content array part missing `type`".to_string()),
+                }
+            }
+        }
+        other => return Err(format!("unsupported message content: {other}")),
+    }
+    Ok((text, images))
+}
+
+/// OpenAI chat messages → (engine `ChatMessage`s, collected images in order).
+/// The image-bearing turn's content carries the [`MEDIA_MARKER`] where each
+/// image sat, so the chat template renders it in place. The multimodal sibling
+/// of [`openai_messages_to_chat`].
+pub fn openai_messages_to_chat_mm(
+    messages: &[OpenAiMessage],
+) -> Result<(Vec<ChatMessage>, Vec<Vec<u8>>), String> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut images = Vec::new();
+    for m in messages {
+        let (content, imgs) = content_to_text_and_images(&m.content)?;
+        images.extend(imgs);
+        out.push(ChatMessage {
+            role: m.role.clone(),
+            content,
+            reasoning_content: None,
+        });
+    }
+    Ok((out, images))
+}
+
 /// OpenAI chat messages → engine `ChatMessage`s. Roles pass through unchanged.
 pub fn openai_messages_to_chat(messages: &[OpenAiMessage]) -> Result<Vec<ChatMessage>, String> {
     messages
@@ -221,6 +308,52 @@ mod tests {
         );
         assert!(content_to_text(&json!([{"type":"image_url","image_url":{}}])).is_err());
         assert_eq!(content_to_text(&Value::Null).unwrap(), "");
+    }
+
+    #[test]
+    fn decode_image_url_data_url() {
+        // base64("hi") == "aGk=".
+        assert_eq!(
+            decode_image_url("data:image/png;base64,aGk=").unwrap(),
+            b"hi"
+        );
+        // Remote URLs and non-base64 data URLs are rejected.
+        assert!(decode_image_url("https://example.com/x.png").is_err());
+        assert!(decode_image_url("data:image/png,rawbytes").is_err());
+    }
+
+    #[test]
+    fn content_mm_interleaves_marker_and_collects_images() {
+        let content = json!([
+            {"type": "text", "text": "look: "},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            {"type": "text", "text": " what is it?"}
+        ]);
+        let (text, images) = content_to_text_and_images(&content).unwrap();
+        assert_eq!(text, format!("look: {MEDIA_MARKER} what is it?"));
+        assert_eq!(images, vec![b"hi".to_vec()]);
+        // A bare string yields no images.
+        let (text, images) = content_to_text_and_images(&json!("plain")).unwrap();
+        assert_eq!(text, "plain");
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn openai_mm_collects_across_messages() {
+        let msgs = vec![
+            OpenAiMessage {
+                role: "user".into(),
+                content: json!([
+                    {"type": "image_url", "image_url": {"url": "data:x;base64,aGk="}},
+                    {"type": "text", "text": "hi"}
+                ]),
+                name: None,
+                tool_call_id: None,
+            },
+        ];
+        let (chat, images) = openai_messages_to_chat_mm(&msgs).unwrap();
+        assert_eq!(chat[0].content, format!("{MEDIA_MARKER}hi"));
+        assert_eq!(images.len(), 1);
     }
 
     #[test]
