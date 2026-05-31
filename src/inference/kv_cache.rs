@@ -65,6 +65,14 @@ pub struct KvCache {
     pub v_layers: Vec<TensorView>,
     /// Number of token positions already written into the cache.
     pub position: u32,
+    /// How far the M-RoPE *position cursor* lags behind `position` (the
+    /// KV-slot count). Zero for text-only sequences. After an image, the
+    /// logical position advances by `max(nx,ny)` while `n_tok = nx*ny` KV
+    /// slots are consumed, so this accumulates `Σ (n_tok - max(nx,ny))`.
+    /// The rope base for any subsequent forward is `position - rope_position_lag`
+    /// while KV writes / `kv_len` keep using `position`. See
+    /// `Qwen35MoeModel::forward_impl` and `refresh_replay_inputs`.
+    pub rope_position_lag: u32,
     /// Optional SSM/Mamba/GDN per-layer recurrent state. Empty for
     /// pure-attention models; populated alongside K/V for hybrid models
     /// like qwen35moe. Each entry is a BufferRange covering the layer's
@@ -158,6 +166,7 @@ impl KvCache {
             k_layers,
             v_layers,
             position: 0,
+            rope_position_lag: 0,
             ssm_region: None,
             ssm_conv_states: Vec::new(),
             ssm_gdn_states: Vec::new(),
@@ -301,6 +310,7 @@ impl KvCache {
     /// spec-decode scratch, rewritten within a step, so they need no reset.
     pub fn reset(&mut self) {
         self.position = 0;
+        self.rope_position_lag = 0;
         if let Some((host_ptr, size)) = self
             .ssm_region
             .as_ref()

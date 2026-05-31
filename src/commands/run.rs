@@ -114,6 +114,13 @@ pub struct RunArgs {
     /// Do not load the matching mmproj vision projector.
     #[arg(long = "no-mmproj")]
     no_mmproj: bool,
+
+    /// Path to an image to prepend to the prompt (requires a VL model + its
+    /// mmproj sidecar). The image is encoded by the vision tower and spliced
+    /// into the decoder as `<|vision_start|><|image_pad|>×N<|vision_end|>`
+    /// before the prompt text.
+    #[arg(long = "image")]
+    image: Option<PathBuf>,
 }
 
 impl RunArgs {
@@ -178,12 +185,53 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let gguf = GgufFile::open(&resolved.main)?;
     let bundle = build_tokenizer(&gguf)?;
 
+    // Build the token sequence. With `--image`, CPU-preprocess the image now
+    // (pure, no GPU) to learn the merged grid + token count, then splice the
+    // vision block `<|vision_start|><|image_pad|>×N<|vision_end|>` ahead of the
+    // prompt text. The GPU encode happens later (after the engine is up).
     let add_special = bundle.add_bos_default || bundle.add_eos_default;
-    let encoding = bundle
-        .tokenizer
-        .encode(args.prompt.as_str(), add_special)
-        .map_err(|e| format!("tokenize failed: {e}"))?;
-    let tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let mut image_setup: Option<ImageSetup> = None;
+    let tokens: Vec<u32> = if let Some(img_path) = args.image.clone() {
+        let mmproj_path = resolved.mmproj.clone().ok_or(
+            "--image requires the model's mmproj vision sidecar, but none was found \
+             (expected a *mmproj*.gguf next to the model)",
+        )?;
+        let mmproj_gguf = GgufFile::open(&mmproj_path)?;
+        let vcfg = crate::vision::parse_config(&mmproj_gguf)?;
+        let pcfg = crate::vision::preprocess::PreprocessConfig::qwen3vl_default(
+            vcfg.patch_size,
+            vcfg.spatial_merge_size,
+            vcfg.image_mean,
+            vcfg.image_std,
+        );
+        let pimg = crate::vision::preprocess::preprocess(&img_path, &pcfg)?;
+        let merge = vcfg.spatial_merge_size as usize;
+        let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
+        let n_tok = pimg.n_tokens as usize;
+        let prompt_tokens = bundle
+            .tokenizer
+            .encode(args.prompt.as_str(), false)
+            .map_err(|e| format!("tokenize failed: {e}"))?
+            .get_ids()
+            .to_vec();
+        let bos = if bundle.add_bos_default { bundle.bos_id } else { None };
+        let (tokens, start) = build_image_prompt_tokens(&bundle, bos, n_tok, &prompt_tokens)?;
+        tracing::info!(
+            image = ?img_path, resized = format!("{}x{}", pimg.resized_w, pimg.resized_h),
+            grid = format!("{}x{}", pimg.grid_w, pimg.grid_h), merged = format!("{nx}x{ny}"),
+            n_image_tokens = n_tok, image_start = start, seq_len = tokens.len(),
+            "image prompt assembled",
+        );
+        image_setup = Some(ImageSetup { mmproj_path, vcfg, pimg, nx, ny, start });
+        tokens
+    } else {
+        bundle
+            .tokenizer
+            .encode(args.prompt.as_str(), add_special)
+            .map_err(|e| format!("tokenize failed: {e}"))?
+            .get_ids()
+            .to_vec()
+    };
 
     let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
@@ -197,27 +245,78 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
 
     let model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
 
-    // Phase 1: load the mmproj vision projector alongside the model, if one was
-    // resolved and `--no-mmproj` wasn't passed. Not consumed yet (the encoder
-    // forward pass + decoder splice land in later phases); held in a local so it
-    // stays alive for the run. An absent sidecar or a load failure degrades to
-    // text-only.
-    let _vision = load_vision(&engine, &resolved, args.no_mmproj);
+    // Phase 1: load the mmproj vision projector alongside the model when no
+    // `--image` was given (held in a local so it stays alive; an absent sidecar
+    // / load failure degrades to text-only). With `--image`, the dedicated
+    // encode path below loads + drives the projector itself, so skip this.
+    let _vision = if args.image.is_none() {
+        load_vision(&engine, &resolved, args.no_mmproj)
+    } else {
+        None
+    };
 
-    // Size the scratch (compute buffer) for this model + n_ubatch before any
-    // forward (including the debug-dump paths below), replacing the placeholder
-    // from Engine::new. With the within-chunk mask this is context-independent
-    // for a homogeneous KV cache.
+    // Size the scratch (compute buffer) before any forward, replacing the
+    // placeholder from Engine::new. With the within-chunk mask this is
+    // context-independent for a homogeneous KV cache. An `--image` prefill runs
+    // the whole prompt in one pass (the splice isn't chunk-aware yet), so size
+    // it for the full prompt and take the max with the vision tower's working
+    // set.
     let max_seq_len = args
         .max_tokens
         .saturating_add(tokens.len() as u32)
         .max(tokens.len() as u32);
-    engine.allocate_scratch(model.scratch_bytes_estimate(
-        args.ubatch_size,
-        max_seq_len,
-        args.cache_type_k,
-        args.cache_type_v,
-    ))?;
+    let decoder_scratch = if image_setup.is_some() {
+        model.scratch_bytes_estimate(0, max_seq_len, args.cache_type_k, args.cache_type_v)
+    } else {
+        model.scratch_bytes_estimate(
+            args.ubatch_size,
+            max_seq_len,
+            args.cache_type_k,
+            args.cache_type_v,
+        )
+    };
+    let vision_scratch = image_setup.as_ref().map(vision_scratch_estimate).unwrap_or(0);
+    engine.allocate_scratch(decoder_scratch.max(vision_scratch))?;
+
+    // Encode the image through the vision tower (GPU), reading the
+    // `[proj_dim, n_tok]` embeddings back to host f32 for the decoder splice.
+    let image_prefill: Option<ImagePrefill> = if let Some(setup) = &image_setup {
+        use crate::vision::encoder::{HostWeights, VisionEncoder};
+        let mmproj_gguf = GgufFile::open(&setup.mmproj_path)?;
+        let vision_weights = engine.upload_weights(&mmproj_gguf)?;
+        let vcfg = &setup.vcfg;
+        let encoder = VisionEncoder::new(
+            &vision_weights,
+            vcfg.n_embd as usize,
+            vcfg.patch_size as usize,
+            vcfg.n_head as usize,
+            vcfg.n_ff as usize,
+            vcfg.n_layer as usize,
+            vcfg.eps,
+        )?;
+        let host_weights = HostWeights::from_gguf(&mmproj_gguf)?;
+        let pimg = &setup.pimg;
+        tracing::info!(
+            proj_dim = encoder.projection_dim,
+            n_image_tokens = setup.nx * setup.ny,
+            "encoding image through vision tower",
+        );
+        let embeddings = engine.forward(&vision_weights, |ctx| {
+            let mut x = encoder.record_patch_embed(ctx, pimg, &host_weights)?;
+            for il in 0..encoder.blocks.len() as u32 {
+                x = encoder.record_block(ctx, x, il, pimg.grid_w, pimg.grid_h)?;
+            }
+            Ok(encoder.record_merger(ctx, x)?.range())
+        })?;
+        Some(ImagePrefill {
+            embeddings,
+            start: setup.start,
+            nx: setup.nx,
+            ny: setup.ny,
+        })
+    } else {
+        None
+    };
 
     // Op smoke-test harnesses — model bring-up scaffolding, gated behind
     // the `gpu_debug` feature. In production builds this whole dispatch
@@ -356,7 +455,38 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     // model loaded an MTP head. Otherwise fall through to the unchanged
     // single-token loop (byte-for-byte identical to before).
     let spec = args.spec_draft_n_max > 0 && model.supports_mtp_spec();
-    if spec {
+    if let Some(prefill) = image_prefill {
+        // Multimodal prefill: a single full-prompt pass that splices the vision
+        // embeddings into the residual at the `<|image_pad|>` rows and uses the
+        // qwen-vl M-RoPE decoder positions. Sample the first token, then decode
+        // the rest with the normal single-token loop — the cache's
+        // `rope_position_lag` (set by the model during this prefill) keeps the
+        // M-RoPE positions continuous past the image. (Image + spec-decode is
+        // not combined; the image path takes precedence.)
+        let t0 = std::time::Instant::now();
+        let first = engine.forward_image_sampled(
+            &*model,
+            &mut cache,
+            &tokens,
+            &prefill.embeddings,
+            prefill.start,
+            prefill.nx,
+            prefill.ny,
+            &mut sampler,
+        )?;
+        prefill_secs = t0.elapsed().as_secs_f64();
+        generated.push(first);
+        let mut step_tokens = vec![first];
+        while (generated.len() as u32) < args.max_tokens {
+            let position_offset = cache.position;
+            let t0 = std::time::Instant::now();
+            let next_id = engine
+                .forward_sampled(&*model, &mut cache, &step_tokens, position_offset, &mut sampler)?;
+            decode_secs += t0.elapsed().as_secs_f64();
+            generated.push(next_id);
+            step_tokens = vec![next_id];
+        }
+    } else if spec {
         let n_max = args.spec_draft_n_max;
         // Prefill via the hidden-exposing forward; sample the first token on
         // the host (the spec path samples on host throughout).
@@ -2709,6 +2839,91 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     (sign << 15) | ((exp16 as u16) << 10) | mant16
 }
 
+/// CPU-side image prep computed before the engine is up (so the assembled
+/// sequence length is known for scratch sizing). Holds the projector path +
+/// parsed config and the preprocessed pixels; the GPU encode reopens the mmproj
+/// and runs the tower.
+struct ImageSetup {
+    mmproj_path: PathBuf,
+    vcfg: crate::vision::VisionConfig,
+    pimg: crate::vision::preprocess::PreprocessedImage,
+    /// Merged-grid dims (= patch grid / spatial_merge).
+    nx: usize,
+    ny: usize,
+    /// Local index of the first `<|image_pad|>` token in the sequence.
+    start: usize,
+}
+
+/// The encoded image ready to splice: `[proj_dim, n_tok]` host f32 (column =
+/// merged token, proj_dim contiguous) plus its placement in the decoder token
+/// sequence.
+struct ImagePrefill {
+    embeddings: Vec<f32>,
+    start: usize,
+    nx: usize,
+    ny: usize,
+}
+
+/// Conservative scratch estimate for the vision tower's single forward (mirrors
+/// `vision_encode_smoke`): ~28k floats/token/block across all blocks plus the
+/// patch-embed + merger stages, floored at 64 MiB.
+fn vision_scratch_estimate(setup: &ImageSetup) -> u64 {
+    let n_pos = (setup.pimg.grid_w as u64) * (setup.pimg.grid_h as u64);
+    let nlayers = setup.vcfg.n_layer as u64;
+    (28_000u64 * n_pos * (nlayers + 2) * 4).max(64 << 20)
+}
+
+/// Assemble the decoder token sequence for an image prompt:
+/// `[BOS?] <|vision_start|> <|image_pad|>×n_tok <|vision_end|> <prompt…>`.
+/// Returns the tokens and the local index of the first image-pad token. Pure
+/// (the caller resolves the ids) so it is unit-testable without a tokenizer.
+fn assemble_image_tokens(
+    bos: Option<u32>,
+    vision_start: u32,
+    image_pad: u32,
+    vision_end: u32,
+    n_tok: usize,
+    prompt_tokens: &[u32],
+) -> (Vec<u32>, usize) {
+    let mut tokens = Vec::with_capacity(bos.is_some() as usize + 2 + n_tok + prompt_tokens.len());
+    if let Some(b) = bos {
+        tokens.push(b);
+    }
+    tokens.push(vision_start);
+    let start = tokens.len();
+    tokens.resize(tokens.len() + n_tok, image_pad); // n_tok image-pad tokens
+    tokens.push(vision_end);
+    tokens.extend_from_slice(prompt_tokens);
+    (tokens, start)
+}
+
+/// Resolve the qwen-vl vision special-token ids from the tokenizer and assemble
+/// the image prompt sequence (see [`assemble_image_tokens`]). Errors clearly if
+/// the model's tokenizer lacks the vision tokens.
+fn build_image_prompt_tokens(
+    bundle: &crate::tokenizer::TokenizerBundle,
+    bos: Option<u32>,
+    n_tok: usize,
+    prompt_tokens: &[u32],
+) -> Result<(Vec<u32>, usize), Box<dyn Error>> {
+    let tid = |s: &str| -> Result<u32, Box<dyn Error>> {
+        bundle.tokenizer.token_to_id(s).ok_or_else(|| {
+            format!("tokenizer has no {s} token — this model is not vision-capable").into()
+        })
+    };
+    let vision_start = tid("<|vision_start|>")?;
+    let image_pad = tid("<|image_pad|>")?;
+    let vision_end = tid("<|vision_end|>")?;
+    Ok(assemble_image_tokens(
+        bos,
+        vision_start,
+        image_pad,
+        vision_end,
+        n_tok,
+        prompt_tokens,
+    ))
+}
+
 /// Resolve the main model path (and any matching mmproj sidecar) from either a
 /// local `-m PATH` or an HF repo. For the local path, scans the model's
 /// directory for an mmproj GGUF (unless `--no-mmproj`); for HF, asks
@@ -2767,5 +2982,38 @@ fn load_vision(
             tracing::warn!(path = ?mmproj_path, error = %e, "failed to load mmproj; continuing text-only");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod image_prompt_tests {
+    use super::assemble_image_tokens;
+
+    /// `<|vision_start|>=10`, `<|image_pad|>=11`, `<|vision_end|>=12`, no BOS,
+    /// 3 image tokens, prompt = [7, 8]. Sequence is start/pads/end then prompt;
+    /// `start` points at the first pad.
+    #[test]
+    fn assembles_vision_block_then_prompt() {
+        let (toks, start) = assemble_image_tokens(None, 10, 11, 12, 3, &[7, 8]);
+        assert_eq!(toks, vec![10, 11, 11, 11, 12, 7, 8]);
+        assert_eq!(start, 1);
+        // The n_tok image-pad tokens are exactly the [start, start+n_tok) slots.
+        assert!(toks[start..start + 3].iter().all(|&t| t == 11));
+    }
+
+    /// A BOS shifts everything (including `start`) right by one.
+    #[test]
+    fn bos_shifts_image_start() {
+        let (toks, start) = assemble_image_tokens(Some(1), 10, 11, 12, 2, &[9]);
+        assert_eq!(toks, vec![1, 10, 11, 11, 12, 9]);
+        assert_eq!(start, 2);
+    }
+
+    /// Empty prompt (caption-style): just the vision block.
+    #[test]
+    fn empty_prompt_is_vision_block_only() {
+        let (toks, start) = assemble_image_tokens(None, 10, 11, 12, 4, &[]);
+        assert_eq!(toks, vec![10, 11, 11, 11, 11, 12]);
+        assert_eq!(start, 1);
     }
 }

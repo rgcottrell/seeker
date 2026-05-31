@@ -759,6 +759,154 @@ impl Engine {
         Ok(token)
     }
 
+    /// Prefill a multimodal prompt (one image) in a single GPU pass and sample
+    /// the first token. Splices the vision-tower embeddings into the decoder
+    /// residual at the `<|image_pad|>` rows and uses the qwen-vl M-RoPE
+    /// positions (via [`crate::models::Model::record_forward_image`]).
+    ///
+    /// This is the image analogue of the prefill branch of
+    /// [`Self::forward_sampled_record`]: a fresh record on the main cmdbuf with
+    /// a single submit, no decode-cmdbuf caching (a prefill changes the graph
+    /// shape, so any cached decode recording is invalidated). Subsequent decode
+    /// steps go through the normal [`Self::forward_sampled`]; the cache's
+    /// `rope_position_lag` (set by the model during this prefill) keeps their
+    /// M-RoPE positions continuous past the image.
+    ///
+    /// Unlike chunked text prefill, the whole prompt (image pads included) runs
+    /// in one pass — the caller must size scratch for the full prompt length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_image_sampled(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        image_embeddings: &[f32],
+        image_start: usize,
+        image_nx: usize,
+        image_ny: usize,
+        sampler: &mut sample::Sampler,
+    ) -> Result<u32, Box<dyn Error>> {
+        if tokens.is_empty() {
+            return Err("forward_image_sampled called with empty token list".into());
+        }
+        let position_offset = cache.position;
+
+        // A prefill changes the graph shape — invalidate any cached decode
+        // recording so a stale binding can't survive into the next decode.
+        self.decode_cache = None;
+        self.scratch.reset();
+        self.descriptors.reset(&self.device)?;
+
+        let decode_dyn_range = {
+            let off = self.scratch.alloc(decode_dyn::DecodeDyn::SIZE)?;
+            BufferRange {
+                buffer: self.scratch.buffer,
+                offset: off,
+                size: decode_dyn::DecodeDyn::SIZE,
+            }
+        };
+
+        unsafe {
+            self.device
+                .device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)?;
+        }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.reset(&self.device, self.command_buffer);
+
+        #[cfg(feature = "gpu_debug")]
+        let taps;
+        let token_range = {
+            let mut ctx = DispatchContext {
+                device: &self.device,
+                weights: model.weights(),
+                scratch: &mut self.scratch,
+                pipelines: &mut self.pipelines,
+                descriptors: &self.descriptors,
+                cmd: self.command_buffer,
+                #[cfg(feature = "gpu_debug")]
+                taps: Vec::new(),
+                #[cfg(feature = "profile_gpu")]
+                n_dispatches: 0,
+                decode_dyn: decode_dyn_range,
+                replay_plan: None,
+                #[cfg(feature = "profile_gpu")]
+                profile: Some(&mut self.profile),
+            };
+            let logits = model
+                .record_forward_image(
+                    &mut ctx,
+                    cache,
+                    tokens,
+                    position_offset,
+                    image_embeddings,
+                    image_start,
+                    image_nx,
+                    image_ny,
+                )?
+                .ok_or("record_forward_image returned no logits")?;
+            let r = sampler.record_chain(&mut ctx, logits)?;
+            #[cfg(feature = "gpu_debug")]
+            {
+                taps = ctx.taps;
+            }
+            r
+        };
+
+        unsafe {
+            self.device.device.end_command_buffer(self.command_buffer)?;
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        #[cfg(feature = "profile_gpu")]
+        self.profile.readback_and_print(&self.device);
+
+        if token_range.size < 4 {
+            return Err(format!("sampler output too small: {} bytes", token_range.size).into());
+        }
+        let host_ptr = self
+            .scratch
+            .host_ptr
+            .ok_or("scratch region is not host-visible — readback requires host-visible scratch")?;
+        let token = unsafe {
+            let src = host_ptr.add(token_range.offset as usize) as *const u32;
+            std::ptr::read(src)
+        };
+        #[cfg(feature = "gpu_debug")]
+        for (name, range) in &taps {
+            if range.size % 4 != 0 {
+                eprintln!("TAP {name}: size {} not 4-byte aligned, skipping", range.size);
+                continue;
+            }
+            let n = (range.size / 4) as usize;
+            let mut buf = vec![0f32; n];
+            unsafe {
+                let src = host_ptr.add(range.offset as usize) as *const f32;
+                std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+            }
+            let sum: f32 = buf.iter().sum();
+            let max_abs: f32 = buf.iter().map(|x| x.abs()).fold(0.0, f32::max);
+            let head: Vec<String> = buf.iter().take(5).map(|v| format!("{v:.4}")).collect();
+            println!("TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]", range.offset, head.join(", "));
+        }
+        // `record_forward_image` advanced `cache.position` (and set
+        // `rope_position_lag`) inside the model — do not advance again here.
+        sampler.accept(token);
+        Ok(token)
+    }
+
     /// Prefill a prompt longer than `n_ubatch` by feeding it in sequential
     /// `≤ n_ubatch`-token chunks. Every chunk but the last is KV-only (no
     /// logits / sampler — see [`Engine::forward_kv_only`]); the final chunk

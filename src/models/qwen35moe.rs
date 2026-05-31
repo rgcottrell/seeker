@@ -341,13 +341,17 @@ impl Model for Qwen35MoeModel {
                 std::ptr::write(tok_dst.add(i), t);
             }
             // M-RoPE positions: 4 axes × L tokens. Each axis gets the
-            // same linear sequence (text-only inference — see
-            // `record_forward` for the same layout at record time).
+            // same linear sequence (text decode — see `record_forward` for
+            // the same layout at record time). The rope base lags the KV-slot
+            // count by `rope_position_lag` once an image was prefilled
+            // (captured into the plan at record time); zero for text-only, so
+            // this matches the original `position_offset + i` layout exactly.
             let l = tokens.len();
+            let rope_base = position_offset.saturating_sub(plan.rope_position_lag);
             let pos_dst = host_ptr.add(pos_off as usize) as *mut u32;
             for axis in 0..4usize {
                 for i in 0..l {
-                    std::ptr::write(pos_dst.add(axis * l + i), position_offset + i as u32);
+                    std::ptr::write(pos_dst.add(axis * l + i), rope_base + i as u32);
                 }
             }
         }
@@ -530,11 +534,16 @@ impl Qwen35MoeModel {
             return Err("empty prompt".into());
         }
         if let Some(img) = image.as_ref() {
-            debug_assert_eq!(
-                img.embeddings.len(),
-                p.n_embd as usize * img.span.n_tok,
-                "image embeddings len != n_embd * n_tok"
-            );
+            if img.embeddings.len() != p.n_embd as usize * img.span.n_tok {
+                return Err(format!(
+                    "image embeddings len {} != n_embd {} * n_tok {} — the vision \
+                     projection_dim must equal the text model's embedding_length",
+                    img.embeddings.len(),
+                    p.n_embd,
+                    img.span.n_tok
+                )
+                .into());
+            }
             if img.span.start + img.span.n_tok > tokens.len() {
                 return Err("image span overruns the token sequence".into());
             }
@@ -579,15 +588,23 @@ impl Qwen35MoeModel {
             Some(img) => std::slice::from_ref(&img.span),
             None => &[],
         };
-        let positions = build_decoder_mrope_positions(l as usize, position_offset, image_spans);
+        // The M-RoPE base is the *logical* position cursor, which lags the
+        // KV-slot count (`position_offset`) by `rope_position_lag` once any
+        // image has been prefilled: an image advances the cursor by
+        // `max(nx,ny)` but consumes `n_tok = nx*ny` KV slots. Text-only ⇒ lag 0
+        // ⇒ `rope_base == position_offset` (the validated text path, unchanged).
+        let rope_base = position_offset.saturating_sub(cache.rope_position_lag);
+        let positions = build_decoder_mrope_positions(l as usize, rope_base, image_spans);
         write_u32(ctx, positions_buf, &positions)?;
 
         // Snapshot the replay-input offsets so the persistent-decode-cmdbuf
         // path can re-write these slots between submits via
-        // `refresh_replay_inputs`.
+        // `refresh_replay_inputs`. `rope_position_lag` is captured here so the
+        // replay path can re-derive the lagged rope base each submit.
         if let Some(plan) = ctx.replay_plan.as_mut() {
             plan.token_buf_offset = Some(token_buf.offset);
             plan.positions_buf_offset = Some(positions_buf.offset);
+            plan.rope_position_lag = cache.rope_position_lag;
         }
 
         // Single-token decode (l == 1) needs no mask: every KV slot is
@@ -768,6 +785,7 @@ impl Qwen35MoeModel {
         // ubatch). cache.position is still advanced.
         if !compute_logits {
             cache_io::advance(cache, l);
+            advance_rope_lag(cache, image.as_ref());
             return Ok(crate::models::ForwardFullOut {
                 logits: None,
                 residual,
@@ -811,6 +829,7 @@ impl Qwen35MoeModel {
         });
 
         cache_io::advance(cache, l);
+        advance_rope_lag(cache, image.as_ref());
         Ok(crate::models::ForwardFullOut { logits, residual })
     }
 
@@ -2776,6 +2795,17 @@ pub struct ImageSpan {
 pub struct DecoderImage<'a> {
     pub embeddings: &'a [f32],
     pub span: ImageSpan,
+}
+
+/// After a forward that spliced an image, advance the cache's M-RoPE lag by
+/// `n_tok - max(nx,ny)` (the gap between KV slots consumed and logical
+/// positions advanced). No-op for text-only forwards (`image == None`), so the
+/// text path is unchanged. Called right after `cache_io::advance`.
+fn advance_rope_lag(cache: &mut KvCache, image: Option<&DecoderImage<'_>>) {
+    if let Some(img) = image {
+        let m = img.span.nx.max(img.span.ny) as u32;
+        cache.rope_position_lag += img.span.n_tok as u32 - m;
+    }
 }
 
 /// Build the 4-axis M-RoPE decoder positions for a token sequence that may

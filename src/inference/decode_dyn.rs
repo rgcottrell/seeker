@@ -138,6 +138,12 @@ pub struct ReplayPlan {
     /// if the sampler config has no penalties (apply_penalties wasn't
     /// recorded).
     pub penalty_pairs: Option<(u64, u32)>,
+    /// `KvCache::rope_position_lag` captured when this decode cmdbuf was
+    /// recorded. The replay path writes M-RoPE positions at
+    /// `position_offset - rope_position_lag` (KV writes still use
+    /// `position_offset`). Zero for text-only sequences, so the text path is
+    /// unchanged. Constant across a decode run (images only appear in prefill).
+    pub rope_position_lag: u32,
 }
 
 /// Per-model constants the host needs to drive the replay path.
