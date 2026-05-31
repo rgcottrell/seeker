@@ -26,6 +26,33 @@ use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
 use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
 use crate::tokenizer::build_tokenizer;
+use crate::vision::encoder::{HostWeights, VisionEncoder};
+
+/// The media placeholder (`mtmd_default_marker()`). `/image` prepends it to the
+/// user turn; `render_prompt` splits the rendered string on it to place the
+/// vision block where the chat template put the content. See `commands::run`.
+const MEDIA_MARKER: &str = "<__media__>";
+
+/// A vision tower built on first `/image` and kept for the session. `vision`
+/// owns the uploaded mmproj weights (the encoder's tensor views borrow nothing
+/// — they hold GPU buffer handles kept valid by `vision`); `host_weights` is the
+/// CPU-side patch-embed/pos-embd copy the encoder needs for the pos-embd resize.
+struct VisionCtx {
+    vision: crate::vision::VisionModel,
+    encoder: VisionEncoder,
+    host_weights: HostWeights,
+}
+
+/// An image encoded through the vision tower: `[proj_dim, n_tok]` host f32
+/// (column = merged token) plus its merged-grid dims. Spliced into the decoder
+/// residual at the `<|image_pad|>` rows during the image turn's prefill.
+#[derive(Clone)]
+struct EncodedImage {
+    embeddings: Vec<f32>,
+    nx: usize,
+    ny: usize,
+    n_tok: usize,
+}
 
 /// Set by the SIGINT watcher when the user presses Ctrl+C *during* generation
 /// (in interactive mode). The decode loop polls it between tokens and stops
@@ -293,21 +320,22 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let weights = engine.upload_weights(&gguf)?;
     let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
 
-    // Phase 1: load the mmproj vision projector alongside the model, if one was
-    // resolved and `--no-mmproj` wasn't passed. Not consumed yet (encoder +
-    // decoder integration land in later phases); held in a local so it stays
-    // alive for the session. Absent sidecar or load failure → text-only.
-    let _vision = load_vision(&engine, &resolved, args.no_mmproj);
+    // The mmproj vision sidecar (if resolved and not `--no-mmproj`). The vision
+    // tower is built lazily on the first `/image` (see `ChatSession::attach_image`)
+    // so a text-only session never uploads the projector.
+    let mmproj_path = if args.no_mmproj { None } else { resolved.mmproj.clone() };
 
     // Size the scratch (compute buffer) for this model + n_ubatch (and the
     // full ctx for heterogeneous caches), replacing the Engine::new
-    // placeholder.
-    engine.allocate_scratch(model.scratch_bytes_estimate(
+    // placeholder. An `/image` turn grows this on demand (image prefill is
+    // single-pass).
+    let scratch_bytes = model.scratch_bytes_estimate(
         args.ubatch_size,
         args.ctx_size,
         args.cache_type_k,
         args.cache_type_v,
-    ))?;
+    );
+    engine.allocate_scratch(scratch_bytes)?;
 
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
@@ -370,6 +398,11 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         context_shift: args.context_shift,
         keep_turns: args.keep,
         template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
+        mmproj_path,
+        vision_ctx: None,
+        pending_image: None,
+        image: None,
+        scratch_bytes,
     };
 
     // Seed an optional system prompt (CLI flag or file) as messages[0].
@@ -466,35 +499,16 @@ async fn resolve_model_path(args: &ChatArgs) -> Result<download::Resolved, Box<d
     }
 }
 
-/// Load the resolved mmproj projector (if any) and return a `VisionModel`.
-///
-/// An absent mmproj or `--no-mmproj` yields `None` with no error. A load
-/// failure is logged as a warning and degrades to text-only, never failing the
-/// whole session.
-fn load_vision(
-    engine: &Engine,
-    resolved: &download::Resolved,
-    no_mmproj: bool,
-) -> Option<crate::vision::VisionModel> {
-    if no_mmproj {
-        return None;
-    }
-    let mmproj_path = resolved.mmproj.as_ref()?;
-    tracing::info!(path = ?mmproj_path, "opening mmproj vision projector");
-
-    let result = (|| -> Result<crate::vision::VisionModel, Box<dyn Error>> {
-        let mmproj_gguf = GgufFile::open(mmproj_path)?;
-        let mmproj_weights = engine.upload_weights(&mmproj_gguf)?;
-        crate::vision::load(&mmproj_gguf, mmproj_weights)
-    })();
-
-    match result {
-        Ok(vision) => Some(vision),
-        Err(e) => {
-            tracing::warn!(path = ?mmproj_path, error = %e, "failed to load mmproj; continuing text-only");
-            None
-        }
-    }
+/// Conservative scratch estimate for the vision tower's single forward (mirrors
+/// `vision_encode_smoke` / `commands::run`): ~28k floats/token/block across all
+/// blocks plus the patch-embed + merger stages, floored at 64 MiB.
+fn vision_scratch_estimate(
+    cfg: &crate::vision::VisionConfig,
+    pimg: &crate::vision::preprocess::PreprocessedImage,
+) -> u64 {
+    let n_pos = (pimg.grid_w as u64) * (pimg.grid_h as u64);
+    let nlayers = cfg.n_layer as u64;
+    (28_000u64 * n_pos * (nlayers + 2) * 4).max(64 << 20)
 }
 
 /// All conversation state plus the GPU resources needed to advance it.
@@ -528,6 +542,23 @@ struct ChatSession {
     /// merged into every render (override the built-in variables). Carries
     /// switches like `enable_thinking` when the user sets them.
     template_kwargs: serde_json::Map<String, serde_json::Value>,
+    /// Path to the mmproj vision sidecar, if one was resolved and `--no-mmproj`
+    /// wasn't passed. The vision tower ([`VisionCtx`]) is built lazily from it on
+    /// the first `/image` (so a text-only session never uploads the projector).
+    mmproj_path: Option<PathBuf>,
+    /// The lazily-built vision tower (None until the first `/image`).
+    vision_ctx: Option<VisionCtx>,
+    /// An image encoded by `/image` but not yet attached to a message — moved to
+    /// `image` (and the marker prepended) when the next user turn is sent.
+    pending_image: Option<EncodedImage>,
+    /// The single image committed to this conversation (its `<__media__>` marker
+    /// lives in one user message). `None` for a text-only conversation. The
+    /// first cut supports one image per conversation; `/clear` drops it.
+    image: Option<EncodedImage>,
+    /// Bytes the scratch region is currently sized for, so image prefills (which
+    /// run single-pass, unlike chunked text prefill) can grow it on demand
+    /// without shrinking it back.
+    scratch_bytes: u64,
 }
 
 /// Timing for one reply, used for the `[ Prompt … | Generation … ]` line.
@@ -652,10 +683,26 @@ impl ChatSession {
         text: &str,
         on_text: impl FnMut(&str, Segment),
     ) -> Result<ReplyStats, Box<dyn Error>> {
-        self.messages.push(ChatMessage::user(text));
+        // Attach a pending `/image` to this turn: the user content carries the
+        // media marker at its head (like llama-mtmd-cli) and the encoded image
+        // becomes the conversation's committed image. Moved, not cloned.
+        let had_pending = self.pending_image.is_some();
+        let content = if had_pending {
+            format!("{MEDIA_MARKER}{text}")
+        } else {
+            text.to_string()
+        };
+        if had_pending {
+            self.image = self.pending_image.take();
+        }
+        self.messages.push(ChatMessage::user(content));
         let result = self.generate(on_text);
         if result.is_err() {
             self.messages.pop();
+            if had_pending {
+                // Fully undo the attach so the image can be retried next turn.
+                self.pending_image = self.image.take();
+            }
         }
         result
     }
@@ -682,9 +729,15 @@ impl ChatSession {
 
     /// Render the current conversation with a generation prompt and tokenize
     /// it (`add_special_tokens=false` — the template emits any BOS it wants).
-    /// Returns both the rendered string (the reasoning seed reads it) and the
-    /// token ids. Shared by `generate` and `evict_to_fit`.
-    fn render_prompt(&self) -> Result<(String, Vec<u32>), Box<dyn Error>> {
+    /// Returns the rendered string (the reasoning seed reads it), the token ids,
+    /// and — when an image is attached — the local index of the first
+    /// `<|image_pad|>` token (where the vision-tower embeddings splice in). The
+    /// rendered string carries the `<__media__>` marker (in the image turn's
+    /// content); we split on it and replace it with
+    /// `<|vision_start|><|image_pad|>×n_tok<|vision_end|>`. Shared by `generate`
+    /// and `evict_to_fit`.
+    #[allow(clippy::type_complexity)] // (rendered, tokens, image_start) is clearer inline than a named alias
+    fn render_prompt(&self) -> Result<(String, Vec<u32>, Option<usize>), Box<dyn Error>> {
         let bundle = self.model.tokenizer();
         let bos = bundle.bos_token.as_deref().unwrap_or("");
         let eos = bundle.eos_token.as_deref().unwrap_or("");
@@ -696,12 +749,35 @@ impl ChatSession {
             eos,
             &self.template_kwargs,
         )?;
-        let enc = bundle
-            .tokenizer
-            .encode(rendered.as_str(), false)
-            .map_err(|e| format!("tokenize failed: {e}"))?;
-        let tokens = enc.get_ids().to_vec();
-        Ok((rendered, tokens))
+        let encode = |text: &str| -> Result<Vec<u32>, Box<dyn Error>> {
+            Ok(bundle
+                .tokenizer
+                .encode(text, false)
+                .map_err(|e| format!("tokenize failed: {e}"))?
+                .get_ids()
+                .to_vec())
+        };
+        let Some(img) = &self.image else {
+            let tokens = encode(&rendered)?;
+            return Ok((rendered, tokens, None));
+        };
+        // One image: split on the marker and splice the vision block.
+        let (before, after) = rendered.split_once(MEDIA_MARKER).ok_or(
+            "conversation has an image but the rendered prompt has no <__media__> marker \
+             (chat template dropped it?)",
+        )?;
+        let tid = |s: &str| -> Result<u32, Box<dyn Error>> {
+            bundle.tokenizer.token_to_id(s).ok_or_else(|| {
+                format!("tokenizer has no {s} token — this model is not vision-capable").into()
+            })
+        };
+        let mut tokens = encode(before)?;
+        tokens.push(tid("<|vision_start|>")?);
+        let image_start = tokens.len();
+        tokens.resize(tokens.len() + img.n_tok, tid("<|image_pad|>")?);
+        tokens.push(tid("<|vision_end|>")?);
+        tokens.extend(encode(after)?);
+        Ok((rendered, tokens, Some(image_start)))
     }
 
     /// `--context-shift`: drop the oldest *whole* user→assistant turn pairs
@@ -718,7 +794,11 @@ impl ChatSession {
     /// Returns the number of turn pairs dropped; a no-op (and zero cost) when
     /// the shift is off or the conversation already fits.
     fn evict_to_fit(&mut self) -> Result<usize, Box<dyn Error>> {
-        if !self.context_shift {
+        // Context-shift eviction is disabled while an image is attached: dropping
+        // turns would move the image's position (and could evict the image turn
+        // itself), which the single-image first cut doesn't track. The ctx-full
+        // guards in `generate` still apply.
+        if !self.context_shift || self.image.is_some() {
             return Ok(0);
         }
         let budget = self
@@ -773,15 +853,25 @@ impl ChatSession {
         // When it drops anything it resets the cache + prior_tokens, so the
         // render below re-prefills the survivors from scratch (SSM-safe).
         let shifted_turns = self.evict_to_fit()?;
-        let (rendered, new_tokens) = self.render_prompt()?;
+        let (rendered, new_tokens, image_start) = self.render_prompt()?;
 
         // Prefix reuse: keep the cache prefix that still matches.
-        let common0 = self
+        let mut common0 = self
             .prior_tokens
             .iter()
             .zip(new_tokens.iter())
             .take_while(|(a, b)| a == b)
             .count();
+        // If an image is attached, the prefill that (re)feeds its vision block
+        // must run through `forward_image_sampled`, which needs the WHOLE block
+        // in the delta. The identical `<|image_pad|>` ids mean prefix reuse
+        // normally stops before the block or sails past it; only an edited cache
+        // could leave the boundary strictly inside the pads — rewind to the
+        // block start there so the full image is re-prefilled, never half.
+        match (&self.image, image_start) {
+            (Some(img), Some(s)) if common0 > s && common0 < s + img.n_tok => common0 = s,
+            _ => {}
+        }
         if common0 > self.cache.position as usize {
             // Shouldn't happen — prior_tokens tracks what's in the cache.
             return Err(format!(
@@ -827,6 +917,37 @@ impl ChatSession {
             )
             .into());
         }
+
+        // Does this prefill delta contain the image's vision block? Only when
+        // the reuse boundary is at/before the first pad — otherwise the block is
+        // already cached (its embeddings were spliced when first prefilled) and
+        // the normal text path applies. When it is in the delta, the prefill
+        // runs single-pass through `forward_image_sampled` (no chunking), so grow
+        // the scratch to fit the whole delta first.
+        let image_in_delta = matches!((&self.image, image_start), (Some(_), Some(s)) if common <= s);
+        // Local pad offset only when the block is in the delta (else `s < common`
+        // for a cached image would underflow this usize).
+        let img_start_in_delta = image_start.filter(|_| image_in_delta).map(|s| s - common);
+        let image_dims = self.image.as_ref().map(|i| (i.nx, i.ny));
+        if image_in_delta {
+            let need = self.model.scratch_bytes_estimate(
+                /*n_ubatch=*/ 0,
+                (common + delta.len()) as u32,
+                self.cache.config.k_dtype,
+                self.cache.config.v_dtype,
+            );
+            if need > self.scratch_bytes {
+                self.engine.allocate_scratch(need)?;
+                self.scratch_bytes = need;
+            }
+        }
+        // Borrow the embeddings for the (single) image prefill forward below.
+        // A slice ref (not a clone) — the [proj_dim,n_tok] buffer can be MBs.
+        let image_embeds: Option<&[f32]> = if image_in_delta {
+            self.image.as_ref().map(|i| i.embeddings.as_slice())
+        } else {
+            None
+        };
 
         // Prefill + decode in one loop. forward_sampled records the model
         // forward then the sampler chain, returning the next token id.
@@ -880,13 +1001,32 @@ impl ChatSession {
             let model = &self.model;
             let t0 = std::time::Instant::now();
             let position = cache.position;
-            let token = self.engine.forward_sampled(
-                &**model,
-                cache,
-                &step_tokens,
-                position,
-                &mut self.sampler,
-            )?;
+            // Forward 0 of an image turn splices the vision embeddings + uses the
+            // qwen-vl M-RoPE positions (single-pass). Every other forward — the
+            // rest of the prefill delta and all decode steps — is the normal
+            // text path; the cache's `rope_position_lag` (set during the image
+            // prefill) keeps their positions continuous past the image.
+            let token = if forwards == 0 && image_in_delta {
+                let (nx, ny) = image_dims.expect("image_in_delta ⇒ dims");
+                self.engine.forward_image_sampled(
+                    &**model,
+                    cache,
+                    &step_tokens,
+                    image_embeds.expect("image_in_delta ⇒ embeddings"),
+                    img_start_in_delta.expect("image_in_delta ⇒ start"),
+                    nx,
+                    ny,
+                    &mut self.sampler,
+                )?
+            } else {
+                self.engine.forward_sampled(
+                    &**model,
+                    cache,
+                    &step_tokens,
+                    position,
+                    &mut self.sampler,
+                )?
+            };
             // Forward 0 is the prefill (N = prompt_tokens); the rest are
             // single-token decode steps. Time them separately, like llama.cpp.
             let dt = t0.elapsed().as_secs_f64();
@@ -1028,6 +1168,78 @@ impl ChatSession {
         })
     }
 
+    /// Build the vision tower from the mmproj sidecar on first `/image` and keep
+    /// it for the session. Errors if the model has no mmproj (or `--no-mmproj`).
+    fn ensure_vision(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.vision_ctx.is_some() {
+            return Ok(());
+        }
+        let path = self.mmproj_path.clone().ok_or(
+            "no vision model available — this model has no mmproj sidecar \
+             (or it was disabled with --no-mmproj)",
+        )?;
+        tracing::info!(path = ?path, "loading vision tower for /image");
+        let gguf = GgufFile::open(&path)?;
+        let weights = self.engine.upload_weights(&gguf)?;
+        let cfg = crate::vision::parse_config(&gguf)?;
+        // The encoder copies its tensor views out of `weights` (no borrow held),
+        // so moving `weights` into the VisionModel below keeps them valid.
+        let encoder = VisionEncoder::new(
+            &weights,
+            cfg.n_embd as usize,
+            cfg.patch_size as usize,
+            cfg.n_head as usize,
+            cfg.n_ff as usize,
+            cfg.n_layer as usize,
+            cfg.eps,
+        )?;
+        let host_weights = HostWeights::from_gguf(&gguf)?;
+        let vision = crate::vision::VisionModel { config: cfg, weights };
+        self.vision_ctx = Some(VisionCtx { vision, encoder, host_weights });
+        Ok(())
+    }
+
+    /// Encode `path` through the vision tower (GPU) and stage it as the pending
+    /// image for the next user turn. Returns the merged grid `(nx, ny, n_tok)`
+    /// for the confirmation line. Errors if an image is already attached.
+    fn attach_image(&mut self, path: &Path) -> Result<(usize, usize, usize), Box<dyn Error>> {
+        if self.image.is_some() {
+            return Err("this conversation already has an image — /clear to start over \
+                        (one image per conversation for now)"
+                .into());
+        }
+        self.ensure_vision()?;
+        let cfg = self.vision_ctx.as_ref().expect("ensure_vision built it").vision.config.clone();
+        let pcfg = crate::vision::preprocess::PreprocessConfig::qwen3vl_default(
+            cfg.patch_size,
+            cfg.spatial_merge_size,
+            cfg.image_mean,
+            cfg.image_std,
+        );
+        let pimg = crate::vision::preprocess::preprocess(path, &pcfg)?;
+        let merge = cfg.spatial_merge_size as usize;
+        let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
+        let n_tok = pimg.n_tokens as usize;
+
+        // Grow the scratch for the vision tower's working set, then encode.
+        let need = vision_scratch_estimate(&cfg, &pimg);
+        if need > self.scratch_bytes {
+            self.engine.allocate_scratch(need)?;
+            self.scratch_bytes = need;
+        }
+        let vc = self.vision_ctx.as_ref().expect("ensure_vision built it");
+        let (encoder, host_weights, weights) = (&vc.encoder, &vc.host_weights, &vc.vision.weights);
+        let embeddings = self.engine.forward(weights, |ctx| {
+            let mut x = encoder.record_patch_embed(ctx, &pimg, host_weights)?;
+            for il in 0..encoder.blocks.len() as u32 {
+                x = encoder.record_block(ctx, x, il, pimg.grid_w, pimg.grid_h)?;
+            }
+            Ok(encoder.record_merger(ctx, x)?.range())
+        })?;
+        self.pending_image = Some(EncodedImage { embeddings, nx, ny, n_tok });
+        Ok((nx, ny, n_tok))
+    }
+
     /// Set (or replace) the leading system message, then reset the cache and
     /// prior-token tracking so the next turn re-prefills the whole conversation
     /// from the new prompt. The full reset is required because the prefix
@@ -1064,6 +1276,10 @@ impl ChatSession {
         self.prior_tokens.clear();
         self.cache.reset();
         self.sampler.reset_recent();
+        // Drop any attached/pending image (the built vision tower is kept — it's
+        // reusable for the next `/image`).
+        self.image = None;
+        self.pending_image = None;
     }
 }
 
@@ -1163,6 +1379,7 @@ fn print_banner(gguf: &GgufFile, path: &Path) {
     println!("  /clear              clear the chat history");
     println!("  /read <file>        add a text file");
     println!("  /glob <pattern>     add text files using globbing pattern");
+    println!("  /image <file>       attach an image to your next message (VL models)");
     println!();
 }
 
@@ -1222,6 +1439,8 @@ fn run_interactive(
                         handle_read(session, arg.trim());
                     } else if let Some(arg) = cmd.strip_prefix("glob") {
                         handle_glob(session, arg.trim());
+                    } else if let Some(arg) = cmd.strip_prefix("image") {
+                        handle_image(session, arg.trim());
                     } else {
                         println!("unknown command: /{cmd}");
                     }
@@ -1343,6 +1562,24 @@ fn handle_read(session: &mut ChatSession, path: &str) {
             emit_reply(session, trimmed);
         }
         Err(e) => println!("/read failed: {e}"),
+    }
+}
+
+/// `/image <file>`: encode an image through the vision tower and stage it for
+/// the next user message (the message then carries the `<__media__>` marker, so
+/// the vision block is spliced into that turn's prefill). Vision models only.
+fn handle_image(session: &mut ChatSession, arg: &str) {
+    // Tolerate surrounding quotes (paths with spaces pasted with quotes).
+    let path = arg.trim().trim_matches('"').trim_matches('\'');
+    if path.is_empty() {
+        println!("usage: /image <path-to-image>");
+        return;
+    }
+    match session.attach_image(Path::new(path)) {
+        Ok((nx, ny, n_tok)) => println!(
+            "(image attached: {nx}×{ny} merged grid, {n_tok} tokens — sent with your next message)"
+        ),
+        Err(e) => println!("/image failed: {e}"),
     }
 }
 
