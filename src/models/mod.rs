@@ -152,6 +152,14 @@ pub trait Model: Send + Sync {
         Err("record_forward_unified (varlen prefill+decode) not implemented for this model".into())
     }
 
+    /// Whether [`Self::record_forward_unified`] is implemented — lets the server
+    /// scheduler use the token-budget / chunked-prefill loop (mixing prefill and
+    /// decode of different requests in one forward). Models without it fall back
+    /// to the serial-prefill + batched-decode path. Default `false`.
+    fn supports_unified(&self) -> bool {
+        false
+    }
+
     /// Conservative upper bound (in bytes) on the transient scratch one
     /// forward pass of `≤ n_ubatch` tokens needs, used to size the engine's
     /// scratch region (llama.cpp-style worst-case compute-buffer reservation).

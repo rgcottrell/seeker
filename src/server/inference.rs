@@ -251,12 +251,20 @@ struct ActiveSeq {
     stream_prefix_index: usize,
     /// Decoded-but-held-back tail (stop-sequence matching).
     pending: String,
-    /// Token to feed at the next batched decode step.
+    /// Token to feed at the next batched decode step (legacy decode path).
     last_token: u32,
     /// This slab's context length (`max_seq_len`).
     ctx: u32,
     terminal: Option<StopReason>,
     disconnected: bool,
+    /// Unified path: cache positions written so far for this slab (= the number
+    /// of logical tokens `prompt ++ generated` already prefilled/decoded). The
+    /// per-step contribution is `logical_len - num_computed`, chunked by the
+    /// token budget. Equals `batch.positions[slab]`.
+    num_computed: u32,
+    /// Whether `GenEvent::Started` has been sent (deferred until the unified
+    /// path finishes prefill and produces this sequence's first token).
+    started: bool,
 }
 
 /// GPU-resident state owned by the worker thread for the whole process. A
@@ -274,6 +282,16 @@ struct Worker {
     eog_ids: Vec<u32>,
     /// Monotonic LRU clock (incremented per admission; avoids wall-clock).
     clock: u64,
+    /// Per-step token budget for the unified scheduler (`max_num_batched_tokens`
+    /// in vLLM terms) — `= --ubatch-size` (bounds one forward to the scratch
+    /// reservation). Decode tokens are scheduled first,
+    /// then prefill chunks fill the remainder, so a long prefill is chunked
+    /// across steps instead of head-of-line-blocking active decodes.
+    max_batch_tokens: u32,
+    /// Whether the model implements the unified varlen forward. When true the
+    /// scheduler uses the token-budget / chunked-prefill loop; otherwise it
+    /// falls back to serial-prefill + batched-decode.
+    unified: bool,
 }
 
 /// Length of the longest common prefix of two token sequences.
@@ -371,6 +389,18 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     );
 
     let eog_ids = model.tokenizer().eog_ids.clone();
+    let unified = model.supports_unified();
+    // Per-step token budget = n_ubatch: the scratch region is sized for one
+    // n_ubatch-token forward (`scratch_bytes_estimate(n_ubatch, ...)` above), so
+    // a unified step must not pack more than that or it overflows scratch.
+    // (n_batch is the higher-level logical batch; n_ubatch is the per-forward
+    // micro-batch — the same split llama.cpp uses.)
+    let max_batch_tokens = cfg.n_ubatch.max(1);
+    tracing::info!(
+        unified,
+        max_batch_tokens,
+        "scheduler mode (unified = token-budget chunked prefill + decode mixing)"
+    );
     let slots = (0..n_slots)
         .map(|_| SlotMeta {
             prior_tokens: Vec::new(),
@@ -386,6 +416,8 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         active: Vec::new(),
         eog_ids,
         clock: 0,
+        max_batch_tokens,
+        unified,
     })
 }
 
@@ -412,23 +444,30 @@ fn worker_main(
     // whole active set one token in a single batched forward, stream + reap
     // finishers. `blocking_recv` is safe here (plain OS thread, not in tokio);
     // `None` ⇒ all senders dropped ⇒ shut down (Engine drops on return).
+    let unified = worker.unified;
     loop {
         if worker.active.is_empty() {
             // Idle: block for the next job (or shutdown).
             match jobs.blocking_recv() {
+                Some(job) if unified => worker.admit_unified(job),
                 Some(job) => worker.admit(job),
                 None => return,
             }
         }
-        // Drain queued jobs into any free slabs without blocking the decode.
+        // Drain queued jobs into any free slabs without blocking the step.
         while worker.free_slabs() > 0 {
             match jobs.try_recv() {
+                Ok(job) if unified => worker.admit_unified(job),
                 Ok(job) => worker.admit(job),
                 Err(_) => break, // empty or all-senders-dropped
             }
         }
         if !worker.active.is_empty() {
-            worker.decode_step();
+            if unified {
+                worker.schedule_step();
+            } else {
+                worker.decode_step();
+            }
             worker.evict_finished();
         }
     }
@@ -594,11 +633,218 @@ impl Worker {
             ctx,
             terminal: None,
             disconnected: false,
+            // Legacy path: admit() already prefilled + sent Started, so the
+            // cache holds the whole prompt and num_computed mirrors it. (Unused
+            // by the legacy decode_step; kept consistent for evict bookkeeping.)
+            num_computed: self.batch.positions[idx],
+            started: true,
         };
         // Stream the first (prefill) token now; it's fed back at the first
         // batched step. The rest advance in `decode_step`.
         process_token(&self.model.tokenizer().tokenizer, &self.eog_ids, &mut seq, first);
         self.active.push(seq);
+    }
+
+    /// Unified-path admission: pick a free slab and apply safe prefix-reuse to
+    /// set the starting cache position (`num_computed`), then push the request
+    /// to the active set WITHOUT prefilling. The prefill runs (chunked) in
+    /// [`Self::schedule_step`] alongside other requests' decode, so a long
+    /// prompt never blocks the worker. Failure → terminal frame + slab released.
+    fn admit_unified(&mut self, job: GenJob) {
+        let GenJob { tokens: new_tokens, config, reply } = job;
+        let GenConfig { sampler: cfg, max_tokens, stop, ignore_eos, id_slot } = config;
+        let prompt_tokens = new_tokens.len() as u32;
+        if new_tokens.is_empty() {
+            let _ = reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
+            return;
+        }
+        let Some(idx) = self.select_free_slab(&new_tokens, id_slot) else {
+            let _ = reply.blocking_send(GenEvent::Error("no free cache slot available".into()));
+            return;
+        };
+        let ctx = self.batch.config.max_seq_len;
+        if prompt_tokens >= ctx {
+            let _ = reply.blocking_send(GenEvent::Error(format!(
+                "prompt is {prompt_tokens} tokens but --ctx-size is {ctx} (no room to generate) — \
+                 raise --ctx-size or shorten the prompt"
+            )));
+            return;
+        }
+        self.clock += 1;
+        self.slots[idx].last_used = self.clock;
+
+        // Safe prefix-reuse: reuse the cached prefix only on a pure extension
+        // (same SSM/GDN-safe rule as the single-seq path), else reset.
+        let common = lcp(&self.slots[idx].prior_tokens, &new_tokens);
+        let cache_pos = self.batch.positions[idx];
+        let pure_extension = common > 0
+            && common == self.slots[idx].prior_tokens.len()
+            && common == cache_pos as usize;
+        let num_computed = if pure_extension {
+            // Reuse [0, common); prefill [common, prompt). If the whole prompt
+            // is cached, rewind one so there's a last token to sample from.
+            if common < new_tokens.len() { common as u32 } else { common as u32 - 1 }
+        } else {
+            self.batch.reset_slot(idx as u32);
+            0
+        };
+        self.batch.positions[idx] = num_computed;
+        self.slots[idx].active = true;
+        tracing::debug!(slab = idx, prompt = prompt_tokens, reused = num_computed, "serve: admit (unified)");
+
+        self.active.push(ActiveSeq {
+            slab: idx as u32,
+            sampler: Sampler::new(cfg),
+            prompt: new_tokens,
+            generated: Vec::new(),
+            prompt_tokens,
+            stop,
+            ignore_eos,
+            max_tokens,
+            reply,
+            stream_ids: Vec::new(),
+            stream_prefix: String::new(),
+            stream_prefix_index: 0,
+            pending: String::new(),
+            last_token: 0,
+            ctx,
+            terminal: None,
+            disconnected: false,
+            num_computed,
+            started: false,
+        });
+    }
+
+    /// One unified scheduler step: assign each active sequence a slice of the
+    /// per-step token budget — **decode tokens first** (so they never starve),
+    /// then **prefill chunks fill the remainder** — and run a single
+    /// `forward_unified`. A long prefill is chunked across steps, mixing with
+    /// other requests' decode in each forward (continuous batching, vLLM-style).
+    /// After the forward, sequences that caught up to their logical end sample +
+    /// stream their next token; mid-prefill chunks discard the (unused) column.
+    fn schedule_step(&mut self) {
+        let ctx = self.batch.config.max_seq_len;
+        let logical_len = |s: &ActiveSeq| s.prompt.len() + s.generated.len();
+
+        // Mark ctx-full sequences terminal (no room to write the next token).
+        for seq in self.active.iter_mut() {
+            if seq.terminal.is_none() && !seq.disconnected && seq.num_computed + 1 >= ctx {
+                seq.terminal = Some(StopReason::ContextFull);
+            }
+        }
+
+        // Token budget: decodes / final-prefill-tokens (remaining == 1) first,
+        // then prefill chunks (remaining > 1) fill whatever's left.
+        let mut budget = self.max_batch_tokens as usize;
+        let mut parts: Vec<(usize, u32)> = Vec::new(); // (active idx, num_new)
+        for (i, seq) in self.active.iter().enumerate() {
+            if seq.terminal.is_some() || seq.disconnected || budget == 0 {
+                continue;
+            }
+            if logical_len(seq) - seq.num_computed as usize == 1 {
+                parts.push((i, 1));
+                budget -= 1;
+            }
+        }
+        for (i, seq) in self.active.iter().enumerate() {
+            if seq.terminal.is_some() || seq.disconnected || budget == 0 {
+                continue;
+            }
+            let rem = logical_len(seq) - seq.num_computed as usize;
+            if rem > 1 {
+                let nn = (rem.min(budget)) as u32;
+                parts.push((i, nn));
+                budget -= nn as usize;
+            }
+        }
+        if parts.is_empty() {
+            return;
+        }
+        parts.sort_by_key(|&(i, _)| i); // ascending → aligns with sampler gather
+
+        // Build the flat packed batch (tokens / positions per token; seq_lens /
+        // slots per sequence).
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut positions: Vec<u32> = Vec::new();
+        let mut seq_lens: Vec<u32> = Vec::new();
+        let mut slots: Vec<u32> = Vec::new();
+        for &(i, nn) in &parts {
+            let seq = &self.active[i];
+            for off in 0..nn {
+                let li = (seq.num_computed + off) as usize;
+                let tok = if li < seq.prompt.len() {
+                    seq.prompt[li]
+                } else {
+                    seq.generated[li - seq.prompt.len()]
+                };
+                tokens.push(tok);
+                positions.push(seq.num_computed + off);
+            }
+            seq_lens.push(nn);
+            slots.push(seq.slab);
+        }
+
+        let part_idxs: std::collections::HashSet<usize> = parts.iter().map(|&(i, _)| i).collect();
+        let mut samplers: Vec<&mut Sampler> = self
+            .active
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| part_idxs.contains(i))
+            .map(|(_, s)| &mut s.sampler)
+            .collect();
+
+        let toks = match self.engine.forward_unified(
+            &*self.model,
+            &mut self.batch,
+            &tokens,
+            &positions,
+            &seq_lens,
+            &slots,
+            &mut samplers,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = e.to_string();
+                for &(i, _) in &parts {
+                    let _ = self.active[i].reply.blocking_send(GenEvent::Error(msg.clone()));
+                    self.active[i].disconnected = true;
+                    self.active[i].terminal = Some(StopReason::ContextFull);
+                }
+                return;
+            }
+        };
+        drop(samplers);
+
+        // Advance each participant; a sequence that reached its logical end this
+        // step (caught up) samples + streams `toks[k]`. Mid-prefill chunks just
+        // advanced `num_computed` (their column is unused).
+        for (k, &(i, nn)) in parts.iter().enumerate() {
+            self.active[i].num_computed += nn;
+            let caught_up =
+                self.active[i].num_computed as usize == logical_len(&self.active[i]);
+            if !caught_up {
+                continue;
+            }
+            if !self.active[i].started {
+                self.active[i].started = true;
+                let pt = self.active[i].prompt_tokens;
+                if self.active[i]
+                    .reply
+                    .blocking_send(GenEvent::Started { prompt_tokens: pt })
+                    .is_err()
+                {
+                    self.active[i].disconnected = true;
+                    continue;
+                }
+            }
+            let token = toks[k];
+            process_token(
+                &self.model.tokenizer().tokenizer,
+                &self.eog_ids,
+                &mut self.active[i],
+                token,
+            );
+        }
     }
 
     /// One batched decode step: gather the active sequences that still have
