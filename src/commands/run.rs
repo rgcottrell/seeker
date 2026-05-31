@@ -242,6 +242,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             batch_decode_smoke_test(&mut engine, model.as_ref())?;
             return Ok(());
         }
+        if std::env::var("SEEKER_UNIFIED_TEST").is_ok() {
+            unified_forward_smoke_test(&mut engine, model.as_ref())?;
+            return Ok(());
+        }
         if std::env::var("SEEKER_WQ_DUMP").is_ok() {
             wq_dump_test(&mut engine, model.weights())?;
             return Ok(());
@@ -600,6 +604,162 @@ fn batch_decode_smoke_test(
             "PASS (batched decode is byte-identical to serial)"
         } else {
             "FAIL (batched decode diverged from serial)"
+        }
+    );
+    Ok(())
+}
+
+/// Unified varlen forward (M5 Phase 2) smoke test. Validates
+/// `record_forward_unified` against the serial reference under a STAGGERED
+/// schedule — sequence `s` is admitted (full-prompt prefill) at step `s`, so
+/// at steps 1..B a forward mixes a fresh prefill chunk (the newly-admitted seq)
+/// with decode (the already-active seqs). Byte-identical token streams confirm
+/// correct varlen prefill + prefill/decode mixing in one forward. Run with
+/// `SEEKER_UNIFIED_TEST=1 seeker run --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn unified_forward_smoke_test(
+    engine: &mut Engine,
+    model: &dyn crate::models::Model,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
+    use crate::inference::sample::{Sampler, SamplerConfig};
+    use std::collections::HashSet;
+
+    // Long prompts so each prefill chunk spans several Bc=32 KV blocks — the
+    // varlen causal mask must hold across block boundaries (not just within one).
+    let prompts = vec![
+        "The history of computing began long before the invention of the modern electronic \
+         computer, with mechanical calculating devices and theoretical foundations laid over \
+         many centuries by mathematicians and engineers across the world. In summary,",
+        "Once upon a time, in a distant land beyond the tall mountains and the wide rivers, \
+         there lived a curious young inventor who spent every waking hour tinkering with gears, \
+         springs, and strange contraptions of her own design. One morning,",
+        "Two plus two equals four, and this simple arithmetic fact has been understood since \
+         antiquity; from there the rules of addition extend naturally to larger numbers and \
+         eventually to the abstract structures studied in modern algebra. Therefore,",
+    ];
+    let b = prompts.len();
+    let n_gen = 12usize;
+    let greedy = SamplerConfig { temperature: 0.0, ..SamplerConfig::default() };
+
+    let bundle = model.tokenizer();
+    let add_special = bundle.add_bos_default || bundle.add_eos_default;
+    let prompts_tokens: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| {
+            bundle.tokenizer.encode(*p, add_special)
+                .map(|e| e.get_ids().to_vec())
+                .map_err(|e| format!("tokenize failed: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let max_prompt = prompts_tokens.iter().map(|t| t.len()).max().unwrap();
+    let max_seq_len = (max_prompt + n_gen + 4) as u32;
+    let config = KvCacheConfig { k_dtype: GgmlType::F16, v_dtype: GgmlType::F16, max_seq_len };
+    let dims = model.cache_dims();
+    println!(
+        "Unified-forward test: B={b}, gen={n_gen}, prompt_lens={:?}",
+        prompts_tokens.iter().map(|t| t.len()).collect::<Vec<_>>()
+    );
+
+    // ---- Serial reference (single-seq prefill + decode, own cache) ----
+    let mut serial: Vec<Vec<u32>> = Vec::with_capacity(b);
+    for tokens in &prompts_tokens {
+        let mut cache =
+            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, config)?;
+        if let Some(ssm) = model.ssm_state_dims() {
+            cache.allocate_ssm_state(&engine.device, ssm.n_ssm_layers, ssm.conv_state_floats, ssm.gdn_state_floats)?;
+        }
+        let mut sampler = Sampler::new(greedy.clone());
+        let first = engine.forward_sampled(model, &mut cache, tokens, 0, &mut sampler)?;
+        let mut stream = vec![first];
+        let mut last = first;
+        for _ in 1..n_gen {
+            let pos = cache.position;
+            last = engine.forward_sampled(model, &mut cache, &[last], pos, &mut sampler)?;
+            stream.push(last);
+        }
+        serial.push(stream);
+    }
+    eprintln!("[unified test] serial reference done");
+
+    // ---- Unified path: staggered admission (seq s prefills at step s) ----
+    let mut batch =
+        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, b as u32, config)?;
+    if let Some(ssm) = model.ssm_state_dims() {
+        batch.allocate_ssm_state(&engine.device, ssm.n_ssm_layers, ssm.conv_state_floats, ssm.gdn_state_floats)?;
+    }
+    let mut samplers: Vec<Sampler> = (0..b).map(|_| Sampler::new(greedy.clone())).collect();
+    let mut generated: Vec<Vec<u32>> = vec![Vec::new(); b];
+    let mut last_token = vec![0u32; b];
+
+    let mut step = 0usize;
+    loop {
+        // Participants: admitted (admission_step = seq index, so s <= step) and
+        // not yet done.
+        let parts: Vec<usize> = (0..b).filter(|&s| s <= step && generated[s].len() < n_gen).collect();
+        if parts.is_empty() {
+            break;
+        }
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut positions: Vec<u32> = Vec::new();
+        let mut seq_lens: Vec<u32> = Vec::new();
+        let mut slots: Vec<u32> = Vec::new();
+        let mut kinds: Vec<&str> = Vec::new();
+        for &s in &parts {
+            if s == step {
+                // Prefill: the whole prompt as one chunk at base 0.
+                let pt = &prompts_tokens[s];
+                tokens.extend_from_slice(pt);
+                positions.extend(0..pt.len() as u32);
+                seq_lens.push(pt.len() as u32);
+                kinds.push("prefill");
+            } else {
+                // Decode: one token at the slab's current position.
+                tokens.push(last_token[s]);
+                positions.push(batch.positions[s]);
+                seq_lens.push(1);
+                kinds.push("decode");
+            }
+            slots.push(s as u32);
+        }
+        let part_set: HashSet<usize> = parts.iter().copied().collect();
+        let mut srefs: Vec<&mut Sampler> = samplers
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| part_set.contains(i))
+            .map(|(_, s)| s)
+            .collect();
+        let toks = engine
+            .forward_unified(model, &mut batch, &tokens, &positions, &seq_lens, &slots, &mut srefs)?;
+        drop(srefs);
+        eprintln!("[unified step {step}] parts={parts:?} kinds={kinds:?} toks={toks:?}");
+        for (i, &s) in parts.iter().enumerate() {
+            generated[s].push(toks[i]);
+            last_token[s] = toks[i];
+        }
+        step += 1;
+    }
+
+    // ---- Compare ----
+    let mut all_ok = true;
+    for s in 0..b {
+        let ok = serial[s] == generated[s];
+        all_ok &= ok;
+        let first_diff = serial[s].iter().zip(generated[s].iter()).position(|(a, b)| a != b);
+        println!(
+            "  seq {s}: {} (serial={:?} unified={:?}{})",
+            if ok { "MATCH" } else { "DIVERGE" },
+            &serial[s][..serial[s].len().min(8)],
+            &generated[s][..generated[s].len().min(8)],
+            first_diff.map(|i| format!(", first diff at token {i}")).unwrap_or_default(),
+        );
+    }
+    println!(
+        "  RESULT: {}",
+        if all_ok {
+            "PASS (unified varlen forward is byte-identical to serial)"
+        } else {
+            "FAIL (unified varlen forward diverged from serial)"
         }
     );
     Ok(())

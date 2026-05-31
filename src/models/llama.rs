@@ -531,6 +531,184 @@ impl Model for LlamaModel {
         }
         Ok(logits)
     }
+
+    /// Unified varlen forward (M5): see the trait doc. `tokens`/`positions` are
+    /// the flat `[N_total]` packed stream; `seq_lens[s]` is sequence `s`'s token
+    /// count this step (prefill chunk or 1 for decode). Mirrors
+    /// [`Self::record_forward_batch`] but the token dimension is `N_total` and
+    /// attention is varlen-causal (Phase-1 `record_batched` with `query_lens`).
+    fn record_forward_unified(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        seq_lens: &[u32],
+        slots: &[u32],
+    ) -> Result<crate::inference::weights::TensorView, Box<dyn Error>> {
+        use crate::inference::command::{record_compute_barriers, record_global_barrier};
+        let p = &self.params;
+        let b = seq_lens.len();
+        let n_total = tokens.len() as u64;
+        if b == 0 || n_total == 0 {
+            return Err("record_forward_unified: empty batch".into());
+        }
+        if positions.len() != tokens.len() || slots.len() != b {
+            return Err("record_forward_unified: tokens/positions/seq_lens/slots length mismatch".into());
+        }
+        if seq_lens.iter().map(|&l| l as u64).sum::<u64>() != n_total {
+            return Err("record_forward_unified: sum(seq_lens) != tokens.len()".into());
+        }
+        let hidden = p.n_embd as u64;
+        let head_dim = p.head_dim() as u64;
+        let n_kv_embd = p.n_embd_kv() as u64;
+        let n_ff = p.n_ff as u64;
+        let n_head = p.n_head as u64;
+        let n_head_kv = p.n_head_kv as u64;
+        let vocab = p.n_vocab as u64;
+        let elem = 4u64;
+
+        // Per-sequence flat offsets (prefix sum), causal lengths, query lengths.
+        let q_starts: Vec<u64> = seq_lens
+            .iter()
+            .scan(0u64, |a, &l| { let s = *a; *a += l as u64; Some(s) })
+            .collect();
+        // base_s = the seq's first token's absolute position; kv after this step.
+        let kv_lens: Vec<u32> = (0..b)
+            .map(|s| positions[q_starts[s] as usize] + seq_lens[s])
+            .collect();
+        let query_lens: Vec<u32> = seq_lens.to_vec();
+
+        // ---- prologue: N_total token ids + N_total flat positions ----
+        let token_buf = ctx.alloc_scratch(n_total * 4)?;
+        write_u32(ctx, token_buf, tokens)?;
+        let positions_buf = ctx.alloc_scratch(n_total * 4)?;
+        write_u32(ctx, positions_buf, positions)?;
+
+        let residual = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, n_total as u32, residual)?;
+        let fa_dyn_range = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
+        let layer_checkpoint = ctx.scratch_checkpoint();
+
+        let rope_params = rope::RopeParams::llama_default(p.rope_dim, p.rope_freq_base);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = (p.n_head / p.n_head_kv).max(1);
+        let fa_params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim as u32,
+            head_dim_v: head_dim as u32,
+            gqa_ratio,
+            scale,
+        };
+
+        for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
+            ctx.scratch_restore(layer_checkpoint);
+
+            let x_norm = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, residual, block.attn_norm, x_norm, p.rms_eps)?;
+
+            let q = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.wq, x_norm, q)?;
+            let k = ctx.alloc_tensor([n_kv_embd, n_total, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.wk, x_norm, k)?;
+            let v = ctx.alloc_tensor([n_kv_embd, n_total, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.wv, x_norm, v)?;
+            record_compute_barriers(ctx.device, ctx.cmd, &[q.range(), k.range(), v.range()]);
+
+            let q_view = reshape_for_rope(q, head_dim, n_head, n_total);
+            let k_view = reshape_for_rope(k, head_dim, n_head_kv, n_total);
+            let q_roped = ctx.alloc_tensor(q_view.dims, GgmlType::F32)?;
+            let k_roped = ctx.alloc_tensor(k_view.dims, GgmlType::F32)?;
+            rope::record_nofence(ctx, q_view, positions_buf, q_roped, rope_params)?;
+            rope::record_nofence(ctx, k_view, positions_buf, k_roped, rope_params)?;
+            record_compute_barriers(ctx.device, ctx.cmd, &[q_roped.range(), k_roped.range()]);
+
+            // Per-sequence K/V write: seq s's L_s-token chunk (flat columns
+            // [q_start, q_start+L)) lands in slab slots[s] at base_s.
+            let k_natural = reshape_for_rope(k_roped, head_dim, n_head_kv, n_total);
+            let v_natural = reshape_for_rope(v, head_dim, n_head_kv, n_total);
+            let tok_stride = head_dim * n_head_kv * elem; // bytes per token column
+            for s in 0..b {
+                let l = seq_lens[s] as u64;
+                let off = q_starts[s] * tok_stride;
+                let chunk = |t: TensorView| -> TensorView {
+                    TensorView {
+                        byte_offset: t.byte_offset + off,
+                        byte_size: l * tok_stride,
+                        dims: [head_dim, n_head_kv, l, 1],
+                        byte_stride: [elem, elem * head_dim, tok_stride, tok_stride * l],
+                        element_stride: [1, head_dim, head_dim * n_head_kv, head_dim * n_head_kv * l],
+                        ..t
+                    }
+                };
+                let base_pos = positions[q_starts[s] as usize];
+                cache_io::record_write(ctx, chunk(k_natural), batch.slot_k_view(slots[s], layer_idx as u32), base_pos)?;
+                cache_io::record_write(ctx, chunk(v_natural), batch.slot_v_view(slots[s], layer_idx as u32), base_pos)?;
+            }
+
+            // Varlen attention: each sequence's L_s query rows attend causally
+            // over its own slab; flat Q/out, in-shader causal mask.
+            let q_attn = permute_to_attn(q_roped, head_dim, n_total, n_head);
+            let k_attn = batch.batched_k_attn_view(layer_idx as u32);
+            let v_attn = batch.batched_v_attn_view(layer_idx as u32);
+            let attn_out = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+            flash_attn::record_batched(
+                ctx, q_attn, k_attn, v_attn, attn_out, fa_params, &kv_lens, fa_dyn_range,
+                Some(slots), Some(&query_lens),
+            )?;
+
+            let proj = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, block.wo, attn_out, proj)?;
+            elementwise::record_add(ctx, residual, proj, residual)?;
+
+            let x_norm2 = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, residual, block.ffn_norm, x_norm2, p.rms_eps)?;
+            let gate = ctx.alloc_tensor([n_ff, n_total, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.ffn_gate, x_norm2, gate)?;
+            let up = ctx.alloc_tensor([n_ff, n_total, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.ffn_up, x_norm2, up)?;
+            record_compute_barriers(ctx.device, ctx.cmd, &[gate.range(), up.range()]);
+            let gate_silu = ctx.alloc_tensor([n_ff, n_total, 1, 1], GgmlType::F32)?;
+            elementwise::record_silu(ctx, gate, gate_silu)?;
+            let ffn_hidden = ctx.alloc_tensor([n_ff, n_total, 1, 1], GgmlType::F32)?;
+            elementwise::record_mul(ctx, gate_silu, up, ffn_hidden)?;
+            let down = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, block.ffn_down, ffn_hidden, down)?;
+            elementwise::record_add(ctx, residual, down, residual)?;
+        }
+        ctx.scratch_restore(layer_checkpoint);
+
+        // Gather each sequence's LAST-token column (flat index q_start+L-1) into
+        // a packed [hidden, B] tensor, then norm + lm_head only on those B
+        // columns (avoids an N_total-wide lm_head). The sample at column s is
+        // sequence s's next token (valid iff s just finished prefill / decodes).
+        let last_hidden = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
+        record_global_barrier(ctx.device, ctx.cmd);
+        unsafe {
+            use ash::vk;
+            for s in 0..b {
+                let src_col = q_starts[s] + seq_lens[s] as u64 - 1;
+                let copy = vk::BufferCopy::default()
+                    .src_offset(residual.byte_offset + src_col * hidden * elem)
+                    .dst_offset(last_hidden.byte_offset + s as u64 * hidden * elem)
+                    .size(hidden * elem);
+                ctx.device.device.cmd_copy_buffer(
+                    ctx.cmd, residual.buffer, last_hidden.buffer, std::slice::from_ref(&copy),
+                );
+            }
+        }
+        record_global_barrier(ctx.device, ctx.cmd);
+
+        let final_norm = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
+        rms_norm::record(ctx, last_hidden, self.weights.output_norm, final_norm, p.rms_eps)?;
+        let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
+        let logits = ctx.alloc_tensor([vocab, b as u64, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, lm_head, final_norm, logits)?;
+
+        for s in 0..b {
+            batch.positions[slots[s] as usize] = kv_lens[s];
+        }
+        Ok(logits)
+    }
 }
 
 /// A single-column `[head_dim, n_head_kv, 1]` view of a `[head_dim, n_head_kv,

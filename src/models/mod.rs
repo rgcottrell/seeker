@@ -129,6 +129,29 @@ pub trait Model: Send + Sync {
         Err("record_forward_batch (batched decode) not implemented for this model".into())
     }
 
+    /// Unified varlen forward (M5): `B` sequences, sequence `s` contributing
+    /// `seq_lens[s]` tokens packed flat (in order) into `tokens` / `positions`
+    /// (`N_total = sum seq_lens`). Mixes prefill chunks (`L_s > 1`) and decode
+    /// (`L_s = 1`) in one forward; attention masks causally per sequence over
+    /// its own slab (`slots[s]`), continuing from the cached prefix at
+    /// `positions[first token of s]`. `positions[t]` is token `t`'s absolute
+    /// cache position; the new K/V land there. Returns the last-token logits of
+    /// each sequence — shape `[vocab, B]`, column `s` = logits at sequence `s`'s
+    /// final supplied token (sample it iff `s` just finished prefilling / is
+    /// decoding). Generalizes [`Self::record_forward_batch`] (the `L_s = 1`
+    /// case). Default: unimplemented.
+    fn record_forward_unified(
+        &self,
+        _ctx: &mut DispatchContext,
+        _batch: &mut crate::inference::kv_cache::BatchKvCache,
+        _tokens: &[u32],
+        _positions: &[u32],
+        _seq_lens: &[u32],
+        _slots: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        Err("record_forward_unified (varlen prefill+decode) not implemented for this model".into())
+    }
+
     /// Conservative upper bound (in bytes) on the transient scratch one
     /// forward pass of `≤ n_ubatch` tokens needs, used to size the engine's
     /// scratch region (llama.cpp-style worst-case compute-buffer reservation).
