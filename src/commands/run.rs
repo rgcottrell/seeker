@@ -740,7 +740,15 @@ fn fa_batch_smoke_test(
         .unwrap_or(2); // gqa_ratio = n_head / n_head_kv
     let gqa = (n_head / n_head_kv) as u32;
     let hidden = head_dim * n_head;
-    let kv_lens: Vec<u32> = vec![5, 8, 3];
+    // `SEEKER_FA_KV_LENS=200,137,256` overrides the per-sequence cache lengths
+    // (default short). Long lengths (> a few Bc=32 blocks) let the split-K
+    // heuristic — or a pinned `SEEKER_FA_SPLIT_KNUM` — fire, so this test also
+    // validates the batched split-K dispatch + combine against the CPU ref.
+    let kv_lens: Vec<u32> = std::env::var("SEEKER_FA_KV_LENS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<u32>>())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![5, 8, 3]);
     let b = kv_lens.len();
     let max_kv = *kv_lens.iter().max().unwrap() as usize;
     let scale = 1.0f32 / (head_dim as f32).sqrt();

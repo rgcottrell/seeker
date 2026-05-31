@@ -375,7 +375,8 @@ pub fn record(
             indirect_wg,
         )?;
         record_compute_barrier(ctx.device, ctx.cmd, partials.range());
-        record_split_k_combine(ctx, partials, out, params.head_dim_v, n, ne2, ne3, k_num)?;
+        // `dyn_range` (= ctx.decode_dyn) carries this call's k_num for the combine.
+        record_split_k_combine(ctx, partials, out, params.head_dim_v, n, ne2, ne3, k_num, dyn_range)?;
     }
     Ok(())
 }
@@ -388,11 +389,19 @@ pub fn record(
 /// slab. `kv_lens[b]` is sequence `b`'s cache length. `out` is `[hidden, B]`
 /// (`[HSV, n_head, B]`). No mask (a decode query attends to its whole cache).
 ///
-/// v1 uses no split-K (`k_num = 1`): each (row, head, seq) workgroup walks its
-/// sequence's KV serially. `blocks_per_split` is sized from the longest
-/// sequence so every sequence's full range is covered; shorter sequences stop
-/// early via the per-element `kv_base + c < p_KV` guard (`p_KV = kv_lens[seq]`).
-/// Split-K for long-context batches is a later (M4) refinement.
+/// Split-K (M4): base parallelism is `n_head * B` workgroups (one per head per
+/// sequence). When that under-fills the GPU — long context, few sequences — KV
+/// is split across `k_num` workgroups per head and merged by
+/// `flash_attn_split_k_reduce`, exactly as the single-sequence decode path. As
+/// `B` grows the base already saturates, so the heuristic falls back to
+/// `k_num = 1` (no split). `blocks_per_split` is sized from the longest
+/// sequence so every sequence's full range is covered; a shorter sequence stops
+/// early via the per-element `kv_base + c < p_KV` guard (`p_KV = kv_lens[seq]`),
+/// and its over-long splits run zero iterations (the combine weights them to
+/// ~0). The batched forward always re-records (no decode replay), so this uses
+/// a plain direct dispatch — none of the single-seq indirect-dispatch machinery
+/// that exists only to vary `k_num` across replayed submits. `SEEKER_FA_SPLIT=0`
+/// disables it; `SEEKER_FA_SPLIT_KNUM=<n>` pins it.
 pub fn record_batched(
     ctx: &mut DispatchContext,
     q: TensorView,
@@ -432,7 +441,18 @@ pub fn record_batched(
     };
 
     let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
-    let num_blocks = max_kv.div_ceil(FA_BC).max(1);
+
+    // Split-K decode heuristic for the batch (see the doc comment). `base_wgs`
+    // counts one workgroup per (head, sequence); `k_num` splits each head's KV
+    // only when that under-fills the GPU. When `k_num == 1`, `pick_k_num`
+    // returns `blocks_per_split == ceil(max_kv / Bc)` — the whole range in one
+    // split, identical to the pre-split single pass.
+    let n = 1u32; // one query row per head per sequence (decode)
+    let ne2 = q.dims[2] as u32; // n_head
+    let ne3 = b;
+    let base_wgs = n * ne2 * ne3;
+    let (k_num, blocks_per_split) =
+        pick_k_num_clamped(ctx.device.shader_core_count, base_wgs, max_kv);
 
     // Per-sequence DecodeDyn array: entry b's kv_len bounds sequence b's KV
     // loop; entry 0's k_num / blocks_per_split are read uniformly by every
@@ -460,8 +480,8 @@ pub fn record_batched(
             e.kv_len = kv_lens[i];
             e.slot = slots.map_or(i as u32, |s| s[i]);
         }
-        entries[0].k_num = 1;
-        entries[0].blocks_per_split = num_blocks;
+        entries[0].k_num = k_num;
+        entries[0].blocks_per_split = blocks_per_split;
         unsafe {
             let dst = host_ptr.add(dyn_range.offset as usize)
                 as *mut crate::inference::decode_dyn::DecodeDyn;
@@ -469,10 +489,7 @@ pub fn record_batched(
         }
     }
 
-    let n = 1u32; // one query row per head per sequence (decode)
-    let ne1 = n;
-    let ne2 = q.dims[2] as u32; // n_head
-    let ne3 = b;
+    let ne1 = n; // n / ne2 / ne3 computed with the split-K heuristic above
     let push_strides = [
         n,
         max_kv,
@@ -519,8 +536,8 @@ pub fn record_batched(
     put_f(&mut push, &mut w, 0.0); // m0
     put_f(&mut push, &mut w, 0.0); // m1
     put_u(&mut push, &mut w, params.gqa_ratio);
-    put_u(&mut push, &mut w, num_blocks); // split_kv (blocks per split)
-    put_u(&mut push, &mut w, 1); // k_num
+    put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
+    put_u(&mut push, &mut w, k_num);
 
     let spec_constants = vec![
         FA_BC,
@@ -538,25 +555,64 @@ pub fn record_batched(
     };
     let pipeline = *ctx.pipelines.get(ctx.device, key, variant_spv)?;
 
-    // Single-pass grid: one workgroup per (query-row, head, sequence).
-    let workgroups = [n, ne2, ne3];
-    super::bind_and_dispatch(
-        ctx,
-        &pipeline,
-        &[0, 1, 2, 3, 4, 5, 6],
-        &[
-            q.range(),
-            k.range(),
-            v.range(),
-            q.range(), // data_m stand-in (MASK_ENABLE=0 → never read)
-            out.range(), // data_o_split stand-in (k_num=1 → unused)
-            out.range(),
-            dyn_range,
-        ],
-        &push,
-        workgroups,
-    )?;
-    record_compute_barrier(ctx.device, ctx.cmd, out.range());
+    if k_num <= 1 {
+        // Single pass: one workgroup per (query-row, head, sequence) writes the
+        // normalized output directly. data_o_split (binding 4) is unused but
+        // still needs a live descriptor → bind `out`.
+        let workgroups = [n, ne2, ne3];
+        super::bind_and_dispatch(
+            ctx,
+            &pipeline,
+            &[0, 1, 2, 3, 4, 5, 6],
+            &[
+                q.range(),
+                k.range(),
+                v.range(),
+                q.range(),   // data_m stand-in (MASK_ENABLE=0 → never read)
+                out.range(), // data_o_split stand-in (k_num=1 → unused)
+                out.range(),
+                dyn_range,
+            ],
+            &push,
+            workgroups,
+        )?;
+        record_compute_barrier(ctx.device, ctx.cmd, out.range());
+    } else {
+        // Split-K: grid.y packs (head, split) = ne2 * k_num; .z is the
+        // sequence. Each workgroup writes its split's unnormalized O partial +
+        // (L, M) into `partials`, then the combine kernel merges k_num partials
+        // per (head, sequence). Direct dispatch — the batched forward always
+        // re-records, so no indirect-dispatch / FA_MAX_K_NUM padding needed:
+        // size partials at exactly k_num (the layout indexes by the runtime
+        // k_num) and pin the grid to k_num here.
+        let partials_floats = (params.head_dim_v as u64 + 2)
+            * n as u64
+            * ne2 as u64
+            * ne3 as u64
+            * k_num as u64;
+        let partials = ctx.alloc_tensor([partials_floats, 1, 1, 1], GgmlType::F32)?;
+        let workgroups = [n, ne2 * k_num, ne3];
+        super::bind_and_dispatch(
+            ctx,
+            &pipeline,
+            &[0, 1, 2, 3, 4, 5, 6],
+            &[
+                q.range(),
+                k.range(),
+                v.range(),
+                q.range(), // data_m stand-in (MASK_ENABLE=0 → never read)
+                partials.range(),
+                out.range(),
+                dyn_range,
+            ],
+            &push,
+            workgroups,
+        )?;
+        record_compute_barrier(ctx.device, ctx.cmd, partials.range());
+        // The combine reads k_num from `data_dyn[0]` — pass the same batched
+        // dyn_range whose entry 0 we set above (NOT ctx.decode_dyn).
+        record_split_k_combine(ctx, partials, out, params.head_dim_v, n, ne2, ne3, k_num, dyn_range)?;
+    }
     Ok(())
 }
 
@@ -628,6 +684,11 @@ fn record_split_k_combine(
     ne2: u32,
     ne3: u32,
     k_num: u32,
+    // DecodeDyn buffer the reduce kernel reads `k_num` from (`data_dyn[0]`).
+    // Single-seq decode passes `ctx.decode_dyn` (k_num written via
+    // `write_field_ctx`); batched decode passes its per-forward dyn_range whose
+    // entry 0 carries the same k_num.
+    dyn_range: crate::inference::buffer::BufferRange,
 ) -> Result<(), Box<dyn Error>> {
     let mut push = [0u8; FA_SPLIT_K_PUSH_BYTES as usize];
     let mut w = 0usize;
@@ -656,7 +717,6 @@ fn record_split_k_combine(
     )?;
     // data_a = partials, data_s = sinks (unused → dummy `out`), data_d = out, data_dyn = DecodeDyn.
     let workgroups = [ne1, head_dim_v.div_ceil(32), ne2 * ne3];
-    let dyn_range = ctx.decode_dyn;
     super::bind_and_dispatch(
         ctx,
         &pipeline,
