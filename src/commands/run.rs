@@ -117,10 +117,23 @@ pub struct RunArgs {
 
     /// Path to an image to prepend to the prompt (requires a VL model + its
     /// mmproj sidecar). The image is encoded by the vision tower and spliced
-    /// into the decoder as `<|vision_start|><|image_pad|>×N<|vision_end|>`
-    /// before the prompt text.
+    /// into the decoder as `<|vision_start|><|image_pad|>×N<|vision_end|>`.
+    /// Pair with `--chat` to match `llama-mtmd-cli`'s prompt construction.
     #[arg(long = "image")]
     image: Option<PathBuf>,
+
+    /// Wrap the prompt in the model's chat template (renders a single user turn
+    /// plus an assistant generation prompt). With `--image`, the media marker
+    /// is placed at the head of the user turn, mirroring llama-mtmd-cli.
+    /// Requires the GGUF to carry tokenizer.chat_template.
+    #[arg(long = "chat")]
+    chat: bool,
+
+    /// Extra chat-template variables as a JSON object, merged into the render
+    /// context (e.g. `--chat-template-kwargs '{"enable_thinking": false}'` to
+    /// suppress a thinking model's `<think>` opener). Only used with `--chat`.
+    #[arg(long = "chat-template-kwargs", value_parser = crate::chat_template::parse_template_kwargs)]
+    chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl RunArgs {
@@ -185,53 +198,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let gguf = GgufFile::open(&resolved.main)?;
     let bundle = build_tokenizer(&gguf)?;
 
-    // Build the token sequence. With `--image`, CPU-preprocess the image now
-    // (pure, no GPU) to learn the merged grid + token count, then splice the
-    // vision block `<|vision_start|><|image_pad|>×N<|vision_end|>` ahead of the
-    // prompt text. The GPU encode happens later (after the engine is up).
-    let add_special = bundle.add_bos_default || bundle.add_eos_default;
-    let mut image_setup: Option<ImageSetup> = None;
-    let tokens: Vec<u32> = if let Some(img_path) = args.image.clone() {
-        let mmproj_path = resolved.mmproj.clone().ok_or(
-            "--image requires the model's mmproj vision sidecar, but none was found \
-             (expected a *mmproj*.gguf next to the model)",
-        )?;
-        let mmproj_gguf = GgufFile::open(&mmproj_path)?;
-        let vcfg = crate::vision::parse_config(&mmproj_gguf)?;
-        let pcfg = crate::vision::preprocess::PreprocessConfig::qwen3vl_default(
-            vcfg.patch_size,
-            vcfg.spatial_merge_size,
-            vcfg.image_mean,
-            vcfg.image_std,
-        );
-        let pimg = crate::vision::preprocess::preprocess(&img_path, &pcfg)?;
-        let merge = vcfg.spatial_merge_size as usize;
-        let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
-        let n_tok = pimg.n_tokens as usize;
-        let prompt_tokens = bundle
-            .tokenizer
-            .encode(args.prompt.as_str(), false)
-            .map_err(|e| format!("tokenize failed: {e}"))?
-            .get_ids()
-            .to_vec();
-        let bos = if bundle.add_bos_default { bundle.bos_id } else { None };
-        let (tokens, start) = build_image_prompt_tokens(&bundle, bos, n_tok, &prompt_tokens)?;
-        tracing::info!(
-            image = ?img_path, resized = format!("{}x{}", pimg.resized_w, pimg.resized_h),
-            grid = format!("{}x{}", pimg.grid_w, pimg.grid_h), merged = format!("{nx}x{ny}"),
-            n_image_tokens = n_tok, image_start = start, seq_len = tokens.len(),
-            "image prompt assembled",
-        );
-        image_setup = Some(ImageSetup { mmproj_path, vcfg, pimg, nx, ny, start });
-        tokens
-    } else {
-        bundle
-            .tokenizer
-            .encode(args.prompt.as_str(), add_special)
-            .map_err(|e| format!("tokenize failed: {e}"))?
-            .get_ids()
-            .to_vec()
-    };
+    // Build the token sequence (raw or `--chat`, ± `--image`). With `--image`
+    // this CPU-preprocesses the image now (pure, no GPU) and returns an
+    // `ImageSetup` for the later GPU encode.
+    let (tokens, image_setup) = build_run_tokens(&args, &bundle, &resolved)?;
 
     let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
@@ -2873,55 +2843,157 @@ fn vision_scratch_estimate(setup: &ImageSetup) -> u64 {
     (28_000u64 * n_pos * (nlayers + 2) * 4).max(64 << 20)
 }
 
-/// Assemble the decoder token sequence for an image prompt:
-/// `[BOS?] <|vision_start|> <|image_pad|>×n_tok <|vision_end|> <prompt…>`.
-/// Returns the tokens and the local index of the first image-pad token. Pure
-/// (the caller resolves the ids) so it is unit-testable without a tokenizer.
+/// The media placeholder llama.cpp's mtmd uses (`mtmd_default_marker()`). With
+/// `--chat`, the rendered chat content embeds it; we split on it to insert the
+/// vision block at the position llama-mtmd-cli would.
+const MEDIA_MARKER: &str = "<__media__>";
+
+/// Splice a vision block between `prefix` and `suffix` token runs:
+/// `prefix… <|vision_start|> <|image_pad|>×n_tok <|vision_end|> …suffix`.
+/// Returns the tokens and the local index of the first image-pad token (where
+/// the vision-tower embeddings get spliced). Pure (the caller resolves the ids)
+/// so it is unit-testable without a tokenizer.
 fn assemble_image_tokens(
-    bos: Option<u32>,
+    prefix: &[u32],
     vision_start: u32,
     image_pad: u32,
     vision_end: u32,
     n_tok: usize,
-    prompt_tokens: &[u32],
+    suffix: &[u32],
 ) -> (Vec<u32>, usize) {
-    let mut tokens = Vec::with_capacity(bos.is_some() as usize + 2 + n_tok + prompt_tokens.len());
-    if let Some(b) = bos {
-        tokens.push(b);
-    }
+    let mut tokens = Vec::with_capacity(prefix.len() + 2 + n_tok + suffix.len());
+    tokens.extend_from_slice(prefix);
     tokens.push(vision_start);
     let start = tokens.len();
     tokens.resize(tokens.len() + n_tok, image_pad); // n_tok image-pad tokens
     tokens.push(vision_end);
-    tokens.extend_from_slice(prompt_tokens);
+    tokens.extend_from_slice(suffix);
     (tokens, start)
 }
 
-/// Resolve the qwen-vl vision special-token ids from the tokenizer and assemble
-/// the image prompt sequence (see [`assemble_image_tokens`]). Errors clearly if
-/// the model's tokenizer lacks the vision tokens.
-fn build_image_prompt_tokens(
+/// Resolve the qwen-vl vision special-token ids `(<|vision_start|>,
+/// <|image_pad|>, <|vision_end|>)` from the tokenizer. Errors clearly if the
+/// model's tokenizer lacks them (not a vision-capable model).
+fn vision_token_ids(
     bundle: &crate::tokenizer::TokenizerBundle,
-    bos: Option<u32>,
-    n_tok: usize,
-    prompt_tokens: &[u32],
-) -> Result<(Vec<u32>, usize), Box<dyn Error>> {
+) -> Result<(u32, u32, u32), Box<dyn Error>> {
     let tid = |s: &str| -> Result<u32, Box<dyn Error>> {
         bundle.tokenizer.token_to_id(s).ok_or_else(|| {
             format!("tokenizer has no {s} token — this model is not vision-capable").into()
         })
     };
-    let vision_start = tid("<|vision_start|>")?;
-    let image_pad = tid("<|image_pad|>")?;
-    let vision_end = tid("<|vision_end|>")?;
-    Ok(assemble_image_tokens(
-        bos,
-        vision_start,
-        image_pad,
-        vision_end,
-        n_tok,
-        prompt_tokens,
-    ))
+    Ok((tid("<|vision_start|>")?, tid("<|image_pad|>")?, tid("<|vision_end|>")?))
+}
+
+/// Build the decoder input tokens for `seeker run` across the four combos of
+/// {raw, `--chat`} × {text, `--image`}, returning the tokens and (when an image
+/// is present) the [`ImageSetup`] for the later GPU encode.
+///
+/// `--chat` renders the model's chat template (single user turn + generation
+/// prompt). With `--image`, the user content is `<__media__>` + prompt and the
+/// rendered string is split on the marker so the vision block lands exactly
+/// where `llama-mtmd-cli` puts it (`img_beg=<|vision_start|>`,
+/// `img_end=<|vision_end|>`). Without `--chat`, the prompt is fed raw (an image
+/// gets a leading `[BOS?]<|vision_start|>…<|vision_end|>` block).
+fn build_run_tokens(
+    args: &RunArgs,
+    bundle: &crate::tokenizer::TokenizerBundle,
+    resolved: &download::Resolved,
+) -> Result<(Vec<u32>, Option<ImageSetup>), Box<dyn Error>> {
+    let encode = |text: &str, add_special: bool| -> Result<Vec<u32>, Box<dyn Error>> {
+        Ok(bundle
+            .tokenizer
+            .encode(text, add_special)
+            .map_err(|e| format!("tokenize failed: {e}"))?
+            .get_ids()
+            .to_vec())
+    };
+
+    // Preprocess the image first (CPU) — its token count is needed before the
+    // sequence can be assembled.
+    let img = if let Some(img_path) = &args.image {
+        let mmproj_path = resolved.mmproj.clone().ok_or(
+            "--image requires the model's mmproj vision sidecar, but none was found \
+             (expected a *mmproj*.gguf next to the model)",
+        )?;
+        let mmproj_gguf = GgufFile::open(&mmproj_path)?;
+        let vcfg = crate::vision::parse_config(&mmproj_gguf)?;
+        let pcfg = crate::vision::preprocess::PreprocessConfig::qwen3vl_default(
+            vcfg.patch_size,
+            vcfg.spatial_merge_size,
+            vcfg.image_mean,
+            vcfg.image_std,
+        );
+        let pimg = crate::vision::preprocess::preprocess(img_path, &pcfg)?;
+        let merge = vcfg.spatial_merge_size as usize;
+        let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
+        let n_tok = pimg.n_tokens as usize;
+        Some((mmproj_path, vcfg, pimg, nx, ny, n_tok))
+    } else {
+        None
+    };
+
+    let (tokens, setup) = if args.chat {
+        let template = bundle
+            .chat_template
+            .as_deref()
+            .ok_or("--chat: the model's GGUF has no tokenizer.chat_template")?;
+        let content = if img.is_some() {
+            format!("{MEDIA_MARKER}{}", args.prompt) // marker first, like llama-mtmd-cli
+        } else {
+            args.prompt.clone()
+        };
+        let messages = vec![crate::chat_template::ChatMessage::user(content)];
+        let kwargs = args.chat_template_kwargs.clone().unwrap_or_default();
+        let rendered = crate::chat_template::render(
+            template,
+            &messages,
+            /*add_generation_prompt=*/ true,
+            bundle.bos_token.as_deref().unwrap_or(""),
+            bundle.eos_token.as_deref().unwrap_or(""),
+            &kwargs,
+        )?;
+        match img {
+            Some((mmproj_path, vcfg, pimg, nx, ny, n_tok)) => {
+                let (before, after) = rendered
+                    .split_once(MEDIA_MARKER)
+                    .ok_or("rendered chat prompt lost the <__media__> marker")?;
+                let (vstart, ipad, vend) = vision_token_ids(bundle)?;
+                let before_tokens = encode(before, false)?;
+                let after_tokens = encode(after, false)?;
+                let (tokens, start) =
+                    assemble_image_tokens(&before_tokens, vstart, ipad, vend, n_tok, &after_tokens);
+                (tokens, Some(ImageSetup { mmproj_path, vcfg, pimg, nx, ny, start }))
+            }
+            None => (encode(&rendered, false)?, None),
+        }
+    } else {
+        let add_special = bundle.add_bos_default || bundle.add_eos_default;
+        match img {
+            Some((mmproj_path, vcfg, pimg, nx, ny, n_tok)) => {
+                let (vstart, ipad, vend) = vision_token_ids(bundle)?;
+                let prefix: Vec<u32> =
+                    bundle.add_bos_default.then_some(bundle.bos_id).flatten().into_iter().collect();
+                let suffix = encode(&args.prompt, false)?;
+                let (tokens, start) =
+                    assemble_image_tokens(&prefix, vstart, ipad, vend, n_tok, &suffix);
+                (tokens, Some(ImageSetup { mmproj_path, vcfg, pimg, nx, ny, start }))
+            }
+            None => (encode(&args.prompt, add_special)?, None),
+        }
+    };
+
+    if let Some(s) = &setup {
+        tracing::info!(
+            image = ?args.image, chat = args.chat,
+            resized = format!("{}x{}", s.pimg.resized_w, s.pimg.resized_h),
+            grid = format!("{}x{}", s.pimg.grid_w, s.pimg.grid_h),
+            merged = format!("{}x{}", s.nx, s.ny),
+            n_image_tokens = s.nx * s.ny, image_start = s.start, seq_len = tokens.len(),
+            "image prompt assembled",
+        );
+    }
+    Ok((tokens, setup))
 }
 
 /// Resolve the main model path (and any matching mmproj sidecar) from either a
@@ -2989,30 +3061,39 @@ fn load_vision(
 mod image_prompt_tests {
     use super::assemble_image_tokens;
 
-    /// `<|vision_start|>=10`, `<|image_pad|>=11`, `<|vision_end|>=12`, no BOS,
-    /// 3 image tokens, prompt = [7, 8]. Sequence is start/pads/end then prompt;
-    /// `start` points at the first pad.
+    /// `<|vision_start|>=10`, `<|image_pad|>=11`, `<|vision_end|>=12`, empty
+    /// prefix, 3 image tokens, suffix = [7, 8]. Sequence is start/pads/end then
+    /// suffix; `start` points at the first pad.
     #[test]
-    fn assembles_vision_block_then_prompt() {
-        let (toks, start) = assemble_image_tokens(None, 10, 11, 12, 3, &[7, 8]);
+    fn assembles_vision_block_then_suffix() {
+        let (toks, start) = assemble_image_tokens(&[], 10, 11, 12, 3, &[7, 8]);
         assert_eq!(toks, vec![10, 11, 11, 11, 12, 7, 8]);
         assert_eq!(start, 1);
         // The n_tok image-pad tokens are exactly the [start, start+n_tok) slots.
         assert!(toks[start..start + 3].iter().all(|&t| t == 11));
     }
 
-    /// A BOS shifts everything (including `start`) right by one.
+    /// A raw-mode BOS prefix shifts everything (including `start`) right by one.
     #[test]
-    fn bos_shifts_image_start() {
-        let (toks, start) = assemble_image_tokens(Some(1), 10, 11, 12, 2, &[9]);
+    fn prefix_shifts_image_start() {
+        let (toks, start) = assemble_image_tokens(&[1], 10, 11, 12, 2, &[9]);
         assert_eq!(toks, vec![1, 10, 11, 11, 12, 9]);
         assert_eq!(start, 2);
     }
 
-    /// Empty prompt (caption-style): just the vision block.
+    /// Chat mode: a multi-token prefix (e.g. `<|im_start|>user\n`) and suffix
+    /// (the prompt text + `<|im_end|>…assistant`) bracket the vision block.
     #[test]
-    fn empty_prompt_is_vision_block_only() {
-        let (toks, start) = assemble_image_tokens(None, 10, 11, 12, 4, &[]);
+    fn chat_prefix_and_suffix_bracket_vision_block() {
+        let (toks, start) = assemble_image_tokens(&[100, 101], 10, 11, 12, 2, &[200, 201, 202]);
+        assert_eq!(toks, vec![100, 101, 10, 11, 11, 12, 200, 201, 202]);
+        assert_eq!(start, 3);
+    }
+
+    /// Empty prefix + empty suffix (caption-style, no chat): just the block.
+    #[test]
+    fn empty_prefix_and_suffix_is_vision_block_only() {
+        let (toks, start) = assemble_image_tokens(&[], 10, 11, 12, 4, &[]);
         assert_eq!(toks, vec![10, 11, 11, 11, 11, 12]);
         assert_eq!(start, 1);
     }
