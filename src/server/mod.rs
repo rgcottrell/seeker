@@ -2,13 +2,17 @@
 //! over [`run`]; tests and future embedded users build the same router via
 //! [`router::build_router`].
 //!
-//! Every endpoint is presently a stub that returns shape-correct, deterministic
-//! placeholder responses. Real inference will land later by replacing the body
-//! of each handler in `handlers/*` — the wire types and routes already match
-//! what llama.cpp's `llama-server` exposes (OpenAI + Anthropic + native).
+//! Generation endpoints drive the GPU engine through a dedicated worker thread
+//! ([`inference`]); the wire types and routes match what llama.cpp's
+//! `llama-server` exposes (OpenAI + Anthropic + native). Endpoints with no
+//! analogue on a causal-LM logits engine (embeddings, rerank, audio) return a
+//! clear 501.
 
 pub mod config;
+pub mod convert;
+pub mod error;
 pub mod handlers;
+pub mod inference;
 pub mod router;
 pub mod state;
 pub mod stream;
@@ -18,7 +22,7 @@ use std::error::Error;
 
 pub use config::ServerConfig;
 pub use router::build_router;
-pub use state::AppState;
+pub use state::{AppState, AppStateInit};
 
 /// Bind to `(host, port)` and serve until the process is interrupted.
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn Error>> {

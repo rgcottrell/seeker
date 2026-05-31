@@ -343,6 +343,26 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             gdn_smoke_test(&mut engine, model.weights())?;
             return Ok(());
         }
+        if std::env::var("SEEKER_FA_BATCH_TEST").is_ok() {
+            fa_batch_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_FA_VARLEN_TEST").is_ok() {
+            fa_varlen_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_GDN_BATCH_TEST").is_ok() {
+            gdn_batch_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_BATCH_DECODE_TEST").is_ok() {
+            batch_decode_smoke_test(&mut engine, model.as_ref())?;
+            return Ok(());
+        }
+        if std::env::var("SEEKER_UNIFIED_TEST").is_ok() {
+            unified_forward_smoke_test(&mut engine, model.as_ref())?;
+            return Ok(());
+        }
         if std::env::var("SEEKER_WQ_DUMP").is_ok() {
             wq_dump_test(&mut engine, model.weights())?;
             return Ok(());
@@ -363,6 +383,20 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             rms_norm_qwen_smoke(&mut engine, model.weights())?;
             return Ok(());
         }
+    }
+
+    // Throughput benchmark — outside the `gpu_debug` gate so it runs in a
+    // release build (no validation-layer overhead skewing the numbers).
+    if std::env::var("SEEKER_BATCH_BENCH").is_ok() {
+        batch_decode_bench(&mut engine, model.as_ref())?;
+        return Ok(());
+    }
+    // Release-capable per-layer divergence dump — bisects the qwen unified
+    // release race by running the same unified forward N times and reporting
+    // the first dumped record whose hash differs across runs.
+    if std::env::var("SEEKER_UNIFIED_DUMP").is_ok() {
+        unified_dump_test(&mut engine, model.as_ref())?;
+        return Ok(());
     }
 
     // `max_seq_len` was computed above (used to size the scratch region).
@@ -555,6 +589,868 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         "timing:    prefill {prefill_tokens} tok in {:.3}s ({prefill_tps:.1} tok/s), decode {} tok in {:.3}s ({decode_tps:.1} tok/s)",
         prefill_secs, decode_steps as u32, decode_secs,
     );
+    Ok(())
+}
+
+/// End-to-end batched-decode correctness test: decode B distinct prompts both
+/// serially (each in its own KvCache) and as a batch (one BatchKvCache, one
+/// `forward_batch_decode` per step), with greedy sampling, and assert the token
+/// streams are **byte-identical** per sequence. This is M1's gate — proof that
+/// batching N sequences into one forward changes nothing about each sequence's
+/// output. Run with `SEEKER_BATCH_DECODE_TEST=1 seeker run --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn batch_decode_smoke_test(
+    engine: &mut Engine,
+    model: &dyn crate::models::Model,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
+    use crate::inference::sample::{Sampler, SamplerConfig};
+
+    let prompts: Vec<&str> = if std::env::var("SEEKER_BATCH_B1").is_ok() {
+        vec!["The capital of France is"]
+    } else if std::env::var("SEEKER_BATCH_SAME").is_ok() {
+        vec![
+            "The capital of France is",
+            "The capital of France is",
+            "The capital of France is",
+        ]
+    } else {
+        vec![
+            "The capital of France is",
+            "Once upon a time, in a land",
+            "Two plus two equals",
+        ]
+    };
+    let b = prompts.len();
+    let n_gen = 16usize; // tokens to generate per sequence (incl. the first)
+
+    let greedy = SamplerConfig {
+        temperature: 0.0,
+        ..SamplerConfig::default()
+    };
+
+    // Tokenize each prompt.
+    let bundle = model.tokenizer();
+    let add_special = bundle.add_bos_default || bundle.add_eos_default;
+    let prompts_tokens: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| {
+            bundle
+                .tokenizer
+                .encode(*p, add_special)
+                .map(|e| e.get_ids().to_vec())
+                .map_err(|e| format!("tokenize failed: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let max_prompt = prompts_tokens.iter().map(|t| t.len()).max().unwrap();
+    let max_seq_len = (max_prompt + n_gen + 4) as u32;
+    let config = KvCacheConfig {
+        k_dtype: GgmlType::F16,
+        v_dtype: GgmlType::F16,
+        max_seq_len,
+    };
+    let dims = model.cache_dims();
+
+    println!(
+        "Batch-decode test: B={b}, gen={n_gen}, prompts={:?}",
+        prompts_tokens.iter().map(|t| t.len()).collect::<Vec<_>>()
+    );
+
+    // ---- Serial reference: each prompt in its own cache ----
+    let mut serial: Vec<Vec<u32>> = Vec::with_capacity(b);
+    for tokens in &prompts_tokens {
+        let mut cache =
+            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, config)?;
+        if let Some(ssm) = model.ssm_state_dims() {
+            cache.allocate_ssm_state(
+                &engine.device,
+                ssm.n_ssm_layers,
+                ssm.conv_state_floats,
+                ssm.gdn_state_floats,
+            )?;
+        }
+        let mut sampler = Sampler::new(greedy.clone());
+        // Prefill (samples the first token), then greedy decode the rest.
+        let first = engine.forward_sampled(model, &mut cache, tokens, 0, &mut sampler)?;
+        let mut stream = vec![first];
+        let mut last = first;
+        for _ in 1..n_gen {
+            let pos = cache.position;
+            last = engine.forward_sampled(model, &mut cache, &[last], pos, &mut sampler)?;
+            stream.push(last);
+        }
+        serial.push(stream);
+    }
+    eprintln!("[batch test] serial reference done ({} streams)", serial.len());
+
+    // ---- Batched: all prompts in one BatchKvCache ----
+    // `SEEKER_BATCH_PERM` parks sequence `s` in a *non-contiguous* slab
+    // (`2*s+1`, leaving even slabs empty) to exercise the gathered, slot-indexed
+    // batched decode (continuous-batching with prefix-reuse parking). The
+    // per-sequence result must be independent of which slab it lives in.
+    let perm: Vec<u32> = if std::env::var("SEEKER_BATCH_PERM").is_ok() {
+        (0..b as u32).map(|s| 2 * s + 1).collect()
+    } else {
+        (0..b as u32).collect()
+    };
+    let n_slots = perm.iter().copied().max().unwrap_or(0) + 1;
+    println!("Batched slab assignment (slot per seq): {perm:?}, n_slots={n_slots}");
+    let mut batch =
+        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, n_slots, config)?;
+    if let Some(ssm) = model.ssm_state_dims() {
+        batch.allocate_ssm_state(
+            &engine.device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
+    }
+    let mut samplers: Vec<Sampler> = (0..b).map(|_| Sampler::new(greedy.clone())).collect();
+    let mut last: Vec<u32> = vec![0; b];
+    let mut batched: Vec<Vec<u32>> = Vec::with_capacity(b);
+    // Prefill each sequence into its (possibly non-contiguous) slab.
+    for (s, tokens) in prompts_tokens.iter().enumerate() {
+        let mut sc = batch.slot_kvcache(perm[s]);
+        let first = engine.forward_sampled(model, &mut sc, tokens, 0, &mut samplers[s])?;
+        batch.positions[perm[s] as usize] = sc.position;
+        last[s] = first;
+        batched.push(vec![first]);
+        eprintln!("[batch test] prefill seq {s} done (slab {}, first token {first})", perm[s]);
+    }
+    // Batched decode steps.
+    for step in 1..n_gen {
+        let positions: Vec<u32> = (0..b).map(|s| batch.positions[perm[s] as usize]).collect();
+        let mut srefs: Vec<&mut Sampler> = samplers.iter_mut().collect();
+        let toks = engine
+            .forward_batch_decode(model, &mut batch, &last, &positions, &perm, &mut srefs)?;
+        let matches: Vec<bool> = (0..b)
+            .map(|s| serial[s].get(step).map(|&t| t == toks[s]).unwrap_or(false))
+            .collect();
+        eprintln!("[batch step {step}] toks={toks:?} match={matches:?}");
+        for s in 0..b {
+            batched[s].push(toks[s]);
+            last[s] = toks[s];
+        }
+    }
+
+    // ---- Compare ----
+    let mut all_ok = true;
+    for s in 0..b {
+        let ok = serial[s] == batched[s];
+        all_ok &= ok;
+        let first_diff = serial[s]
+            .iter()
+            .zip(batched[s].iter())
+            .position(|(a, b)| a != b);
+        println!(
+            "  seq {s}: {} (serial={:?} batched={:?}{})",
+            if ok { "MATCH" } else { "DIVERGE" },
+            &serial[s][..serial[s].len().min(8)],
+            &batched[s][..batched[s].len().min(8)],
+            first_diff
+                .map(|i| format!(", first diff at token {i}"))
+                .unwrap_or_default(),
+        );
+    }
+    println!(
+        "  RESULT: {}",
+        if all_ok {
+            "PASS (batched decode is byte-identical to serial)"
+        } else {
+            "FAIL (batched decode diverged from serial)"
+        }
+    );
+    Ok(())
+}
+
+/// Unified varlen forward (M5 Phase 2) smoke test. Validates
+/// `record_forward_unified` against the serial reference under a STAGGERED
+/// schedule — sequence `s` is admitted (full-prompt prefill) at step `s`, so
+/// at steps 1..B a forward mixes a fresh prefill chunk (the newly-admitted seq)
+/// with decode (the already-active seqs). Byte-identical token streams confirm
+/// correct varlen prefill + prefill/decode mixing in one forward. Run with
+/// `SEEKER_UNIFIED_TEST=1 seeker run --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn unified_forward_smoke_test(
+    engine: &mut Engine,
+    model: &dyn crate::models::Model,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
+    use crate::inference::sample::{Sampler, SamplerConfig};
+    use std::collections::HashSet;
+
+    // Long prompts so each prefill chunk spans several Bc=32 KV blocks — the
+    // varlen causal mask must hold across block boundaries (not just within one).
+    let prompts = vec![
+        "The history of computing began long before the invention of the modern electronic \
+         computer, with mechanical calculating devices and theoretical foundations laid over \
+         many centuries by mathematicians and engineers across the world. In summary,",
+        "Once upon a time, in a distant land beyond the tall mountains and the wide rivers, \
+         there lived a curious young inventor who spent every waking hour tinkering with gears, \
+         springs, and strange contraptions of her own design. One morning,",
+        "Two plus two equals four, and this simple arithmetic fact has been understood since \
+         antiquity; from there the rules of addition extend naturally to larger numbers and \
+         eventually to the abstract structures studied in modern algebra. Therefore,",
+    ];
+    let b = prompts.len();
+    let n_gen = 12usize;
+    let greedy = SamplerConfig { temperature: 0.0, ..SamplerConfig::default() };
+
+    let bundle = model.tokenizer();
+    let add_special = bundle.add_bos_default || bundle.add_eos_default;
+    let prompts_tokens: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| {
+            bundle.tokenizer.encode(*p, add_special)
+                .map(|e| e.get_ids().to_vec())
+                .map_err(|e| format!("tokenize failed: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let max_prompt = prompts_tokens.iter().map(|t| t.len()).max().unwrap();
+    let max_seq_len = (max_prompt + n_gen + 4) as u32;
+    let config = KvCacheConfig { k_dtype: GgmlType::F16, v_dtype: GgmlType::F16, max_seq_len };
+    let dims = model.cache_dims();
+    println!(
+        "Unified-forward test: B={b}, gen={n_gen}, prompt_lens={:?}",
+        prompts_tokens.iter().map(|t| t.len()).collect::<Vec<_>>()
+    );
+
+    // ---- Serial reference (single-seq prefill + decode, own cache) ----
+    let mut serial: Vec<Vec<u32>> = Vec::with_capacity(b);
+    for tokens in &prompts_tokens {
+        let mut cache =
+            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, config)?;
+        if let Some(ssm) = model.ssm_state_dims() {
+            cache.allocate_ssm_state(&engine.device, ssm.n_ssm_layers, ssm.conv_state_floats, ssm.gdn_state_floats)?;
+        }
+        let mut sampler = Sampler::new(greedy.clone());
+        let first = engine.forward_sampled(model, &mut cache, tokens, 0, &mut sampler)?;
+        let mut stream = vec![first];
+        let mut last = first;
+        for _ in 1..n_gen {
+            let pos = cache.position;
+            last = engine.forward_sampled(model, &mut cache, &[last], pos, &mut sampler)?;
+            stream.push(last);
+        }
+        serial.push(stream);
+    }
+    eprintln!("[unified test] serial reference done");
+
+    // ---- Unified path: staggered admission (seq s prefills at step s) ----
+    let mut batch =
+        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, b as u32, config)?;
+    if let Some(ssm) = model.ssm_state_dims() {
+        batch.allocate_ssm_state(&engine.device, ssm.n_ssm_layers, ssm.conv_state_floats, ssm.gdn_state_floats)?;
+    }
+    let mut samplers: Vec<Sampler> = (0..b).map(|_| Sampler::new(greedy.clone())).collect();
+    let mut generated: Vec<Vec<u32>> = vec![Vec::new(); b];
+    let mut last_token = vec![0u32; b];
+
+    let mut step = 0usize;
+    loop {
+        // Participants: admitted (admission_step = seq index, so s <= step) and
+        // not yet done.
+        let parts: Vec<usize> = (0..b).filter(|&s| s <= step && generated[s].len() < n_gen).collect();
+        if parts.is_empty() {
+            break;
+        }
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut positions: Vec<u32> = Vec::new();
+        let mut seq_lens: Vec<u32> = Vec::new();
+        let mut slots: Vec<u32> = Vec::new();
+        let mut kinds: Vec<&str> = Vec::new();
+        for &s in &parts {
+            if s == step {
+                // Prefill: the whole prompt as one chunk at base 0.
+                let pt = &prompts_tokens[s];
+                tokens.extend_from_slice(pt);
+                positions.extend(0..pt.len() as u32);
+                seq_lens.push(pt.len() as u32);
+                kinds.push("prefill");
+            } else {
+                // Decode: one token at the slab's current position.
+                tokens.push(last_token[s]);
+                positions.push(batch.positions[s]);
+                seq_lens.push(1);
+                kinds.push("decode");
+            }
+            slots.push(s as u32);
+        }
+        let part_set: HashSet<usize> = parts.iter().copied().collect();
+        let mut srefs: Vec<&mut Sampler> = samplers
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| part_set.contains(i))
+            .map(|(_, s)| s)
+            .collect();
+        let toks = engine
+            .forward_unified(model, &mut batch, &tokens, &positions, &seq_lens, &slots, &mut srefs)?;
+        drop(srefs);
+        eprintln!("[unified step {step}] parts={parts:?} kinds={kinds:?} toks={toks:?}");
+        for (i, &s) in parts.iter().enumerate() {
+            generated[s].push(toks[i]);
+            last_token[s] = toks[i];
+        }
+        step += 1;
+    }
+
+    // ---- Compare ----
+    let mut all_ok = true;
+    for s in 0..b {
+        let ok = serial[s] == generated[s];
+        all_ok &= ok;
+        let first_diff = serial[s].iter().zip(generated[s].iter()).position(|(a, b)| a != b);
+        println!(
+            "  seq {s}: {} (serial={:?} unified={:?}{})",
+            if ok { "MATCH" } else { "DIVERGE" },
+            &serial[s][..serial[s].len().min(8)],
+            &generated[s][..generated[s].len().min(8)],
+            first_diff.map(|i| format!(", first diff at token {i}")).unwrap_or_default(),
+        );
+    }
+    println!(
+        "  RESULT: {}",
+        if all_ok {
+            "PASS (unified varlen forward is byte-identical to serial)"
+        } else {
+            "FAIL (unified varlen forward diverged from serial)"
+        }
+    );
+    Ok(())
+}
+
+/// Release-capable per-layer divergence dump (NOT gpu_debug-gated) for bisecting
+/// the qwen unified release-only nondeterminism. Runs `record_forward_unified`
+/// `N` times on the SAME single-sequence prefill (resetting the slab's SSM state
+/// between runs), dumping the residual after each block + MoE, and reports the
+/// first dumped record whose hash differs across runs — the offending op. Run
+/// with `SEEKER_UNIFIED_DUMP=1 seeker run -m <qwen>` (override runs/prompt via
+/// `SEEKER_DUMP_RUNS`, `SEEKER_DUMP_PROMPT`).
+fn unified_dump_test(
+    engine: &mut Engine,
+    model: &dyn crate::models::Model,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
+
+    let env_usize = |k: &str, d: usize| {
+        std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    };
+    let runs = env_usize("SEEKER_DUMP_RUNS", 4);
+    let prompt_len = env_usize("SEEKER_DUMP_PROMPT", 80);
+
+    let bundle = model.tokenizer();
+    let seed = bundle
+        .tokenizer
+        .encode("The history of computing began long before the invention of", true)
+        .map(|e| e.get_ids().to_vec())
+        .map_err(|e| format!("tokenize failed: {e}"))?;
+    let prompt: Vec<u32> = (0..prompt_len).map(|i| seed[i % seed.len()]).collect();
+    let positions: Vec<u32> = (0..prompt.len() as u32).collect();
+    let seq_lens = vec![prompt.len() as u32];
+    let slots = vec![0u32];
+
+    let dims = model.cache_dims();
+    let config = KvCacheConfig {
+        k_dtype: GgmlType::F16,
+        v_dtype: GgmlType::F16,
+        max_seq_len: (prompt.len() + 16) as u32,
+    };
+    let mut batch =
+        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, 1, config)?;
+    if let Some(ssm) = model.ssm_state_dims() {
+        batch.allocate_ssm_state(
+            &engine.device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
+    }
+
+    println!("Unified dump: prompt_len={}, runs={runs} (same input each run)", prompt.len());
+    let mut reference: Option<Vec<(String, u64)>> = None;
+    for run in 0..runs {
+        // Fresh start each run: zero the slab's SSM state, rewind position. The
+        // prefill overwrites K/V [0, len). So each run begins identically →
+        // any cross-run difference is the bug.
+        batch.reset_slot(0);
+        batch.positions[0] = 0;
+        let h = engine
+            .forward_unified_dump(model, &mut batch, &prompt, &positions, &seq_lens, &slots)?;
+        match &reference {
+            None => {
+                println!("  run {run}: captured {} dump records (reference)", h.len());
+                reference = Some(h);
+            }
+            Some(r) => {
+                let first = r
+                    .iter()
+                    .zip(h.iter())
+                    .enumerate()
+                    .find(|(_, ((_, h1), (_, h2)))| h1 != h2);
+                match first {
+                    Some((i, ((label, h1), (_, h2)))) => {
+                        let n_diff = r.iter().zip(h.iter()).filter(|((_, a), (_, b))| a != b).count();
+                        println!(
+                            "  run {run}: FIRST DIVERGENCE at record {i} '{label}': {h1:016x} vs {h2:016x}  ({n_diff}/{} records differ)",
+                            r.len()
+                        );
+                    }
+                    None => println!("  run {run}: identical to reference (all {} records match)", r.len()),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Aggregate decode-throughput benchmark for batched decode. Decode is
+/// bandwidth-bound (each token re-reads the whole weight set), so batching B
+/// sequences into one forward amortizes that read across B tokens — aggregate
+/// tok/s should scale up with B until the path turns compute-bound. Prefills B
+/// contiguous slabs with a fixed prompt, times `n_decode` batched steps per
+/// batch size, and prints aggregate / per-sequence tok/s. The B=1 row is the
+/// single-stream baseline. Run with `SEEKER_BATCH_BENCH=1 seeker run`. Override
+/// with `SEEKER_BENCH_BATCHES=1,2,4,8`, `SEEKER_BENCH_PROMPT=128`,
+/// `SEEKER_BENCH_DECODE=128`.
+fn batch_decode_bench(
+    engine: &mut Engine,
+    model: &dyn crate::models::Model,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
+    use crate::inference::sample::{Sampler, SamplerConfig};
+    use std::time::Instant;
+
+    let env_usize = |k: &str, d: usize| {
+        std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    };
+    let prompt_len = env_usize("SEEKER_BENCH_PROMPT", 128);
+    let n_decode = env_usize("SEEKER_BENCH_DECODE", 128);
+    let warmup = 4usize;
+    let batches: Vec<usize> = std::env::var("SEEKER_BENCH_BATCHES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 2, 4, 8]);
+
+    let greedy = SamplerConfig {
+        temperature: 0.0,
+        ..SamplerConfig::default()
+    };
+    // A real prompt tokenized then padded (by repetition) to `prompt_len`, so
+    // every sequence carries the same realistic-length cache.
+    let bundle = model.tokenizer();
+    let seed = bundle
+        .tokenizer
+        .encode("The history of computing began long before the invention of", true)
+        .map(|e| e.get_ids().to_vec())
+        .map_err(|e| format!("tokenize failed: {e}"))?;
+    let prompt: Vec<u32> = (0..prompt_len).map(|i| seed[i % seed.len()]).collect();
+
+    let dims = model.cache_dims();
+    let max_seq = (prompt_len + n_decode + warmup + 8) as u32;
+    let config = KvCacheConfig {
+        k_dtype: GgmlType::F16,
+        v_dtype: GgmlType::F16,
+        max_seq_len: max_seq,
+    };
+
+    println!(
+        "Batch-decode throughput: prompt_len={prompt_len}, decode_steps={n_decode}, model dims n_layer={}",
+        dims.n_layer
+    );
+    println!("  B   aggregate tok/s   per-seq tok/s   ms/step   speedup");
+    let mut baseline = 0f64;
+    for &b in &batches {
+        let mut batch = BatchKvCache::new(
+            &engine.device,
+            dims.n_layer,
+            dims.head_dim,
+            dims.n_head_kv,
+            b as u32,
+            config,
+        )?;
+        if let Some(ssm) = model.ssm_state_dims() {
+            batch.allocate_ssm_state(
+                &engine.device,
+                ssm.n_ssm_layers,
+                ssm.conv_state_floats,
+                ssm.gdn_state_floats,
+            )?;
+        }
+        let mut samplers: Vec<Sampler> = (0..b).map(|_| Sampler::new(greedy.clone())).collect();
+        let mut last: Vec<u32> = vec![0; b];
+        for s in 0..b {
+            let mut sc = batch.slot_kvcache(s as u32);
+            last[s] = engine.forward_sampled(model, &mut sc, &prompt, 0, &mut samplers[s])?;
+            batch.positions[s] = sc.position;
+        }
+        let slot_ids: Vec<u32> = (0..b as u32).collect();
+        let step = |engine: &mut Engine, batch: &mut BatchKvCache, last: &mut Vec<u32>, samplers: &mut [Sampler]| -> Result<(), Box<dyn Error>> {
+            let positions: Vec<u32> = (0..b).map(|s| batch.positions[s]).collect();
+            let mut srefs: Vec<&mut Sampler> = samplers.iter_mut().collect();
+            *last = engine
+                .forward_batch_decode(model, batch, last, &positions, &slot_ids, &mut srefs)?;
+            Ok(())
+        };
+        for _ in 0..warmup {
+            step(engine, &mut batch, &mut last, &mut samplers)?;
+        }
+        let t0 = Instant::now();
+        for _ in 0..n_decode {
+            step(engine, &mut batch, &mut last, &mut samplers)?;
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let agg = (b as f64 * n_decode as f64) / elapsed;
+        let per_seq = n_decode as f64 / elapsed;
+        let ms_step = elapsed * 1000.0 / n_decode as f64;
+        if b == batches[0] {
+            baseline = agg;
+        }
+        println!(
+            "  {b:<3} {agg:>14.1}   {per_seq:>13.1}   {ms_step:>7.2}   {:>5.2}x",
+            agg / baseline.max(1e-9)
+        );
+    }
+    Ok(())
+}
+
+/// Batched-decode flash-attention smoke test: B sequences, one query token
+/// each, each attending to its own KV slab over its own `kv_len`. Runs the
+/// batched dispatch (`flash_attn::record_batched`) on synthetic F32 Q/K/V and
+/// compares against a CPU reference (per-(seq, head) softmax attention). This
+/// proves the per-sequence `kv_len` keystone works for `n_seqs > 1` — the
+/// linchpin of continuous batching — independent of the slab-KV / forward
+/// plumbing. Run with `SEEKER_FA_BATCH_TEST=1 seeker run --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn fa_batch_smoke_test(
+    engine: &mut Engine,
+    weights: &crate::inference::weights::WeightsHandle,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::buffer::BufferRange;
+    use crate::inference::ops::flash_attn;
+
+    let head_dim: usize = std::env::var("SEEKER_FA_HEAD_DIM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64); // multiple of 32 (HSV_PER_THREAD = HSV/32)
+    let n_head: usize = std::env::var("SEEKER_FA_N_HEAD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let n_head_kv: usize = std::env::var("SEEKER_FA_N_HEAD_KV")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2); // gqa_ratio = n_head / n_head_kv
+    let gqa = (n_head / n_head_kv) as u32;
+    let hidden = head_dim * n_head;
+    // `SEEKER_FA_KV_LENS=200,137,256` overrides the per-sequence cache lengths
+    // (default short). Long lengths (> a few Bc=32 blocks) let the split-K
+    // heuristic — or a pinned `SEEKER_FA_SPLIT_KNUM` — fire, so this test also
+    // validates the batched split-K dispatch + combine against the CPU ref.
+    let kv_lens: Vec<u32> = std::env::var("SEEKER_FA_KV_LENS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<u32>>())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![5, 8, 3]);
+    let b = kv_lens.len();
+    let max_kv = *kv_lens.iter().max().unwrap() as usize;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    println!(
+        "FA batch smoke: B={b}, head_dim={head_dim}, n_head={n_head}, n_head_kv={n_head_kv}, kv_lens={kv_lens:?}"
+    );
+
+    // Deterministic synthetic inputs (host-side, also drive the CPU reference).
+    let q_val = |s: usize, h: usize, d: usize| ((s * 7 + h * 3 + d) as f32 * 0.013).sin();
+    let k_val =
+        |s: usize, kh: usize, j: usize, d: usize| ((s * 5 + kh * 4 + j * 2 + d) as f32 * 0.021).cos();
+    let v_val = |s: usize, kh: usize, j: usize, d: usize| {
+        ((s * 9 + kh * 2 + j * 3 + d) as f32 * 0.017).sin() * 0.5
+    };
+
+    // CPU reference: out[s][h][d].
+    let mut reference = vec![0f32; b * hidden];
+    for s in 0..b {
+        for h in 0..n_head {
+            let kh = h / (gqa as usize);
+            let klen = kv_lens[s] as usize;
+            let mut scores = vec![0f32; klen];
+            let mut maxs = f32::NEG_INFINITY;
+            for j in 0..klen {
+                let mut dot = 0f32;
+                for d in 0..head_dim {
+                    dot += q_val(s, h, d) * k_val(s, kh, j, d);
+                }
+                scores[j] = dot * scale;
+                maxs = maxs.max(scores[j]);
+            }
+            let mut denom = 0f32;
+            for sj in scores.iter_mut() {
+                *sj = (*sj - maxs).exp();
+                denom += *sj;
+            }
+            for d in 0..head_dim {
+                let mut acc = 0f32;
+                for j in 0..klen {
+                    acc += scores[j] * v_val(s, kh, j, d);
+                }
+                reference[s * hidden + h * head_dim + d] = acc / denom;
+            }
+        }
+    }
+
+    // GPU batched dispatch on synthetic F32 Q/K/V laid out as the shader expects:
+    //   Q [head_dim, 1, n_head, B]   (contiguous: [B][n_head][head_dim])
+    //   K/V [head_dim, max_kv, n_head_kv, B]  ([B][n_head_kv][max_kv][head_dim])
+    let gpu_out = engine.forward(weights, |ctx| -> Result<BufferRange, Box<dyn Error>> {
+        let host = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
+        let q = ctx.alloc_tensor([head_dim as u64, 1, n_head as u64, b as u64], GgmlType::F32)?;
+        let k = ctx.alloc_tensor(
+            [head_dim as u64, max_kv as u64, n_head_kv as u64, b as u64],
+            GgmlType::F32,
+        )?;
+        let v = ctx.alloc_tensor(
+            [head_dim as u64, max_kv as u64, n_head_kv as u64, b as u64],
+            GgmlType::F32,
+        )?;
+        unsafe {
+            let qp = host.add(q.byte_offset as usize) as *mut f32;
+            for s in 0..b {
+                for h in 0..n_head {
+                    for d in 0..head_dim {
+                        *qp.add(s * hidden + h * head_dim + d) = q_val(s, h, d);
+                    }
+                }
+            }
+            let kp = host.add(k.byte_offset as usize) as *mut f32;
+            let vp = host.add(v.byte_offset as usize) as *mut f32;
+            let slab = n_head_kv * max_kv * head_dim;
+            for s in 0..b {
+                for kh in 0..n_head_kv {
+                    for j in 0..max_kv {
+                        for d in 0..head_dim {
+                            let idx = s * slab + kh * (max_kv * head_dim) + j * head_dim + d;
+                            *kp.add(idx) = k_val(s, kh, j, d);
+                            *vp.add(idx) = v_val(s, kh, j, d);
+                        }
+                    }
+                }
+            }
+        }
+        let out = ctx.alloc_tensor([hidden as u64, b as u64, 1, 1], GgmlType::F32)?;
+        let params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim as u32,
+            head_dim_v: head_dim as u32,
+            gqa_ratio: gqa,
+            scale,
+        };
+        let fa_dyn = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
+        flash_attn::record_batched(ctx, q, k, v, out, params, &kv_lens, fa_dyn, None, None)?;
+        Ok(out.range())
+    })?;
+
+    let mut max_err = 0f32;
+    let mut worst = (0usize, 0usize, 0usize);
+    for s in 0..b {
+        for h in 0..n_head {
+            for d in 0..head_dim {
+                let idx = s * hidden + h * head_dim + d;
+                let e = (gpu_out[idx] - reference[idx]).abs();
+                if e > max_err {
+                    max_err = e;
+                    worst = (s, h, d);
+                }
+            }
+        }
+    }
+    let (ws, wh, wd) = worst;
+    let widx = ws * hidden + wh * head_dim + wd;
+    println!(
+        "  max_err = {max_err:.3e} at (seq={ws}, head={wh}, d={wd}); gpu={:.5}, ref={:.5}",
+        gpu_out[widx], reference[widx]
+    );
+    if max_err < 1e-4 {
+        println!("  RESULT: PASS (batched attention matches per-sequence CPU reference)");
+    } else {
+        println!("  RESULT: FAIL — batched attention diverges from the CPU reference");
+    }
+    Ok(())
+}
+
+/// Unified **varlen** batched flash-attn smoke test: B sequences, each
+/// contributing `L_s` query rows over its own KV slab, with the shader masking
+/// causally in-place (row r of seq s attends to `[0, base_s + r]`,
+/// `base_s = kv_len_s - L_s`). Mixes prefill chunks (L>1, with and without a
+/// cached prefix) and decode (L=1) in one batch — the unified scheduling case —
+/// and checks the GPU output against an independent causal CPU reference.
+/// Run with `SEEKER_FA_VARLEN_TEST=1 seeker run --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn fa_varlen_smoke_test(
+    engine: &mut Engine,
+    weights: &crate::inference::weights::WeightsHandle,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::buffer::BufferRange;
+    use crate::inference::ops::flash_attn;
+    use crate::inference::weights::TensorView;
+
+    let head_dim: usize = 64;
+    let n_head: usize = 4;
+    let n_head_kv: usize = 2;
+    let gqa = (n_head / n_head_kv) as u32;
+    let hidden = head_dim * n_head;
+    let hidden_v = hidden; // head_dim_v == head_dim_k here
+
+    // (base, L) per sequence: a fresh prefill (no prefix), a prefill chunk with
+    // a cached prefix, and a decode (L=1). kv_len = base + L; query_len = L.
+    let seqs: Vec<(usize, usize)> = vec![(0, 4), (5, 3), (10, 1)];
+    let kv_lens: Vec<u32> = seqs.iter().map(|&(base, l)| (base + l) as u32).collect();
+    let query_lens: Vec<u32> = seqs.iter().map(|&(_, l)| l as u32).collect();
+    let q_starts: Vec<usize> = {
+        let mut acc = 0;
+        seqs.iter().map(|&(_, l)| { let s = acc; acc += l; s }).collect()
+    };
+    let n_total: usize = seqs.iter().map(|&(_, l)| l).sum();
+    let b = seqs.len();
+    let max_kv = *kv_lens.iter().max().unwrap() as usize;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    println!(
+        "FA varlen smoke: B={b}, head_dim={head_dim}, n_head={n_head}, n_head_kv={n_head_kv}, \
+         (base,L)={seqs:?}, N_total={n_total}"
+    );
+
+    // Deterministic synthetic inputs (host-side; also drive the CPU reference).
+    let q_val = |s: usize, r: usize, h: usize, d: usize| {
+        ((s * 7 + r * 11 + h * 3 + d) as f32 * 0.013).sin()
+    };
+    let k_val =
+        |s: usize, kh: usize, j: usize, d: usize| ((s * 5 + kh * 4 + j * 2 + d) as f32 * 0.021).cos();
+    let v_val = |s: usize, kh: usize, j: usize, d: usize| {
+        ((s * 9 + kh * 2 + j * 3 + d) as f32 * 0.017).sin() * 0.5
+    };
+
+    // CPU reference: out[token][head][d], token = q_start[s] + r, causal over
+    // KV [0, base_s + r].
+    let mut reference = vec![0f32; n_total * hidden_v];
+    for (s, &(base, l)) in seqs.iter().enumerate() {
+        for r in 0..l {
+            let token = q_starts[s] + r;
+            let p = base + r; // absolute query position; attends to [0, p]
+            for h in 0..n_head {
+                let kh = h / (gqa as usize);
+                let klen = p + 1;
+                let mut scores = vec![0f32; klen];
+                let mut maxs = f32::NEG_INFINITY;
+                for (j, sc) in scores.iter_mut().enumerate() {
+                    let mut dot = 0f32;
+                    for d in 0..head_dim {
+                        dot += q_val(s, r, h, d) * k_val(s, kh, j, d);
+                    }
+                    *sc = dot * scale;
+                    maxs = maxs.max(*sc);
+                }
+                let mut denom = 0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - maxs).exp();
+                    denom += *sc;
+                }
+                for d in 0..head_dim {
+                    let mut acc = 0f32;
+                    for (j, &sc) in scores.iter().enumerate() {
+                        acc += sc * v_val(s, kh, j, d);
+                    }
+                    reference[token * hidden_v + h * head_dim + d] = acc / denom;
+                }
+            }
+        }
+    }
+
+    // GPU varlen dispatch. Q flat [head_dim, n_head, N_total] (token outermost),
+    // viewed as [head_dim, N_total, n_head] (per-token stride = hidden). K/V are
+    // the slab layout [head_dim, max_kv, n_head_kv, B] (seq b → slab b).
+    let gpu_out = engine.forward(weights, |ctx| -> Result<BufferRange, Box<dyn Error>> {
+        let host = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
+        let q = ctx.alloc_tensor([head_dim as u64, n_head as u64, n_total as u64, 1], GgmlType::F32)?;
+        let k = ctx.alloc_tensor(
+            [head_dim as u64, max_kv as u64, n_head_kv as u64, b as u64],
+            GgmlType::F32,
+        )?;
+        let v = ctx.alloc_tensor(
+            [head_dim as u64, max_kv as u64, n_head_kv as u64, b as u64],
+            GgmlType::F32,
+        )?;
+        unsafe {
+            let qp = host.add(q.byte_offset as usize) as *mut f32;
+            for (s, &(_, l)) in seqs.iter().enumerate() {
+                for r in 0..l {
+                    let token = q_starts[s] + r;
+                    for h in 0..n_head {
+                        for d in 0..head_dim {
+                            *qp.add(token * hidden + h * head_dim + d) = q_val(s, r, h, d);
+                        }
+                    }
+                }
+            }
+            let kp = host.add(k.byte_offset as usize) as *mut f32;
+            let vp = host.add(v.byte_offset as usize) as *mut f32;
+            let slab = n_head_kv * max_kv * head_dim;
+            for (s, &(base, l)) in seqs.iter().enumerate() {
+                for kh in 0..n_head_kv {
+                    for j in 0..(base + l) {
+                        for d in 0..head_dim {
+                            let idx = s * slab + kh * (max_kv * head_dim) + j * head_dim + d;
+                            *kp.add(idx) = k_val(s, kh, j, d);
+                            *vp.add(idx) = v_val(s, kh, j, d);
+                        }
+                    }
+                }
+            }
+        }
+        let elem = 4u64;
+        // [head_dim, N_total, n_head] view: per-token stride = hidden, head stride = head_dim.
+        let q_view = TensorView {
+            dims: [head_dim as u64, n_total as u64, n_head as u64, 1],
+            byte_stride: [elem, elem * hidden as u64, elem * head_dim as u64, elem * hidden as u64 * n_total as u64],
+            element_stride: [1, hidden as u64, head_dim as u64, hidden as u64 * n_total as u64],
+            ..q
+        };
+        let out = ctx.alloc_tensor([hidden_v as u64, n_total as u64, 1, 1], GgmlType::F32)?;
+        let params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim as u32,
+            head_dim_v: head_dim as u32,
+            gqa_ratio: gqa,
+            scale,
+        };
+        let fa_dyn = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
+        flash_attn::record_batched(
+            ctx, q_view, k, v, out, params, &kv_lens, fa_dyn, /*slots=*/ None,
+            /*query_lens=*/ Some(&query_lens),
+        )?;
+        Ok(out.range())
+    })?;
+
+    let mut max_err = 0f32;
+    let mut worst = (0usize, 0usize);
+    for token in 0..n_total {
+        for i in 0..hidden_v {
+            let idx = token * hidden_v + i;
+            let e = (gpu_out[idx] - reference[idx]).abs();
+            if e > max_err {
+                max_err = e;
+                worst = (token, i);
+            }
+        }
+    }
+    let (wt, wi) = worst;
+    let widx = wt * hidden_v + wi;
+    println!(
+        "  max_err = {max_err:.3e} at (token={wt}, i={wi}); gpu={:.5}, ref={:.5}",
+        gpu_out[widx], reference[widx]
+    );
+    if max_err < 1e-4 {
+        println!("  RESULT: PASS (varlen causal batched attention matches CPU reference)");
+    } else {
+        println!("  RESULT: FAIL — varlen batched attention diverges from the CPU reference");
+    }
     Ok(())
 }
 
@@ -1850,6 +2746,190 @@ fn wq_dump_test(
     Ok(())
 }
 
+/// Batched gated-delta-net smoke test: B sequences, each with its own
+/// recurrent state, run through GDN at `n_seqs = B` in one dispatch, vs a
+/// per-sequence CPU reference. Proves the recurrent state batches correctly
+/// (`seq_id` indexing) — the linchpin of batched decode for the qwen35moe
+/// SSM hybrid (M2). Run with `SEEKER_GDN_BATCH_TEST=1 ... --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn gdn_batch_smoke_test(
+    engine: &mut Engine,
+    weights: &crate::inference::weights::WeightsHandle,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::ops::ssm::{record_gated_delta_net, GdnStrides};
+
+    let s_v: u64 = 128;
+    let num_v: u64 = 2; // heads
+    let l: u64 = 3; // tokens per sequence
+    let b: u64 = 3; // sequences (n_seqs)
+    let scale: f32 = 1.0;
+    let _ = weights;
+    let per_seq = (s_v * num_v * l) as usize; // q/k/v per sequence
+    let gb_per_seq = (num_v * l) as usize; // g/beta per sequence
+
+    println!("GDN batch smoke: B={b}, s_v={s_v}, num_v={num_v}, L={l}");
+
+    // Per-sequence synthetic inputs (vary by sequence `s`).
+    let mut q_host = vec![0f32; b as usize * per_seq];
+    let mut k_host = vec![0f32; b as usize * per_seq];
+    let mut v_host = vec![0f32; b as usize * per_seq];
+    let mut g_host = vec![0f32; b as usize * gb_per_seq];
+    let mut beta_host = vec![0f32; b as usize * gb_per_seq];
+    for s in 0..b as usize {
+        for t in 0..l as usize {
+            for h in 0..num_v as usize {
+                for i in 0..s_v as usize {
+                    let off = s * per_seq + t * (s_v * num_v) as usize + h * s_v as usize + i;
+                    q_host[off] = ((s * 13 + t * 7 + h * 3 + i) as f32 * 0.13).sin();
+                    k_host[off] = ((s * 17 + t * 11 + h * 5 + i) as f32 * 0.07).cos();
+                    v_host[off] = ((s * 19 + t * 5 + h * 2 + i) as f32 * 0.19).sin() * 0.5;
+                }
+                let gh = s * gb_per_seq + t * num_v as usize + h;
+                g_host[gh] = -0.1 * (s as f32 + 1.0) * (h as f32 + 1.0);
+                beta_host[gh] = 0.5 + 0.1 * t as f32 + 0.05 * s as f32;
+            }
+        }
+    }
+
+    // CPU reference: per-sequence recurrence (state resets per sequence).
+    let attn_per_seq = (l * num_v * s_v) as usize;
+    let mut ref_out = vec![0f32; b as usize * attn_per_seq];
+    for s in 0..b as usize {
+        for h in 0..num_v as usize {
+            let mut state = vec![0f32; (s_v * s_v) as usize]; // col-major [S_V*S_V]
+            for t in 0..l as usize {
+                let base = s * per_seq + t * (s_v * num_v) as usize + h * s_v as usize;
+                let q = &q_host[base..base + s_v as usize];
+                let k = &k_host[base..base + s_v as usize];
+                let v = &v_host[base..base + s_v as usize];
+                let g_val = g_host[s * gb_per_seq + t * num_v as usize + h].exp();
+                let beta = beta_host[s * gb_per_seq + t * num_v as usize + h];
+                let mut kv = vec![0f32; s_v as usize];
+                for c in 0..s_v as usize {
+                    let mut acc = 0f32;
+                    for r in 0..s_v as usize {
+                        acc += g_val * state[c * s_v as usize + r] * k[r];
+                    }
+                    kv[c] = acc;
+                }
+                for c in 0..s_v as usize {
+                    let delta = (v[c] - kv[c]) * beta;
+                    for r in 0..s_v as usize {
+                        state[c * s_v as usize + r] =
+                            g_val * state[c * s_v as usize + r] + k[r] * delta;
+                    }
+                }
+                for c in 0..s_v as usize {
+                    let mut acc = 0f32;
+                    for r in 0..s_v as usize {
+                        acc += state[c * s_v as usize + r] * q[r];
+                    }
+                    let out_idx =
+                        s * attn_per_seq + t * (num_v * s_v) as usize + h * s_v as usize + c;
+                    ref_out[out_idx] = acc * scale;
+                }
+            }
+        }
+    }
+
+    let gpu_out = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let elem = 4u64;
+            // q/k/v: [s_v, num_v, l, B]; g/beta: [num_v, l, B] (seq outermost).
+            let q = ctx.alloc_tensor([s_v, num_v, l, b], GgmlType::F32)?;
+            let k = ctx.alloc_tensor([s_v, num_v, l, b], GgmlType::F32)?;
+            let v = ctx.alloc_tensor([s_v, num_v, l, b], GgmlType::F32)?;
+            let g = ctx.alloc_tensor([num_v, l, b, 1], GgmlType::F32)?;
+            let beta = ctx.alloc_tensor([num_v, l, b, 1], GgmlType::F32)?;
+            let host_ptr = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
+            let cp = |dst: &crate::inference::weights::TensorView, src: &[f32]| unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    host_ptr.add(dst.byte_offset as usize) as *mut f32,
+                    src.len(),
+                );
+            };
+            cp(&q, &q_host);
+            cp(&k, &k_host);
+            cp(&v, &v_host);
+            cp(&g, &g_host);
+            cp(&beta, &beta_host);
+
+            let attn_floats = b * l * num_v * s_v;
+            let state_floats = b * num_v * s_v * s_v;
+            let gdn_total = attn_floats + state_floats;
+            let gdn_dst = ctx.alloc_scratch(gdn_total * elem)?;
+            let state_in = ctx.alloc_scratch(state_floats * elem)?;
+            unsafe {
+                std::ptr::write_bytes(
+                    host_ptr.add(state_in.offset as usize) as *mut u8,
+                    0,
+                    state_in.size as usize,
+                );
+            }
+
+            record_gated_delta_net(
+                ctx,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state_in,
+                gdn_dst,
+                num_v as u32,
+                num_v as u32,
+                l as u32,
+                b as u32, // n_seqs = B
+                attn_floats as u32, // s_off: state region starts after all B attn outputs
+                scale,
+                GdnStrides { s1: s_v as u32, s2: (s_v * num_v) as u32, s3: (s_v * num_v * l) as u32 },
+                GdnStrides { s1: s_v as u32, s2: (s_v * num_v) as u32, s3: (s_v * num_v * l) as u32 },
+                GdnStrides { s1: 1, s2: num_v as u32, s3: (num_v * l) as u32 },
+                s_v as u32,
+                1, // k_snapshots = 1
+            )?;
+            Ok(crate::inference::buffer::BufferRange {
+                buffer: gdn_dst.buffer,
+                offset: gdn_dst.offset,
+                size: attn_floats * elem,
+            })
+        },
+    )?;
+
+    // Relative error: the recurrent sums reach large magnitudes (~1e3), so an
+    // absolute threshold is meaningless — compare against |ref| (floored at 1).
+    let mut max_rel = 0f32;
+    let mut worst = (0usize, 0usize, 0usize, 0usize);
+    for s in 0..b as usize {
+        for t in 0..l as usize {
+            for h in 0..num_v as usize {
+                for c in 0..s_v as usize {
+                    let idx = s * attn_per_seq + t * (num_v * s_v) as usize + h * s_v as usize + c;
+                    let rel = (gpu_out[idx] - ref_out[idx]).abs() / ref_out[idx].abs().max(1.0);
+                    if rel > max_rel {
+                        max_rel = rel;
+                        worst = (s, t, h, c);
+                    }
+                }
+            }
+        }
+    }
+    let (ws, wt, wh, wc) = worst;
+    let widx = ws * attn_per_seq + wt * (num_v * s_v) as usize + wh * s_v as usize + wc;
+    println!(
+        "  max_rel_err = {max_rel:.3e} at (seq={ws}, t={wt}, head={wh}, c={wc}); gpu={:.5}, ref={:.5}",
+        gpu_out[widx], ref_out[widx]
+    );
+    if max_rel < 1e-4 {
+        println!("  RESULT: PASS (batched GDN recurrence matches per-sequence reference)");
+    } else {
+        println!("  RESULT: FAIL — batched GDN diverges from the per-sequence reference");
+    }
+    Ok(())
+}
+
 /// Gated-delta-net smoke test. Feeds known Q/K/V/g/β to GDN with
 /// zero initial state, reads back output, compares against a CPU
 /// reference of the recurrent update. Verifies the most complex op
@@ -2026,12 +3106,7 @@ fn gdn_smoke_test(
                     s3: (num_v * l) as u32,
                 },
                 s_v as u32,
-                // k_snapshots: 0 = no per-position K snapshotting (the
-                // MTP-spec-decode path); this diagnostic smoke test runs the
-                // plain single-pass GDN. Added when the spec-decode K-snapshot
-                // arg landed and this test wasn't updated (pre-existing breakage
-                // surfaced once the vision smoke test made gpu_debug compile).
-                0,
+                1, // k_snapshots = 1 (normal mode: final state only, no checkpoint)
             )?;
             // Return only the attn portion (first attn_floats of gdn_dst).
             Ok(crate::inference::buffer::BufferRange {
@@ -2631,15 +3706,17 @@ fn kquant_matmul_test(
     let m = a.dims[1]; // output rows
     println!("kquant matmul test: {full_name} dtype={:?} K={k} M={m}", a.dtype);
 
-    // Raw quant bytes. Weights are now per-tensor device-local buffers (each
-    // tensor at offset 0 in its own buffer), so read via `debug_host_base`
-    // rather than the old single host-visible `weights.region` (which no longer
-    // exists after the per-tensor device-local refactor). Returns None for true
-    // device-local memory; this diagnostic test then can't run.
-    let host_ptr = weights
+    // Raw quant bytes — weights are per-tensor device-local now, so go through
+    // the debug host-base accessor (same as the other gpu_debug harnesses).
+    let base = weights
         .debug_host_base(&a)
-        .ok_or("weights are device-local; kquant host readback unavailable")?;
-    let raw: &[u8] = unsafe { std::slice::from_raw_parts(host_ptr, a.byte_size as usize) };
+        .ok_or("host-side weight reads unsupported (weights are device-local)")?;
+    let raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            base.add(a.byte_offset as usize),
+            a.byte_size as usize,
+        )
+    };
 
     // Deterministic input vector b[i] = sin(i * 0.01) — varied, bounded.
     let b_host: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01).sin()).collect();

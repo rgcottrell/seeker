@@ -1,16 +1,17 @@
 //! HTTP server shared state.
 //!
-//! Today this is just the chat-template + special-token strings needed by
-//! `/apply-template`. As more handlers grow real implementations (the
-//! OpenAI / llama-server stubs eventually call into inference) they'll
-//! pull additional resources — engine, model, sampler defaults — through
-//! this same struct.
+//! Holds everything the handlers need that outlives a single request: the
+//! shared tokenizer + chat template (for synchronous render/encode/tokenize),
+//! the [`InferenceHandle`] to the GPU worker thread, and the CLI-provided
+//! generation defaults that individual API requests override. Cheaply
+//! cloneable (`Arc`-wrapped) so axum can hand a copy to every request.
 
 use std::sync::Arc;
 
-/// Cheaply cloneable per-request handle. `Arc`-wrapping keeps the inner
-/// strings cheap to share across the threadpool that axum's
-/// `tokio::spawn`-per-request model produces.
+use crate::inference::sample::SamplerConfig;
+use crate::server::inference::InferenceHandle;
+use crate::tokenizer::TokenizerBundle;
+
 #[derive(Clone, Default)]
 pub struct AppState {
     inner: Arc<Inner>,
@@ -18,47 +19,135 @@ pub struct AppState {
 
 #[derive(Default)]
 struct Inner {
-    /// Raw jinja2 chat template from the loaded model's GGUF, if any.
-    chat_template: Option<String>,
-    /// String form of the BOS / EOS tokens — most chat templates reference
-    /// these as `{{ bos_token }}` / `{{ eos_token }}`.
-    bos_token: Option<String>,
-    eos_token: Option<String>,
+    /// Shared tokenizer + chat template + special tokens. `None` until a model
+    /// is loaded (`serve` can start without `--model` for `/health` etc.).
+    tokenizer: Option<Arc<TokenizerBundle>>,
+    /// Handle to the GPU worker. `None` ⇒ generation endpoints return 503.
+    inference: Option<InferenceHandle>,
     /// Extra template-context variables from `serve --chat-template-kwargs`,
-    /// merged into every `/apply-template` render (override built-ins).
+    /// merged into every render (override built-ins).
     template_kwargs: serde_json::Map<String, serde_json::Value>,
+    /// CLI sampling flags as the per-request base (requests override fields).
+    default_sampler: SamplerConfig,
+    /// `--max-tokens` default for requests that omit `max_tokens`/`n_predict`.
+    default_max_tokens: u32,
+    /// `--ignore-eos` (not exposed per-request).
+    default_ignore_eos: bool,
+    /// `--system-prompt`, injected as the leading system turn for chat/messages
+    /// requests that carry no system message of their own.
+    default_system_prompt: Option<String>,
+    /// `--ctx-size`, reported in `/props`.
+    ctx_size: u32,
+    /// Number of cache slots (`--parallel`), reported by `/props` + `/slots`.
+    n_slots: u32,
+    /// Model id reported by `/models` and echoed in responses (file stem).
+    model_id: String,
+    /// Absolute model path, reported in `/props`.
+    model_path: Option<String>,
+}
+
+/// Everything needed to build an `AppState` with a loaded model. Built by
+/// `serve::run` once the worker reports ready.
+pub struct AppStateInit {
+    pub tokenizer: Arc<TokenizerBundle>,
+    pub inference: InferenceHandle,
+    pub template_kwargs: serde_json::Map<String, serde_json::Value>,
+    pub default_sampler: SamplerConfig,
+    pub default_max_tokens: u32,
+    pub default_ignore_eos: bool,
+    pub default_system_prompt: Option<String>,
+    pub ctx_size: u32,
+    pub n_slots: u32,
+    pub model_id: String,
+    pub model_path: String,
 }
 
 impl AppState {
-    pub fn new(
-        chat_template: Option<String>,
-        bos_token: Option<String>,
-        eos_token: Option<String>,
-        template_kwargs: serde_json::Map<String, serde_json::Value>,
-    ) -> Self {
+    /// Build state for a loaded model (the full inference path).
+    pub fn new(init: AppStateInit) -> Self {
         Self {
             inner: Arc::new(Inner {
-                chat_template,
-                bos_token,
-                eos_token,
-                template_kwargs,
+                tokenizer: Some(init.tokenizer),
+                inference: Some(init.inference),
+                template_kwargs: init.template_kwargs,
+                default_sampler: init.default_sampler,
+                default_max_tokens: init.default_max_tokens,
+                default_ignore_eos: init.default_ignore_eos,
+                default_system_prompt: init.default_system_prompt,
+                ctx_size: init.ctx_size,
+                n_slots: init.n_slots,
+                model_id: init.model_id,
+                model_path: Some(init.model_path),
             }),
         }
     }
 
+    /// The loaded tokenizer bundle, if any (`/tokenize`, `/detokenize`,
+    /// render+encode for chat endpoints, `count_tokens`).
+    pub fn tokenizer(&self) -> Option<&TokenizerBundle> {
+        self.inner.tokenizer.as_deref()
+    }
+
+    /// Handle to the GPU worker, if a model is loaded.
+    pub fn inference(&self) -> Option<&InferenceHandle> {
+        self.inner.inference.as_ref()
+    }
+
     pub fn chat_template(&self) -> Option<&str> {
-        self.inner.chat_template.as_deref()
+        self.inner
+            .tokenizer
+            .as_ref()
+            .and_then(|t| t.chat_template.as_deref())
     }
 
     pub fn bos_token(&self) -> Option<&str> {
-        self.inner.bos_token.as_deref()
+        self.inner
+            .tokenizer
+            .as_ref()
+            .and_then(|t| t.bos_token.as_deref())
     }
 
     pub fn eos_token(&self) -> Option<&str> {
-        self.inner.eos_token.as_deref()
+        self.inner
+            .tokenizer
+            .as_ref()
+            .and_then(|t| t.eos_token.as_deref())
     }
 
     pub fn template_kwargs(&self) -> &serde_json::Map<String, serde_json::Value> {
         &self.inner.template_kwargs
+    }
+
+    pub fn default_sampler(&self) -> &SamplerConfig {
+        &self.inner.default_sampler
+    }
+
+    pub fn default_max_tokens(&self) -> u32 {
+        self.inner.default_max_tokens
+    }
+
+    pub fn default_ignore_eos(&self) -> bool {
+        self.inner.default_ignore_eos
+    }
+
+    pub fn default_system_prompt(&self) -> Option<&str> {
+        self.inner.default_system_prompt.as_deref()
+    }
+
+    pub fn ctx_size(&self) -> u32 {
+        self.inner.ctx_size
+    }
+
+    /// Number of KV-cache slots (`--parallel`); 0 when no model is loaded.
+    pub fn n_slots(&self) -> u32 {
+        self.inner.n_slots
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.inner.model_id
+    }
+
+    pub fn model_path(&self) -> Option<&str> {
+        self.inner.model_path.as_deref()
     }
 }

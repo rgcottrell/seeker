@@ -268,8 +268,15 @@ fn record_inner(
     //
     // Verified ~3× prefill win on Llama-1B Q4_K_M and ~1.4× on
     // qwen35moe Q4_K_XL @ N=320; default-on. `SEEKER_MM_CM=0` opts out.
+    // M (output rows) must also be a multiple of 16: the CoopMat store writes
+    // full 16×16 fragments, so a non-16-aligned M would mishandle / overrun the
+    // partial output fragment — observed as NONDETERMINISTIC output (and likely
+    // OOB writes) for qwen35moe's shared-expert gate, an M=1 (hidden→1)
+    // projection. (Llama's M values are all multiples of 32, which is why this
+    // was latent.) Non-aligned M falls through to mul_mm / per-column matvec,
+    // which handle arbitrary M deterministically.
     let mm_cm_enabled = !*crate::runtime_flags::MM_CM_DISABLED;
-    if ctx.device.coop_matrix && n >= 32 && n % 16 == 0 && mm_cm_enabled {
+    if ctx.device.coop_matrix && n >= 32 && n % 16 == 0 && a.dims[1] % 16 == 0 && mm_cm_enabled {
         if let Some(variant) = mmcm_variant(a.dtype) {
             return record_mul_mm_cm(ctx, &variant, a, b, d, fence);
         }

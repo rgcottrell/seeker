@@ -3,8 +3,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const STUB_MODEL: &str = "seeker-stub";
-
 // ---------------------------------------------------------------------------
 // /completion (llama-server native)
 // ---------------------------------------------------------------------------
@@ -44,21 +42,24 @@ pub struct CompletionRequest {
 }
 
 impl CompletionRequest {
-    /// Translate sampling fields into a `SamplerConfig`, filling missing
-    /// fields from the Qwen3-recommended defaults.
-    pub fn sampler_config(&self) -> crate::inference::sample::SamplerConfig {
-        let d = crate::inference::sample::SamplerConfig::default();
+    /// Translate sampling fields into a `SamplerConfig`, filling missing fields
+    /// from the server's CLI-provided `base` defaults. `logit_bias` always
+    /// inherits the CLI base (not exposed per-request).
+    pub fn sampler_config(
+        &self,
+        base: &crate::inference::sample::SamplerConfig,
+    ) -> crate::inference::sample::SamplerConfig {
         crate::inference::sample::SamplerConfig {
-            temperature: self.temperature.unwrap_or(d.temperature),
-            top_k: self.top_k.unwrap_or(d.top_k),
-            top_p: self.top_p.unwrap_or(d.top_p),
-            min_p: self.min_p.unwrap_or(d.min_p),
-            presence_penalty: self.presence_penalty.unwrap_or(d.presence_penalty),
-            frequency_penalty: self.frequency_penalty.unwrap_or(d.frequency_penalty),
-            repeat_penalty: self.repeat_penalty.unwrap_or(d.repeat_penalty),
-            penalty_last_n: self.repeat_last_n.unwrap_or(d.penalty_last_n),
-            seed: self.seed.unwrap_or(d.seed),
-            logit_bias: Vec::new(),
+            temperature: self.temperature.unwrap_or(base.temperature),
+            top_k: self.top_k.unwrap_or(base.top_k),
+            top_p: self.top_p.unwrap_or(base.top_p),
+            min_p: self.min_p.unwrap_or(base.min_p),
+            presence_penalty: self.presence_penalty.unwrap_or(base.presence_penalty),
+            frequency_penalty: self.frequency_penalty.unwrap_or(base.frequency_penalty),
+            repeat_penalty: self.repeat_penalty.unwrap_or(base.repeat_penalty),
+            penalty_last_n: self.repeat_last_n.unwrap_or(base.penalty_last_n),
+            seed: self.seed.unwrap_or(base.seed),
+            logit_bias: base.logit_bias.clone(),
         }
     }
 }
@@ -70,18 +71,6 @@ pub struct CompletionResponse {
     pub model: String,
     pub tokens_predicted: u32,
     pub tokens_evaluated: u32,
-}
-
-impl CompletionResponse {
-    pub fn stub() -> Self {
-        Self {
-            content: super::openai::STUB_TEXT.to_string(),
-            stop: true,
-            model: STUB_MODEL.to_string(),
-            tokens_predicted: 0,
-            tokens_evaluated: 0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -118,14 +107,28 @@ pub struct TokenizeRequest {
     pub with_pieces: Option<bool>,
 }
 
+/// `tokens` is either a bare id array or, when `with_pieces` is set, an array
+/// of `{id, piece}` objects — matching llama-server's two response shapes.
 #[derive(Debug, Serialize)]
 pub struct TokenizeResponse {
-    pub tokens: Vec<u32>,
+    pub tokens: Value,
 }
 
 impl TokenizeResponse {
-    pub fn stub() -> Self {
-        Self { tokens: vec![0] }
+    pub fn ids(ids: Vec<u32>) -> Self {
+        Self {
+            tokens: Value::Array(ids.into_iter().map(Value::from).collect()),
+        }
+    }
+
+    pub fn pieces(pairs: Vec<(u32, String)>) -> Self {
+        let arr = pairs
+            .into_iter()
+            .map(|(id, piece)| serde_json::json!({"id": id, "piece": piece}))
+            .collect();
+        Self {
+            tokens: Value::Array(arr),
+        }
     }
 }
 
@@ -138,37 +141,6 @@ pub struct DetokenizeRequest {
 #[derive(Debug, Serialize)]
 pub struct DetokenizeResponse {
     pub content: String,
-}
-
-impl DetokenizeResponse {
-    pub fn stub() -> Self {
-        Self {
-            content: String::new(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// /embedding (singular — native llama-server form, separate from OpenAI)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Default, Deserialize)]
-pub struct LlamaEmbeddingRequest {
-    #[serde(default)]
-    pub content: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LlamaEmbeddingResponse {
-    pub embedding: Vec<f32>,
-}
-
-impl LlamaEmbeddingResponse {
-    pub fn stub() -> Self {
-        Self {
-            embedding: vec![0.0; 8],
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,14 +162,6 @@ pub struct ApplyTemplateResponse {
     pub prompt: String,
 }
 
-impl ApplyTemplateResponse {
-    pub fn stub() -> Self {
-        Self {
-            prompt: String::new(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // /props (GET + POST)
 // ---------------------------------------------------------------------------
@@ -209,18 +173,6 @@ pub struct PropsResponse {
     pub build_info: &'static str,
     pub default_generation_settings: Value,
     pub total_slots: u32,
-}
-
-impl PropsResponse {
-    pub fn stub() -> Self {
-        Self {
-            model_path: None,
-            chat_template: None,
-            build_info: "seeker-stub",
-            default_generation_settings: Value::Object(serde_json::Map::new()),
-            total_slots: 0,
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]

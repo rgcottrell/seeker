@@ -505,6 +505,33 @@ impl Model for Qwen35MoeModel {
     ) -> Result<crate::models::MtpDraftOut, Box<dyn Error>> {
         self.mtp_draft_impl(ctx, cache, h_last, prev_token, position)
     }
+
+    fn record_forward_batch(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        slots: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        self.forward_batch_impl(ctx, batch, tokens, positions, slots)
+    }
+
+    fn supports_unified(&self) -> bool {
+        true
+    }
+
+    fn record_forward_unified(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        seq_lens: &[u32],
+        slots: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        self.forward_unified_impl(ctx, batch, tokens, positions, seq_lens, slots)
+    }
 }
 
 impl Qwen35MoeModel {
@@ -1216,6 +1243,282 @@ impl Qwen35MoeModel {
             cast::record_cast(ctx, src, dst)?;
         }
         Ok(())
+    }
+
+    /// Batched **decode** forward (M2): `B = tokens.len()` sequences, one token
+    /// each, in one pass. Mirrors [`Self::forward_impl`] but per-sequence:
+    /// attention layers use per-slab KV + batched flash-attn; SSM layers use
+    /// per-sequence conv/GDN state at `n_seqs = B`. The MoE FFN footer is
+    /// token-parallel and sequence-agnostic, so the existing `moe_ffn` is
+    /// reused with `l = B`. Returns `[vocab, B]` logits (column s = sequence s).
+    fn forward_batch_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        slots: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        let p = &self.params;
+        let b = tokens.len() as u64;
+        if b == 0 {
+            return Err("forward_batch_impl: empty batch".into());
+        }
+        if positions.len() != tokens.len() || slots.len() != tokens.len() {
+            return Err("forward_batch_impl: tokens/positions/slots length mismatch".into());
+        }
+        let hidden = p.n_embd as u64;
+        let head_dim_k = p.head_dim_k as u64;
+        let head_dim_v = p.head_dim_v as u64;
+        let n_head = p.n_head as u64;
+        let n_head_kv = p.n_head_kv as u64;
+        let n_embd_kv = p.n_embd_k_gqa() as u64;
+        let n_embd_vv = p.n_embd_v_gqa() as u64;
+        let wq_out = p.wq_out() as u64;
+        let hidden_v = head_dim_v * n_head;
+        let vocab = p.n_vocab as u64;
+
+        // Prologue: B token ids; M-RoPE positions [4 axes × B] (each axis gets
+        // the same per-sequence text position); embedding → residual [hidden, B].
+        let token_buf = ctx.alloc_scratch(b * 4)?;
+        write_u32(ctx, token_buf, tokens)?;
+        let positions_buf = ctx.alloc_scratch(4 * b * 4)?;
+        let mut pos: Vec<u32> = Vec::with_capacity(4 * b as usize);
+        for _axis in 0..4 {
+            pos.extend_from_slice(positions);
+        }
+        write_u32(ctx, positions_buf, &pos)?;
+
+        let residual = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, b as u32, residual)?;
+        // Persistent per-forward DecodeDyn array for the batched flash-attn.
+        // MUST be allocated before `layer_checkpoint` so per-layer
+        // `scratch_restore` never reclaims it — the shader reads its `kv_len`
+        // at execute time, long after the host write here, and a reclaimed
+        // offset would be overwritten by a later layer (e.g. the SSM
+        // conv_input memset) → garbage length → unbounded KV loop → GPU hang.
+        let fa_dyn_range = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
+        let layer_checkpoint = ctx.scratch_checkpoint();
+
+        let rope_params = rope_multi::RopeMultiParams::qwen_default(
+            p.rope_dim,
+            p.rope_freq_base,
+            p.rope_sections,
+        );
+        let scale = 1.0 / (head_dim_k as f32).sqrt();
+        let fa_params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim_k as u32,
+            head_dim_v: head_dim_v as u32,
+            gqa_ratio: (p.n_head / p.n_head_kv).max(1),
+            scale,
+        };
+        let kv_lens: Vec<u32> = positions.iter().map(|&pp| pp + 1).collect();
+
+        for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
+            ctx.scratch_restore(layer_checkpoint);
+            match block {
+                BlockWeights::Attention(att) => {
+                    attention_block_batch(
+                        ctx, att, batch, residual, positions_buf, rope_params, fa_params,
+                        layer_idx as u32, positions, slots, &kv_lens, p, head_dim_k, head_dim_v,
+                        n_head, n_head_kv, n_embd_kv, n_embd_vv, wq_out, hidden, hidden_v, b,
+                        fa_dyn_range,
+                    )?;
+                }
+                BlockWeights::Ssm(ssm_w) => {
+                    let ssm_layer_idx = (0..layer_idx)
+                        .filter(|&i| !p.is_attention_layer(i as u32))
+                        .count() as u32;
+                    ssm_block_batch(
+                        ctx, ssm_w, batch, residual, p, hidden, b, ssm_layer_idx, positions, slots,
+                    )?;
+                }
+            }
+            moe_ffn(
+                ctx,
+                block.moe(),
+                block.post_attn_norm(),
+                residual,
+                p,
+                hidden,
+                b as u32,
+                layer_idx as u32,
+            )?;
+        }
+        ctx.scratch_restore(layer_checkpoint);
+
+        // Epilogue: final norm + lm_head over ALL B columns (each is its
+        // sequence's last — and only — token this step).
+        let final_norm = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+        rms_norm::record(ctx, residual, self.weights.output_norm, final_norm, p.rms_eps)?;
+        let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
+        let logits = ctx.alloc_tensor([vocab, b, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, lm_head, final_norm, logits)?;
+
+        for (s, &pp) in positions.iter().enumerate() {
+            batch.positions[slots[s] as usize] = pp + 1;
+        }
+        Ok(logits)
+    }
+
+    /// Unified varlen forward (M5 Phase 4): `B` sequences, sequence `s`
+    /// contributing `seq_lens[s]` tokens packed flat into `tokens`/`positions`
+    /// (`N_total = sum`). Dense ops + M-RoPE run on the flat `[hidden, N_total]`
+    /// stream; attention layers use the per-slab varlen causal flash (Phase 1);
+    /// SSM layers loop per-sequence over [`ssm_block`] — the GDN/conv recurrence
+    /// is sequential, so each sequence runs its own `L_s`-token scan over its
+    /// slab's conv/GDN state (a global barrier + scratch restore between
+    /// sequences). MoE FFN is token-parallel → reused on `N_total`. Returns each
+    /// sequence's last-token logits, `[vocab, B]`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unified_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        seq_lens: &[u32],
+        slots: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        use crate::inference::command::record_global_barrier;
+        let p = &self.params;
+        let b = seq_lens.len();
+        let n_total = tokens.len() as u64;
+        if b == 0 || n_total == 0 {
+            return Err("forward_unified_impl: empty batch".into());
+        }
+        if positions.len() != tokens.len() || slots.len() != b {
+            return Err("forward_unified_impl: tokens/positions/seq_lens/slots length mismatch".into());
+        }
+        if seq_lens.iter().map(|&l| l as u64).sum::<u64>() != n_total {
+            return Err("forward_unified_impl: sum(seq_lens) != tokens.len()".into());
+        }
+        let hidden = p.n_embd as u64;
+        let head_dim_k = p.head_dim_k as u64;
+        let head_dim_v = p.head_dim_v as u64;
+        let n_head = p.n_head as u64;
+        let n_head_kv = p.n_head_kv as u64;
+        let n_embd_kv = p.n_embd_k_gqa() as u64;
+        let n_embd_vv = p.n_embd_v_gqa() as u64;
+        let wq_out = p.wq_out() as u64;
+        let hidden_v = head_dim_v * n_head;
+        let vocab = p.n_vocab as u64;
+        let elem = 4u64;
+
+        let q_starts: Vec<u64> = seq_lens
+            .iter()
+            .scan(0u64, |a, &l| { let s = *a; *a += l as u64; Some(s) })
+            .collect();
+        let kv_lens: Vec<u32> = (0..b)
+            .map(|s| positions[q_starts[s] as usize] + seq_lens[s])
+            .collect();
+
+        // Prologue: flat token ids, M-RoPE positions ([4 axes × N_total], each
+        // axis the flat per-token position — text-only), embedding → residual.
+        let token_buf = ctx.alloc_scratch(n_total * 4)?;
+        write_u32(ctx, token_buf, tokens)?;
+        let positions_buf = ctx.alloc_scratch(4 * n_total * 4)?;
+        let mut pos: Vec<u32> = Vec::with_capacity(4 * n_total as usize);
+        for _axis in 0..4 {
+            pos.extend_from_slice(positions);
+        }
+        write_u32(ctx, positions_buf, &pos)?;
+
+        let residual = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, n_total as u32, residual)?;
+        let fa_dyn_range = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
+        let layer_checkpoint = ctx.scratch_checkpoint();
+
+        let rope_params =
+            rope_multi::RopeMultiParams::qwen_default(p.rope_dim, p.rope_freq_base, p.rope_sections);
+        let scale = 1.0 / (head_dim_k as f32).sqrt();
+        let fa_params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim_k as u32,
+            head_dim_v: head_dim_v as u32,
+            gqa_ratio: (p.n_head / p.n_head_kv).max(1),
+            scale,
+        };
+
+        for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
+            ctx.scratch_restore(layer_checkpoint);
+            match block {
+                BlockWeights::Attention(att) => {
+                    attention_block_unified(
+                        ctx, att, batch, residual, positions_buf, rope_params, fa_params,
+                        layer_idx as u32, &kv_lens, seq_lens, &q_starts, slots, p, head_dim_k,
+                        head_dim_v, n_head, n_head_kv, n_embd_kv, n_embd_vv, wq_out, hidden,
+                        hidden_v, n_total, fa_dyn_range,
+                    )?;
+                }
+                BlockWeights::Ssm(ssm_w) => {
+                    let ssm_layer_idx = (0..layer_idx)
+                        .filter(|&i| !p.is_attention_layer(i as u32))
+                        .count() as u32;
+                    // Per-sequence GDN/conv recurrence (sequential): each runs
+                    // its L_s-token scan over its slab's state, writing its own
+                    // disjoint residual columns. Each ssm_block uses FRESH
+                    // scratch (no mid-layer restore — matching single-seq
+                    // forward_impl) so its GPU work is never raced by a later
+                    // op reusing the same scratch offsets. The layer-top
+                    // scratch_restore reclaims it all next layer. Total scratch
+                    // ≈ a single-seq forward over N_total tokens (within the
+                    // n_ubatch reservation). Disjoint residual slices + fresh
+                    // scratch ⇒ no inter-sequence barrier needed.
+                    for s in 0..b {
+                        let l = seq_lens[s];
+                        let off = q_starts[s] * hidden * elem;
+                        let residual_slice = TensorView {
+                            byte_offset: residual.byte_offset + off,
+                            byte_size: l as u64 * hidden * elem,
+                            dims: [hidden, l as u64, 1, 1],
+                            byte_stride: [elem, hidden * elem, hidden * elem * l as u64, hidden * elem * l as u64],
+                            element_stride: [1, hidden, hidden * l as u64, hidden * l as u64],
+                            ..residual
+                        };
+                        let gdn_state = Some(batch.gdn_state_slot(ssm_layer_idx, slots[s]));
+                        let conv_state = Some(batch.conv_state_slot(ssm_layer_idx, slots[s]));
+                        ssm_block(
+                            ctx, ssm_w, residual_slice, p, hidden, l, layer_idx as u32,
+                            gdn_state, conv_state, None, None,
+                        )?;
+                    }
+                }
+            }
+            // Release-capable dump: snapshot the residual after the block (attn
+            // /ssm) and after MoE. No-op unless ctx.dump is set (debug harness).
+            ctx.dump(&format!("L{layer_idx:02}-block"), residual);
+            moe_ffn(ctx, block.moe(), block.post_attn_norm(), residual, p, hidden, n_total as u32, layer_idx as u32)?;
+            ctx.dump(&format!("L{layer_idx:02}-moe"), residual);
+        }
+        ctx.scratch_restore(layer_checkpoint);
+
+        // Epilogue: gather each sequence's last-token column → norm + lm_head.
+        let last_hidden = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
+        record_global_barrier(ctx.device, ctx.cmd);
+        unsafe {
+            use ash::vk;
+            for s in 0..b {
+                let src_col = q_starts[s] + seq_lens[s] as u64 - 1;
+                let copy = vk::BufferCopy::default()
+                    .src_offset(residual.byte_offset + src_col * hidden * elem)
+                    .dst_offset(last_hidden.byte_offset + s as u64 * hidden * elem)
+                    .size(hidden * elem);
+                ctx.device.device.cmd_copy_buffer(
+                    ctx.cmd, residual.buffer, last_hidden.buffer, std::slice::from_ref(&copy),
+                );
+            }
+        }
+        record_global_barrier(ctx.device, ctx.cmd);
+        let final_norm = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
+        rms_norm::record(ctx, last_hidden, self.weights.output_norm, final_norm, p.rms_eps)?;
+        let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
+        let logits = ctx.alloc_tensor([vocab, b as u64, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, lm_head, final_norm, logits)?;
+
+        for s in 0..b {
+            batch.positions[slots[s] as usize] = kv_lens[s];
+        }
+        Ok(logits)
     }
 }
 
@@ -2331,6 +2634,570 @@ fn moe_ffn(
     let _ = routed;
     ctx.tap(&format!("l_out-{layer_idx}"), residual)?;
 
+    Ok(())
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Batched-decode (M2) block helpers: B sequences, one token each.
+// ───────────────────────────────────────────────────────────────────────
+
+/// A single-column `[d0, d1, 1, 1]` view of a contiguous `[d0, d1, B]` tensor
+/// (sequence `s`), for the per-sequence KV cache write.
+fn col3(t: TensorView, s: u64, col_stride: u64, d0: u64, d1: u64) -> TensorView {
+    let elem = t.byte_stride[0];
+    TensorView {
+        buffer: t.buffer,
+        byte_offset: t.byte_offset + s * col_stride,
+        byte_size: d0 * d1 * elem,
+        dims: [d0, d1, 1, 1],
+        byte_stride: [elem, elem * d0, elem * d0 * d1, elem * d0 * d1],
+        element_stride: [1, d0, d0 * d1, d0 * d1],
+        dtype: t.dtype,
+    }
+}
+
+/// Reinterpret a contiguous `[head_dim, n_head, B]` (post-RoPE) Q as the
+/// `[head_dim, 1, n_head, B]` flash-attn batched-decode layout (batch stride =
+/// `batch_stride`, = head_dim*n_head).
+fn batched_q_attn_view(t: TensorView, head_dim: u64, n_head: u64, b: u64, batch_stride: u64) -> TensorView {
+    let elem = t.byte_stride[0];
+    TensorView {
+        buffer: t.buffer,
+        byte_offset: t.byte_offset,
+        byte_size: t.byte_size,
+        dims: [head_dim, 1, n_head, b],
+        byte_stride: [elem, elem * head_dim, elem * head_dim, elem * batch_stride],
+        element_stride: [1, head_dim, head_dim, batch_stride],
+        dtype: t.dtype,
+    }
+}
+
+/// Batched qwen attention block: per-slab KV + batched flash-attn, M-RoPE +
+/// per-head Q/K norm + Q-gate, B sequences at their own positions.
+#[allow(clippy::too_many_arguments)]
+fn attention_block_batch(
+    ctx: &mut DispatchContext,
+    att: &AttentionBlockWeights,
+    batch: &crate::inference::kv_cache::BatchKvCache,
+    residual: TensorView,
+    positions_buf: crate::inference::buffer::BufferRange,
+    rope_params: rope_multi::RopeMultiParams,
+    fa_params: flash_attn::FlashAttnParams,
+    layer_idx: u32,
+    positions: &[u32],
+    slots: &[u32],
+    kv_lens: &[u32],
+    p: &Qwen35MoeParams,
+    head_dim_k: u64,
+    head_dim_v: u64,
+    n_head: u64,
+    n_head_kv: u64,
+    n_embd_kv: u64,
+    n_embd_vv: u64,
+    wq_out: u64,
+    hidden: u64,
+    hidden_v: u64,
+    b: u64,
+    fa_dyn_range: crate::inference::buffer::BufferRange,
+) -> Result<(), Box<dyn Error>> {
+    let elem = 4u64;
+    let x_norm = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+    rms_norm::record(ctx, residual, att.attn_norm, x_norm, p.rms_eps)?;
+
+    let q_full = ctx.alloc_tensor([wq_out, b, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, att.wq, x_norm, q_full)?;
+    let k = ctx.alloc_tensor([n_embd_kv, b, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, att.wk, x_norm, k)?;
+    let v = ctx.alloc_tensor([n_embd_vv, b, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, att.wv, x_norm, v)?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[q_full.range(), k.range(), v.range()],
+    );
+
+    let q_attn_view = slice_q_half(q_full, head_dim_k, n_head, b, /*gate=*/ false);
+    let q_gate_view = slice_q_half(q_full, head_dim_k, n_head, b, /*gate=*/ true);
+    let k_view = reshape_for_rope(k, head_dim_k, n_head_kv, b);
+    let v_view = reshape_for_rope(v, head_dim_v, n_head_kv, b);
+
+    // Per-head RMS norm + M-RoPE into F32 scratch (per-sequence cache writes
+    // below — the fused K-to-cache write bakes a single position offset, so it
+    // can't serve B sequences at different positions/slabs).
+    let q_roped = ctx.alloc_tensor([head_dim_k, n_head, b, 1], GgmlType::F32)?;
+    rope_multi::record_rms_norm_rope_nofence(
+        ctx, q_attn_view, positions_buf, att.attn_q_norm, q_roped, rope_params, p.rms_eps,
+    )?;
+    let k_roped = ctx.alloc_tensor([head_dim_k, n_head_kv, b, 1], GgmlType::F32)?;
+    rope_multi::record_rms_norm_rope_nofence(
+        ctx, k_view, positions_buf, att.attn_k_norm, k_roped, rope_params, p.rms_eps,
+    )?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[q_roped.range(), k_roped.range()],
+    );
+
+    // Per-sequence K/V cache writes: column s → slab `slots[s]` at positions[s].
+    let k_col_stride = head_dim_k * n_head_kv * elem;
+    let v_col_stride = head_dim_v * n_head_kv * elem;
+    for s in 0..b as usize {
+        let k_col = col3(k_roped, s as u64, k_col_stride, head_dim_k, n_head_kv);
+        let v_col = col3(v_view, s as u64, v_col_stride, head_dim_v, n_head_kv);
+        cache_io::record_write(ctx, k_col, batch.slot_k_view(slots[s], layer_idx), positions[s])?;
+        cache_io::record_write(ctx, v_col, batch.slot_v_view(slots[s], layer_idx), positions[s])?;
+    }
+
+    // Batched attention. The K/V views bind every slab; the flash reads each
+    // sequence's slab via `DecodeDyn::slot` (= slots[s]).
+    let q_attn = batched_q_attn_view(q_roped, head_dim_k, n_head, b, hidden_v);
+    let k_attn = batch.batched_k_attn_view(layer_idx);
+    let v_attn = batch.batched_v_attn_view(layer_idx);
+    let attn_out = ctx.alloc_tensor([hidden_v, b, 1, 1], GgmlType::F32)?;
+    flash_attn::record_batched(
+        ctx, q_attn, k_attn, v_attn, attn_out, fa_params, kv_lens, fa_dyn_range, Some(slots),
+        /*query_lens=*/ None,
+    )?;
+
+    // Sigmoid-gate the attention output by q_gate.
+    let q_gate_contig = ctx.alloc_tensor([head_dim_k, n_head, b, 1], GgmlType::F32)?;
+    cast::record_cast(ctx, q_gate_view, q_gate_contig)?;
+    let q_gate_flat = TensorView {
+        dims: [hidden_v, b, 1, 1],
+        byte_size: q_gate_contig.byte_size,
+        byte_stride: [4, 4 * hidden_v, 4 * hidden_v * b, 4 * hidden_v * b],
+        element_stride: [1, hidden_v, hidden_v * b, hidden_v * b],
+        ..q_gate_contig
+    };
+    let attn_gated = ctx.alloc_tensor([hidden_v, b, 1, 1], GgmlType::F32)?;
+    elementwise::record_sigmoid_mul_split(ctx, q_gate_flat, attn_out, attn_gated)?;
+
+    // residual += wo @ attn_gated. B > 1 so the fused matvec-accumulate path
+    // (N=1 only) doesn't apply — use the general matmul + add.
+    let proj = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+    matmul::record(ctx, att.wo, attn_gated, proj)?;
+    elementwise::record_add(ctx, residual, proj, residual)?;
+    Ok(())
+}
+
+/// Unified varlen qwen attention block (M5 Phase 4): like
+/// [`attention_block_batch`] but each sequence contributes `seq_lens[s]` query
+/// rows (a prefill chunk or 1 for decode), packed flat in the `N_total` token
+/// dimension. Dense ops + M-RoPE + Q-gate run on the flat stream; each sequence
+/// writes its `L_s`-token K/V chunk to its slab at `base_s = kv_lens[s] -
+/// seq_lens[s]`; the flash is the varlen causal path (`query_lens = seq_lens`).
+#[allow(clippy::too_many_arguments)]
+fn attention_block_unified(
+    ctx: &mut DispatchContext,
+    att: &AttentionBlockWeights,
+    batch: &crate::inference::kv_cache::BatchKvCache,
+    residual: TensorView,
+    positions_buf: crate::inference::buffer::BufferRange,
+    rope_params: rope_multi::RopeMultiParams,
+    fa_params: flash_attn::FlashAttnParams,
+    layer_idx: u32,
+    kv_lens: &[u32],
+    seq_lens: &[u32],
+    q_starts: &[u64],
+    slots: &[u32],
+    p: &Qwen35MoeParams,
+    head_dim_k: u64,
+    head_dim_v: u64,
+    n_head: u64,
+    n_head_kv: u64,
+    n_embd_kv: u64,
+    n_embd_vv: u64,
+    wq_out: u64,
+    hidden: u64,
+    hidden_v: u64,
+    n_total: u64,
+    fa_dyn_range: crate::inference::buffer::BufferRange,
+) -> Result<(), Box<dyn Error>> {
+    let elem = 4u64;
+    let b = seq_lens.len();
+    let x_norm = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+    rms_norm::record(ctx, residual, att.attn_norm, x_norm, p.rms_eps)?;
+
+    let q_full = ctx.alloc_tensor([wq_out, n_total, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, att.wq, x_norm, q_full)?;
+    let k = ctx.alloc_tensor([n_embd_kv, n_total, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, att.wk, x_norm, k)?;
+    let v = ctx.alloc_tensor([n_embd_vv, n_total, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, att.wv, x_norm, v)?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[q_full.range(), k.range(), v.range()],
+    );
+
+    let q_attn_view = slice_q_half(q_full, head_dim_k, n_head, n_total, /*gate=*/ false);
+    let q_gate_view = slice_q_half(q_full, head_dim_k, n_head, n_total, /*gate=*/ true);
+    let k_view = reshape_for_rope(k, head_dim_k, n_head_kv, n_total);
+    let v_view = reshape_for_rope(v, head_dim_v, n_head_kv, n_total);
+
+    let q_roped = ctx.alloc_tensor([head_dim_k, n_head, n_total, 1], GgmlType::F32)?;
+    rope_multi::record_rms_norm_rope_nofence(
+        ctx, q_attn_view, positions_buf, att.attn_q_norm, q_roped, rope_params, p.rms_eps,
+    )?;
+    let k_roped = ctx.alloc_tensor([head_dim_k, n_head_kv, n_total, 1], GgmlType::F32)?;
+    rope_multi::record_rms_norm_rope_nofence(
+        ctx, k_view, positions_buf, att.attn_k_norm, k_roped, rope_params, p.rms_eps,
+    )?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[q_roped.range(), k_roped.range()],
+    );
+
+    // Per-sequence K/V chunk write: seq s's L_s columns → slab slots[s] at base_s.
+    let k_tok_stride = head_dim_k * n_head_kv * elem;
+    let v_tok_stride = head_dim_v * n_head_kv * elem;
+    let chunk = |t: TensorView, qs: u64, l: u64, d0: u64, d1: u64, tok_stride: u64| -> TensorView {
+        TensorView {
+            byte_offset: t.byte_offset + qs * tok_stride,
+            byte_size: l * tok_stride,
+            dims: [d0, d1, l, 1],
+            byte_stride: [elem, elem * d0, tok_stride, tok_stride * l],
+            element_stride: [1, d0, d0 * d1, d0 * d1 * l],
+            ..t
+        }
+    };
+    for s in 0..b {
+        let l = seq_lens[s] as u64;
+        let base = kv_lens[s] - seq_lens[s];
+        let k_chunk = chunk(k_roped, q_starts[s], l, head_dim_k, n_head_kv, k_tok_stride);
+        let v_chunk = chunk(v_view, q_starts[s], l, head_dim_v, n_head_kv, v_tok_stride);
+        cache_io::record_write(ctx, k_chunk, batch.slot_k_view(slots[s], layer_idx), base)?;
+        cache_io::record_write(ctx, v_chunk, batch.slot_v_view(slots[s], layer_idx), base)?;
+    }
+
+    // Varlen attention: flat token-major Q view; the flash masks causally per
+    // sequence over its own slab.
+    let q_attn = TensorView {
+        dims: [head_dim_k, n_total, n_head, 1],
+        byte_stride: [elem, elem * head_dim_k * n_head, elem * head_dim_k, elem * head_dim_k * n_head * n_total],
+        element_stride: [1, head_dim_k * n_head, head_dim_k, head_dim_k * n_head * n_total],
+        ..q_roped
+    };
+    let k_attn = batch.batched_k_attn_view(layer_idx);
+    let v_attn = batch.batched_v_attn_view(layer_idx);
+    let attn_out = ctx.alloc_tensor([hidden_v, n_total, 1, 1], GgmlType::F32)?;
+    flash_attn::record_batched(
+        ctx, q_attn, k_attn, v_attn, attn_out, fa_params, kv_lens, fa_dyn_range, Some(slots),
+        Some(seq_lens),
+    )?;
+
+    // Sigmoid-gate by q_gate (per-token).
+    let q_gate_contig = ctx.alloc_tensor([head_dim_k, n_head, n_total, 1], GgmlType::F32)?;
+    cast::record_cast(ctx, q_gate_view, q_gate_contig)?;
+    let q_gate_flat = TensorView {
+        dims: [hidden_v, n_total, 1, 1],
+        byte_size: q_gate_contig.byte_size,
+        byte_stride: [elem, elem * hidden_v, elem * hidden_v * n_total, elem * hidden_v * n_total],
+        element_stride: [1, hidden_v, hidden_v * n_total, hidden_v * n_total],
+        ..q_gate_contig
+    };
+    let attn_gated = ctx.alloc_tensor([hidden_v, n_total, 1, 1], GgmlType::F32)?;
+    elementwise::record_sigmoid_mul_split(ctx, q_gate_flat, attn_out, attn_gated)?;
+
+    let proj = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+    matmul::record(ctx, att.wo, attn_gated, proj)?;
+    elementwise::record_add(ctx, residual, proj, residual)?;
+    Ok(())
+}
+
+/// Batched qwen SSM/GDN block: per-sequence conv-input packing + conv at
+/// `n_seqs = B`, then gated-delta-net at `n_seqs = B` over per-sequence state.
+#[allow(clippy::too_many_arguments)]
+fn ssm_block_batch(
+    ctx: &mut DispatchContext,
+    ssm_w: &SsmBlockWeights,
+    batch: &crate::inference::kv_cache::BatchKvCache,
+    residual: TensorView,
+    p: &Qwen35MoeParams,
+    hidden: u64,
+    b: u64,
+    ssm_layer_idx: u32,
+    _positions: &[u32],
+    slots: &[u32],
+) -> Result<(), Box<dyn Error>> {
+    let elem = 4u64;
+    let num_k = p.ssm_groups as u64;
+    let num_v = p.ssm_dt_rank as u64;
+    let s_v = p.ssm_state as u64;
+    let conv_kernel = p.ssm_conv as u64;
+    let key_dim = num_k * s_v;
+    let value_dim = num_v * s_v;
+    let conv_channels = 2 * key_dim + value_dim;
+    let n_padded = (conv_kernel - 1) + 1; // L=1 per sequence
+    let state_dim_inner = conv_kernel - 1;
+
+    let x_norm = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+    rms_norm::record(ctx, residual, ssm_w.attn_norm, x_norm, p.rms_eps)?;
+
+    let qkv = ctx.alloc_tensor([conv_channels, b, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, ssm_w.attn_qkv, x_norm, qkv)?;
+    let z = ctx.alloc_tensor([value_dim, b, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, ssm_w.attn_gate, x_norm, z)?;
+    let beta_pre = ctx.alloc_tensor([num_v, b, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, ssm_w.ssm_beta, x_norm, beta_pre)?;
+    let alpha_pre = ctx.alloc_tensor([num_v, b, 1, 1], GgmlType::F32)?;
+    matmul::record_nofence(ctx, ssm_w.ssm_alpha, x_norm, alpha_pre)?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[qkv.range(), z.range(), beta_pre.range(), alpha_pre.range()],
+    );
+
+    let beta = ctx.alloc_tensor([num_v, b, 1, 1], GgmlType::F32)?;
+    elementwise::record_sigmoid_nofence(ctx, beta_pre, beta)?;
+    let alpha = ctx.alloc_tensor([num_v, b, 1, 1], GgmlType::F32)?;
+    elementwise::record_ssm_alpha_fuse_nofence(
+        ctx, alpha_pre, ssm_w.ssm_dt_bias, ssm_w.ssm_a, alpha, num_v as u32,
+    )?;
+
+    // ── conv input [n_padded, conv_channels, B]: per-seq prefix + tail ──
+    let conv_input = ctx.alloc_tensor([n_padded, conv_channels, b, 1], GgmlType::F32)?;
+    {
+        let host = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
+        unsafe {
+            std::ptr::write_bytes(
+                host.add(conv_input.byte_offset as usize) as *mut u8,
+                0,
+                conv_input.byte_size as usize,
+            );
+        }
+    }
+    // ── Per-sequence conv + GDN recurrent state. When the batch already
+    // occupies contiguous slabs [0,B) (the dense / single-stream case), the
+    // ops read/write the persistent seq-outermost blocks directly — zero copy.
+    // Otherwise (a gathered, non-contiguous batch — prefix-reuse parked
+    // conversations in arbitrary slabs) gather each sequence's state into
+    // contiguous [0,B) working buffers, run, and scatter back after the GDN.
+    let contiguous = slots.iter().enumerate().all(|(i, &s)| s as u64 == i as u64);
+    let conv_floats = batch.conv_slot_floats();
+    let gdn_floats = batch.gdn_slot_floats();
+    let (conv_state, gdn_state_in, gathered) = if contiguous {
+        (
+            batch.conv_state_layer(ssm_layer_idx),
+            batch.gdn_state_layer(ssm_layer_idx),
+            None,
+        )
+    } else {
+        let conv_work = ctx.alloc_scratch(b * conv_floats * elem)?;
+        let gdn_work = ctx.alloc_scratch(b * gdn_floats * elem)?;
+        unsafe {
+            use ash::vk;
+            for bi in 0..b {
+                let cs = batch.conv_state_slot(ssm_layer_idx, slots[bi as usize]);
+                let copy = vk::BufferCopy::default()
+                    .src_offset(cs.offset)
+                    .dst_offset(conv_work.offset + bi * conv_floats * elem)
+                    .size(conv_floats * elem);
+                ctx.device.device.cmd_copy_buffer(
+                    ctx.cmd, cs.buffer, conv_work.buffer, std::slice::from_ref(&copy),
+                );
+                let gs = batch.gdn_state_slot(ssm_layer_idx, slots[bi as usize]);
+                let copy = vk::BufferCopy::default()
+                    .src_offset(gs.offset)
+                    .dst_offset(gdn_work.offset + bi * gdn_floats * elem)
+                    .size(gdn_floats * elem);
+                ctx.device.device.cmd_copy_buffer(
+                    ctx.cmd, gs.buffer, gdn_work.buffer, std::slice::from_ref(&copy),
+                );
+            }
+        }
+        crate::inference::command::record_global_barrier(ctx.device, ctx.cmd);
+        (conv_work, gdn_work, Some((conv_work, gdn_work)))
+    };
+    // (a) conv_state (all B) → conv_input prefixes (all B).
+    let prefix_src = TensorView {
+        buffer: conv_state.buffer,
+        byte_offset: conv_state.offset,
+        byte_size: conv_state.size,
+        dims: [state_dim_inner, conv_channels, b, 1],
+        byte_stride: [elem, state_dim_inner * elem, state_dim_inner * conv_channels * elem, state_dim_inner * conv_channels * elem],
+        element_stride: [1, state_dim_inner, state_dim_inner * conv_channels, state_dim_inner * conv_channels],
+        dtype: GgmlType::F32,
+    };
+    let prefix_dst = TensorView {
+        buffer: conv_input.buffer,
+        byte_offset: conv_input.byte_offset,
+        byte_size: conv_input.byte_size,
+        dims: [state_dim_inner, conv_channels, b, 1],
+        byte_stride: [elem, n_padded * elem, n_padded * conv_channels * elem, n_padded * conv_channels * elem],
+        element_stride: [1, n_padded, n_padded * conv_channels, n_padded * conv_channels],
+        dtype: GgmlType::F32,
+    };
+    cast::record_cast(ctx, prefix_src, prefix_dst)?;
+    // (b) qkv [conv_channels, B] → conv_input tail (position kernel-1, all B).
+    let tail_src = TensorView {
+        buffer: qkv.buffer,
+        byte_offset: qkv.byte_offset,
+        byte_size: qkv.byte_size,
+        dims: [1, conv_channels, b, 1],
+        byte_stride: [conv_channels * elem, elem, conv_channels * elem, conv_channels * elem],
+        element_stride: [conv_channels, 1, conv_channels, conv_channels],
+        dtype: qkv.dtype,
+    };
+    let tail_dst = TensorView {
+        buffer: conv_input.buffer,
+        byte_offset: conv_input.byte_offset + (conv_kernel - 1) * elem,
+        byte_size: conv_input.byte_size - (conv_kernel - 1) * elem,
+        dims: [1, conv_channels, b, 1],
+        byte_stride: [elem, n_padded * elem, n_padded * conv_channels * elem, n_padded * conv_channels * elem],
+        element_stride: [1, n_padded, n_padded * conv_channels, n_padded * conv_channels],
+        dtype: conv_input.dtype,
+    };
+    cast::record_cast(ctx, tail_src, tail_dst)?;
+    // (c) conv state writeback: conv_input[1..kernel] (all B) → conv_state.
+    let wb_src = TensorView {
+        buffer: conv_input.buffer,
+        byte_offset: conv_input.byte_offset + elem, // s_idx = L = 1
+        byte_size: conv_input.byte_size - elem,
+        dims: [state_dim_inner, conv_channels, b, 1],
+        byte_stride: [elem, n_padded * elem, n_padded * conv_channels * elem, n_padded * conv_channels * elem],
+        element_stride: [1, n_padded, n_padded * conv_channels, n_padded * conv_channels],
+        dtype: GgmlType::F32,
+    };
+    cast::record_cast(ctx, wb_src, prefix_src)?;
+
+    // conv1d (fused silu), n_seqs = B → conv_out [conv_channels, 1, B].
+    let conv_out = ctx.alloc_tensor([conv_channels, 1, b, 1], GgmlType::F32)?;
+    ssm::record_ssm_conv_nofence(
+        ctx, conv_input, ssm_w.ssm_conv1d, conv_out, conv_channels as u32, n_padded as u32, 1,
+        b as u32, conv_kernel as u32, /*fuse_silu=*/ true,
+    )?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[beta.range(), alpha.range(), conv_out.range()],
+    );
+
+    // Slice Q/K/V from conv_out [seq][token=1][channel] → [s_v, num_heads, 1, B].
+    let slice_qkv = |chan_offset: u64, chan_count: u64| -> TensorView {
+        TensorView {
+            buffer: conv_out.buffer,
+            byte_offset: conv_out.byte_offset + chan_offset * elem,
+            byte_size: conv_out.byte_size - chan_offset * elem,
+            dims: [chan_count, 1, b, 1],
+            byte_stride: [elem, conv_channels * elem, conv_channels * elem, conv_channels * elem],
+            element_stride: [1, conv_channels, conv_channels, conv_channels],
+            dtype: conv_out.dtype,
+        }
+    };
+    let head_view = |slice: TensorView, num_heads: u64| -> TensorView {
+        TensorView {
+            buffer: slice.buffer,
+            byte_offset: slice.byte_offset,
+            byte_size: slice.byte_size,
+            dims: [s_v, num_heads, 1, b],
+            byte_stride: [elem, s_v * elem, conv_channels * elem, conv_channels * elem],
+            element_stride: [1, s_v, conv_channels, conv_channels],
+            dtype: slice.dtype,
+        }
+    };
+    let q_view = head_view(slice_qkv(0, key_dim), num_k);
+    let k_view = head_view(slice_qkv(key_dim, key_dim), num_k);
+    let v_view = head_view(slice_qkv(2 * key_dim, value_dim), num_v);
+
+    let ssm_norm_eps = 1e-6;
+    let q_normed = ctx.alloc_tensor([s_v, num_k, 1, b], GgmlType::F32)?;
+    elementwise::record_l2_norm_nofence(ctx, q_view, q_normed, ssm_norm_eps)?;
+    let k_normed = ctx.alloc_tensor([s_v, num_k, 1, b], GgmlType::F32)?;
+    elementwise::record_l2_norm_nofence(ctx, k_view, k_normed, ssm_norm_eps)?;
+    crate::inference::command::record_compute_barriers(
+        ctx.device,
+        ctx.cmd,
+        &[q_normed.range(), k_normed.range()],
+    );
+
+    // gated-delta-net at n_seqs = B.
+    let attn_floats = b * num_v * s_v; // B * (1 token * num_v * s_v)
+    let state_floats = b * num_v * s_v * s_v;
+    let gdn_dst = ctx.alloc_scratch((attn_floats + state_floats) * elem)?;
+    let gdn_scale = 1.0 / (s_v as f32).sqrt();
+    let q_normed_strides = ssm::GdnStrides {
+        s1: s_v as u32,
+        s2: (s_v * num_k) as u32,
+        s3: (s_v * num_k) as u32,
+    };
+    let v_strides = ssm::GdnStrides {
+        s1: s_v as u32,
+        s2: conv_channels as u32,
+        s3: conv_channels as u32,
+    };
+    let b_strides = ssm::GdnStrides {
+        s1: 1,
+        s2: num_v as u32,
+        s3: num_v as u32,
+    };
+    ssm::record_gated_delta_net(
+        ctx, q_normed, k_normed, v_view, alpha, beta, gdn_state_in, gdn_dst, num_v as u32,
+        num_k as u32, 1, b as u32, attn_floats as u32, gdn_scale, q_normed_strides, v_strides,
+        b_strides, s_v as u32, 1,
+    )?;
+    // Write the updated GDN state back. The conv writeback (cast) already
+    // landed the new conv state in `conv_state` above. A compute→transfer
+    // barrier (the conv cast / GDN dispatch fenced their writes) precedes; a
+    // global barrier after makes the writes visible before the next read.
+    crate::inference::command::record_global_barrier(ctx.device, ctx.cmd);
+    unsafe {
+        use ash::vk;
+        match gathered {
+            // Non-contiguous: scatter conv_work + gdn_dst[state] to each slab.
+            Some((conv_work, _)) => {
+                for bi in 0..b {
+                    let cs = batch.conv_state_slot(ssm_layer_idx, slots[bi as usize]);
+                    let copy = vk::BufferCopy::default()
+                        .src_offset(conv_work.offset + bi * conv_floats * elem)
+                        .dst_offset(cs.offset)
+                        .size(conv_floats * elem);
+                    ctx.device.device.cmd_copy_buffer(
+                        ctx.cmd, conv_work.buffer, cs.buffer, std::slice::from_ref(&copy),
+                    );
+                    let gs = batch.gdn_state_slot(ssm_layer_idx, slots[bi as usize]);
+                    let copy = vk::BufferCopy::default()
+                        .src_offset(gdn_dst.offset + attn_floats * elem + bi * gdn_floats * elem)
+                        .dst_offset(gs.offset)
+                        .size(gdn_floats * elem);
+                    ctx.device.device.cmd_copy_buffer(
+                        ctx.cmd, gdn_dst.buffer, gs.buffer, std::slice::from_ref(&copy),
+                    );
+                }
+            }
+            // Contiguous: one B-wide copy straight to the persistent block.
+            None => {
+                let copy = vk::BufferCopy::default()
+                    .src_offset(gdn_dst.offset + attn_floats * elem)
+                    .dst_offset(gdn_state_in.offset)
+                    .size(state_floats * elem);
+                ctx.device.device.cmd_copy_buffer(
+                    ctx.cmd, gdn_dst.buffer, gdn_state_in.buffer, std::slice::from_ref(&copy),
+                );
+            }
+        }
+    }
+    crate::inference::command::record_global_barrier(ctx.device, ctx.cmd);
+
+    // gated_attn = (rms_norm(gdn_attn) * ssm_norm) * silu(z); then ssm_out proj.
+    let gdn_attn = TensorView {
+        buffer: gdn_dst.buffer,
+        byte_offset: gdn_dst.offset,
+        byte_size: attn_floats * elem,
+        dims: [s_v, num_v, b, 1],
+        byte_stride: [elem, s_v * elem, s_v * num_v * elem, s_v * num_v * b * elem],
+        element_stride: [1, s_v, s_v * num_v, s_v * num_v * b],
+        dtype: GgmlType::F32,
+    };
+    let gated_attn = ctx.alloc_tensor([value_dim, b, 1, 1], GgmlType::F32)?;
+    elementwise::record_ssm_norm_gate(
+        ctx, gdn_attn, ssm_w.ssm_norm, z, gated_attn, s_v as u32, num_v as u32, b as u32, p.rms_eps,
+    )?;
+    // B > 1 → general matmul + add (the fused matvec-accumulate is N=1 only).
+    let proj = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+    matmul::record(ctx, ssm_w.ssm_out, gated_attn, proj)?;
+    elementwise::record_add(ctx, residual, proj, residual)?;
     Ok(())
 }
 

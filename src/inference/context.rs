@@ -60,6 +60,26 @@ pub struct DispatchContext<'a> {
     /// [`mark`]: DispatchContext::mark
     #[cfg(feature = "profile_gpu")]
     pub profile: Option<&'a mut super::profile::ProfileRecorder>,
+    /// Release-capable per-op buffer dump (NOT gpu_debug-gated). When set,
+    /// [`dump`](DispatchContext::dump) records a transfer copy of a tensor into
+    /// `dump.buffer` during recording; the host reads them back after submit.
+    /// Used to bisect release-only nondeterminism (run the same forward twice,
+    /// find the first record whose bytes differ → the offending op). `None` on
+    /// every production path, so `dump()` is a cheap early-return.
+    pub dump: Option<DumpState>,
+}
+
+/// A persistent host-visible sink for [`DispatchContext::dump`]. The owning
+/// debug method allocates `buffer` (host-visible, TRANSFER_DST) and keeps its
+/// backing memory alive across the submit, then reads `records` back via
+/// `host_ptr`.
+pub struct DumpState {
+    pub buffer: vk::Buffer,
+    pub host_ptr: *mut u8,
+    pub capacity: u64,
+    pub cursor: u64,
+    /// `(label, byte_offset, byte_size)` per recorded dump, in record order.
+    pub records: Vec<(String, u64, u64)>,
 }
 
 impl<'a> DispatchContext<'a> {
@@ -80,6 +100,43 @@ impl<'a> DispatchContext<'a> {
     #[cfg(not(feature = "profile_gpu"))]
     #[inline(always)]
     pub fn mark(&mut self, _kind: super::profile::BlockClass) {}
+
+    /// Release-capable dump: when `self.dump` is set, record a transfer copy of
+    /// `t`'s bytes into the dump buffer (after a global barrier so the copy
+    /// observes `t`'s compute writes) and register `(label, offset, size)` for
+    /// host readback after submit. No-op (early return) when dump is unset —
+    /// the production path. Used to bisect release-only nondeterminism by
+    /// comparing the recorded bytes across two runs of the same input.
+    pub fn dump(&mut self, label: &str, t: TensorView) {
+        self.dump_range(label, BufferRange { buffer: t.buffer, offset: t.byte_offset, size: t.byte_size });
+    }
+
+    /// [`dump`](Self::dump) for a raw [`BufferRange`] (e.g. scratch slots that
+    /// aren't `TensorView`s, like MoE routing `ids`).
+    pub fn dump_range(&mut self, label: &str, r: BufferRange) {
+        let (dump_buf, offset) = match self.dump.as_mut() {
+            Some(d) => {
+                if d.cursor + r.size > d.capacity {
+                    return; // out of dump space — silently skip the tail
+                }
+                let off = d.cursor;
+                d.records.push((label.to_string(), off, r.size));
+                d.cursor += r.size;
+                (d.buffer, off)
+            }
+            None => return,
+        };
+        super::command::record_global_barrier(self.device, self.cmd);
+        let copy = vk::BufferCopy::default()
+            .src_offset(r.offset)
+            .dst_offset(offset)
+            .size(r.size);
+        unsafe {
+            self.device
+                .device
+                .cmd_copy_buffer(self.cmd, r.buffer, dump_buf, std::slice::from_ref(&copy));
+        }
+    }
 }
 
 impl<'a> DispatchContext<'a> {

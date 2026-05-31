@@ -77,6 +77,42 @@ impl Default for SamplerConfig {
 }
 
 impl SamplerConfig {
+    /// Build a config from raw CLI fields, resolving `penalty_last_n < 0` to the
+    /// whole context window (`ctx_size`) — llama.cpp's `--repeat-last-n -1`.
+    /// Shared by `seeker chat` and `seeker serve` so both map flags identically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_cli(
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        min_p: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+        repeat_penalty: f32,
+        penalty_last_n: i32,
+        ctx_size: u32,
+        seed: u64,
+        logit_bias: Vec<(u32, f32)>,
+    ) -> Self {
+        Self {
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            presence_penalty,
+            frequency_penalty,
+            repeat_penalty,
+            // -1 → whole context window; otherwise the literal count (0 = off).
+            penalty_last_n: if penalty_last_n < 0 {
+                ctx_size as usize
+            } else {
+                penalty_last_n as usize
+            },
+            seed,
+            logit_bias,
+        }
+    }
+
     /// True if greedy short-circuit applies. Penalties still run.
     pub fn is_greedy(&self) -> bool {
         self.temperature <= 0.0

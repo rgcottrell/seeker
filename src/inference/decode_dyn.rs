@@ -40,17 +40,58 @@ pub struct DecodeDyn {
     /// dyn-offset V-cache write shader so the cmdbuf binds the *full*
     /// cache layer instead of a position-baked slice.
     pub v_cache_d_offset: u32,
-    pub _pad1: u32,
+    /// KV-cache slab index for batched/continuous decode — the flash-attn
+    /// kernel reads K/V from `slot * nb13` / `slot * nb23`, so a gathered batch
+    /// can address arbitrary (non-contiguous) `BatchKvCache` slabs. `0` (slab 0)
+    /// for single-sequence decode, byte-identical to the old `iq3`-strided read.
+    pub slot: u32,
+    /// Number of query rows (`L_s`) this sequence contributes this step, for the
+    /// unified varlen batched flash (`VARLEN` spec constant). Decode = 1; a
+    /// prefill chunk = its token count. Rows `>= n_query` are skipped. The
+    /// per-row causal bound is `base + i_row + 1` with `base = kv_len - n_query`
+    /// (the cached prefix length), so the shader masks causally in-place — no
+    /// host mask. Unused when `VARLEN == 0`.
+    pub n_query: u32,
+    /// Flat query-token offset: index of this sequence's first query row in the
+    /// packed `[N_total]` token dimension (`q_start[s] = sum L_i for i<s`).
+    /// Decode = the sequence's batch index. Unused when `VARLEN == 0`.
+    pub q_start: u32,
 }
 
 impl DecodeDyn {
-    pub const SIZE: u64 = 32;
+    pub const SIZE: u64 = 40;
 }
 
 /// Allocate the DecodeDyn slot in the active scratch region. Pair with
 /// [`write`] to populate fields via the host-mapped pointer.
 pub fn alloc(ctx: &mut DispatchContext) -> Result<BufferRange, Box<dyn Error>> {
     ctx.alloc_scratch(DecodeDyn::SIZE)
+}
+
+/// Allocate a contiguous array of `n_seqs` DecodeDyn entries for batched
+/// decode — one entry per sequence (batch element). The flash-attn kernel
+/// indexes `data_dyn[iq3].kv_len` by batch element, so each sequence attends
+/// to its own cache length; `n_seqs == 1` is byte-identical to [`alloc`].
+pub fn alloc_array(ctx: &mut DispatchContext, n_seqs: u32) -> Result<BufferRange, Box<dyn Error>> {
+    ctx.alloc_scratch(DecodeDyn::SIZE * (n_seqs.max(1) as u64))
+}
+
+/// Host-write a single field of entry `seq_idx` within a DecodeDyn array
+/// allocated by [`alloc_array`]. Offsets past entry 0 by `seq_idx * SIZE`.
+pub fn write_field_indexed<T: Copy>(
+    ctx: &DispatchContext,
+    range: BufferRange,
+    seq_idx: u32,
+    field_offset: usize,
+    value: T,
+) -> Result<(), Box<dyn Error>> {
+    let host_ptr = ctx
+        .scratch
+        .host_ptr
+        .ok_or("scratch not host-visible — DecodeDyn requires mapped memory")?;
+    let entry_offset = range.offset + (seq_idx as u64) * DecodeDyn::SIZE;
+    write_field(host_ptr, entry_offset, field_offset, value);
+    Ok(())
 }
 
 /// Write a populated `DecodeDyn` into the scratch slot via the mapped
@@ -116,6 +157,9 @@ pub const OFFSET_ROPE_D_OFFSET: usize = 12;
 pub const OFFSET_UNIFORM_RNG: usize = 16;
 pub const OFFSET_PENALTY_COUNT: usize = 20;
 pub const OFFSET_V_CACHE_D_OFFSET: usize = 24;
+pub const OFFSET_SLOT: usize = 28;
+pub const OFFSET_N_QUERY: usize = 32;
+pub const OFFSET_Q_START: usize = 36;
 
 /// Snapshot of the scratch offsets and small constants captured during
 /// the first decode recording. Lets the host re-populate the same slots

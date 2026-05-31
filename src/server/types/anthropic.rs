@@ -6,9 +6,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const STUB_TEXT: &str = "[stub] seeker serve has no inference backend wired up yet";
-pub const STUB_MODEL: &str = "seeker-stub";
-
 #[derive(Debug, Default, Deserialize)]
 pub struct MessagesRequest {
     #[serde(default)]
@@ -74,23 +71,6 @@ pub struct MessagesResponse {
     pub usage: AnthropicUsage,
 }
 
-impl MessagesResponse {
-    pub fn stub(req: &MessagesRequest) -> Self {
-        Self {
-            id: "msg_seeker_stub".to_string(),
-            kind: "message",
-            role: "assistant",
-            model: req.model.clone().unwrap_or_else(|| STUB_MODEL.to_string()),
-            content: vec![ContentBlock::Text {
-                text: STUB_TEXT.to_string(),
-            }],
-            stop_reason: "end_turn",
-            stop_sequence: None,
-            usage: AnthropicUsage::default(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // /v1/messages/count_tokens
 // ---------------------------------------------------------------------------
@@ -110,10 +90,4 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize)]
 pub struct CountTokensResponse {
     pub input_tokens: u32,
-}
-
-impl CountTokensResponse {
-    pub fn stub() -> Self {
-        Self { input_tokens: 0 }
-    }
 }

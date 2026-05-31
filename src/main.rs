@@ -104,6 +104,7 @@ where
                 "-sys" => Some("--system-prompt"),
                 "-sysf" => Some("--system-prompt-file"),
                 "-ub" => Some("--ubatch-size"),
+                "-np" => Some("--parallel"),
                 _ => None,
             };
             match (canonical, tail) {
@@ -124,6 +125,14 @@ mod tests {
         assert_eq!(
             rewrite_shorts(["seeker", "chat", "-sys", "Be terse.", "-sysf=p.txt"]),
             vec!["seeker", "chat", "--system-prompt", "Be terse.", "--system-prompt-file=p.txt"]
+        );
+    }
+
+    #[test]
+    fn rewrites_parallel_short_for_serve() {
+        assert_eq!(
+            rewrite_shorts(["seeker", "serve", "-np", "4"]),
+            vec!["seeker", "serve", "--parallel", "4"]
         );
     }
 

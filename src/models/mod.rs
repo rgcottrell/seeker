@@ -126,6 +126,62 @@ pub trait Model: Send + Sync {
         Err("model does not support image input".into())
     }
 
+    /// Batched **decode** forward: advance `B = tokens.len()` independent
+    /// sequences by one token each in a single pass. `tokens[s]` is sequence
+    /// `s`'s input token and `positions[s]` is its current cache position
+    /// (its new K/V lands there; it attends over `[0, positions[s] + 1)`).
+    /// `slots[s]` is the `BatchKvCache` slab that sequence `s`'s K/V and
+    /// recurrent state live in — the batch can gather arbitrary, non-contiguous
+    /// slabs (so prefix-reuse can park a conversation in any slab and still join
+    /// the batch). Returns the next-token logits for all sequences — shape
+    /// `[vocab_size, B]`, dtype F32, column `s` being sequence `s`'s logits.
+    ///
+    /// Default: unimplemented. Implemented per-architecture (llama, qwen35moe).
+    /// The dense ops already process the `B`-wide token dimension; the
+    /// per-sequence work is attention (own KV slab + length) and, for hybrids,
+    /// the recurrent state.
+    fn record_forward_batch(
+        &self,
+        _ctx: &mut DispatchContext,
+        _batch: &mut crate::inference::kv_cache::BatchKvCache,
+        _tokens: &[u32],
+        _positions: &[u32],
+        _slots: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        Err("record_forward_batch (batched decode) not implemented for this model".into())
+    }
+
+    /// Unified varlen forward (M5): `B` sequences, sequence `s` contributing
+    /// `seq_lens[s]` tokens packed flat (in order) into `tokens` / `positions`
+    /// (`N_total = sum seq_lens`). Mixes prefill chunks (`L_s > 1`) and decode
+    /// (`L_s = 1`) in one forward; attention masks causally per sequence over
+    /// its own slab (`slots[s]`), continuing from the cached prefix at
+    /// `positions[first token of s]`. `positions[t]` is token `t`'s absolute
+    /// cache position; the new K/V land there. Returns the last-token logits of
+    /// each sequence — shape `[vocab, B]`, column `s` = logits at sequence `s`'s
+    /// final supplied token (sample it iff `s` just finished prefilling / is
+    /// decoding). Generalizes [`Self::record_forward_batch`] (the `L_s = 1`
+    /// case). Default: unimplemented.
+    fn record_forward_unified(
+        &self,
+        _ctx: &mut DispatchContext,
+        _batch: &mut crate::inference::kv_cache::BatchKvCache,
+        _tokens: &[u32],
+        _positions: &[u32],
+        _seq_lens: &[u32],
+        _slots: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        Err("record_forward_unified (varlen prefill+decode) not implemented for this model".into())
+    }
+
+    /// Whether [`Self::record_forward_unified`] is implemented — lets the server
+    /// scheduler use the token-budget / chunked-prefill loop (mixing prefill and
+    /// decode of different requests in one forward). Models without it fall back
+    /// to the serial-prefill + batched-decode path. Default `false`.
+    fn supports_unified(&self) -> bool {
+        false
+    }
+
     /// Conservative upper bound (in bytes) on the transient scratch one
     /// forward pass of `≤ n_ubatch` tokens needs, used to size the engine's
     /// scratch region (llama.cpp-style worst-case compute-buffer reservation).

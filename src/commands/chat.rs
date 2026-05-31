@@ -261,7 +261,8 @@ fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
 
 /// Parse one `--logit-bias` entry: `ID=BIAS` or llama.cpp's `ID(+/-)BIAS`
 /// (the sign is part of the bias). BIAS may be `inf` / `-inf` to force / ban.
-fn parse_logit_bias(s: &str) -> Result<(u32, f32), String> {
+/// Shared with `seeker serve` (same `--logit-bias` flag).
+pub(crate) fn parse_logit_bias(s: &str) -> Result<(u32, f32), String> {
     let (id_str, bias_str) = if let Some((a, b)) = s.split_once('=') {
         (a, b)
     } else {
@@ -286,23 +287,19 @@ fn parse_logit_bias(s: &str) -> Result<(u32, f32), String> {
 
 impl ChatArgs {
     fn sampler_config(&self) -> SamplerConfig {
-        SamplerConfig {
-            temperature: self.temperature,
-            top_k: self.top_k,
-            top_p: self.top_p,
-            min_p: self.min_p,
-            presence_penalty: self.presence_penalty,
-            frequency_penalty: self.frequency_penalty,
-            repeat_penalty: self.repeat_penalty,
-            // -1 → whole context window; otherwise the literal count (0 = off).
-            penalty_last_n: if self.penalty_last_n < 0 {
-                self.ctx_size as usize
-            } else {
-                self.penalty_last_n as usize
-            },
-            seed: self.seed,
-            logit_bias: self.logit_bias.clone(),
-        }
+        SamplerConfig::from_cli(
+            self.temperature,
+            self.top_k,
+            self.top_p,
+            self.min_p,
+            self.presence_penalty,
+            self.frequency_penalty,
+            self.repeat_penalty,
+            self.penalty_last_n,
+            self.ctx_size,
+            self.seed,
+            self.logit_bias.clone(),
+        )
     }
 }
 

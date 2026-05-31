@@ -345,6 +345,59 @@ impl KvCache {
 
 }
 
+impl KvCache {
+    /// Build a non-owning `KvCache` over slab `byte_offset`s inside a shared
+    /// buffer (a [`BatchKvCache`] slot). The `region` is borrowed
+    /// ([`Region::borrowed`]) so Drop frees nothing — the `BatchKvCache` owns
+    /// the buffer. SSM state is left empty (attention-only; the batched SSM
+    /// path lands with qwen35moe in M2). Used to prefill one sequence into its
+    /// slab via the existing single-sequence forward path.
+    #[allow(clippy::too_many_arguments)]
+    fn borrowed_slot(
+        config: KvCacheConfig,
+        buffer: vk::Buffer,
+        host_ptr: Option<*mut u8>,
+        buffer_size: u64,
+        alignment: u64,
+        k_layers: Vec<TensorView>,
+        v_layers: Vec<TensorView>,
+        position: u32,
+        device: Arc<DeviceShared>,
+        // Per-slot SSM recurrent state (empty for attention-only models). When
+        // present, the borrowed cache points at the owning BatchKvCache's
+        // per-sequence state slices so a single-sequence prefill writes its
+        // final conv/GDN state where the batched decode reads it. The region is
+        // borrowed (Drop frees nothing — the BatchKvCache owns it).
+        ssm_conv_states: Vec<crate::inference::buffer::BufferRange>,
+        ssm_gdn_states: Vec<crate::inference::buffer::BufferRange>,
+        ssm_region: Option<(vk::Buffer, Option<*mut u8>, u64)>,
+    ) -> Self {
+        let ssm_region = ssm_region
+            .map(|(buf, hp, size)| Region::borrowed(buf, hp, size, alignment));
+        Self {
+            config,
+            region: Region::borrowed(buffer, host_ptr, buffer_size, alignment),
+            k_layers,
+            v_layers,
+            position,
+            // Borrowed single-sequence slot: text starts with no M-RoPE lag; an
+            // image prefill through this path sets it (multimodal-in-scheduler).
+            rope_position_lag: 0,
+            ssm_region,
+            ssm_conv_states,
+            ssm_gdn_states,
+            ssm_gdn_snap_region: None,
+            ssm_gdn_snapshots: Vec::new(),
+            ssm_conv_backup_region: None,
+            ssm_conv_backups: Vec::new(),
+            ssm_max_snapshots: 0,
+            ssm_conv_kernel: 0,
+            ssm_conv_channels: 0,
+            device,
+        }
+    }
+}
+
 impl Drop for KvCache {
     fn drop(&mut self) {
         // Free the KV region + any SSM/snapshot regions. The Arc keeps the
@@ -447,4 +500,403 @@ fn make_view(
 
 fn align_up(v: u64, alignment: u64) -> u64 {
     (v + alignment - 1) & !(alignment - 1)
+}
+
+/// A KV cache holding `n_slots` independent sequence slabs in one shared buffer
+/// per layer, so a batched decode can address all active sequences through the
+/// flash-attn batch stride (`nb13`/`nb23`). Each slab has the identical natural
+/// `[head_dim, n_head_kv, max_seq_len]` layout as a standalone [`KvCache`]
+/// layer; slabs are padded to the storage-buffer alignment so every slot's
+/// byte offset is bindable. Attention-only (F32/F16/BF16 caches) for now — the
+/// quant-cache and SSM-state slabs land later (M2/M4).
+pub struct BatchKvCache {
+    pub config: KvCacheConfig,
+    pub n_slots: u32,
+    pub n_layer: u32,
+    head_dim: u32,
+    n_head_kv: u32,
+    region: Region,
+    buffer: vk::Buffer,
+    host_ptr: Option<*mut u8>,
+    buffer_size: u64,
+    alignment: u64,
+    /// Byte offset of each layer's K slab-0 / V slab-0.
+    k_base: Vec<u64>,
+    v_base: Vec<u64>,
+    /// Per-slot slab stride in bytes (padded to `alignment`).
+    k_slab_stride: u64,
+    v_slab_stride: u64,
+    /// Current write position (tokens) of each slot.
+    pub positions: Vec<u32>,
+    /// Per-sequence SSM/GDN recurrent state (hybrid models), allocated by
+    /// [`Self::allocate_ssm_state`]. Per layer the GDN state is one contiguous
+    /// `B × gdn_state_floats` block (the GDN shader indexes seq as the
+    /// outermost state dim → dispatched at `n_seqs = B`); the conv state is
+    /// `B × conv_state_floats`, addressed per slot for the per-sequence
+    /// conv-input prefix + writeback.
+    ssm_region: Option<Region>,
+    ssm_conv_base: Vec<u64>,
+    ssm_gdn_base: Vec<u64>,
+    conv_slab_floats: u32,
+    gdn_slab_floats: u32,
+    device: Arc<DeviceShared>,
+}
+
+impl BatchKvCache {
+    pub fn new(
+        device: &Device,
+        n_layer: u32,
+        head_dim: u32,
+        n_head_kv: u32,
+        n_slots: u32,
+        config: KvCacheConfig,
+    ) -> Result<Self, Box<dyn Error>> {
+        validate_dtype(config.k_dtype, "K")?;
+        validate_dtype(config.v_dtype, "V")?;
+        validate_head_dim(head_dim, config.k_dtype, "K")?;
+        validate_head_dim(head_dim, config.v_dtype, "V")?;
+        for (ty, side) in [(config.k_dtype, "K"), (config.v_dtype, "V")] {
+            if ty.block_layout().0 != 1 {
+                return Err(format!(
+                    "BatchKvCache: quant {side} cache dtype {ty:?} not supported yet \
+                     (batched decode needs a flat per-element stride; use f16/bf16/f32)"
+                )
+                .into());
+            }
+        }
+
+        let max_seq_len = config.max_seq_len as u64;
+        let head_dim_u = head_dim as u64;
+        let n_head_kv_u = n_head_kv as u64;
+        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+
+        let k_slab = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, config.k_dtype);
+        let v_slab = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, config.v_dtype);
+        let k_slab_stride = align_up(k_slab, align);
+        let v_slab_stride = align_up(v_slab, align);
+        let k_block = k_slab_stride * n_slots as u64;
+        let v_block = v_slab_stride * n_slots as u64;
+
+        let mut k_base = Vec::with_capacity(n_layer as usize);
+        let mut v_base = Vec::with_capacity(n_layer as usize);
+        let mut cursor = 0u64;
+        for _ in 0..n_layer {
+            let kb = align_up(cursor, align);
+            cursor = kb + k_block;
+            let vb = align_up(cursor, align);
+            cursor = vb + v_block;
+            k_base.push(kb);
+            v_base.push(vb);
+        }
+        let total = cursor.max(1);
+
+        let region = Region::new(
+            device,
+            total,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        // Zero the whole buffer so no slot ever reads stale K/V on its first
+        // forward (mirrors KvCache's implicit zero-on-fresh-alloc reliance).
+        if let Some(p) = region.host_ptr {
+            unsafe { std::ptr::write_bytes(p, 0, total as usize) };
+        }
+
+        Ok(Self {
+            config,
+            n_slots,
+            n_layer,
+            head_dim,
+            n_head_kv,
+            buffer: region.buffer,
+            host_ptr: region.host_ptr,
+            buffer_size: region.size,
+            alignment: region.alignment,
+            region,
+            k_base,
+            v_base,
+            k_slab_stride,
+            v_slab_stride,
+            positions: vec![0; n_slots as usize],
+            ssm_region: None,
+            ssm_conv_base: Vec::new(),
+            ssm_gdn_base: Vec::new(),
+            conv_slab_floats: 0,
+            gdn_slab_floats: 0,
+            device: device.shared(),
+        })
+    }
+
+    /// Allocate per-sequence SSM recurrent state for a hybrid model. Per layer:
+    /// a contiguous `n_slots × gdn_state_floats` GDN block (seq-outermost, so a
+    /// single `n_seqs = n_slots` gated-delta-net dispatch reads/writes all
+    /// sequences) and an `n_slots × conv_state_floats` conv block (addressed per
+    /// slot). Zero-initialized. Layer blocks are storage-aligned.
+    pub fn allocate_ssm_state(
+        &mut self,
+        device: &Device,
+        n_ssm_layers: u32,
+        conv_state_floats: u32,
+        gdn_state_floats: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let n = self.n_slots as u64;
+        let conv_block = (conv_state_floats as u64) * n * 4;
+        let gdn_block = (gdn_state_floats as u64) * n * 4;
+        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+
+        let mut conv_base = Vec::with_capacity(n_ssm_layers as usize);
+        let mut gdn_base = Vec::with_capacity(n_ssm_layers as usize);
+        let mut cursor = 0u64;
+        for _ in 0..n_ssm_layers {
+            let cb = align_up(cursor, align);
+            cursor = cb + conv_block;
+            let gb = align_up(cursor, align);
+            cursor = gb + gdn_block;
+            conv_base.push(cb);
+            gdn_base.push(gb);
+        }
+        let total = cursor.max(1);
+
+        let region = Region::new(
+            device,
+            total,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        if let Some(p) = region.host_ptr {
+            unsafe { std::ptr::write_bytes(p, 0, total as usize) };
+        }
+        self.ssm_region = Some(region);
+        self.ssm_conv_base = conv_base;
+        self.ssm_gdn_base = gdn_base;
+        self.conv_slab_floats = conv_state_floats;
+        self.gdn_slab_floats = gdn_state_floats;
+        Ok(())
+    }
+
+    /// The contiguous `n_slots × gdn_state_floats` GDN state block for `layer`
+    /// (fed to a single `n_seqs = n_slots` gated-delta-net dispatch).
+    pub fn gdn_state_layer(&self, layer: u32) -> crate::inference::buffer::BufferRange {
+        let region = self.ssm_region.as_ref().expect("SSM state not allocated");
+        crate::inference::buffer::BufferRange {
+            buffer: region.buffer,
+            offset: self.ssm_gdn_base[layer as usize],
+            size: (self.gdn_slab_floats as u64) * (self.n_slots as u64) * 4,
+        }
+    }
+
+    /// The contiguous `n_slots × conv_state_floats` conv state block for
+    /// `layer` (seq-outermost) — for batched conv-input prefix + writeback casts.
+    pub fn conv_state_layer(&self, layer: u32) -> crate::inference::buffer::BufferRange {
+        let region = self.ssm_region.as_ref().expect("SSM state not allocated");
+        crate::inference::buffer::BufferRange {
+            buffer: region.buffer,
+            offset: self.ssm_conv_base[layer as usize],
+            size: (self.conv_slab_floats as u64) * (self.n_slots as u64) * 4,
+        }
+    }
+
+    /// Sequence `slot`'s conv state for `layer` (the per-sequence conv-input
+    /// prefix source and writeback target).
+    pub fn conv_state_slot(&self, layer: u32, slot: u32) -> crate::inference::buffer::BufferRange {
+        let region = self.ssm_region.as_ref().expect("SSM state not allocated");
+        let slab = (self.conv_slab_floats as u64) * 4;
+        crate::inference::buffer::BufferRange {
+            buffer: region.buffer,
+            offset: self.ssm_conv_base[layer as usize] + slot as u64 * slab,
+            size: slab,
+        }
+    }
+
+    /// Sequence `slot`'s GDN state for `layer` — a single-sequence `gdn_floats`
+    /// slice of the seq-outermost block. Used to point a borrowed single-slot
+    /// prefill cache at this slot's state so the prefill persists its final
+    /// recurrent state where the batched decode will pick it up.
+    pub fn gdn_state_slot(&self, layer: u32, slot: u32) -> crate::inference::buffer::BufferRange {
+        let region = self.ssm_region.as_ref().expect("SSM state not allocated");
+        let slab = (self.gdn_slab_floats as u64) * 4;
+        crate::inference::buffer::BufferRange {
+            buffer: region.buffer,
+            offset: self.ssm_gdn_base[layer as usize] + slot as u64 * slab,
+            size: slab,
+        }
+    }
+
+    /// Number of SSM layers with allocated per-slot state (0 if none).
+    pub fn n_ssm_layers(&self) -> usize {
+        self.ssm_conv_base.len()
+    }
+
+    /// Total device memory (K/V slabs + SSM state) backing all slots, in bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.region.size + self.ssm_region.as_ref().map_or(0, |r| r.size)
+    }
+
+    /// Zero just slot `slot`'s recurrent SSM state (all layers), leaving every
+    /// other slab untouched. Use before re-prefilling a reused slab on a
+    /// divergent prompt — the recurrent state has no per-position undo, so a
+    /// non-extension must start from a fresh (zero) state. The attention K/V
+    /// needs no zeroing: the prefill overwrites `[0, len)` and reads are bounded
+    /// by the position cursor. (The whole-region [`KvCache::reset`] is unsafe
+    /// here — it would clobber the other slabs' live state.)
+    pub fn reset_slot(&self, slot: u32) {
+        let Some(host) = self.ssm_region.as_ref().and_then(|r| r.host_ptr) else {
+            return;
+        };
+        for layer in 0..self.n_ssm_layers() as u32 {
+            for r in [self.conv_state_slot(layer, slot), self.gdn_state_slot(layer, slot)] {
+                // SAFETY: `r` is a sub-range of the HOST_VISIBLE|HOST_COHERENT
+                // ssm_region that `host` maps from offset 0.
+                unsafe {
+                    std::ptr::write_bytes(host.add(r.offset as usize), 0, r.size as usize);
+                }
+            }
+        }
+    }
+
+    /// Per-slot conv / GDN recurrent-state lengths (floats), for gathering an
+    /// active batch's state out of the seq-outermost per-layer blocks.
+    pub fn conv_slot_floats(&self) -> u64 {
+        self.conv_slab_floats as u64
+    }
+    pub fn gdn_slot_floats(&self) -> u64 {
+        self.gdn_slab_floats as u64
+    }
+
+    /// Single-slot natural `[head_dim, n_head_kv, max_seq_len]` K view (slab
+    /// `slot`, layer `layer`) — identical layout to `KvCache::k_layers[layer]`.
+    pub fn slot_k_view(&self, slot: u32, layer: u32) -> TensorView {
+        make_view(
+            self.buffer,
+            self.k_base[layer as usize] + slot as u64 * self.k_slab_stride,
+            self.head_dim as u64,
+            self.config.max_seq_len as u64,
+            self.n_head_kv as u64,
+            self.config.k_dtype,
+        )
+    }
+
+    pub fn slot_v_view(&self, slot: u32, layer: u32) -> TensorView {
+        make_view(
+            self.buffer,
+            self.v_base[layer as usize] + slot as u64 * self.v_slab_stride,
+            self.head_dim as u64,
+            self.config.max_seq_len as u64,
+            self.n_head_kv as u64,
+            self.config.v_dtype,
+        )
+    }
+
+    /// Batched flash-attn K view for `layer`: permuted `[head_dim, max_seq_len,
+    /// n_head_kv, n_slots]` with the slot as the batch dimension (stride = slab
+    /// stride). Binds the **whole** per-layer K block (all slots) so the kernel
+    /// can read any slab via `DecodeDyn::slot` — a gathered batch addresses
+    /// non-contiguous slots. The shader bounds each sequence's KV loop by its
+    /// own `kv_len`, so the unused tail past each slot's position is never read.
+    pub fn batched_k_attn_view(&self, layer: u32) -> TensorView {
+        batched_attn_view(
+            self.buffer,
+            self.k_base[layer as usize],
+            self.k_slab_stride,
+            self.head_dim as u64,
+            self.config.max_seq_len as u64,
+            self.n_head_kv as u64,
+            self.n_slots,
+            self.config.k_dtype,
+        )
+    }
+
+    pub fn batched_v_attn_view(&self, layer: u32) -> TensorView {
+        batched_attn_view(
+            self.buffer,
+            self.v_base[layer as usize],
+            self.v_slab_stride,
+            self.head_dim as u64,
+            self.config.max_seq_len as u64,
+            self.n_head_kv as u64,
+            self.n_slots,
+            self.config.v_dtype,
+        )
+    }
+
+    /// A non-owning single-sequence `KvCache` over slot `slot` (its slabs +
+    /// current position). Use it to prefill one sequence into its slab via the
+    /// existing single-sequence forward path; afterwards copy its `position`
+    /// back into `self.positions[slot]`.
+    pub fn slot_kvcache(&self, slot: u32) -> KvCache {
+        let k_layers = (0..self.n_layer).map(|l| self.slot_k_view(slot, l)).collect();
+        let v_layers = (0..self.n_layer).map(|l| self.slot_v_view(slot, l)).collect();
+        // Point the borrowed cache at this slot's per-sequence SSM state so a
+        // hybrid prefill persists its final conv/GDN state into the batch slab
+        // (the batched decode continues from it). Zero-initialized by
+        // allocate_ssm_state, so the prefill still starts from a fresh state.
+        let n_ssm = self.n_ssm_layers();
+        let (ssm_conv_states, ssm_gdn_states, ssm_region) = if n_ssm > 0 {
+            let conv = (0..n_ssm as u32).map(|l| self.conv_state_slot(l, slot)).collect();
+            let gdn = (0..n_ssm as u32).map(|l| self.gdn_state_slot(l, slot)).collect();
+            let r = self.ssm_region.as_ref().expect("SSM state allocated");
+            (conv, gdn, Some((r.buffer, r.host_ptr, r.size)))
+        } else {
+            (Vec::new(), Vec::new(), None)
+        };
+        KvCache::borrowed_slot(
+            self.config,
+            self.buffer,
+            self.host_ptr,
+            self.buffer_size,
+            self.alignment,
+            k_layers,
+            v_layers,
+            self.positions[slot as usize],
+            self.device.clone(),
+            ssm_conv_states,
+            ssm_gdn_states,
+            ssm_region,
+        )
+    }
+}
+
+impl Drop for BatchKvCache {
+    fn drop(&mut self) {
+        let dev = self.device.raw();
+        self.region.destroy(dev);
+        if let Some(mut r) = self.ssm_region.take() {
+            r.destroy(dev);
+        }
+    }
+}
+
+/// Build a batched flash-attn K/V view: permuted `[head_dim, max_seq_len,
+/// n_head_kv, B]` with the slot as the (stride `slab_stride` bytes) batch
+/// dimension. Assumes a flat per-element stride (block_size == 1).
+#[allow(clippy::too_many_arguments)]
+fn batched_attn_view(
+    buffer: vk::Buffer,
+    base: u64,
+    slab_stride_bytes: u64,
+    head_dim: u64,
+    max_seq_len: u64,
+    n_head_kv: u64,
+    b: u32,
+    dtype: GgmlType,
+) -> TensorView {
+    let ts = dtype.block_layout().1 as u64; // type_size (block_size == 1)
+    let element_stride = [1u64, head_dim * n_head_kv, head_dim, slab_stride_bytes / ts];
+    let byte_stride = [
+        element_stride[0] * ts,
+        element_stride[1] * ts,
+        element_stride[2] * ts,
+        element_stride[3] * ts,
+    ];
+    TensorView {
+        buffer,
+        byte_offset: base,
+        byte_size: slab_stride_bytes * b as u64,
+        dims: [head_dim, max_seq_len, n_head_kv, b as u64],
+        byte_stride,
+        element_stride,
+        dtype,
+    }
 }
