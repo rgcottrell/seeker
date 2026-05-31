@@ -416,13 +416,45 @@ pub fn record_batched(
     // contiguous layout. `Some` lets a gathered batch read non-contiguous slabs
     // (continuous-batching with prefix-reuse parking). Must be `kv_lens.len()`.
     slots: Option<&[u32]>,
+    // Per-sequence query-row counts (`L_s`). `None` → decode: each sequence
+    // contributes one query row, split-K enabled, legacy Q/out layout
+    // (`[head_dim, 1, n_head, B]`, batch stride nb03). `Some` → unified varlen:
+    // sequence `s` contributes `query_lens[s]` rows packed flat in the token
+    // dimension; the shader masks causally in-place (row r of seq s sees
+    // `[0, kv_lens[s] - query_lens[s] + r]`). q/out are the flat
+    // `[head_dim, N_total, n_head]` / `[hidden_v, N_total]` layouts (per-token
+    // stride nb01, per-head nb02); split-K is disabled (the `L_s` rows already
+    // fill the grid). Must be `kv_lens.len()`; each `query_lens[s] <= kv_lens[s]`.
+    query_lens: Option<&[u32]>,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(q.dtype, GgmlType::F32);
     debug_assert_eq!(out.dtype, GgmlType::F32);
     debug_assert_eq!(k.dtype, v.dtype, "flash_attn requires K and V to share a dtype");
     let b = kv_lens.len() as u32;
     debug_assert!(b >= 1, "record_batched needs at least one sequence");
-    debug_assert_eq!(q.dims[3].max(1) as u32, b, "q batch dim must equal kv_lens.len()");
+    let varlen = query_lens.is_some();
+    if let Some(ql) = query_lens {
+        debug_assert_eq!(ql.len(), kv_lens.len(), "query_lens must match kv_lens");
+        debug_assert!(
+            ql.iter().zip(kv_lens).all(|(&q, &kv)| q >= 1 && q <= kv),
+            "each query_lens[s] must be in 1..=kv_lens[s]"
+        );
+    } else {
+        debug_assert_eq!(q.dims[3].max(1) as u32, b, "q batch dim must equal kv_lens.len()");
+    }
+    // Flat per-sequence query offsets (prefix sum of query_lens) and the grid's
+    // x-dim (max query rows). Decode: query_lens = all-1 → q_start[s]=s, 1 row.
+    let query_lens_vec: Vec<u32> =
+        query_lens.map(|q| q.to_vec()).unwrap_or_else(|| vec![1; b as usize]);
+    let q_starts: Vec<u32> = query_lens_vec
+        .iter()
+        .scan(0u32, |acc, &l| {
+            let s = *acc;
+            *acc += l;
+            Some(s)
+        })
+        .collect();
+    let max_rows = query_lens_vec.iter().copied().max().unwrap_or(1);
 
     let (variant_name, variant_spv) = match k.dtype {
         GgmlType::F32 => ("flash_attn_f32_f32", shaders::FLASH_ATTN_F32_F32_SPV.as_bytes()),
@@ -447,12 +479,17 @@ pub fn record_batched(
     // only when that under-fills the GPU. When `k_num == 1`, `pick_k_num`
     // returns `blocks_per_split == ceil(max_kv / Bc)` — the whole range in one
     // split, identical to the pre-split single pass.
-    let n = 1u32; // one query row per head per sequence (decode)
     let ne2 = q.dims[2] as u32; // n_head
     let ne3 = b;
-    let base_wgs = n * ne2 * ne3;
-    let (k_num, blocks_per_split) =
-        pick_k_num_clamped(ctx.device.shader_core_count, base_wgs, max_kv);
+    // Grid x-dim = query rows. Decode: 1 row/seq, split KV via the heuristic.
+    // Varlen: max_rows rows/seq (the L_s rows already fill the grid → no split).
+    let (n, k_num, blocks_per_split) = if varlen {
+        (max_rows, 1u32, max_kv.div_ceil(FA_BC).max(1))
+    } else {
+        let base_wgs = ne2 * ne3; // one wg per (head, seq)
+        let (k, bps) = pick_k_num_clamped(ctx.device.shader_core_count, base_wgs, max_kv);
+        (1u32, k, bps)
+    };
 
     // Per-sequence DecodeDyn array: entry b's kv_len bounds sequence b's KV
     // loop; entry 0's k_num / blocks_per_split are read uniformly by every
@@ -479,6 +516,8 @@ pub fn record_batched(
         for (i, e) in entries.iter_mut().enumerate() {
             e.kv_len = kv_lens[i];
             e.slot = slots.map_or(i as u32, |s| s[i]);
+            e.n_query = query_lens_vec[i];
+            e.q_start = q_starts[i];
         }
         entries[0].k_num = k_num;
         entries[0].blocks_per_split = blocks_per_split;
@@ -543,8 +582,9 @@ pub fn record_batched(
         FA_BC,
         params.head_dim_k,
         params.head_dim_v,
-        0, // MASK_ENABLE
-        0, // Clamp
+        0,                          // MASK_ENABLE (varlen masks causally in-shader)
+        0,                          // Clamp
+        if varlen { 1 } else { 0 }, // VARLEN
     ];
     let key = PipelineKey {
         name: variant_name.to_string(),

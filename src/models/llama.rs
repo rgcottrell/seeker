@@ -494,7 +494,7 @@ impl Model for LlamaModel {
             let attn_out = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
             flash_attn::record_batched(
                 ctx, q_attn, k_attn, v_attn, attn_out, fa_params, &kv_lens, fa_dyn_range,
-                Some(slots),
+                Some(slots), /*query_lens=*/ None,
             )?;
 
             let proj = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;

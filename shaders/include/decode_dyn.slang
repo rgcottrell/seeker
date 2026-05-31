@@ -16,4 +16,10 @@ struct DecodeDyn {
     // so prefix-reuse can park a conversation in any slab and still join the
     // batch. Single-sequence decode leaves it 0 (slab 0). // 28
     uint  slot;
+    // Unified varlen batched flash (VARLEN spec constant): query rows this
+    // sequence contributes (L_s; decode=1) and its flat first-query-token
+    // offset. base = kv_len - n_query is the cached prefix; row i_row attends
+    // causally to [0, base + i_row]. Unused when VARLEN == 0. // 32, 36
+    uint  n_query;
+    uint  q_start;
 };

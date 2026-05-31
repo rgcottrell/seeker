@@ -35,6 +35,13 @@ import glsl;  // gl_SubgroupInvocationID, gl_LocalInvocationIndex
 [SpecializationConstant] const uint HSV          = 128;
 [SpecializationConstant] const uint MASK_ENABLE  = 0;
 [SpecializationConstant] const uint Clamp        = 0;
+// Unified varlen batched decode/prefill. When 1, each sequence (iq3) contributes
+// data_dyn[iq3].n_query query rows packed flat at data_dyn[iq3].q_start, and the
+// KV loop is bounded per-row by the in-shader causal length base + i_row + 1
+// (base = kv_len - n_query) — no host mask, MASK_ENABLE must be 0. When 0 the
+// kernel uses the legacy single-sequence / batched-decode layout (push p.N rows,
+// p.nb03 batch stride, host mask for prefill causality).
+[SpecializationConstant] const uint VARLEN       = 0;
 
 static const uint WORKGROUP_SIZE = 32;
 
@@ -276,13 +283,21 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     // and output stay packed by `iq3`; only the cache reads are slab-indexed.
     // Single-sequence decode sets slot 0 → identical to the old `iq3 * nb`.
     const uint kv_slot    = data_dyn[iq3].slot;
+    // Unified varlen (VARLEN==1): this sequence contributes `p_nq` query rows
+    // packed flat starting at flat token `p_qstart`; `base` is its cached prefix
+    // length (kv before this step's tokens). Legacy (VARLEN==0): p.N rows,
+    // q_start/base unused (decode reads all of kv_len; prefill uses the host
+    // mask for causality).
+    const uint p_nq     = (VARLEN != 0u) ? data_dyn[iq3].n_query : p.N;
+    const uint p_qstart = (VARLEN != 0u) ? data_dyn[iq3].q_start : 0u;
+    const uint base     = (VARLEN != 0u) ? (p_KV - p_nq) : 0u;
     // grid.y packs (head, split): head = y / k_num, split = y % k_num.
     // With k_num == 1 this collapses to head = y, split = 0 — identical to
     // the pre-split-K dispatch.
     const uint iq2    = gl_WorkGroupID.y / p_k_num;
     const uint split  = gl_WorkGroupID.y % p_k_num;
 
-    if (i_row >= p.N) { return; }
+    if (i_row >= p_nq) { return; }
 
     const uint rk2 = p.neq2 / p.nek2;
     const uint rk3 = p.neq3 / p.nek3;
@@ -293,7 +308,12 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     const uint iv3 = iq3 / rv3;
     const uint iv2 = iq2 / rv2;
 
-    const uint q_off = iq3 * p.nb03 + iq2 * p.nb02 + i_row * p.nb01;
+    // VARLEN: flat token-major Q — row (q_start + i_row) at the per-token
+    // stride nb01 (= head_dim*n_head), heads at nb02. Legacy: the
+    // [head_dim, N, n_head, B] view with batch stride nb03.
+    const uint q_off = (VARLEN != 0u)
+        ? (p_qstart + i_row) * p.nb01 + iq2 * p.nb02
+        : iq3 * p.nb03 + iq2 * p.nb02 + i_row * p.nb01;
 
     for (uint d = tid; d < HSK; d += WORKGROUP_SIZE) {
         Q_sh[d] = float(data_q[q_off + d]) * p.scale;
@@ -313,7 +333,11 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                      + (iq2 % p.nem2) * p.nem1 * p.N
                      + i_row * p.N;
 
-    const uint num_blocks  = (p_KV + Bc - 1) / Bc;
+    // Per-row causal length: VARLEN row i_row sees [0, base + i_row]; legacy
+    // uses the full kv_len (decode attends to all of it; prefill relies on the
+    // host mask). This is the only KV bound — no host mask in the VARLEN path.
+    const uint eff_kv = (VARLEN != 0u) ? (base + i_row + 1u) : p_KV;
+    const uint num_blocks  = (eff_kv + Bc - 1) / Bc;
     // This workgroup handles only its split's slice of the KV blocks.
     // k_num == 1 ⇒ split_kv == num_blocks ⇒ [0, num_blocks): full range.
     // A split past the end (block_start >= num_blocks) runs zero iterations
@@ -327,7 +351,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         for (uint c0 = 0; c0 < Bc; c0 += WORKGROUP_SIZE) {
             const uint c = c0 + tid;
             float s = 0.0f;
-            if (c < Bc && kv_base + c < p_KV) {
+            if (c < Bc && kv_base + c < eff_kv) {
                 const uint k_off = kv_slot * p.nb13 + ik2 * p.nb12 + (kv_base + c) * p.nb11;
                 [unroll] for (uint d = 0; d < HSK; ++d) {
                     s += Q_sh[d] * read_k_element(k_off + d);
@@ -355,7 +379,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
             Of[d] *= m_scale;
         }
         [unroll] for (uint c = 0; c < Bc; ++c) {
-            if (kv_base + c >= p_KV) { break; }
+            if (kv_base + c >= eff_kv) { break; }
             const float p_c = exp(S_sh[c] - M_new);
             Lf += p_c;
             const uint v_off = kv_slot * p.nb23 + iv2 * p.nb22 + (kv_base + c) * p.nb21;
@@ -370,10 +394,13 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
 
     if (p_k_num <= 1u) {
         // 4) Single pass: normalize + write final, [HSV, n_head, L] layout.
+        // VARLEN writes flat token-major at (q_start + i_row); legacy uses the
+        // [HSV, n_head, ne1, B] layout with batch index iq3. (VARLEN forces
+        // k_num==1, so the split-K branch below never runs for it.)
         const float inv_L = Lf == 0.0f ? 0.0f : 1.0f / Lf;
-        const uint o_off = iq3 * p.ne2 * p.ne1 * HSV
-                         + i_row * p.ne2 * HSV
-                         + iq2 * HSV;
+        const uint o_off = (VARLEN != 0u)
+            ? (p_qstart + i_row) * p.ne2 * HSV + iq2 * HSV
+            : iq3 * p.ne2 * p.ne1 * HSV + i_row * p.ne2 * HSV + iq2 * HSV;
         [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
             const uint d_global = d * WORKGROUP_SIZE + tid;
             data_o[o_off + d_global] = D_TYPE(Of[d] * inv_L);

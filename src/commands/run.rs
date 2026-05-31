@@ -230,6 +230,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             fa_batch_smoke_test(&mut engine, model.weights())?;
             return Ok(());
         }
+        if std::env::var("SEEKER_FA_VARLEN_TEST").is_ok() {
+            fa_varlen_smoke_test(&mut engine, model.weights())?;
+            return Ok(());
+        }
         if std::env::var("SEEKER_GDN_BATCH_TEST").is_ok() {
             gdn_batch_smoke_test(&mut engine, model.weights())?;
             return Ok(());
@@ -842,7 +846,7 @@ fn fa_batch_smoke_test(
             scale,
         };
         let fa_dyn = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
-        flash_attn::record_batched(ctx, q, k, v, out, params, &kv_lens, fa_dyn, None)?;
+        flash_attn::record_batched(ctx, q, k, v, out, params, &kv_lens, fa_dyn, None, None)?;
         Ok(out.range())
     })?;
 
@@ -870,6 +874,183 @@ fn fa_batch_smoke_test(
         println!("  RESULT: PASS (batched attention matches per-sequence CPU reference)");
     } else {
         println!("  RESULT: FAIL — batched attention diverges from the CPU reference");
+    }
+    Ok(())
+}
+
+/// Unified **varlen** batched flash-attn smoke test: B sequences, each
+/// contributing `L_s` query rows over its own KV slab, with the shader masking
+/// causally in-place (row r of seq s attends to `[0, base_s + r]`,
+/// `base_s = kv_len_s - L_s`). Mixes prefill chunks (L>1, with and without a
+/// cached prefix) and decode (L=1) in one batch — the unified scheduling case —
+/// and checks the GPU output against an independent causal CPU reference.
+/// Run with `SEEKER_FA_VARLEN_TEST=1 seeker run --features gpu_debug`.
+#[cfg(feature = "gpu_debug")]
+fn fa_varlen_smoke_test(
+    engine: &mut Engine,
+    weights: &crate::inference::weights::WeightsHandle,
+) -> Result<(), Box<dyn Error>> {
+    use crate::inference::buffer::BufferRange;
+    use crate::inference::ops::flash_attn;
+    use crate::inference::weights::TensorView;
+
+    let head_dim: usize = 64;
+    let n_head: usize = 4;
+    let n_head_kv: usize = 2;
+    let gqa = (n_head / n_head_kv) as u32;
+    let hidden = head_dim * n_head;
+    let hidden_v = hidden; // head_dim_v == head_dim_k here
+
+    // (base, L) per sequence: a fresh prefill (no prefix), a prefill chunk with
+    // a cached prefix, and a decode (L=1). kv_len = base + L; query_len = L.
+    let seqs: Vec<(usize, usize)> = vec![(0, 4), (5, 3), (10, 1)];
+    let kv_lens: Vec<u32> = seqs.iter().map(|&(base, l)| (base + l) as u32).collect();
+    let query_lens: Vec<u32> = seqs.iter().map(|&(_, l)| l as u32).collect();
+    let q_starts: Vec<usize> = {
+        let mut acc = 0;
+        seqs.iter().map(|&(_, l)| { let s = acc; acc += l; s }).collect()
+    };
+    let n_total: usize = seqs.iter().map(|&(_, l)| l).sum();
+    let b = seqs.len();
+    let max_kv = *kv_lens.iter().max().unwrap() as usize;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    println!(
+        "FA varlen smoke: B={b}, head_dim={head_dim}, n_head={n_head}, n_head_kv={n_head_kv}, \
+         (base,L)={seqs:?}, N_total={n_total}"
+    );
+
+    // Deterministic synthetic inputs (host-side; also drive the CPU reference).
+    let q_val = |s: usize, r: usize, h: usize, d: usize| {
+        ((s * 7 + r * 11 + h * 3 + d) as f32 * 0.013).sin()
+    };
+    let k_val =
+        |s: usize, kh: usize, j: usize, d: usize| ((s * 5 + kh * 4 + j * 2 + d) as f32 * 0.021).cos();
+    let v_val = |s: usize, kh: usize, j: usize, d: usize| {
+        ((s * 9 + kh * 2 + j * 3 + d) as f32 * 0.017).sin() * 0.5
+    };
+
+    // CPU reference: out[token][head][d], token = q_start[s] + r, causal over
+    // KV [0, base_s + r].
+    let mut reference = vec![0f32; n_total * hidden_v];
+    for (s, &(base, l)) in seqs.iter().enumerate() {
+        for r in 0..l {
+            let token = q_starts[s] + r;
+            let p = base + r; // absolute query position; attends to [0, p]
+            for h in 0..n_head {
+                let kh = h / (gqa as usize);
+                let klen = p + 1;
+                let mut scores = vec![0f32; klen];
+                let mut maxs = f32::NEG_INFINITY;
+                for (j, sc) in scores.iter_mut().enumerate() {
+                    let mut dot = 0f32;
+                    for d in 0..head_dim {
+                        dot += q_val(s, r, h, d) * k_val(s, kh, j, d);
+                    }
+                    *sc = dot * scale;
+                    maxs = maxs.max(*sc);
+                }
+                let mut denom = 0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - maxs).exp();
+                    denom += *sc;
+                }
+                for d in 0..head_dim {
+                    let mut acc = 0f32;
+                    for (j, &sc) in scores.iter().enumerate() {
+                        acc += sc * v_val(s, kh, j, d);
+                    }
+                    reference[token * hidden_v + h * head_dim + d] = acc / denom;
+                }
+            }
+        }
+    }
+
+    // GPU varlen dispatch. Q flat [head_dim, n_head, N_total] (token outermost),
+    // viewed as [head_dim, N_total, n_head] (per-token stride = hidden). K/V are
+    // the slab layout [head_dim, max_kv, n_head_kv, B] (seq b → slab b).
+    let gpu_out = engine.forward(weights, |ctx| -> Result<BufferRange, Box<dyn Error>> {
+        let host = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
+        let q = ctx.alloc_tensor([head_dim as u64, n_head as u64, n_total as u64, 1], GgmlType::F32)?;
+        let k = ctx.alloc_tensor(
+            [head_dim as u64, max_kv as u64, n_head_kv as u64, b as u64],
+            GgmlType::F32,
+        )?;
+        let v = ctx.alloc_tensor(
+            [head_dim as u64, max_kv as u64, n_head_kv as u64, b as u64],
+            GgmlType::F32,
+        )?;
+        unsafe {
+            let qp = host.add(q.byte_offset as usize) as *mut f32;
+            for (s, &(_, l)) in seqs.iter().enumerate() {
+                for r in 0..l {
+                    let token = q_starts[s] + r;
+                    for h in 0..n_head {
+                        for d in 0..head_dim {
+                            *qp.add(token * hidden + h * head_dim + d) = q_val(s, r, h, d);
+                        }
+                    }
+                }
+            }
+            let kp = host.add(k.byte_offset as usize) as *mut f32;
+            let vp = host.add(v.byte_offset as usize) as *mut f32;
+            let slab = n_head_kv * max_kv * head_dim;
+            for (s, &(base, l)) in seqs.iter().enumerate() {
+                for kh in 0..n_head_kv {
+                    for j in 0..(base + l) {
+                        for d in 0..head_dim {
+                            let idx = s * slab + kh * (max_kv * head_dim) + j * head_dim + d;
+                            *kp.add(idx) = k_val(s, kh, j, d);
+                            *vp.add(idx) = v_val(s, kh, j, d);
+                        }
+                    }
+                }
+            }
+        }
+        let elem = 4u64;
+        // [head_dim, N_total, n_head] view: per-token stride = hidden, head stride = head_dim.
+        let q_view = TensorView {
+            dims: [head_dim as u64, n_total as u64, n_head as u64, 1],
+            byte_stride: [elem, elem * hidden as u64, elem * head_dim as u64, elem * hidden as u64 * n_total as u64],
+            element_stride: [1, hidden as u64, head_dim as u64, hidden as u64 * n_total as u64],
+            ..q
+        };
+        let out = ctx.alloc_tensor([hidden_v as u64, n_total as u64, 1, 1], GgmlType::F32)?;
+        let params = flash_attn::FlashAttnParams {
+            head_dim_k: head_dim as u32,
+            head_dim_v: head_dim as u32,
+            gqa_ratio: gqa,
+            scale,
+        };
+        let fa_dyn = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
+        flash_attn::record_batched(
+            ctx, q_view, k, v, out, params, &kv_lens, fa_dyn, /*slots=*/ None,
+            /*query_lens=*/ Some(&query_lens),
+        )?;
+        Ok(out.range())
+    })?;
+
+    let mut max_err = 0f32;
+    let mut worst = (0usize, 0usize);
+    for token in 0..n_total {
+        for i in 0..hidden_v {
+            let idx = token * hidden_v + i;
+            let e = (gpu_out[idx] - reference[idx]).abs();
+            if e > max_err {
+                max_err = e;
+                worst = (token, i);
+            }
+        }
+    }
+    let (wt, wi) = worst;
+    let widx = wt * hidden_v + wi;
+    println!(
+        "  max_err = {max_err:.3e} at (token={wt}, i={wi}); gpu={:.5}, ref={:.5}",
+        gpu_out[widx], reference[widx]
+    );
+    if max_err < 1e-4 {
+        println!("  RESULT: PASS (varlen causal batched attention matches CPU reference)");
+    } else {
+        println!("  RESULT: FAIL — varlen batched attention diverges from the CPU reference");
     }
     Ok(())
 }

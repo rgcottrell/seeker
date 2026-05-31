@@ -45,10 +45,21 @@ pub struct DecodeDyn {
     /// can address arbitrary (non-contiguous) `BatchKvCache` slabs. `0` (slab 0)
     /// for single-sequence decode, byte-identical to the old `iq3`-strided read.
     pub slot: u32,
+    /// Number of query rows (`L_s`) this sequence contributes this step, for the
+    /// unified varlen batched flash (`VARLEN` spec constant). Decode = 1; a
+    /// prefill chunk = its token count. Rows `>= n_query` are skipped. The
+    /// per-row causal bound is `base + i_row + 1` with `base = kv_len - n_query`
+    /// (the cached prefix length), so the shader masks causally in-place — no
+    /// host mask. Unused when `VARLEN == 0`.
+    pub n_query: u32,
+    /// Flat query-token offset: index of this sequence's first query row in the
+    /// packed `[N_total]` token dimension (`q_start[s] = sum L_i for i<s`).
+    /// Decode = the sequence's batch index. Unused when `VARLEN == 0`.
+    pub q_start: u32,
 }
 
 impl DecodeDyn {
-    pub const SIZE: u64 = 32;
+    pub const SIZE: u64 = 40;
 }
 
 /// Allocate the DecodeDyn slot in the active scratch region. Pair with
@@ -147,6 +158,8 @@ pub const OFFSET_UNIFORM_RNG: usize = 16;
 pub const OFFSET_PENALTY_COUNT: usize = 20;
 pub const OFFSET_V_CACHE_D_OFFSET: usize = 24;
 pub const OFFSET_SLOT: usize = 28;
+pub const OFFSET_N_QUERY: usize = 32;
+pub const OFFSET_Q_START: usize = 36;
 
 /// Snapshot of the scratch offsets and small constants captured during
 /// the first decode recording. Lets the host re-populate the same slots

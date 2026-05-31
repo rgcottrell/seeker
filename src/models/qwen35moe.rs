@@ -2478,6 +2478,7 @@ fn attention_block_batch(
     let attn_out = ctx.alloc_tensor([hidden_v, b, 1, 1], GgmlType::F32)?;
     flash_attn::record_batched(
         ctx, q_attn, k_attn, v_attn, attn_out, fa_params, kv_lens, fa_dyn_range, Some(slots),
+        /*query_lens=*/ None,
     )?;
 
     // Sigmoid-gate the attention output by q_gate.
