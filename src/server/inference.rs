@@ -818,8 +818,9 @@ impl Worker {
         let n_pos = (image.pimg.grid_w as u64) * (image.pimg.grid_h as u64);
         // Mirror `vision_scratch_estimate` (commands::run / chat): `encode_image`
         // reclaims each stage's scratch between layers, so the working set is
-        // O(n_pos) — ~28k floats/token for the largest stage, budget 32k.
-        let need = (32_000u64 * n_pos * 4).max(64 << 20);
+        // O(n_pos) — ~28k floats/token for the largest stage, budget 40k (margin
+        // + long-KV flash-attn split-K partials ~3k floats/token).
+        let need = (40_000u64 * n_pos * 4).max(64 << 20);
         if need > self.scratch_bytes {
             self.engine.allocate_scratch(need)?;
             self.scratch_bytes = need;

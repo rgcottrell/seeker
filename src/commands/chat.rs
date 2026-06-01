@@ -501,11 +501,11 @@ async fn resolve_model_path(args: &ChatArgs) -> Result<download::Resolved, Box<d
 /// stage's scratch between layers (checkpoint/restore), so the working set is
 /// the persistent residual carriers + RoPE positions plus the single largest
 /// stage — O(n_pos), NOT O(n_layer · n_pos). The per-token high-water across
-/// the stages is ~28k floats; budget 32k for margin (copy ops, alignment).
-/// Floored at 64 MiB.
+/// the stages is ~28k floats; budget 40k for margin (copy ops, alignment, and
+/// the long-KV flash-attn split-K partials ~3k floats/token). Floored at 64 MiB.
 fn vision_scratch_estimate(pimg: &crate::vision::preprocess::PreprocessedImage) -> u64 {
     let n_pos = (pimg.grid_w as u64) * (pimg.grid_h as u64);
-    (32_000u64 * n_pos * 4).max(64 << 20)
+    (40_000u64 * n_pos * 4).max(64 << 20)
 }
 
 /// All conversation state plus the GPU resources needed to advance it.

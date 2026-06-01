@@ -43,6 +43,24 @@ const FA_SPLIT_CORE_COUNT_FALLBACK: u32 = 16;
 /// saturates at ~8 (target=80 / base_wgs=10); 16 leaves headroom.
 pub const FA_MAX_K_NUM: u32 = 16;
 
+/// Max KV keys a single flash-attn workgroup may walk in the VISION
+/// full-attention path before we force a KV-split. The vision tower attends
+/// bidirectionally over all `n_pos` patches, so the single-pass kernel has each
+/// workgroup walk all `n_pos` keys serially; past ~14k keys that one dispatch
+/// trips the RADV/Strix-Halo per-dispatch watchdog (the device is lost). We
+/// split the KV (split-K, direct dispatch, partials sized at the actual small
+/// k_num) so each split walks ≤ this many keys. 12k leaves margin under the
+/// observed ~14.3k cliff. Override with `SEEKER_FA_VISION_WALK` (also used to
+/// force the split at small n_pos for validation against the single-pass path).
+/// Only read on the vision path (mask=None, n>1), never on the decode hot path.
+fn vision_fa_kv_walk() -> u32 {
+    std::env::var("SEEKER_FA_VISION_WALK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(12_000)
+}
+
 /// Same heuristic as `pick_k_num`, clamped to `FA_MAX_K_NUM`. Used by
 /// the Engine to decide whether a cached decode cmdbuf can be replayed
 /// for the current `kv` — the wg count is baked into the cmdbuf via
@@ -196,8 +214,20 @@ pub fn record(
 
     // ---- split-K decode heuristic (replicates llama.cpp, clamped to FA_MAX_K_NUM) ----
     let base_wgs = n * ne2 * ne3;
-    let (k_num, blocks_per_split) =
-        pick_k_num_clamped(ctx.device.shader_core_count, base_wgs, kv);
+    // Vision full-attention over long KV (no mask + many query rows): a single
+    // workgroup walking all `kv` keys trips the per-dispatch watchdog past ~14k.
+    // Force a KV-split so each split walks ≤ VISION_FA_KV_WALK keys. The split-K
+    // branch below then uses a DIRECT dispatch (fresh forward each encode, no
+    // decode-replay) with partials sized at the actual (small) k_num rather than
+    // FA_MAX_K_NUM. Decode/prefill (mask present, or n == 1) is unaffected.
+    let vision_split = mask.is_none() && n > 1 && kv > vision_fa_kv_walk();
+    let (k_num, blocks_per_split) = if vision_split {
+        let num_blocks = kv.div_ceil(FA_BC).max(1);
+        let kf = kv.div_ceil(vision_fa_kv_walk()).clamp(2, num_blocks);
+        (kf, num_blocks.div_ceil(kf))
+    } else {
+        pick_k_num_clamped(ctx.device.shader_core_count, base_wgs, kv)
+    };
     // Mirror kv/k_num/blocks_per_split into the per-forward DecodeDyn
     // slot. The shader reads them from there so the recorded cmdbuf
     // is replay-stable (host overwrites these fields between submits
@@ -308,12 +338,45 @@ pub fn record(
         // runtime k_num via a host-side write to the 12-byte
         // `indirect_wg` slot. Partials are sized once at `FA_MAX_K_NUM`
         // so the binding (offset, size) is constant across calls.
+        // Decode replay sizes partials at FA_MAX_K_NUM for a stable binding; the
+        // vision direct-dispatch path has no replay, so size at the actual k_num
+        // (the combine indexes partials by runtime k_num — see
+        // flash_attn_split_k_reduce.slang). At a large vision n this keeps the
+        // partials ~200 MB (k_num·(hd+2)·n·heads) instead of FA_MAX_K_NUM×.
+        let knum_partials = if vision_split { k_num } else { FA_MAX_K_NUM };
         let partials_floats = (params.head_dim_v as u64 + 2)
             * n as u64
             * ne2 as u64
             * ne3 as u64
-            * FA_MAX_K_NUM as u64;
+            * knum_partials as u64;
         let partials = ctx.alloc_tensor([partials_floats, 1, 1, 1], GgmlType::F32)?;
+
+        if vision_split {
+            // Direct dispatch — one workgroup per (query row, head, split):
+            // grid [n, ne2 * k_num, ne3]. No indirect args (those exist only for
+            // decode-cmdbuf replay where k_num varies between submits).
+            super::bind_and_dispatch(
+                ctx,
+                &pipeline,
+                &[0, 1, 2, 3, 4, 5, 6],
+                &[
+                    q.range(),
+                    k.range(),
+                    v.range(),
+                    mask_range,
+                    partials.range(),
+                    out.range(),
+                    dyn_range,
+                ],
+                &push,
+                [n, ne2 * k_num, ne3],
+            )?;
+            record_compute_barrier(ctx.device, ctx.cmd, partials.range());
+            record_split_k_combine(
+                ctx, partials, out, params.head_dim_v, n, ne2, ne3, k_num, dyn_range,
+            )?;
+            return Ok(());
+        }
 
         let indirect_wg = ctx.alloc_scratch(12)?;
         // Write the (wg_x, wg_y, wg_z) tuple via cmd_update_buffer —

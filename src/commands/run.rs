@@ -3919,11 +3919,11 @@ struct ImagePrefill {
 /// `commands::chat` / `server`). [`VisionEncoder::encode_image`] reclaims each
 /// stage's scratch between layers, so the working set is O(n_pos), NOT
 /// O(n_layer · n_pos): the persistent residual carriers + RoPE positions plus
-/// the single largest stage, ~28k floats/token; budget 32k for margin. Floored
-/// at 64 MiB.
+/// the single largest stage, ~28k floats/token; budget 40k for margin and the
+/// long-KV flash-attn split-K partials (~3k floats/token). Floored at 64 MiB.
 fn vision_scratch_estimate(setup: &ImageSetup) -> u64 {
     let n_pos = (setup.pimg.grid_w as u64) * (setup.pimg.grid_h as u64);
-    (32_000u64 * n_pos * 4).max(64 << 20)
+    (40_000u64 * n_pos * 4).max(64 << 20)
 }
 
 /// The media placeholder llama.cpp's mtmd uses (`mtmd_default_marker()`). With
