@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # slang version the tree is built against (slangc ships with the Vulkan SDK
+  # locally; CI fetches the matching standalone release). Bump alongside local.
+  SLANG_VERSION: "2026.8"
+
+jobs:
+  check:
+    name: fmt + clippy + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: System build deps
+        # openssl-sys (via reqwest/native-tls) links system OpenSSL.
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Install slangc
+        # build.rs compiles the .slang compute shaders with slangc. ash loads
+        # Vulkan at runtime, so building/clippy need only slangc — no GPU.
+        run: |
+          url=$(curl -fsSL "https://api.github.com/repos/shader-slang/slang/releases/tags/v${SLANG_VERSION}" \
+            | jq -r '[.assets[] | select(.name | test("linux-x86_64.*\\.tar\\.gz$"))][0].browser_download_url')
+          echo "slang asset: $url"
+          test -n "$url" && test "$url" != "null"
+          curl -fsSL "$url" -o /tmp/slang.tar.gz
+          mkdir -p "$HOME/slang"
+          tar -xzf /tmp/slang.tar.gz -C "$HOME/slang"
+          slangbin=$(dirname "$(find "$HOME/slang" -name slangc -type f | head -1)")
+          echo "slangc at: $slangbin"
+          echo "$slangbin" >> "$GITHUB_PATH"
+
+      - name: Verify slangc
+        run: slangc -v
+
+      - name: fmt + clippy + build
+        run: ./scripts/check.sh
+
+  # NOTE: `cargo test` is not run in CI — the inference tests need a Vulkan
+  # device. Run `cargo test` locally on a GPU host.
