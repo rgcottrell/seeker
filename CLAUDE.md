@@ -29,7 +29,8 @@ existing override). If you somehow push without ever building, enable it by hand
 scripts/install-hooks.sh
 ```
 
-Bypass a single push with `git push --no-verify`.
+Bypass a single push with `git push --no-verify`. The hook no-ops when `CI` is
+set — the workflow runs the gate in its own job.
 
 ## Build dependency
 
