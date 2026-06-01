@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#
+# Source-controlled pre-push gate. Runs the full warning-clean check
+# (scripts/check.sh: fmt + clippy -D warnings + build) before any push, so a
+# branch is PR-ready. Commits are intentionally NOT gated — save WIP freely.
+#
+# Enable once per clone:  scripts/install-hooks.sh   (sets core.hooksPath)
+# Bypass a single push:   git push --no-verify
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+exec "$repo_root/scripts/check.sh"
