@@ -106,17 +106,17 @@ pub trait Model: Send + Sync {
 
     /// Record ONE chunk of an image-containing prefill (chunked so a large image
     /// + prompt doesn't run as one oversized forward — which TDR-hangs the GPU).
-    /// `chunk_tokens` are this chunk's tokens; `chunk_global_start` is the global
-    /// prompt index of `chunk_tokens[0]`. `image_embeddings` is the FULL encoder
-    /// output `[n_embd, n_tok]` (column = merged token, n_embd contiguous); the
-    /// model splices only the columns whose `<|image_pad|>` slots fall in this
-    /// chunk. `image_global_start` is the first image-pad token's global index,
-    /// `image_nx`/`image_ny` the merged grid (`n_tok = nx*ny`), `prompt_pos0` the
-    /// absolute position of global token 0 (so the M-RoPE 2D cursor is continuous
-    /// across chunks). `compute_logits` is true only for the final chunk (which
-    /// samples). Advances `cache.position` by the chunk length; does NOT touch
-    /// `rope_position_lag` (the caller sets it once after the whole prefill).
-    /// Returns the last-token logits when `compute_logits`. Default unsupported.
+    ///   `chunk_tokens` are this chunk's tokens; `chunk_global_start` is the global
+    ///   prompt index of `chunk_tokens[0]`. `image_embeddings` is the FULL encoder
+    ///   output `[n_embd, n_tok]` (column = merged token, n_embd contiguous); the
+    ///   model splices only the columns whose `<|image_pad|>` slots fall in this
+    ///   chunk. `image_global_start` is the first image-pad token's global index,
+    ///   `image_nx`/`image_ny` the merged grid (`n_tok = nx*ny`), `prompt_pos0` the
+    ///   absolute position of global token 0 (so the M-RoPE 2D cursor is continuous
+    ///   across chunks). `compute_logits` is true only for the final chunk (which
+    ///   samples). Advances `cache.position` by the chunk length; does NOT touch
+    ///   `rope_position_lag` (the caller sets it once after the whole prefill).
+    ///   Returns the last-token logits when `compute_logits`. Default unsupported.
     #[allow(clippy::too_many_arguments)]
     fn record_forward_image_chunk(
         &self,

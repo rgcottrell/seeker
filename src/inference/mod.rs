@@ -114,10 +114,7 @@ pub struct SpecStepOut {
 impl Engine {
     pub fn new(n_ubatch: u32, n_batch: u32) -> Result<Self, Box<dyn Error>> {
         if n_ubatch != 0 && n_ubatch > n_batch {
-            return Err(format!(
-                "n_ubatch ({n_ubatch}) must be <= n_batch ({n_batch})"
-            )
-            .into());
+            return Err(format!("n_ubatch ({n_ubatch}) must be <= n_batch ({n_batch})").into());
         }
         let device = Device::new()?;
         let pipelines = PipelineCache::new();
@@ -322,10 +319,9 @@ impl Engine {
         self.profile.readback_and_print(&self.device);
 
         // Read logits back from scratch's host pointer.
-        let host_ptr = self
-            .scratch
-            .host_ptr
-            .ok_or("scratch region is not host-visible — readback path requires a staging buffer")?;
+        let host_ptr = self.scratch.host_ptr.ok_or(
+            "scratch region is not host-visible — readback path requires a staging buffer",
+        )?;
         if logits_range.size % 4 != 0 {
             return Err(format!("logits size {} not 4-byte aligned", logits_range.size).into());
         }
@@ -345,7 +341,10 @@ impl Engine {
         #[cfg(feature = "gpu_debug")]
         for (name, range) in &taps {
             if range.size % 4 != 0 {
-                eprintln!("TAP {name}: size {} not 4-byte aligned, skipping", range.size);
+                eprintln!(
+                    "TAP {name}: size {} not 4-byte aligned, skipping",
+                    range.size
+                );
                 continue;
             }
             let n = (range.size / 4) as usize;
@@ -357,7 +356,11 @@ impl Engine {
             let sum: f32 = buf.iter().sum();
             let max_abs: f32 = buf.iter().map(|x| x.abs()).fold(0.0, f32::max);
             let head: Vec<String> = buf.iter().take(5).map(|v| format!("{v:.4}")).collect();
-            println!("TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]", range.offset, head.join(", "));
+            println!(
+                "TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]",
+                range.offset,
+                head.join(", ")
+            );
         }
         Ok(out)
     }
@@ -452,8 +455,11 @@ impl Engine {
             ranges
         };
         #[cfg(feature = "profile_gpu")]
-        self.profile
-            .mark(&self.device, self.command_buffer, profile::BlockClass::Epilogue);
+        self.profile.mark(
+            &self.device,
+            self.command_buffer,
+            profile::BlockClass::Epilogue,
+        );
 
         unsafe {
             self.device.device.end_command_buffer(self.command_buffer)?;
@@ -490,6 +496,7 @@ impl Engine {
     /// (`[vocab, B]`). Returns one token per sequence; the caller decides which
     /// to keep (a mid-prefill chunk's token is discarded). The samplers/`slots`
     /// arrays are per-sequence (length `B`), not per-token.
+    #[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
     pub fn forward_unified(
         &mut self,
         model: &dyn crate::models::Model,
@@ -506,7 +513,9 @@ impl Engine {
             return Err("forward_unified: empty batch".into());
         }
         if positions.len() != n_total || samplers.len() != b || slots.len() != b {
-            return Err("forward_unified: tokens/positions/seq_lens/slots/samplers length mismatch".into());
+            return Err(
+                "forward_unified: tokens/positions/seq_lens/slots/samplers length mismatch".into(),
+            );
         }
         // Varlen graph shape differs from the single-sequence decode cmdbuf.
         self.decode_cache = None;
@@ -553,8 +562,8 @@ impl Engine {
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
-            let logits =
-                model.record_forward_unified(&mut ctx, batch, tokens, positions, seq_lens, slots)?;
+            let logits = model
+                .record_forward_unified(&mut ctx, batch, tokens, positions, seq_lens, slots)?;
             let vocab = logits.dims[0];
             let elem = logits.byte_stride[0];
             let mut ranges = Vec::with_capacity(b);
@@ -573,8 +582,11 @@ impl Engine {
             ranges
         };
         #[cfg(feature = "profile_gpu")]
-        self.profile
-            .mark(&self.device, self.command_buffer, profile::BlockClass::Epilogue);
+        self.profile.mark(
+            &self.device,
+            self.command_buffer,
+            profile::BlockClass::Epilogue,
+        );
 
         unsafe {
             self.device.device.end_command_buffer(self.command_buffer)?;
@@ -634,7 +646,11 @@ impl Engine {
         self.descriptors.reset(&self.device)?;
         let decode_dyn_range = {
             let off = self.scratch.alloc(decode_dyn::DecodeDyn::SIZE)?;
-            BufferRange { buffer: self.scratch.buffer, offset: off, size: decode_dyn::DecodeDyn::SIZE }
+            BufferRange {
+                buffer: self.scratch.buffer,
+                offset: off,
+                size: decode_dyn::DecodeDyn::SIZE,
+            }
         };
 
         unsafe {
@@ -643,7 +659,9 @@ impl Engine {
                 .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device.device.begin_command_buffer(self.command_buffer, &begin)?;
+            self.device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)?;
         }
         #[cfg(feature = "profile_gpu")]
         self.profile.reset(&self.device, self.command_buffer);
@@ -672,7 +690,8 @@ impl Engine {
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
-            let _ = model.record_forward_unified(&mut ctx, batch, tokens, positions, seq_lens, slots)?;
+            let _ = model
+                .record_forward_unified(&mut ctx, batch, tokens, positions, seq_lens, slots)?;
             ctx.dump.take().expect("dump set").records
         };
 
@@ -684,13 +703,16 @@ impl Engine {
             self.device
                 .device
                 .queue_submit(self.device.queue, &[submit], self.fence)?;
-            self.device.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
 
         // FNV-1a over each record's raw bytes.
         let mut out = Vec::with_capacity(records.len());
         for (label, off, size) in records {
-            let bytes = unsafe { std::slice::from_raw_parts(dump_host.add(off as usize), size as usize) };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(dump_host.add(off as usize), size as usize) };
             let mut h: u64 = 0xcbf29ce484222325;
             for &b in bytes {
                 h ^= b as u64;
@@ -732,7 +754,11 @@ impl Engine {
         sampler: &mut sample::Sampler,
     ) -> Result<u32, Box<dyn Error>> {
         let prof = crate::runtime_flags::profile_forward();
-        let t0 = if prof { Some(std::time::Instant::now()) } else { None };
+        let t0 = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         #[cfg(feature = "profile_gpu")]
         if prof {
             crate::inference::command::BARRIER_COMPUTE_COUNT.with(|c| c.set(0));
@@ -797,6 +823,7 @@ impl Engine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
     fn forward_sampled_replay(
         &mut self,
         model: &dyn crate::models::Model,
@@ -824,8 +851,18 @@ impl Engine {
         // Update DecodeDyn fields owned by the engine. The sampler
         // refresh below covers uniform_rng + penalty_count; the model
         // doesn't touch decode_dyn directly during replay.
-        decode_dyn::write_field(host_ptr, plan.decode_dyn_offset, decode_dyn::OFFSET_KV_LEN, kv_len);
-        decode_dyn::write_field(host_ptr, plan.decode_dyn_offset, decode_dyn::OFFSET_K_NUM, k_num);
+        decode_dyn::write_field(
+            host_ptr,
+            plan.decode_dyn_offset,
+            decode_dyn::OFFSET_KV_LEN,
+            kv_len,
+        );
+        decode_dyn::write_field(
+            host_ptr,
+            plan.decode_dyn_offset,
+            decode_dyn::OFFSET_K_NUM,
+            k_num,
+        );
         decode_dyn::write_field(
             host_ptr,
             plan.decode_dyn_offset,
@@ -992,7 +1029,13 @@ impl Engine {
                 profile: Some(&mut self.profile),
             };
             let logits = model
-                .record_forward(&mut ctx, cache, tokens, position_offset, /*compute_logits=*/ true)?
+                .record_forward(
+                    &mut ctx,
+                    cache,
+                    tokens,
+                    position_offset,
+                    /*compute_logits=*/ true,
+                )?
                 .ok_or("record_forward(compute_logits=true) returned no logits")?;
             let r = sampler.record_chain(&mut ctx, logits)?;
             #[cfg(feature = "gpu_debug")]
@@ -1007,7 +1050,8 @@ impl Engine {
             r
         };
         #[cfg(feature = "profile_gpu")]
-        self.profile.mark(&self.device, cmd, profile::BlockClass::Sampler);
+        self.profile
+            .mark(&self.device, cmd, profile::BlockClass::Sampler);
         let t_record = t0.map(|t| t.elapsed());
 
         unsafe {
@@ -1039,7 +1083,10 @@ impl Engine {
         #[cfg(feature = "gpu_debug")]
         for (name, range) in &taps {
             if range.size % 4 != 0 {
-                eprintln!("TAP {name}: size {} not 4-byte aligned, skipping", range.size);
+                eprintln!(
+                    "TAP {name}: size {} not 4-byte aligned, skipping",
+                    range.size
+                );
                 continue;
             }
             let n = (range.size / 4) as usize;
@@ -1051,32 +1098,33 @@ impl Engine {
             let sum: f32 = buf.iter().sum();
             let max_abs: f32 = buf.iter().map(|x| x.abs()).fold(0.0, f32::max);
             let head: Vec<String> = buf.iter().take(5).map(|v| format!("{v:.4}")).collect();
-            println!("TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]", range.offset, head.join(", "));
+            println!(
+                "TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]",
+                range.offset,
+                head.join(", ")
+            );
         }
         sampler.accept(token);
 
         // Stash the recording so subsequent matching decodes can replay.
-        if cache_recording {
-            if let (Some((k_num, blocks_per_split)), Some(mc), Some(plan)) =
+        if cache_recording
+            && let (Some((k_num, blocks_per_split)), Some(mc), Some(plan)) =
                 (want_grid, model.replay_constants(), captured_plan)
-            {
-                if plan.token_buf_offset.is_some()
-                    && plan.positions_buf_offset.is_some()
-                    && plan.sampler_output_offset.is_some()
-                {
-                    let kv_after = position_offset + tokens.len() as u32;
-                    self.decode_cache = Some(DecodeCache {
-                        sampler_config_hash: want_config_hash,
-                        shape_key: 0,
-                        kv_len: kv_after,
-                        k_num,
-                        blocks_per_split,
-                        plan,
-                        model_constants: mc,
-                    });
-                    self.decode_scratch_cursor = self.scratch.cursor;
-                }
-            }
+            && plan.token_buf_offset.is_some()
+            && plan.positions_buf_offset.is_some()
+            && plan.sampler_output_offset.is_some()
+        {
+            let kv_after = position_offset + tokens.len() as u32;
+            self.decode_cache = Some(DecodeCache {
+                sampler_config_hash: want_config_hash,
+                shape_key: 0,
+                kv_len: kv_after,
+                k_num,
+                blocks_per_split,
+                plan,
+                model_constants: mc,
+            });
+            self.decode_scratch_cursor = self.scratch.cursor;
         }
 
         if let (Some(rec), Some(wait)) = (t_record, t_wait) {
@@ -1134,7 +1182,11 @@ impl Engine {
         }
         let prompt_pos0 = cache.position;
         let n = tokens.len();
-        let ub = if self.n_ubatch == 0 { n } else { self.n_ubatch as usize };
+        let ub = if self.n_ubatch == 0 {
+            n
+        } else {
+            self.n_ubatch as usize
+        };
 
         let mut token = 0u32;
         let mut start = 0usize;
@@ -1247,7 +1299,8 @@ impl Engine {
                 compute_logits,
             )?;
             let tr = if let Some(s) = sampler.as_deref_mut() {
-                let logits = logits.ok_or("record_forward_image_chunk: no logits on final chunk")?;
+                let logits =
+                    logits.ok_or("record_forward_image_chunk: no logits on final chunk")?;
                 Some(s.record_chain(&mut ctx, logits)?)
             } else {
                 None
@@ -1278,7 +1331,10 @@ impl Engine {
         if let Some(host_ptr) = self.scratch.host_ptr {
             for (name, range) in &taps {
                 if range.size % 4 != 0 {
-                    eprintln!("TAP {name}: size {} not 4-byte aligned, skipping", range.size);
+                    eprintln!(
+                        "TAP {name}: size {} not 4-byte aligned, skipping",
+                        range.size
+                    );
                     continue;
                 }
                 let n = (range.size / 4) as usize;
@@ -1290,7 +1346,11 @@ impl Engine {
                 let sum: f32 = buf.iter().sum();
                 let max_abs: f32 = buf.iter().map(|x| x.abs()).fold(0.0, f32::max);
                 let head: Vec<String> = buf.iter().take(5).map(|v| format!("{v:.4}")).collect();
-                println!("TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]", range.offset, head.join(", "));
+                println!(
+                    "TAP {name} n={n} off={} sum={sum:.6} max_abs={max_abs:.6} head=[{}]",
+                    range.offset,
+                    head.join(", ")
+                );
             }
         }
 
@@ -1310,7 +1370,7 @@ impl Engine {
             let src = host_ptr.add(token_range.offset as usize) as *const u32;
             std::ptr::read(src)
         };
-        if let Some(s) = sampler.as_deref_mut() {
+        if let Some(s) = sampler {
             s.accept(token);
         }
         Ok(Some(token))
@@ -1455,7 +1515,11 @@ impl Engine {
 
     /// Write F32 data into a scratch slot via the mapped host pointer. Used
     /// for inputs that originate on the CPU side (token id positions, etc.).
-    pub fn write_scratch_f32(&self, range: BufferRange, data: &[f32]) -> Result<(), Box<dyn Error>> {
+    pub fn write_scratch_f32(
+        &self,
+        range: BufferRange,
+        data: &[f32],
+    ) -> Result<(), Box<dyn Error>> {
         let host_ptr = self
             .scratch
             .host_ptr
@@ -1550,14 +1614,15 @@ impl Engine {
         #[cfg(feature = "profile_gpu")]
         self.profile.readback_and_print(&self.device);
 
-        let host_ptr = self
-            .scratch
-            .host_ptr
-            .ok_or("scratch region is not host-visible — spec readback needs host-visible scratch")?;
+        let host_ptr = self.scratch.host_ptr.ok_or(
+            "scratch region is not host-visible — spec readback needs host-visible scratch",
+        )?;
         let mut out = Vec::with_capacity(ranges.len());
         for r in &ranges {
             if r.size % 4 != 0 {
-                return Err(format!("spec readback range size {} not 4-byte aligned", r.size).into());
+                return Err(
+                    format!("spec readback range size {} not 4-byte aligned", r.size).into(),
+                );
             }
             let n = (r.size / 4) as usize;
             let mut buf = vec![0f32; n];
@@ -1585,6 +1650,7 @@ impl Engine {
     ///
     /// On return, all `emitted` tokens are committed and `cache.position`
     /// has advanced to `position + emitted.len()`.
+    #[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
     pub fn decode_speculative(
         &mut self,
         model: &dyn crate::models::Model,
@@ -1630,8 +1696,9 @@ impl Engine {
         //       recurrent-state snapshots (instead of writing the live
         //       state). Partial acceptance then rolls back by committing one
         //       snapshot in finalize — no re-run.
-        let verify_tokens: Vec<u32> =
-            std::iter::once(last_token).chain(drafts.iter().copied()).collect();
+        let verify_tokens: Vec<u32> = std::iter::once(last_token)
+            .chain(drafts.iter().copied())
+            .collect();
         // Greedy + no penalties → argmax each verify position on the GPU and
         // read back only N+1 token ids (4 bytes each), avoiding the ~5 MB
         // write-combined logits readback. Lossless and identical to the
@@ -1642,7 +1709,8 @@ impl Engine {
         let (emitted, residual): (Vec<u32>, Vec<f32>) = if greedy_verify {
             let vocab_u = vocab as u64;
             let outs = self.run_spec_record(weights, |ctx| {
-                let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
+                let o =
+                    model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
                 let logits = o.logits.expect("record_forward_full computes logits");
                 let mut ranges = Vec::with_capacity(n + 2);
                 for i in 0..=n {
@@ -1675,9 +1743,12 @@ impl Engine {
             (emitted, outs[n + 1].clone())
         } else {
             let outs = self.run_spec_record(weights, |ctx| {
-                let o = model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
+                let o =
+                    model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
                 Ok(vec![
-                    o.logits.expect("record_forward_full computes logits").range(),
+                    o.logits
+                        .expect("record_forward_full computes logits")
+                        .range(),
                     o.residual.range(),
                 ])
             })?;
@@ -1685,7 +1756,10 @@ impl Engine {
             let logit_rows: Vec<Vec<f32>> = (0..=n)
                 .map(|i| all_logits[i * vocab..(i + 1) * vocab].to_vec())
                 .collect();
-            (sampler.sample_and_compare(&logit_rows, &drafts), outs[1].clone())
+            (
+                sampler.sample_and_compare(&logit_rows, &drafts),
+                outs[1].clone(),
+            )
         };
         let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
         let residual = &residual; // [n_embd, n+1] contiguous (col i at i*hidden)
@@ -1715,7 +1789,10 @@ impl Engine {
                 Ok(vec![])
             })?;
         }
-        debug_assert_eq!(cache.position, new_pos, "spec step left cache.position wrong");
+        debug_assert_eq!(
+            cache.position, new_pos,
+            "spec step left cache.position wrong"
+        );
         if dbg {
             let fin_ms = t_fin.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
@@ -1750,7 +1827,9 @@ impl Engine {
         let outs = self.run_spec_record(weights, |ctx| {
             let o = model.record_forward_full(ctx, cache, tokens, position, full_logits, false)?;
             Ok(vec![
-                o.logits.expect("record_forward_full computes logits").range(),
+                o.logits
+                    .expect("record_forward_full computes logits")
+                    .range(),
                 o.residual.range(),
             ])
         })?;
@@ -1780,7 +1859,11 @@ impl Engine {
     }
 
     /// Write u32 data into a scratch slot (e.g. token ids for get_rows).
-    pub fn write_scratch_u32(&self, range: BufferRange, data: &[u32]) -> Result<(), Box<dyn Error>> {
+    pub fn write_scratch_u32(
+        &self,
+        range: BufferRange,
+        data: &[u32],
+    ) -> Result<(), Box<dyn Error>> {
         let host_ptr = self
             .scratch
             .host_ptr
@@ -1802,7 +1885,9 @@ impl Drop for Engine {
         unsafe {
             let _ = self.device.device.device_wait_idle();
             self.device.device.destroy_fence(self.fence, None);
-            self.device.device.destroy_command_pool(self.command_pool, None);
+            self.device
+                .device
+                .destroy_command_pool(self.command_pool, None);
         }
         self.scratch.destroy(&self.device.device);
         self.descriptors.destroy(&self.device);

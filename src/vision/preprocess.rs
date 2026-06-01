@@ -573,16 +573,32 @@ mod tests {
         let sum: f64 = out.pixels.iter().map(|&v| v as f64).sum();
         eprintln!(
             "SEEKER xvalidate: resized={}x{} grid={}x{} n_tokens={} pixels_len={} checksum_sum_f64={:.6}",
-            out.resized_w, out.resized_h, out.grid_w, out.grid_h, out.n_tokens, out.pixels.len(), sum
+            out.resized_w,
+            out.resized_h,
+            out.grid_w,
+            out.grid_h,
+            out.n_tokens,
+            out.pixels.len(),
+            sum
         );
         eprintln!(
             "SEEKER first5=[{}]",
-            out.pixels.iter().take(5).map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(", ")
+            out.pixels
+                .iter()
+                .take(5)
+                .map(|v| format!("{v:.6}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let last5: Vec<_> = out.pixels.iter().rev().take(5).cloned().collect();
         eprintln!(
             "SEEKER last5=[{}]",
-            last5.iter().rev().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(", ")
+            last5
+                .iter()
+                .rev()
+                .map(|v| format!("{v:.6}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         // Write little-endian f32 for exact element-wise diff vs the Python ref.
         if std::env::var("SEEKER_XVAL_DUMP").is_ok() {

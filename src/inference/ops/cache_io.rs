@@ -61,7 +61,13 @@ pub fn record_write_nofence(
     cache_layer: TensorView,
     position: u32,
 ) -> Result<(), Box<dyn Error>> {
-    record_write_inner(ctx, new_kv_f32, cache_layer, position, /*fence=*/ false)
+    record_write_inner(
+        ctx,
+        new_kv_f32,
+        cache_layer,
+        position,
+        /*fence=*/ false,
+    )
 }
 
 /// Fused KV cache write: a single strided cast directly into the cache
@@ -81,7 +87,10 @@ pub fn record_write_fused_nofence(
     let l = new_kv_f32.dims[2];
     let dtype = cache_layer.dtype;
     let (block_size, type_size) = dtype.block_layout();
-    debug_assert_eq!(block_size, 1, "fused KV write only handles non-block dtypes");
+    debug_assert_eq!(
+        block_size, 1,
+        "fused KV write only handles non-block dtypes"
+    );
 
     // Build a TensorView aimed at the cache slot for this batch's
     // tokens — same shape as `new_kv_f32`, but in the cache's dtype
@@ -96,7 +105,12 @@ pub fn record_write_fused_nofence(
         type_size as u64 * head_dim * n_head_kv,
         type_size as u64 * head_dim * n_head_kv * l.max(1),
     ];
-    let dst_elem_stride: [u64; 4] = [1, head_dim, head_dim * n_head_kv, head_dim * n_head_kv * l.max(1)];
+    let dst_elem_stride: [u64; 4] = [
+        1,
+        head_dim,
+        head_dim * n_head_kv,
+        head_dim * n_head_kv * l.max(1),
+    ];
     let cache_slot = TensorView {
         buffer: cache_layer.buffer,
         byte_offset: dst_offset_bytes,
@@ -153,9 +167,11 @@ pub fn record_v_cache_write_f16_nofence(
     push[0..4].copy_from_slice(&n_elements.to_ne_bytes());
 
     let key = PipelineKey::dense("v_cache_write_f16_f32", 3, 4, vec![256u32]);
-    let pipeline = *ctx
-        .pipelines
-        .get(ctx.device, key, shaders::V_CACHE_WRITE_F16_F32_SPV.as_bytes())?;
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::V_CACHE_WRITE_F16_F32_SPV.as_bytes(),
+    )?;
     let dyn_range = ctx.decode_dyn;
     let workgroups = [n_elements.div_ceil(256), 1, 1];
     super::bind_and_dispatch(
@@ -193,7 +209,7 @@ fn record_write_inner(
     // Copy into the cache at the right byte offset.
     let per_token_bytes = per_token_bytes(head_dim, n_head_kv, dtype);
     let dst_offset = cache_layer.byte_offset + position as u64 * per_token_bytes;
-    let copy_size = (l as u64) * per_token_bytes;
+    let copy_size = l * per_token_bytes;
     record_copy(
         ctx.device,
         ctx.cmd,

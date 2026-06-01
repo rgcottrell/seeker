@@ -93,7 +93,9 @@ impl PipelineCache {
             for (_, p) in self.pipelines.drain() {
                 device.device.destroy_pipeline(p.pipeline, None);
                 device.device.destroy_pipeline_layout(p.layout, None);
-                device.device.destroy_descriptor_set_layout(p.set_layout, None);
+                device
+                    .device
+                    .destroy_descriptor_set_layout(p.set_layout, None);
             }
         }
     }
@@ -104,14 +106,13 @@ fn build_pipeline(
     spirv: &[u8],
     key: &PipelineKey,
 ) -> Result<CachedPipeline, Box<dyn Error>> {
-    if spirv.len() % 4 != 0 {
+    if !spirv.len().is_multiple_of(4) {
         return Err(format!("SPIR-V size {} not 4-byte aligned", spirv.len()).into());
     }
     // SAFETY: SPIR-V binaries are emitted by build.rs into Shader blocks
     // with 4-byte alignment, so a u32-aligned reinterpret is sound.
-    let words = unsafe {
-        std::slice::from_raw_parts(spirv.as_ptr() as *const u32, spirv.len() / 4)
-    };
+    let words =
+        unsafe { std::slice::from_raw_parts(spirv.as_ptr() as *const u32, spirv.len() / 4) };
     let module_info = vk::ShaderModuleCreateInfo::default().code(words);
     let module = unsafe { device.device.create_shader_module(&module_info, None) }?;
 
@@ -140,14 +141,21 @@ fn build_pipeline(
     let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
         .flags(set_layout_flags)
         .bindings(&layout_bindings);
-    let set_layout =
-        unsafe { device.device.create_descriptor_set_layout(&set_layout_info, None) }?;
+    let set_layout = unsafe {
+        device
+            .device
+            .create_descriptor_set_layout(&set_layout_info, None)
+    }?;
 
     let push_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
         .offset(0)
         .size(key.push_size);
-    let push_ranges = if key.push_size > 0 { vec![push_range] } else { Vec::new() };
+    let push_ranges = if key.push_size > 0 {
+        vec![push_range]
+    } else {
+        Vec::new()
+    };
     let layout_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(std::slice::from_ref(&set_layout))
         .push_constant_ranges(&push_ranges);
@@ -202,8 +210,8 @@ fn build_pipeline(
             )
             .into());
         }
-        req_sgs_info =
-            vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(size);
+        req_sgs_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+            .required_subgroup_size(size);
         stage = stage.push(&mut req_sgs_info);
     }
     let pipeline_info = vk::ComputePipelineCreateInfo::default()

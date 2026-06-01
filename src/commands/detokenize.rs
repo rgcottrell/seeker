@@ -8,14 +8,18 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::commands::download::{resolve_hf, HfResolveArgs};
+use crate::commands::download::{HfResolveArgs, resolve_hf};
 use crate::gguf::GgufFile;
 use crate::tokenizer::build_tokenizer;
 
 #[derive(Args)]
 pub struct DetokenizeArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]". (short: -hf, -hfr)
-    #[arg(long = "hf-repo", required_unless_present = "model", conflicts_with = "model")]
+    #[arg(
+        long = "hf-repo",
+        required_unless_present = "model",
+        conflicts_with = "model"
+    )]
     hf_repo: Option<String>,
 
     /// Specific file to use within the repo. (short: -hff)

@@ -3,9 +3,9 @@
 //! Anthropic routes use `{type:"error", error:{type,message}}`. SDKs branch on
 //! these shapes, so each surface returns its own.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 use super::types::common::{ApiError, ApiErrorDetail};
@@ -33,7 +33,11 @@ const NO_MODEL_MSG: &str =
 
 /// 503 for OpenAI / llama generation endpoints when no model is loaded.
 pub fn no_model_openai() -> Response {
-    openai(StatusCode::SERVICE_UNAVAILABLE, "server_error", NO_MODEL_MSG)
+    openai(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        NO_MODEL_MSG,
+    )
 }
 
 /// 503 for Anthropic generation endpoints when no model is loaded.

@@ -23,10 +23,10 @@
 //! installed) we log and continue.
 
 use std::error::Error;
-use std::ffi::{c_char, CStr};
+use std::ffi::{CStr, c_char};
 use std::sync::Arc;
 
-use ash::{vk, Entry, Instance};
+use ash::{Entry, Instance, vk};
 use vk::TaggedStructure as _;
 
 const REQUIRED_API_VERSION: u32 = vk::make_api_version(0, 1, 4, 0);
@@ -137,7 +137,10 @@ impl Device {
         let inst_layer_names: Vec<*const c_char>;
         let mut inst_flags = vk::InstanceCreateFlags::empty();
         let portability_inst = vk::KHR_PORTABILITY_ENUMERATION_NAME;
-        if avail_inst_exts.iter().any(|e| ext_name(&e.extension_name) == portability_inst) {
+        if avail_inst_exts
+            .iter()
+            .any(|e| ext_name(&e.extension_name) == portability_inst)
+        {
             inst_ext_names.push(portability_inst.as_ptr());
             inst_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
         }
@@ -152,7 +155,9 @@ impl Device {
             if enabled {
                 inst_ext_names.push(vk::EXT_DEBUG_UTILS_NAME.as_ptr());
                 inst_layer_names = vec![validation::LAYER.as_ptr()];
-                tracing::info!("Vulkan validation layer + debug_utils enabled (debug build / gpu_debug)");
+                tracing::info!(
+                    "Vulkan validation layer + debug_utils enabled (debug build / gpu_debug)"
+                );
             } else {
                 inst_layer_names = Vec::new();
                 if !layer_ok {
@@ -306,7 +311,10 @@ impl Device {
                 missing.push(name);
             }
         };
-        require("storage_buffer16_bit_access", q11.storage_buffer16_bit_access);
+        require(
+            "storage_buffer16_bit_access",
+            q11.storage_buffer16_bit_access,
+        );
         require(
             "uniform_and_storage_buffer16_bit_access",
             q11.uniform_and_storage_buffer16_bit_access,
@@ -572,16 +580,13 @@ fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error
         }
 
         let avail = unsafe { instance.enumerate_device_extension_properties(p) }?;
-        let has_ext = |needle: &CStr| {
-            avail.iter().any(|e| ext_name(&e.extension_name) == needle)
-        };
+        let has_ext = |needle: &CStr| avail.iter().any(|e| ext_name(&e.extension_name) == needle);
         let portability = has_ext(vk::KHR_PORTABILITY_SUBSET_NAME);
         let coop_matrix_ext = has_ext(vk::KHR_COOPERATIVE_MATRIX_NAME);
         let coop_matrix2_ext = has_ext(vk::NV_COOPERATIVE_MATRIX2_NAME);
         let shader_core_props2_ext = has_ext(vk::AMD_SHADER_CORE_PROPERTIES2_NAME);
 
-        let queue_families =
-            unsafe { instance.get_physical_device_queue_family_properties(p) };
+        let queue_families = unsafe { instance.get_physical_device_queue_family_properties(p) };
         let qf = queue_families
             .iter()
             .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE));
@@ -602,9 +607,9 @@ fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error
 
 #[cfg(any(debug_assertions, feature = "gpu_debug"))]
 mod validation {
-    use std::ffi::{c_void, CStr};
+    use std::ffi::{CStr, c_void};
 
-    use ash::{ext, vk, Entry, Instance, VkResult};
+    use ash::{Entry, Instance, VkResult, ext, vk};
 
     pub const LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 

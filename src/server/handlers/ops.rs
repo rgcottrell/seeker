@@ -1,9 +1,9 @@
 //! Operational endpoints: health, props, slots, metrics, lora-adapters.
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde_json::json;
 
 use crate::server::state::AppState;

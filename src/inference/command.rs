@@ -23,11 +23,9 @@ pub fn record_dispatch(
     workgroups: [u32; 3],
 ) {
     unsafe {
-        device.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            pipeline.pipeline,
-        );
+        device
+            .device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
         device.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -67,9 +65,15 @@ pub fn record_dispatch_indirect(
     indirect: BufferRange,
 ) {
     debug_assert_eq!(binding_indices.len(), bindings.len());
-    debug_assert!(indirect.size >= 12, "indirect dispatch slot must hold 3×u32");
+    debug_assert!(
+        indirect.size >= 12,
+        "indirect dispatch slot must hold 3×u32"
+    );
     const MAX: usize = 8;
-    debug_assert!(bindings.len() <= MAX, "raise MAX in record_dispatch_indirect");
+    debug_assert!(
+        bindings.len() <= MAX,
+        "raise MAX in record_dispatch_indirect"
+    );
     let mut infos: [vk::DescriptorBufferInfo; MAX] = [vk::DescriptorBufferInfo::default(); MAX];
     let mut writes: [vk::WriteDescriptorSet<'_>; MAX] = [vk::WriteDescriptorSet::default(); MAX];
     let n = bindings.len();
@@ -84,11 +88,9 @@ pub fn record_dispatch_indirect(
     }
     let writes = &writes[..n];
     unsafe {
-        device.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            pipeline.pipeline,
-        );
+        device
+            .device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
         device.device.cmd_push_descriptor_set(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -148,11 +150,9 @@ pub fn record_dispatch_push(
     }
     let writes = &writes[..n];
     unsafe {
-        device.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            pipeline.pipeline,
-        );
+        device
+            .device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
         device.device.cmd_push_descriptor_set(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -203,7 +203,6 @@ std::thread_local! {
 /// vkCmdPipelineBarrier call. Use after a batch of nofence dispatches
 /// that wrote disjoint regions (Q/K/V matmuls, FFN gate/up, etc.) to
 /// fence them all at once before downstream reads.
-
 pub fn record_compute_barriers(device: &Device, cmd: vk::CommandBuffer, ranges: &[BufferRange]) {
     #[cfg(feature = "profile_gpu")]
     BARRIER_COMPUTE_COUNT.with(|c| c.set(c.get() + 1));

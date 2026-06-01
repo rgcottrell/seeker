@@ -101,7 +101,6 @@ pub fn bind_and_dispatch_indirect(
     Ok(())
 }
 
-
 /// Byte size of `UnaryParams` (in shaders/include/generic_unary_head.slang):
 /// 32 × 4 bytes = 128 bytes.
 pub const UNARY_PARAMS_BYTES: u32 = 32 * 4;

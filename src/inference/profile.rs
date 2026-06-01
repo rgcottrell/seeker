@@ -35,13 +35,13 @@ pub enum BlockClass {
 impl BlockClass {
     pub fn label(self) -> &'static str {
         match self {
-            BlockClass::Embed    => "embed",
-            BlockClass::Attn     => "attn",
-            BlockClass::Ssm      => "ssm",
-            BlockClass::MoE      => "moe",
+            BlockClass::Embed => "embed",
+            BlockClass::Attn => "attn",
+            BlockClass::Ssm => "ssm",
+            BlockClass::MoE => "moe",
             BlockClass::Epilogue => "epilogue",
-            BlockClass::LmHead   => "lm_head",
-            BlockClass::Sampler  => "sampler",
+            BlockClass::LmHead => "lm_head",
+            BlockClass::Sampler => "sampler",
         }
     }
 }
@@ -88,7 +88,9 @@ mod inner {
         /// the top of every forward, right after `begin_command_buffer`.
         pub fn reset(&mut self, device: &Device, cmd: vk::CommandBuffer) {
             unsafe {
-                device.device.cmd_reset_query_pool(cmd, self.query_pool, 0, POOL_SIZE);
+                device
+                    .device
+                    .cmd_reset_query_pool(cmd, self.query_pool, 0, POOL_SIZE);
             }
             self.marks.clear();
             self.next = 0;
@@ -154,7 +156,7 @@ mod inner {
             for (k, kind) in kinds.iter().enumerate() {
                 let ms = totals_ns[*kind as usize] as f64 / 1_000_000.0;
                 if k > 0 {
-                    out.push_str(" ");
+                    out.push(' ');
                 }
                 out.push_str(&format!("{}={ms:.2}ms", kind.label()));
             }

@@ -102,6 +102,7 @@ pub struct FlashAttnParams {
 /// `flash_attn_split_k_reduce`; otherwise a single workgroup per head walks
 /// the whole cache serially, starving the GPU and making per-token latency
 /// grow with context length.
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 pub fn record(
     ctx: &mut DispatchContext,
     q: TensorView,
@@ -155,30 +156,50 @@ pub fn record(
         && v.dtype == GgmlType::F16
         && *crate::runtime_flags::FA_CM
         && prefix_len == 0
+        && let Some(m) = mask
     {
-        if let Some(m) = mask {
-            return record_cm1(ctx, q, k, v, m, out, params, kv_actual);
-        }
+        return record_cm1(ctx, q, k, v, m, out, params, kv_actual);
     }
 
     let (variant_name, variant_spv) = match k.dtype {
-        GgmlType::F32 => ("flash_attn_f32_f32", shaders::FLASH_ATTN_F32_F32_SPV.as_bytes()),
-        GgmlType::F16 => ("flash_attn_f32_f16", shaders::FLASH_ATTN_F32_F16_SPV.as_bytes()),
-        GgmlType::BF16 => ("flash_attn_f32_bf16", shaders::FLASH_ATTN_F32_BF16_SPV.as_bytes()),
-        GgmlType::Q4_0 => ("flash_attn_f32_q4_0", shaders::FLASH_ATTN_F32_Q4_0_SPV.as_bytes()),
-        GgmlType::Q4_1 => ("flash_attn_f32_q4_1", shaders::FLASH_ATTN_F32_Q4_1_SPV.as_bytes()),
-        GgmlType::Q5_0 => ("flash_attn_f32_q5_0", shaders::FLASH_ATTN_F32_Q5_0_SPV.as_bytes()),
-        GgmlType::Q5_1 => ("flash_attn_f32_q5_1", shaders::FLASH_ATTN_F32_Q5_1_SPV.as_bytes()),
-        GgmlType::Q8_0 => ("flash_attn_f32_q8_0", shaders::FLASH_ATTN_F32_Q8_0_SPV.as_bytes()),
+        GgmlType::F32 => (
+            "flash_attn_f32_f32",
+            shaders::FLASH_ATTN_F32_F32_SPV.as_bytes(),
+        ),
+        GgmlType::F16 => (
+            "flash_attn_f32_f16",
+            shaders::FLASH_ATTN_F32_F16_SPV.as_bytes(),
+        ),
+        GgmlType::BF16 => (
+            "flash_attn_f32_bf16",
+            shaders::FLASH_ATTN_F32_BF16_SPV.as_bytes(),
+        ),
+        GgmlType::Q4_0 => (
+            "flash_attn_f32_q4_0",
+            shaders::FLASH_ATTN_F32_Q4_0_SPV.as_bytes(),
+        ),
+        GgmlType::Q4_1 => (
+            "flash_attn_f32_q4_1",
+            shaders::FLASH_ATTN_F32_Q4_1_SPV.as_bytes(),
+        ),
+        GgmlType::Q5_0 => (
+            "flash_attn_f32_q5_0",
+            shaders::FLASH_ATTN_F32_Q5_0_SPV.as_bytes(),
+        ),
+        GgmlType::Q5_1 => (
+            "flash_attn_f32_q5_1",
+            shaders::FLASH_ATTN_F32_Q5_1_SPV.as_bytes(),
+        ),
+        GgmlType::Q8_0 => (
+            "flash_attn_f32_q8_0",
+            shaders::FLASH_ATTN_F32_Q8_0_SPV.as_bytes(),
+        ),
         GgmlType::IQ4_NL => (
             "flash_attn_f32_iq4_nl",
             shaders::FLASH_ATTN_F32_IQ4_NL_SPV.as_bytes(),
         ),
         other => {
-            return Err(format!(
-                "flash_attn: no shader variant for K/V dtype {other:?}"
-            )
-            .into());
+            return Err(format!("flash_attn: no shader variant for K/V dtype {other:?}").into());
         }
     };
 
@@ -377,7 +398,15 @@ pub fn record(
             )?;
             record_compute_barrier(ctx.device, ctx.cmd, partials.range());
             record_split_k_combine(
-                ctx, partials, out, params.head_dim_v, n, ne2, ne3, k_num, dyn_range,
+                ctx,
+                partials,
+                out,
+                params.head_dim_v,
+                n,
+                ne2,
+                ne3,
+                k_num,
+                dyn_range,
             )?;
             return Ok(());
         }
@@ -397,9 +426,8 @@ pub fn record(
         // varies between submits. Phase 4 will switch to a host→staging
         // → cmd_copy_buffer chain with the right barriers.
         let wg_data: [u32; 3] = [n, ne2 * k_num, ne3];
-        let wg_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(wg_data.as_ptr() as *const u8, 12)
-        };
+        let wg_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(wg_data.as_ptr() as *const u8, 12) };
         unsafe {
             ctx.device.device.cmd_update_buffer(
                 ctx.cmd,
@@ -443,7 +471,17 @@ pub fn record(
         )?;
         record_compute_barrier(ctx.device, ctx.cmd, partials.range());
         // `dyn_range` (= ctx.decode_dyn) carries this call's k_num for the combine.
-        record_split_k_combine(ctx, partials, out, params.head_dim_v, n, ne2, ne3, k_num, dyn_range)?;
+        record_split_k_combine(
+            ctx,
+            partials,
+            out,
+            params.head_dim_v,
+            n,
+            ne2,
+            ne3,
+            k_num,
+            dyn_range,
+        )?;
     }
     Ok(())
 }
@@ -469,6 +507,7 @@ pub fn record(
 /// a plain direct dispatch — none of the single-seq indirect-dispatch machinery
 /// that exists only to vary `k_num` across replayed submits. `SEEKER_FA_SPLIT=0`
 /// disables it; `SEEKER_FA_SPLIT_KNUM=<n>` pins it.
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 pub fn record_batched(
     ctx: &mut DispatchContext,
     q: TensorView,
@@ -496,7 +535,10 @@ pub fn record_batched(
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(q.dtype, GgmlType::F32);
     debug_assert_eq!(out.dtype, GgmlType::F32);
-    debug_assert_eq!(k.dtype, v.dtype, "flash_attn requires K and V to share a dtype");
+    debug_assert_eq!(
+        k.dtype, v.dtype,
+        "flash_attn requires K and V to share a dtype"
+    );
     let b = kv_lens.len() as u32;
     debug_assert!(b >= 1, "record_batched needs at least one sequence");
     let varlen = query_lens.is_some();
@@ -507,12 +549,17 @@ pub fn record_batched(
             "each query_lens[s] must be in 1..=kv_lens[s]"
         );
     } else {
-        debug_assert_eq!(q.dims[3].max(1) as u32, b, "q batch dim must equal kv_lens.len()");
+        debug_assert_eq!(
+            q.dims[3].max(1) as u32,
+            b,
+            "q batch dim must equal kv_lens.len()"
+        );
     }
     // Flat per-sequence query offsets (prefix sum of query_lens) and the grid's
     // x-dim (max query rows). Decode: query_lens = all-1 → q_start[s]=s, 1 row.
-    let query_lens_vec: Vec<u32> =
-        query_lens.map(|q| q.to_vec()).unwrap_or_else(|| vec![1; b as usize]);
+    let query_lens_vec: Vec<u32> = query_lens
+        .map(|q| q.to_vec())
+        .unwrap_or_else(|| vec![1; b as usize]);
     let q_starts: Vec<u32> = query_lens_vec
         .iter()
         .scan(0u32, |acc, &l| {
@@ -524,19 +571,45 @@ pub fn record_batched(
     let max_rows = query_lens_vec.iter().copied().max().unwrap_or(1);
 
     let (variant_name, variant_spv) = match k.dtype {
-        GgmlType::F32 => ("flash_attn_f32_f32", shaders::FLASH_ATTN_F32_F32_SPV.as_bytes()),
-        GgmlType::F16 => ("flash_attn_f32_f16", shaders::FLASH_ATTN_F32_F16_SPV.as_bytes()),
-        GgmlType::BF16 => ("flash_attn_f32_bf16", shaders::FLASH_ATTN_F32_BF16_SPV.as_bytes()),
-        GgmlType::Q4_0 => ("flash_attn_f32_q4_0", shaders::FLASH_ATTN_F32_Q4_0_SPV.as_bytes()),
-        GgmlType::Q4_1 => ("flash_attn_f32_q4_1", shaders::FLASH_ATTN_F32_Q4_1_SPV.as_bytes()),
-        GgmlType::Q5_0 => ("flash_attn_f32_q5_0", shaders::FLASH_ATTN_F32_Q5_0_SPV.as_bytes()),
-        GgmlType::Q5_1 => ("flash_attn_f32_q5_1", shaders::FLASH_ATTN_F32_Q5_1_SPV.as_bytes()),
-        GgmlType::Q8_0 => ("flash_attn_f32_q8_0", shaders::FLASH_ATTN_F32_Q8_0_SPV.as_bytes()),
+        GgmlType::F32 => (
+            "flash_attn_f32_f32",
+            shaders::FLASH_ATTN_F32_F32_SPV.as_bytes(),
+        ),
+        GgmlType::F16 => (
+            "flash_attn_f32_f16",
+            shaders::FLASH_ATTN_F32_F16_SPV.as_bytes(),
+        ),
+        GgmlType::BF16 => (
+            "flash_attn_f32_bf16",
+            shaders::FLASH_ATTN_F32_BF16_SPV.as_bytes(),
+        ),
+        GgmlType::Q4_0 => (
+            "flash_attn_f32_q4_0",
+            shaders::FLASH_ATTN_F32_Q4_0_SPV.as_bytes(),
+        ),
+        GgmlType::Q4_1 => (
+            "flash_attn_f32_q4_1",
+            shaders::FLASH_ATTN_F32_Q4_1_SPV.as_bytes(),
+        ),
+        GgmlType::Q5_0 => (
+            "flash_attn_f32_q5_0",
+            shaders::FLASH_ATTN_F32_Q5_0_SPV.as_bytes(),
+        ),
+        GgmlType::Q5_1 => (
+            "flash_attn_f32_q5_1",
+            shaders::FLASH_ATTN_F32_Q5_1_SPV.as_bytes(),
+        ),
+        GgmlType::Q8_0 => (
+            "flash_attn_f32_q8_0",
+            shaders::FLASH_ATTN_F32_Q8_0_SPV.as_bytes(),
+        ),
         GgmlType::IQ4_NL => (
             "flash_attn_f32_iq4_nl",
             shaders::FLASH_ATTN_F32_IQ4_NL_SPV.as_bytes(),
         ),
-        other => return Err(format!("flash_attn: no shader variant for K/V dtype {other:?}").into()),
+        other => {
+            return Err(format!("flash_attn: no shader variant for K/V dtype {other:?}").into());
+        }
     };
 
     let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
@@ -602,24 +675,24 @@ pub fn record_batched(
         ne1,
         ne2,
         ne3,
-        q.dims[2] as u32,             // neq2
-        b,                            // neq3
-        k.dims[2] as u32,             // nek2
-        b,                            // nek3
-        v.dims[2] as u32,             // nev2
-        b,                            // nev3
-        1,                            // nem1 (mask disabled)
-        1,                            // nem2
-        1,                            // nem3
-        q.element_stride[1] as u32,   // nb01
-        q.element_stride[2] as u32,   // nb02
-        q.element_stride[3] as u32,   // nb03
-        k.element_stride[1] as u32,   // nb11
-        k.element_stride[2] as u32,   // nb12
-        k.element_stride[3] as u32,   // nb13
-        v.element_stride[1] as u32,   // nb21
-        v.element_stride[2] as u32,   // nb22
-        v.element_stride[3] as u32,   // nb23
+        q.dims[2] as u32,           // neq2
+        b,                          // neq3
+        k.dims[2] as u32,           // nek2
+        b,                          // nek3
+        v.dims[2] as u32,           // nev2
+        b,                          // nev3
+        1,                          // nem1 (mask disabled)
+        1,                          // nem2
+        1,                          // nem3
+        q.element_stride[1] as u32, // nb01
+        q.element_stride[2] as u32, // nb02
+        q.element_stride[3] as u32, // nb03
+        k.element_stride[1] as u32, // nb11
+        k.element_stride[2] as u32, // nb12
+        k.element_stride[3] as u32, // nb13
+        v.element_stride[1] as u32, // nb21
+        v.element_stride[2] as u32, // nb22
+        v.element_stride[3] as u32, // nb23
     ];
 
     let mut push = [0u8; FA_PUSH_BYTES as usize];
@@ -692,11 +765,8 @@ pub fn record_batched(
         // re-records, so no indirect-dispatch / FA_MAX_K_NUM padding needed:
         // size partials at exactly k_num (the layout indexes by the runtime
         // k_num) and pin the grid to k_num here.
-        let partials_floats = (params.head_dim_v as u64 + 2)
-            * n as u64
-            * ne2 as u64
-            * ne3 as u64
-            * k_num as u64;
+        let partials_floats =
+            (params.head_dim_v as u64 + 2) * n as u64 * ne2 as u64 * ne3 as u64 * k_num as u64;
         let partials = ctx.alloc_tensor([partials_floats, 1, 1, 1], GgmlType::F32)?;
         let workgroups = [n, ne2 * k_num, ne3];
         super::bind_and_dispatch(
@@ -718,7 +788,17 @@ pub fn record_batched(
         record_compute_barrier(ctx.device, ctx.cmd, partials.range());
         // The combine reads k_num from `data_dyn[0]` — pass the same batched
         // dyn_range whose entry 0 we set above (NOT ctx.decode_dyn).
-        record_split_k_combine(ctx, partials, out, params.head_dim_v, n, ne2, ne3, k_num, dyn_range)?;
+        record_split_k_combine(
+            ctx,
+            partials,
+            out,
+            params.head_dim_v,
+            n,
+            ne2,
+            ne3,
+            k_num,
+            dyn_range,
+        )?;
     }
     Ok(())
 }
@@ -782,6 +862,7 @@ fn roundup_mult(m: u32, n: u32) -> u32 {
 /// Merge `k_num` per-split (O, L, M) partials into the final attention output
 /// via `flash_attn_split_k_reduce`. One workgroup per (row, head, batch);
 /// grid.y tiles HSV in BLOCK_SIZE(=32)-wide chunks.
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 fn record_split_k_combine(
     ctx: &mut DispatchContext,
     partials: TensorView,
@@ -848,6 +929,7 @@ fn record_split_k_combine(
 ///     dispatch. Mask is small (`L × L` per layer; F16 is 2× cheaper than
 ///     F32) so the cast cost is negligible.
 ///   - Pinned to wave32 (single subgroup, hardcoded in shader).
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 fn record_cm1(
     ctx: &mut DispatchContext,
     q: TensorView,
@@ -944,16 +1026,24 @@ fn record_cm1(
         spec_constants,
         required_subgroup_size: Some(32),
     };
-    let pipeline = *ctx
-        .pipelines
-        .get(ctx.device, key, shaders::FLASH_ATTN_CM1_F32_F16_SPV.as_bytes())?;
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::FLASH_ATTN_CM1_F32_F16_SPV.as_bytes(),
+    )?;
     // Workgroup.x covers Br=16 query rows; .y is heads; .z is batch.
     let workgroups = [n.div_ceil(16), ne2, ne3];
     super::bind_and_dispatch(
         ctx,
         &pipeline,
         &[0, 1, 2, 3, 5],
-        &[q.range(), k.range(), v.range(), mask_f16.range(), out.range()],
+        &[
+            q.range(),
+            k.range(),
+            v.range(),
+            mask_f16.range(),
+            out.range(),
+        ],
         &push,
         workgroups,
     )?;

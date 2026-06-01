@@ -2,15 +2,17 @@
 //! embeddings / rerank / responses / audio return 501 (no embedding/pooling
 //! path on a causal-LM logits engine).
 
+use axum::Json;
 use axum::extract::State;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::Value;
 
-use crate::server::convert::{self, openai_messages_to_chat_mm, parse_stop, prompt_value_to_tokens};
+use crate::server::convert::{
+    self, openai_messages_to_chat_mm, parse_stop, prompt_value_to_tokens,
+};
 use crate::server::error;
-use crate::server::inference::{collect, GenConfig, GenOutput, ServeImage};
+use crate::server::inference::{GenConfig, GenOutput, ServeImage, collect};
 use crate::server::state::AppState;
 use crate::server::stream::{gen_id, openai_chat_stream, openai_completion_stream, unix_now};
 use crate::server::types::common::Usage;

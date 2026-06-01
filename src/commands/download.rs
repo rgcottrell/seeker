@@ -31,7 +31,7 @@ pub struct DownloadArgs {
 /// and `:UD-Q4_K_XL` (two tokens) matches `model.UD-Q4_K_XL.gguf`.
 fn split_tokens(s: &str) -> Vec<String> {
     s.to_ascii_lowercase()
-        .split(|c: char| c == '.' || c == '-')
+        .split(['.', '-'])
         .filter(|t| !t.is_empty())
         .map(|t| t.to_string())
         .collect()
@@ -125,14 +125,14 @@ pub(crate) fn find_sidecar_mmproj(main: &Path) -> Option<PathBuf> {
     }
 
     // Prefer a candidate sharing the main file's quant tag.
-    if let Some(quant) = quant_tag(main_name) {
-        if let Some(p) = candidates.iter().find(|p| {
+    if let Some(quant) = quant_tag(main_name)
+        && let Some(p) = candidates.iter().find(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| filename_contains_quant(n, &quant))
-        }) {
-            return Some(p.clone());
-        }
+        })
+    {
+        return Some(p.clone());
     }
     candidates.into_iter().next()
 }
@@ -151,10 +151,10 @@ fn pick_any_main_gguf(files: &[String]) -> Option<String> {
 fn pick_mmproj(files: &[String], main_quant: Option<&str>) -> Option<String> {
     let candidates: Vec<&String> = files.iter().filter(|f| is_mmproj_gguf(f)).collect();
 
-    if let Some(q) = main_quant {
-        if let Some(m) = candidates.iter().find(|f| filename_contains_quant(f, q)) {
-            return Some((*m).clone());
-        }
+    if let Some(q) = main_quant
+        && let Some(m) = candidates.iter().find(|f| filename_contains_quant(f, q))
+    {
+        return Some((*m).clone());
     }
     if let Some(m) = candidates
         .iter()
@@ -226,10 +226,10 @@ fn list_files_offline(cache: &Cache, repo_id: &str) -> Result<Vec<String>, Box<d
             continue;
         };
         for entry in rd.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if seen.insert(name.to_string()) {
-                    out.push(name.to_string());
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && seen.insert(name.to_string())
+            {
+                out.push(name.to_string());
             }
         }
     }
@@ -329,12 +329,30 @@ pub(crate) async fn resolve_hf(
     };
 
     info!(file = %main_file, quant = ?effective_quant, "selected main file");
-    let main = fetch_or_resolve(&cache, &repo_id, &api_repo, &cache_repo, &main_file, args.offline).await?;
+    let main = fetch_or_resolve(
+        &cache,
+        &repo_id,
+        &api_repo,
+        &cache_repo,
+        &main_file,
+        args.offline,
+    )
+    .await?;
 
     let mmproj = if want_mmproj {
         if let Some(mmproj) = pick_mmproj(&files, effective_quant.as_deref()) {
             info!(file = %mmproj, "selected mmproj sidecar");
-            Some(fetch_or_resolve(&cache, &repo_id, &api_repo, &cache_repo, &mmproj, args.offline).await?)
+            Some(
+                fetch_or_resolve(
+                    &cache,
+                    &repo_id,
+                    &api_repo,
+                    &cache_repo,
+                    &mmproj,
+                    args.offline,
+                )
+                .await?,
+            )
         } else {
             debug!("no mmproj sidecar found in repo");
             None
@@ -382,8 +400,14 @@ mod tests {
 
     #[test]
     fn quant_match_handles_new_multi_token_quants() {
-        assert!(filename_contains_quant("model.UD-Q4_K_XL.gguf", "UD-Q4_K_XL"));
-        assert!(filename_contains_quant("model-UD-Q4_K_XL.gguf", "ud-q4_k_xl"));
+        assert!(filename_contains_quant(
+            "model.UD-Q4_K_XL.gguf",
+            "UD-Q4_K_XL"
+        ));
+        assert!(filename_contains_quant(
+            "model-UD-Q4_K_XL.gguf",
+            "ud-q4_k_xl"
+        ));
     }
 
     #[test]
@@ -477,7 +501,8 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let base = std::env::temp_dir().join(format!("seeker-dl-test-{}-{tag}", std::process::id()));
+            let base =
+                std::env::temp_dir().join(format!("seeker-dl-test-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&base).unwrap();
             TempDir(base)
@@ -491,7 +516,12 @@ mod tests {
 
     /// Build an HF-style cache under `hub_root`: `refs/main -> main_commit` plus
     /// the given `{commit: [files]}` snapshots, each file a real empty file.
-    fn build_hf_cache(hub_root: &Path, repo_id: &str, main_commit: &str, snaps: &[(&str, &[&str])]) {
+    fn build_hf_cache(
+        hub_root: &Path,
+        repo_id: &str,
+        main_commit: &str,
+        snaps: &[(&str, &[&str])],
+    ) {
         let folder = hub_root.join(Repo::new(repo_id.to_string(), RepoType::Model).folder_name());
         std::fs::create_dir_all(folder.join("refs")).unwrap();
         std::fs::write(folder.join("refs").join("main"), main_commit).unwrap();
@@ -535,7 +565,10 @@ mod tests {
             &tmp.0,
             "unsloth/Demo-GGUF",
             "newcommit",
-            &[("newcommit", &["model.gguf"]), ("oldcommit", &["mmproj-BF16.gguf"])],
+            &[
+                ("newcommit", &["model.gguf"]),
+                ("oldcommit", &["mmproj-BF16.gguf"]),
+            ],
         );
         let cache = Cache::new(tmp.0.clone());
         let found = find_cached_in_snapshots(&cache, "unsloth/Demo-GGUF", "mmproj-BF16.gguf");
@@ -561,7 +594,9 @@ mod tests {
 
         let found = find_sidecar_mmproj(&main);
         assert!(
-            found.as_ref().is_some_and(|p| p.ends_with("mmproj-BF16.gguf")),
+            found
+                .as_ref()
+                .is_some_and(|p| p.ends_with("mmproj-BF16.gguf")),
             "expected sibling-snapshot mmproj, got {found:?}"
         );
     }

@@ -11,12 +11,12 @@ use std::sync::Arc;
 use clap::Args;
 
 use crate::commands::chat::parse_logit_bias;
-use crate::commands::download::{resolve_hf, HfResolveArgs};
+use crate::commands::download::{HfResolveArgs, resolve_hf};
 use crate::gguf::{GgmlType, GgufFile};
 use crate::inference::kv_cache::parse_dtype;
 use crate::inference::sample::SamplerConfig;
 use crate::server::inference::{InferenceHandle, WorkerConfig};
-use crate::server::{run as server_run, AppState, AppStateInit, ServerConfig};
+use crate::server::{AppState, AppStateInit, ServerConfig, run as server_run};
 use crate::tokenizer::build_tokenizer;
 
 #[derive(Args)]
@@ -118,12 +118,20 @@ pub struct ServeArgs {
     frequency_penalty: f32,
 
     /// Repetition penalty (multiply/divide repeated logits; 1.0 = off).
-    #[arg(long = "repeat-penalty", alias = "repetition-penalty", default_value_t = 1.0)]
+    #[arg(
+        long = "repeat-penalty",
+        alias = "repetition-penalty",
+        default_value_t = 1.0
+    )]
     repeat_penalty: f32,
 
     /// How many trailing tokens contribute to penalties. `-1` = the whole
     /// context (`--ctx-size`); `0` = disabled. (llama.cpp's `--repeat-last-n`.)
-    #[arg(long = "penalty-last-n", default_value_t = 64, allow_hyphen_values = true)]
+    #[arg(
+        long = "penalty-last-n",
+        default_value_t = 64,
+        allow_hyphen_values = true
+    )]
     penalty_last_n: i32,
 
     /// Never stop on an end-of-generation token; generate until the limit.

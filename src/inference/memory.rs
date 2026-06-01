@@ -47,11 +47,11 @@ impl Region {
 
         let mem_type = pick_memory_type(&device.mem_props, reqs.memory_type_bits, required_flags)
             .ok_or_else(|| {
-                format!(
-                    "no memory type satisfies bits={:#x} flags={:?}",
-                    reqs.memory_type_bits, required_flags
-                )
-            })?;
+            format!(
+                "no memory type satisfies bits={:#x} flags={:?}",
+                reqs.memory_type_bits, required_flags
+            )
+        })?;
 
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(reqs.size)
@@ -66,7 +66,9 @@ impl Region {
         unsafe { device.device.bind_buffer_memory(buffer, memory, 0) }?;
 
         let mt = device.mem_props.memory_types[mem_type as usize];
-        let host_visible = mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+        let host_visible = mt
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
         let host_ptr = if host_visible {
             let ptr = unsafe {
                 device
@@ -83,7 +85,9 @@ impl Region {
             memory,
             size: reqs.size,
             cursor: 0,
-            alignment: reqs.alignment.max(device.limits.min_storage_buffer_offset_alignment),
+            alignment: reqs
+                .alignment
+                .max(device.limits.min_storage_buffer_offset_alignment),
             host_ptr,
             host_visible,
             device_ptr_dropper: None,
@@ -95,7 +99,12 @@ impl Region {
     /// `destroy` is a no-op; the real owner frees the buffer + memory. Used to
     /// hand a per-slot `KvCache` a `Region` that aliases a shared batched KV
     /// buffer without double-freeing it.
-    pub fn borrowed(buffer: vk::Buffer, host_ptr: Option<*mut u8>, size: u64, alignment: u64) -> Self {
+    pub fn borrowed(
+        buffer: vk::Buffer,
+        host_ptr: Option<*mut u8>,
+        size: u64,
+        alignment: u64,
+    ) -> Self {
         Self {
             buffer,
             memory: vk::DeviceMemory::null(),
@@ -187,11 +196,11 @@ impl DeviceBuffer {
 
         let mem_type = pick_memory_type(&device.mem_props, reqs.memory_type_bits, required_flags)
             .ok_or_else(|| {
-                format!(
-                    "no memory type satisfies bits={:#x} flags={:?}",
-                    reqs.memory_type_bits, required_flags
-                )
-            })?;
+            format!(
+                "no memory type satisfies bits={:#x} flags={:?}",
+                reqs.memory_type_bits, required_flags
+            )
+        })?;
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(reqs.size)
             .memory_type_index(mem_type);
@@ -205,7 +214,9 @@ impl DeviceBuffer {
         unsafe { device.device.bind_buffer_memory(buffer, memory, 0) }?;
 
         let mt = device.mem_props.memory_types[mem_type as usize];
-        let host_visible = mt.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+        let host_visible = mt
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
         let host_ptr = if host_visible {
             let ptr = unsafe {
                 device

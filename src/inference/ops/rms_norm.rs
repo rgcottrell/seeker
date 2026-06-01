@@ -1,7 +1,7 @@
 //! `rms_norm` with multiply-by-weight (the LLaMA path). Dispatches
 //! `shaders::RMS_NORM_F32_SPV` with the `do_multiply` spec constant set to
 //! 1. Push constants follow llama.cpp's `vk_op_binary_push_constants`
-//! exactly (ggml-vulkan.cpp:11322).
+//!    exactly (ggml-vulkan.cpp:11322).
 //!
 //! Shader contract: see `shaders/compute/rms_norm.slang` +
 //! `shaders/include/generic_binary_head.slang`. Workgroup count is

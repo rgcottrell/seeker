@@ -234,9 +234,14 @@ pub fn record_accumulate(
     debug_assert_eq!(b.dims[1], 1, "matmul accumulate path is matvec-only (N=1)");
     debug_assert_eq!(d.dtype, GgmlType::F32);
     let variant = mmv_variant(a.dtype).ok_or_else(|| {
-        format!("matmul accumulate: weight dtype {:?} not yet wired", a.dtype)
+        format!(
+            "matmul accumulate: weight dtype {:?} not yet wired",
+            a.dtype
+        )
     })?;
-    record_mul_mat_vec_with_flags(ctx, &variant, a, b, d, /*fence=*/ true, /*accumulate=*/ true)
+    record_mul_mat_vec_with_flags(
+        ctx, &variant, a, b, d, /*fence=*/ true, /*accumulate=*/ true,
+    )
 }
 
 fn record_inner(
@@ -276,10 +281,14 @@ fn record_inner(
     // was latent.) Non-aligned M falls through to mul_mm / per-column matvec,
     // which handle arbitrary M deterministically.
     let mm_cm_enabled = !*crate::runtime_flags::MM_CM_DISABLED;
-    if ctx.device.coop_matrix && n >= 32 && n % 16 == 0 && a.dims[1] % 16 == 0 && mm_cm_enabled {
-        if let Some(variant) = mmcm_variant(a.dtype) {
-            return record_mul_mm_cm(ctx, &variant, a, b, d, fence);
-        }
+    if ctx.device.coop_matrix
+        && n >= 32
+        && n.is_multiple_of(16)
+        && a.dims[1].is_multiple_of(16)
+        && mm_cm_enabled
+        && let Some(variant) = mmcm_variant(a.dtype)
+    {
+        return record_mul_mm_cm(ctx, &variant, a, b, d, fence);
     }
 
     if a.dtype == GgmlType::F16 && n > 1 {
@@ -301,10 +310,10 @@ fn record_inner(
         // per-WG work is large enough to bottleneck on memory issue rate.
         // Gate on `SEEKER_MM_SPLIT_K=<n>` for now (no auto-pick); 0
         // disables. Only Q8_0 (the lm_head dtype) is wired.
-        if a.dtype == GgmlType::Q8_0 {
-            if let Some(split_k) = pick_mm_split_k(a.dims[0] as u32, a.dims[1] as u32) {
-                return record_mul_mat_vec_split_k(ctx, &variant, a, b, d, split_k, fence);
-            }
+        if a.dtype == GgmlType::Q8_0
+            && let Some(split_k) = pick_mm_split_k(a.dims[0] as u32, a.dims[1] as u32)
+        {
+            return record_mul_mat_vec_split_k(ctx, &variant, a, b, d, split_k, fence);
         }
         record_mul_mat_vec(ctx, &variant, a, b, d, fence)?;
     } else {
@@ -453,9 +462,15 @@ fn record_mul_mm_cm(
 
     let mut push = [0u8; MUL_MM_CM_PARAMS_BYTES as usize];
     let fields = [
-        m, n, k,
-        stride_a, stride_b, stride_d,
-        batch_stride_a, batch_stride_b, batch_stride_d,
+        m,
+        n,
+        k,
+        stride_a,
+        stride_b,
+        stride_d,
+        batch_stride_a,
+        batch_stride_b,
+        batch_stride_d,
         1, // num_batches
         1, // ne02
         1, // ne12
@@ -605,7 +620,7 @@ fn record_mul_mat_vec_with_flags(
         spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows, accumulate as u32],
         required_subgroup_size: Some(32),
     };
-    let pipeline = ctx.pipelines.get(ctx.device, key, variant.spv)?.clone();
+    let pipeline = *ctx.pipelines.get(ctx.device, key, variant.spv)?;
 
     let workgroups = [m.div_ceil(num_rows), num_batches, 1];
     super::bind_and_dispatch(
@@ -641,7 +656,7 @@ fn pick_mm_split_k(ncols: u32, nrows: u32) -> Option<u32> {
     // K divisible by `4 * K_PER_ITER * BLOCK_SIZE = 1024` so 4-way split-K
     // partitions cleanly. Skip when rows are small enough that the
     // single-pass kernel already issues plenty of workgroups.
-    if nrows >= 32_768 && ncols % 1024 == 0 {
+    if nrows >= 32_768 && ncols.is_multiple_of(1024) {
         Some(4)
     } else {
         None
@@ -662,7 +677,11 @@ fn record_mul_mat_vec_split_k(
     fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(b.dims[1], 1, "split-K matvec requires N=1");
-    debug_assert_eq!(a.dtype, GgmlType::Q8_0, "split-K matvec wired for Q8_0 only");
+    debug_assert_eq!(
+        a.dtype,
+        GgmlType::Q8_0,
+        "split-K matvec wired for Q8_0 only"
+    );
 
     let ncols = a.dims[0] as u32;
     let m = a.dims[1] as u32;
@@ -682,9 +701,19 @@ fn record_mul_mat_vec_split_k(
     // single-batch defaults.
     let mut push = [0u8; MUL_MAT_VEC_PARAMS_BYTES as usize];
     let fields = [
-        ncols, ncols, ncols, m, // ncols, stride_a, stride_b, stride_d
-        ncols * m, ncols, m,    // batch_stride_a, _b, _d (single batch)
-        0, 0, 1, 1, 1, 1,       // fusion_flags, base_work_group_y, ne02..broadcast3
+        ncols,
+        ncols,
+        ncols,
+        m, // ncols, stride_a, stride_b, stride_d
+        ncols * m,
+        ncols,
+        m, // batch_stride_a, _b, _d (single batch)
+        0,
+        0,
+        1,
+        1,
+        1,
+        1, // fusion_flags, base_work_group_y, ne02..broadcast3
     ];
     for (i, v) in fields.iter().enumerate() {
         push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
@@ -700,10 +729,11 @@ fn record_mul_mat_vec_split_k(
         spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows, 0, split_k],
         required_subgroup_size: Some(32),
     };
-    let pipeline = ctx
-        .pipelines
-        .get(ctx.device, key, shaders::MUL_MAT_VEC_SPLIT_K_Q8_0_SPV.as_bytes())?
-        .clone();
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::MUL_MAT_VEC_SPLIT_K_Q8_0_SPV.as_bytes(),
+    )?;
 
     // Dispatch: (M / NUM_ROWS, SPLIT_K, 1).
     let workgroups = [m.div_ceil(num_rows), split_k, 1];

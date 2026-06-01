@@ -31,7 +31,10 @@ pub(super) fn read_string_array(
         .collect()
 }
 
-pub(super) fn read_f32_array(gguf: &GgufFile, key: &'static str) -> Result<Vec<f32>, TokenizerError> {
+pub(super) fn read_f32_array(
+    gguf: &GgufFile,
+    key: &'static str,
+) -> Result<Vec<f32>, TokenizerError> {
     let arr = match gguf.get(key) {
         Some(MetadataValue::Array(a)) => a,
         Some(_) => return Err(TokenizerError::WrongFieldType(key)),

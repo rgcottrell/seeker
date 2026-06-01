@@ -1,10 +1,10 @@
 //! Multi-section (M-RoPE) dispatch. Mirrors `ops/rope.rs` but binds
 //! `rope_multi.slang`'s F32 variant and populates `rope_params.sections[]`
 //! + `is_imrope`. Used for Qwen 3.5 / Qwen-VL models where the rotated
-//! dimensions are partitioned into 3 axis groups (typically text +
-//! image height + image width). For text-only inference we still set the
-//! sections array (per the GGUF metadata) but route every axis to the
-//! same `positions` buffer — the shader handles that case.
+//!   dimensions are partitioned into 3 axis groups (typically text +
+//!   image height + image width). For text-only inference we still set the
+//!   sections array (per the GGUF metadata) but route every axis to the
+//!   same `positions` buffer — the shader handles that case.
 //!
 //! Push-constant struct: shared `rope_params` from
 //! shaders/include/rope_params.slang (116 bytes).
@@ -79,7 +79,9 @@ pub fn record_rms_norm_rope_nofence(
     params: RopeMultiParams,
     eps: f32,
 ) -> Result<(), Box<dyn Error>> {
-    record_rms_norm_rope_impl(ctx, src, positions, weight, dst, params, eps, /*fence=*/ false)
+    record_rms_norm_rope_impl(
+        ctx, src, positions, weight, dst, params, eps, /*fence=*/ false,
+    )
 }
 
 /// As [`record_rms_norm_rope_nofence`] but writes the rotated K
@@ -94,6 +96,7 @@ pub fn record_rms_norm_rope_nofence(
 /// the binding start, so we pass `cache_layer.range()` (offset 0 into
 /// the layer) and feed `position * head_dim * n_head_kv` as
 /// `d_offset` so the new tokens land at the right slot.
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 pub fn record_rms_norm_rope_to_cache_f16_nofence(
     ctx: &mut DispatchContext,
     src: TensorView,
@@ -186,15 +189,12 @@ pub fn record_rms_norm_rope_to_cache_f16_nofence(
     let _ = d_offset; // value already lives in DecodeDyn
     debug_assert_eq!(w, PUSH_BYTES as usize);
 
-    let key = PipelineKey::dense(
-        "rms_norm_rope_multi_to_f16",
-        6,
-        PUSH_BYTES,
-        vec![ne00],
-    );
-    let pipeline = *ctx
-        .pipelines
-        .get(ctx.device, key, shaders::RMS_NORM_ROPE_MULTI_TO_F16_SPV.as_bytes())?;
+    let key = PipelineKey::dense("rms_norm_rope_multi_to_f16", 6, PUSH_BYTES, vec![ne00]);
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::RMS_NORM_ROPE_MULTI_TO_F16_SPV.as_bytes(),
+    )?;
     let workgroups = [ne01, ne02, src.dims[3].max(1) as u32];
 
     let dummy = positions;
@@ -203,7 +203,14 @@ pub fn record_rms_norm_rope_to_cache_f16_nofence(
         ctx,
         &pipeline,
         &[0, 1, 2, 3, 4, 5],
-        &[src.range(), positions, dummy, cache_layer.range(), weight.range(), dyn_range],
+        &[
+            src.range(),
+            positions,
+            dummy,
+            cache_layer.range(),
+            weight.range(),
+            dyn_range,
+        ],
         &push,
         workgroups,
     )?;
@@ -212,6 +219,7 @@ pub fn record_rms_norm_rope_to_cache_f16_nofence(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 fn record_rms_norm_rope_impl(
     ctx: &mut DispatchContext,
     src: TensorView,
@@ -282,15 +290,12 @@ fn record_rms_norm_rope_impl(
 
     // Spec-const NUM_THREADS = head_dim (= ne00). Same head_dim for both
     // Q and K, so this caches as one pipeline.
-    let key = PipelineKey::dense(
-        "rms_norm_rope_multi_f32",
-        5,
-        PUSH_BYTES,
-        vec![ne00],
-    );
-    let pipeline = *ctx
-        .pipelines
-        .get(ctx.device, key, shaders::RMS_NORM_ROPE_MULTI_F32_SPV.as_bytes())?;
+    let key = PipelineKey::dense("rms_norm_rope_multi_f32", 5, PUSH_BYTES, vec![ne00]);
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::RMS_NORM_ROPE_MULTI_F32_SPV.as_bytes(),
+    )?;
     // Workgroups: (n_head, L, n_seqs). Each WG handles one (head, token)
     // row, reducing internally over `head_dim`.
     let workgroups = [ne01, ne02, src.dims[3].max(1) as u32];

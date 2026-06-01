@@ -8,17 +8,21 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::commands::download;
-use crate::commands::download::{resolve_hf, HfResolveArgs};
+use crate::commands::download::{HfResolveArgs, resolve_hf};
 use crate::gguf::{GgmlType, GgufFile};
-use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
-use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
+use crate::inference::kv_cache::{KvCacheConfig, parse_dtype};
+use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::tokenizer::build_tokenizer;
 
 #[derive(Args)]
 pub struct RunArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]". (short: -hf, -hfr)
-    #[arg(long = "hf-repo", required_unless_present = "model", conflicts_with = "model")]
+    #[arg(
+        long = "hf-repo",
+        required_unless_present = "model",
+        conflicts_with = "model"
+    )]
     hf_repo: Option<String>,
 
     /// Specific file within the repo. (short: -hff)
@@ -81,7 +85,11 @@ pub struct RunArgs {
     frequency_penalty: f32,
 
     /// Repetition penalty (multiply/divide repeated logits; 1.0 = off).
-    #[arg(long = "repeat-penalty", alias = "repetition-penalty", default_value_t = 1.0)]
+    #[arg(
+        long = "repeat-penalty",
+        alias = "repetition-penalty",
+        default_value_t = 1.0
+    )]
     repeat_penalty: f32,
 
     /// How many trailing tokens contribute to penalties (≤ scratch budget).
@@ -245,7 +253,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             args.cache_type_v,
         )
     };
-    let vision_scratch = image_setup.as_ref().map(vision_scratch_estimate).unwrap_or(0);
+    let vision_scratch = image_setup
+        .as_ref()
+        .map(vision_scratch_estimate)
+        .unwrap_or(0);
     engine.allocate_scratch(decoder_scratch.max(vision_scratch))?;
 
     // Encode the image through the vision tower (GPU), reading the
@@ -406,12 +417,8 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         max_seq_len,
     };
     let dims = model.cache_dims();
-    let mut cache = engine.allocate_kv_cache(
-        dims.n_layer,
-        dims.head_dim,
-        dims.n_head_kv,
-        cache_config,
-    )?;
+    let mut cache =
+        engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
     // Hybrid models (qwen35moe etc.) also need persistent SSM/GDN
     // recurrent state. Allocate it on the cache; the model reads/writes
     // it across forwards.
@@ -484,8 +491,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         while (generated.len() as u32) < args.max_tokens {
             let position_offset = cache.position;
             let t0 = std::time::Instant::now();
-            let next_id = engine
-                .forward_sampled(&*model, &mut cache, &step_tokens, position_offset, &mut sampler)?;
+            let next_id = engine.forward_sampled(
+                &*model,
+                &mut cache,
+                &step_tokens,
+                position_offset,
+                &mut sampler,
+            )?;
             decode_secs += t0.elapsed().as_secs_f64();
             generated.push(next_id);
             step_tokens = vec![next_id];
@@ -495,8 +507,8 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         // Prefill via the hidden-exposing forward; sample the first token on
         // the host (the spec path samples on host throughout).
         let t0 = std::time::Instant::now();
-        let (logits, residual) =
-            engine.forward_full_readback(&*model, &mut cache, &tokens, 0, /*full_logits=*/ false)?;
+        let (logits, residual) = engine
+            .forward_full_readback(&*model, &mut cache, &tokens, 0, /*full_logits=*/ false)?;
         let prompt_len = tokens.len();
         let hsz = residual.len() / prompt_len;
         let mut h_last = residual[(prompt_len - 1) * hsz..prompt_len * hsz].to_vec();
@@ -520,7 +532,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         while (generated.len() as u32) < args.max_tokens {
             let position = cache.position;
             let out = engine.decode_speculative(
-                &*model, &mut cache, last_token, &h_last, position, &mut sampler, n_max,
+                &*model,
+                &mut cache,
+                last_token,
+                &h_last,
+                position,
+                &mut sampler,
+                n_max,
             )?;
             total_accepted += out.accepted as u64;
             spec_steps += 1;
@@ -548,7 +566,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         for step in 0..args.max_tokens {
             let position_offset = cache.position;
             let t0 = std::time::Instant::now();
-            let next_id = engine.forward_sampled(&*model, &mut cache, &step_tokens, position_offset, &mut sampler)?;
+            let next_id = engine.forward_sampled(
+                &*model,
+                &mut cache,
+                &step_tokens,
+                position_offset,
+                &mut sampler,
+            )?;
             let elapsed = t0.elapsed().as_secs_f64();
             if step == 0 {
                 prefill_secs = elapsed;
@@ -682,7 +706,10 @@ fn batch_decode_smoke_test(
         }
         serial.push(stream);
     }
-    eprintln!("[batch test] serial reference done ({} streams)", serial.len());
+    eprintln!(
+        "[batch test] serial reference done ({} streams)",
+        serial.len()
+    );
 
     // ---- Batched: all prompts in one BatchKvCache ----
     // `SEEKER_BATCH_PERM` parks sequence `s` in a *non-contiguous* slab
@@ -696,8 +723,14 @@ fn batch_decode_smoke_test(
     };
     let n_slots = perm.iter().copied().max().unwrap_or(0) + 1;
     println!("Batched slab assignment (slot per seq): {perm:?}, n_slots={n_slots}");
-    let mut batch =
-        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, n_slots, config)?;
+    let mut batch = BatchKvCache::new(
+        &engine.device,
+        dims.n_layer,
+        dims.head_dim,
+        dims.n_head_kv,
+        n_slots,
+        config,
+    )?;
     if let Some(ssm) = model.ssm_state_dims() {
         batch.allocate_ssm_state(
             &engine.device,
@@ -716,14 +749,17 @@ fn batch_decode_smoke_test(
         batch.positions[perm[s] as usize] = sc.position;
         last[s] = first;
         batched.push(vec![first]);
-        eprintln!("[batch test] prefill seq {s} done (slab {}, first token {first})", perm[s]);
+        eprintln!(
+            "[batch test] prefill seq {s} done (slab {}, first token {first})",
+            perm[s]
+        );
     }
     // Batched decode steps.
     for step in 1..n_gen {
         let positions: Vec<u32> = (0..b).map(|s| batch.positions[perm[s] as usize]).collect();
         let mut srefs: Vec<&mut Sampler> = samplers.iter_mut().collect();
-        let toks = engine
-            .forward_batch_decode(model, &mut batch, &last, &positions, &perm, &mut srefs)?;
+        let toks =
+            engine.forward_batch_decode(model, &mut batch, &last, &positions, &perm, &mut srefs)?;
         let matches: Vec<bool> = (0..b)
             .map(|s| serial[s].get(step).map(|&t| t == toks[s]).unwrap_or(false))
             .collect();
@@ -782,7 +818,7 @@ fn unified_forward_smoke_test(
 
     // Long prompts so each prefill chunk spans several Bc=32 KV blocks — the
     // varlen causal mask must hold across block boundaries (not just within one).
-    let prompts = vec![
+    let prompts = [
         "The history of computing began long before the invention of the modern electronic \
          computer, with mechanical calculating devices and theoretical foundations laid over \
          many centuries by mathematicians and engineers across the world. In summary,",
@@ -795,21 +831,30 @@ fn unified_forward_smoke_test(
     ];
     let b = prompts.len();
     let n_gen = 12usize;
-    let greedy = SamplerConfig { temperature: 0.0, ..SamplerConfig::default() };
+    let greedy = SamplerConfig {
+        temperature: 0.0,
+        ..SamplerConfig::default()
+    };
 
     let bundle = model.tokenizer();
     let add_special = bundle.add_bos_default || bundle.add_eos_default;
     let prompts_tokens: Vec<Vec<u32>> = prompts
         .iter()
         .map(|p| {
-            bundle.tokenizer.encode(*p, add_special)
+            bundle
+                .tokenizer
+                .encode(*p, add_special)
                 .map(|e| e.get_ids().to_vec())
                 .map_err(|e| format!("tokenize failed: {e}"))
         })
         .collect::<Result<_, _>>()?;
     let max_prompt = prompts_tokens.iter().map(|t| t.len()).max().unwrap();
     let max_seq_len = (max_prompt + n_gen + 4) as u32;
-    let config = KvCacheConfig { k_dtype: GgmlType::F16, v_dtype: GgmlType::F16, max_seq_len };
+    let config = KvCacheConfig {
+        k_dtype: GgmlType::F16,
+        v_dtype: GgmlType::F16,
+        max_seq_len,
+    };
     let dims = model.cache_dims();
     println!(
         "Unified-forward test: B={b}, gen={n_gen}, prompt_lens={:?}",
@@ -822,7 +867,12 @@ fn unified_forward_smoke_test(
         let mut cache =
             engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, config)?;
         if let Some(ssm) = model.ssm_state_dims() {
-            cache.allocate_ssm_state(&engine.device, ssm.n_ssm_layers, ssm.conv_state_floats, ssm.gdn_state_floats)?;
+            cache.allocate_ssm_state(
+                &engine.device,
+                ssm.n_ssm_layers,
+                ssm.conv_state_floats,
+                ssm.gdn_state_floats,
+            )?;
         }
         let mut sampler = Sampler::new(greedy.clone());
         let first = engine.forward_sampled(model, &mut cache, tokens, 0, &mut sampler)?;
@@ -838,10 +888,21 @@ fn unified_forward_smoke_test(
     eprintln!("[unified test] serial reference done");
 
     // ---- Unified path: staggered admission (seq s prefills at step s) ----
-    let mut batch =
-        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, b as u32, config)?;
+    let mut batch = BatchKvCache::new(
+        &engine.device,
+        dims.n_layer,
+        dims.head_dim,
+        dims.n_head_kv,
+        b as u32,
+        config,
+    )?;
     if let Some(ssm) = model.ssm_state_dims() {
-        batch.allocate_ssm_state(&engine.device, ssm.n_ssm_layers, ssm.conv_state_floats, ssm.gdn_state_floats)?;
+        batch.allocate_ssm_state(
+            &engine.device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
     }
     let mut samplers: Vec<Sampler> = (0..b).map(|_| Sampler::new(greedy.clone())).collect();
     let mut generated: Vec<Vec<u32>> = vec![Vec::new(); b];
@@ -851,7 +912,9 @@ fn unified_forward_smoke_test(
     loop {
         // Participants: admitted (admission_step = seq index, so s <= step) and
         // not yet done.
-        let parts: Vec<usize> = (0..b).filter(|&s| s <= step && generated[s].len() < n_gen).collect();
+        let parts: Vec<usize> = (0..b)
+            .filter(|&s| s <= step && generated[s].len() < n_gen)
+            .collect();
         if parts.is_empty() {
             break;
         }
@@ -884,8 +947,9 @@ fn unified_forward_smoke_test(
             .filter(|(i, _)| part_set.contains(i))
             .map(|(_, s)| s)
             .collect();
-        let toks = engine
-            .forward_unified(model, &mut batch, &tokens, &positions, &seq_lens, &slots, &mut srefs)?;
+        let toks = engine.forward_unified(
+            model, &mut batch, &tokens, &positions, &seq_lens, &slots, &mut srefs,
+        )?;
         drop(srefs);
         eprintln!("[unified step {step}] parts={parts:?} kinds={kinds:?} toks={toks:?}");
         for (i, &s) in parts.iter().enumerate() {
@@ -900,13 +964,18 @@ fn unified_forward_smoke_test(
     for s in 0..b {
         let ok = serial[s] == generated[s];
         all_ok &= ok;
-        let first_diff = serial[s].iter().zip(generated[s].iter()).position(|(a, b)| a != b);
+        let first_diff = serial[s]
+            .iter()
+            .zip(generated[s].iter())
+            .position(|(a, b)| a != b);
         println!(
             "  seq {s}: {} (serial={:?} unified={:?}{})",
             if ok { "MATCH" } else { "DIVERGE" },
             &serial[s][..serial[s].len().min(8)],
             &generated[s][..generated[s].len().min(8)],
-            first_diff.map(|i| format!(", first diff at token {i}")).unwrap_or_default(),
+            first_diff
+                .map(|i| format!(", first diff at token {i}"))
+                .unwrap_or_default(),
         );
     }
     println!(
@@ -934,7 +1003,10 @@ fn unified_dump_test(
     use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
 
     let env_usize = |k: &str, d: usize| {
-        std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
     };
     let runs = env_usize("SEEKER_DUMP_RUNS", 4);
     let prompt_len = env_usize("SEEKER_DUMP_PROMPT", 80);
@@ -942,7 +1014,10 @@ fn unified_dump_test(
     let bundle = model.tokenizer();
     let seed = bundle
         .tokenizer
-        .encode("The history of computing began long before the invention of", true)
+        .encode(
+            "The history of computing began long before the invention of",
+            true,
+        )
         .map(|e| e.get_ids().to_vec())
         .map_err(|e| format!("tokenize failed: {e}"))?;
     let prompt: Vec<u32> = (0..prompt_len).map(|i| seed[i % seed.len()]).collect();
@@ -956,8 +1031,14 @@ fn unified_dump_test(
         v_dtype: GgmlType::F16,
         max_seq_len: (prompt.len() + 16) as u32,
     };
-    let mut batch =
-        BatchKvCache::new(&engine.device, dims.n_layer, dims.head_dim, dims.n_head_kv, 1, config)?;
+    let mut batch = BatchKvCache::new(
+        &engine.device,
+        dims.n_layer,
+        dims.head_dim,
+        dims.n_head_kv,
+        1,
+        config,
+    )?;
     if let Some(ssm) = model.ssm_state_dims() {
         batch.allocate_ssm_state(
             &engine.device,
@@ -967,7 +1048,10 @@ fn unified_dump_test(
         )?;
     }
 
-    println!("Unified dump: prompt_len={}, runs={runs} (same input each run)", prompt.len());
+    println!(
+        "Unified dump: prompt_len={}, runs={runs} (same input each run)",
+        prompt.len()
+    );
     let mut reference: Option<Vec<(String, u64)>> = None;
     for run in 0..runs {
         // Fresh start each run: zero the slab's SSM state, rewind position. The
@@ -990,13 +1074,20 @@ fn unified_dump_test(
                     .find(|(_, ((_, h1), (_, h2)))| h1 != h2);
                 match first {
                     Some((i, ((label, h1), (_, h2)))) => {
-                        let n_diff = r.iter().zip(h.iter()).filter(|((_, a), (_, b))| a != b).count();
+                        let n_diff = r
+                            .iter()
+                            .zip(h.iter())
+                            .filter(|((_, a), (_, b))| a != b)
+                            .count();
                         println!(
                             "  run {run}: FIRST DIVERGENCE at record {i} '{label}': {h1:016x} vs {h2:016x}  ({n_diff}/{} records differ)",
                             r.len()
                         );
                     }
-                    None => println!("  run {run}: identical to reference (all {} records match)", r.len()),
+                    None => println!(
+                        "  run {run}: identical to reference (all {} records match)",
+                        r.len()
+                    ),
                 }
             }
         }
@@ -1022,7 +1113,10 @@ fn batch_decode_bench(
     use std::time::Instant;
 
     let env_usize = |k: &str, d: usize| {
-        std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
     };
     let prompt_len = env_usize("SEEKER_BENCH_PROMPT", 128);
     let n_decode = env_usize("SEEKER_BENCH_DECODE", 128);
@@ -1041,7 +1135,10 @@ fn batch_decode_bench(
     let bundle = model.tokenizer();
     let seed = bundle
         .tokenizer
-        .encode("The history of computing began long before the invention of", true)
+        .encode(
+            "The history of computing began long before the invention of",
+            true,
+        )
         .map(|e| e.get_ids().to_vec())
         .map_err(|e| format!("tokenize failed: {e}"))?;
     let prompt: Vec<u32> = (0..prompt_len).map(|i| seed[i % seed.len()]).collect();
@@ -1085,7 +1182,11 @@ fn batch_decode_bench(
             batch.positions[s] = sc.position;
         }
         let slot_ids: Vec<u32> = (0..b as u32).collect();
-        let step = |engine: &mut Engine, batch: &mut BatchKvCache, last: &mut Vec<u32>, samplers: &mut [Sampler]| -> Result<(), Box<dyn Error>> {
+        let step = |engine: &mut Engine,
+                    batch: &mut BatchKvCache,
+                    last: &mut Vec<u32>,
+                    samplers: &mut [Sampler]|
+         -> Result<(), Box<dyn Error>> {
             let positions: Vec<u32> = (0..b).map(|s| batch.positions[s]).collect();
             let mut srefs: Vec<&mut Sampler> = samplers.iter_mut().collect();
             *last = engine
@@ -1149,7 +1250,11 @@ fn fa_batch_smoke_test(
     // validates the batched split-K dispatch + combine against the CPU ref.
     let kv_lens: Vec<u32> = std::env::var("SEEKER_FA_KV_LENS")
         .ok()
-        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<u32>>())
+        .map(|s| {
+            s.split(',')
+                .filter_map(|x| x.trim().parse().ok())
+                .collect::<Vec<u32>>()
+        })
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec![5, 8, 3]);
     let b = kv_lens.len();
@@ -1162,8 +1267,9 @@ fn fa_batch_smoke_test(
 
     // Deterministic synthetic inputs (host-side, also drive the CPU reference).
     let q_val = |s: usize, h: usize, d: usize| ((s * 7 + h * 3 + d) as f32 * 0.013).sin();
-    let k_val =
-        |s: usize, kh: usize, j: usize, d: usize| ((s * 5 + kh * 4 + j * 2 + d) as f32 * 0.021).cos();
+    let k_val = |s: usize, kh: usize, j: usize, d: usize| {
+        ((s * 5 + kh * 4 + j * 2 + d) as f32 * 0.021).cos()
+    };
     let v_val = |s: usize, kh: usize, j: usize, d: usize| {
         ((s * 9 + kh * 2 + j * 3 + d) as f32 * 0.017).sin() * 0.5
     };
@@ -1176,6 +1282,7 @@ fn fa_batch_smoke_test(
             let klen = kv_lens[s] as usize;
             let mut scores = vec![0f32; klen];
             let mut maxs = f32::NEG_INFINITY;
+            #[allow(clippy::needless_range_loop)]
             for j in 0..klen {
                 let mut dot = 0f32;
                 for d in 0..head_dim {
@@ -1191,6 +1298,7 @@ fn fa_batch_smoke_test(
             }
             for d in 0..head_dim {
                 let mut acc = 0f32;
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..klen {
                     acc += scores[j] * v_val(s, kh, j, d);
                 }
@@ -1307,7 +1415,13 @@ fn fa_varlen_smoke_test(
     let query_lens: Vec<u32> = seqs.iter().map(|&(_, l)| l as u32).collect();
     let q_starts: Vec<usize> = {
         let mut acc = 0;
-        seqs.iter().map(|&(_, l)| { let s = acc; acc += l; s }).collect()
+        seqs.iter()
+            .map(|&(_, l)| {
+                let s = acc;
+                acc += l;
+                s
+            })
+            .collect()
     };
     let n_total: usize = seqs.iter().map(|&(_, l)| l).sum();
     let b = seqs.len();
@@ -1322,8 +1436,9 @@ fn fa_varlen_smoke_test(
     let q_val = |s: usize, r: usize, h: usize, d: usize| {
         ((s * 7 + r * 11 + h * 3 + d) as f32 * 0.013).sin()
     };
-    let k_val =
-        |s: usize, kh: usize, j: usize, d: usize| ((s * 5 + kh * 4 + j * 2 + d) as f32 * 0.021).cos();
+    let k_val = |s: usize, kh: usize, j: usize, d: usize| {
+        ((s * 5 + kh * 4 + j * 2 + d) as f32 * 0.021).cos()
+    };
     let v_val = |s: usize, kh: usize, j: usize, d: usize| {
         ((s * 9 + kh * 2 + j * 3 + d) as f32 * 0.017).sin() * 0.5
     };
@@ -1369,7 +1484,10 @@ fn fa_varlen_smoke_test(
     // the slab layout [head_dim, max_kv, n_head_kv, B] (seq b → slab b).
     let gpu_out = engine.forward(weights, |ctx| -> Result<BufferRange, Box<dyn Error>> {
         let host = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
-        let q = ctx.alloc_tensor([head_dim as u64, n_head as u64, n_total as u64, 1], GgmlType::F32)?;
+        let q = ctx.alloc_tensor(
+            [head_dim as u64, n_head as u64, n_total as u64, 1],
+            GgmlType::F32,
+        )?;
         let k = ctx.alloc_tensor(
             [head_dim as u64, max_kv as u64, n_head_kv as u64, b as u64],
             GgmlType::F32,
@@ -1409,8 +1527,18 @@ fn fa_varlen_smoke_test(
         // [head_dim, N_total, n_head] view: per-token stride = hidden, head stride = head_dim.
         let q_view = TensorView {
             dims: [head_dim as u64, n_total as u64, n_head as u64, 1],
-            byte_stride: [elem, elem * hidden as u64, elem * head_dim as u64, elem * hidden as u64 * n_total as u64],
-            element_stride: [1, hidden as u64, head_dim as u64, hidden as u64 * n_total as u64],
+            byte_stride: [
+                elem,
+                elem * hidden as u64,
+                elem * head_dim as u64,
+                elem * hidden as u64 * n_total as u64,
+            ],
+            element_stride: [
+                1,
+                hidden as u64,
+                head_dim as u64,
+                hidden as u64 * n_total as u64,
+            ],
             ..q
         };
         let out = ctx.alloc_tensor([hidden_v as u64, n_total as u64, 1, 1], GgmlType::F32)?;
@@ -1422,7 +1550,15 @@ fn fa_varlen_smoke_test(
         };
         let fa_dyn = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
         flash_attn::record_batched(
-            ctx, q_view, k, v, out, params, &kv_lens, fa_dyn, /*slots=*/ None,
+            ctx,
+            q_view,
+            k,
+            v,
+            out,
+            params,
+            &kv_lens,
+            fa_dyn,
+            /*slots=*/ None,
             /*query_lens=*/ Some(&query_lens),
         )?;
         Ok(out.range())
@@ -1475,8 +1611,8 @@ fn fa_varlen_smoke_test(
 ///     cargo run --features gpu_debug --bin seeker -- run -m <mmproj.gguf> ""
 #[cfg(feature = "gpu_debug")]
 fn vision_patchembed_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
-    use crate::vision::encoder::{patch_embed_cpu, HostWeights, VisionEncoder};
-    use crate::vision::preprocess::{preprocess_rgb8, PreprocessConfig};
+    use crate::vision::encoder::{HostWeights, VisionEncoder, patch_embed_cpu};
+    use crate::vision::preprocess::{PreprocessConfig, preprocess_rgb8};
 
     let mmproj_path = std::env::var("SEEKER_MMPROJ").unwrap_or_else(|_| {
         "/models/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/\
@@ -1604,9 +1740,9 @@ fn vision_patchembed_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
 #[cfg(feature = "gpu_debug")]
 fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
     use crate::vision::encoder::{
-        block_cpu_stage, patch_embed_cpu, BlockHostWeights, HostWeights, VisionEncoder,
+        BlockHostWeights, HostWeights, VisionEncoder, block_cpu_stage, patch_embed_cpu,
     };
-    use crate::vision::preprocess::{preprocess_rgb8, PreprocessConfig};
+    use crate::vision::preprocess::{PreprocessConfig, preprocess_rgb8};
 
     let mmproj_path = std::env::var("SEEKER_MMPROJ").unwrap_or_else(|_| {
         "/models/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/\
@@ -1630,8 +1766,7 @@ fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
     );
 
     let weights = engine.upload_weights(&gguf)?;
-    let encoder =
-        VisionEncoder::new(&weights, n_embd, patch_size, n_head, n_ff, n_layer, eps)?;
+    let encoder = VisionEncoder::new(&weights, n_embd, patch_size, n_head, n_ff, n_layer, eps)?;
     let hw = HostWeights::from_gguf(&gguf)?;
     let bw0 = BlockHostWeights::from_gguf(&gguf, 0)?;
 
@@ -1681,7 +1816,10 @@ fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
                 bytes.extend_from_slice(&v.to_ne_bytes());
             }
             let range = ctx.alloc_scratch(bytes.len() as u64)?;
-            let base = ctx.scratch.host_ptr.ok_or("vision: scratch not host-visible")?;
+            let base = ctx
+                .scratch
+                .host_ptr
+                .ok_or("vision: scratch not host-visible")?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -1704,8 +1842,7 @@ fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
                 element_stride: es,
                 dtype: crate::gguf::GgmlType::F32,
             };
-            let positions =
-                crate::vision::encoder::stage_vision_positions(ctx, grid_w, grid_h)?;
+            let positions = crate::vision::encoder::stage_vision_positions(ctx, grid_w, grid_h)?;
             let out = encoder.record_block(ctx, x, 0, positions)?;
             Ok(out.range())
         },
@@ -1759,14 +1896,19 @@ fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
     println!(
         "VISION block{}: elements={} max_abs={max_abs:.3e} mean_abs={mean_abs:.3e} \
          worst_idx={worst} gpu={:.6} cpu={:.6} -> {}",
-        stage.as_deref().map(|s| format!("({s})")).unwrap_or_else(|| "(layer 0)".to_string()),
+        stage
+            .as_deref()
+            .map(|s| format!("({s})"))
+            .unwrap_or_else(|| "(layer 0)".to_string()),
         gpu.len(),
         gpu[worst],
         cpu[worst],
         if pass { "PASS" } else { "FAIL" }
     );
     if !pass {
-        return Err(format!("vision block GPU-vs-CPU max_abs {max_abs:.3e} > tol {tol:.0e}").into());
+        return Err(
+            format!("vision block GPU-vs-CPU max_abs {max_abs:.3e} > tol {tol:.0e}").into(),
+        );
     }
     Ok(())
 }
@@ -1804,10 +1946,10 @@ fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
 #[cfg(feature = "gpu_debug")]
 fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
     use crate::vision::encoder::{
-        block_cpu, merger_cpu, patch_embed_cpu, BlockHostWeights, HostWeights, MergerHostWeights,
-        VisionEncoder,
+        BlockHostWeights, HostWeights, MergerHostWeights, VisionEncoder, block_cpu, merger_cpu,
+        patch_embed_cpu,
     };
-    use crate::vision::preprocess::{preprocess, preprocess_rgb8, PreprocessConfig};
+    use crate::vision::preprocess::{PreprocessConfig, preprocess, preprocess_rgb8};
 
     let mmproj_path = std::env::var("SEEKER_MMPROJ").unwrap_or_else(|_| {
         "/models/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-MTP-GGUF/snapshots/\
@@ -1875,14 +2017,18 @@ fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
     let grid_w = img.grid_w;
     let grid_h = img.grid_h;
     let n_pos = (grid_w * grid_h) as usize;
-    let coop_path = n_pos >= 32 && n_pos % 16 == 0;
+    let coop_path = n_pos >= 32 && n_pos.is_multiple_of(16);
     println!(
         "VISION image: resized={}x{} grid={grid_w}x{grid_h} n_patches={n_pos} \
          n_tokens={} matmul_path={}",
         img.resized_w,
         img.resized_h,
         img.n_tokens,
-        if coop_path { "coop-matrix (f16-staged)" } else { "mul_mat_vec (f32-acc)" }
+        if coop_path {
+            "coop-matrix (f16-staged)"
+        } else {
+            "mul_mat_vec (f32-acc)"
+        }
     );
 
     let weights = engine.upload_weights(&gguf)?;
@@ -1912,8 +2058,7 @@ fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
         &weights,
         |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
             let mut x = encoder.record_patch_embed(ctx, &img, &hw)?;
-            let positions =
-                crate::vision::encoder::stage_vision_positions(ctx, grid_w, grid_h)?;
+            let positions = crate::vision::encoder::stage_vision_positions(ctx, grid_w, grid_h)?;
             for il in 0..nlayers as u32 {
                 x = encoder.record_block(ctx, x, il, positions)?;
             }
@@ -1927,7 +2072,16 @@ fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
     // CPU reference (exact f32).
     let mut cpu = patch_embed_cpu(&hw, n_embd, patch_size, &img);
     for bw in &blocks {
-        cpu = block_cpu(bw, &cpu, n_embd, n_head, n_ff, eps, grid_w as usize, grid_h as usize);
+        cpu = block_cpu(
+            bw,
+            &cpu,
+            n_embd,
+            n_head,
+            n_ff,
+            eps,
+            grid_w as usize,
+            grid_h as usize,
+        );
     }
     if run_merger {
         cpu = merger_cpu(&mh, &cpu, n_embd, eps);
@@ -1937,7 +2091,11 @@ fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
         return Err(format!("length mismatch: gpu {} vs cpu {}", gpu.len(), cpu.len()).into());
     }
 
-    let feat = if run_merger { encoder.projection_dim } else { n_embd };
+    let feat = if run_merger {
+        encoder.projection_dim
+    } else {
+        n_embd
+    };
     debug_assert_eq!(gpu.len() % feat, 0, "output not a whole number of tokens");
     let n_tok = gpu.len() / feat;
 
@@ -1957,7 +2115,11 @@ fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         std::fs::write(&dump, &bytes)?;
-        println!("VISION wrote {} f32 ({} bytes) to {dump}", gpu.len(), gpu.len() * 4);
+        println!(
+            "VISION wrote {} f32 ({} bytes) to {dump}",
+            gpu.len(),
+            gpu.len() * 4
+        );
     }
 
     // GPU-vs-CPU: max-abs/mean-abs (informational) + per-token cosine (gate).
@@ -1989,9 +2151,11 @@ fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
     if let Ok(anchor_path) = std::env::var("SEEKER_VISION_ANCHOR") {
         let bytes = std::fs::read(&anchor_path)?;
         if bytes.len() % 4 != 0 {
-            return Err(
-                format!("anchor {anchor_path}: {} bytes, not f32-aligned", bytes.len()).into(),
-            );
+            return Err(format!(
+                "anchor {anchor_path}: {} bytes, not f32-aligned",
+                bytes.len()
+            )
+            .into());
         }
         let anchor: Vec<f32> = bytes
             .chunks_exact(4)
@@ -2120,7 +2284,11 @@ fn per_token_cosine(a: &[f32], b: &[f32], feat: usize, n_tok: usize) -> (f64, f6
         }
         sum_cos += cos;
     }
-    let mean = if n_tok > 0 { sum_cos / n_tok as f64 } else { 0.0 };
+    let mean = if n_tok > 0 {
+        sum_cos / n_tok as f64
+    } else {
+        0.0
+    };
     (if n_tok > 0 { min_cos } else { 0.0 }, mean, worst)
 }
 
@@ -2155,6 +2323,7 @@ fn inplace_binary_smoke_test(
 
     let mut wrong = 0usize;
     let mut max_err = 0f32;
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n as usize {
         let expected = a_val(i) + b_val(i);
         let err = (out[i] - expected).abs();
@@ -2203,9 +2372,9 @@ fn ssm_conv_smoke_test(
 
     // Read kernel weights to host once so we can build the CPU reference.
     let kernel_host: Vec<f32> = {
-        let base = weights.debug_host_base(&kernel).ok_or(
-            "host-side weight reads unsupported (weights are device-local)",
-        )?;
+        let base = weights
+            .debug_host_base(&kernel)
+            .ok_or("host-side weight reads unsupported (weights are device-local)")?;
         let total = (conv_kernel * conv_channels) as usize;
         let mut out = vec![0f32; total];
         unsafe {
@@ -2236,7 +2405,7 @@ fn ssm_conv_smoke_test(
             let conv_input = ctx.alloc_tensor([n_padded, conv_channels, 1, 1], GgmlType::F32)?;
             unsafe {
                 std::ptr::write_bytes(
-                    host_ptr.add(conv_input.byte_offset as usize) as *mut u8,
+                    host_ptr.add(conv_input.byte_offset as usize),
                     0,
                     conv_input.byte_size as usize,
                 );
@@ -2394,11 +2563,7 @@ fn l2_norm_smoke_test(
             let host_ptr = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
             unsafe {
                 let p = host_ptr.add(conv_out.byte_offset as usize) as *mut f32;
-                std::ptr::copy_nonoverlapping(
-                    conv_out_host.as_ptr(),
-                    p,
-                    conv_out_host.len(),
-                );
+                std::ptr::copy_nonoverlapping(conv_out_host.as_ptr(), p, conv_out_host.len());
             }
             let elem = 4u64;
             // Q slice: same view the SSM block builds.
@@ -2474,25 +2639,32 @@ fn rms_norm_qwen_smoke(
         |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
             let token_buf = ctx.alloc_scratch(4)?;
             let host_ptr = ctx.scratch.host_ptr.ok_or("no host ptr")?;
-            unsafe { *(host_ptr.add(token_buf.offset as usize) as *mut u32) = 9419; }
+            unsafe {
+                *(host_ptr.add(token_buf.offset as usize) as *mut u32) = 9419;
+            }
             let out = ctx.alloc_tensor([n, 1, 1, 1], GgmlType::F32)?;
-            crate::inference::ops::elementwise::record_get_rows(ctx, embed_view, token_buf, 1, out)?;
+            crate::inference::ops::elementwise::record_get_rows(
+                ctx, embed_view, token_buf, 1, out,
+            )?;
             Ok(out.range())
         },
     )?;
     let input = embed_host.clone();
-    println!("input head={:?}, max_abs={:.4}", &input[..5],
-        input.iter().map(|v| v.abs()).fold(0.0, f32::max));
+    println!(
+        "input head={:?}, max_abs={:.4}",
+        &input[..5],
+        input.iter().map(|v| v.abs()).fold(0.0, f32::max)
+    );
     let mut w_host = vec![0f32; n as usize];
-    let weight_base = weights.debug_host_base(&weight_view).ok_or(
-        "host-side weight reads unsupported (weights are device-local)",
-    )?;
+    let weight_base = weights
+        .debug_host_base(&weight_view)
+        .ok_or("host-side weight reads unsupported (weights are device-local)")?;
     unsafe {
         let p = weight_base.add(weight_view.byte_offset as usize) as *const f32;
         std::ptr::copy_nonoverlapping(p, w_host.as_mut_ptr(), n as usize);
     }
     // CPU reference
-    let sum_sq: f32 = input.iter().map(|x| x*x).sum();
+    let sum_sq: f32 = input.iter().map(|x| x * x).sum();
     let mean = sum_sq / n as f32;
     let scale = 1.0 / (mean + eps).sqrt();
     let mut ref_out = vec![0f32; n as usize];
@@ -2502,8 +2674,10 @@ fn rms_norm_qwen_smoke(
     let ref_sum: f32 = ref_out.iter().sum();
     let ref_max: f32 = ref_out.iter().map(|v| v.abs()).fold(0.0, f32::max);
     println!("CPU: sum_sq={sum_sq:.6}, mean={mean:.9}, scale={scale:.4}");
-    println!("CPU ref: sum={ref_sum:.4}, max_abs={ref_max:.4}, head={:?}",
-        &ref_out[..5]);
+    println!(
+        "CPU ref: sum={ref_sum:.4}, max_abs={ref_max:.4}, head={:?}",
+        &ref_out[..5]
+    );
     // GPU — replicate the qwen forward's prologue exactly:
     // 1. token_buf + positions_buf + mask alloc
     // 2. record_get_rows to populate residual
@@ -2519,7 +2693,7 @@ fn rms_norm_qwen_smoke(
             unsafe {
                 *(host_ptr.add(token_buf.offset as usize) as *mut u32) = 9419;
                 for axis in 0..4 {
-                    *(host_ptr.add(positions_buf.offset as usize + axis*4) as *mut u32) = 0;
+                    *(host_ptr.add(positions_buf.offset as usize + axis * 4) as *mut u32) = 0;
                 }
             }
             let mask = ctx.alloc_tensor([1, 1, 1, 1], GgmlType::F32)?;
@@ -2527,7 +2701,9 @@ fn rms_norm_qwen_smoke(
                 *(host_ptr.add(mask.byte_offset as usize) as *mut f32) = 0.0;
             }
             let residual = ctx.alloc_tensor([n, 1, 1, 1], GgmlType::F32)?;
-            crate::inference::ops::elementwise::record_get_rows(ctx, embed_view, token_buf, 1, residual)?;
+            crate::inference::ops::elementwise::record_get_rows(
+                ctx, embed_view, token_buf, 1, residual,
+            )?;
             let dst = ctx.alloc_tensor([n, 1, 1, 1], GgmlType::F32)?;
             crate::inference::ops::rms_norm::record(ctx, residual, weight_view, dst, eps)?;
             let _ = positions_buf;
@@ -2536,7 +2712,10 @@ fn rms_norm_qwen_smoke(
     )?;
     let gpu_sum: f32 = gpu_out.iter().sum();
     let gpu_max: f32 = gpu_out.iter().map(|v| v.abs()).fold(0.0, f32::max);
-    println!("GPU: sum={gpu_sum:.4}, max_abs={gpu_max:.4}, head={:?}", &gpu_out[..5]);
+    println!(
+        "GPU: sum={gpu_sum:.4}, max_abs={gpu_max:.4}, head={:?}",
+        &gpu_out[..5]
+    );
     let mut max_diff = 0f32;
     for i in 0..n as usize {
         let d = (gpu_out[i] - ref_out[i]).abs();
@@ -2561,7 +2740,9 @@ fn tap_sanity_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
 ) -> Result<(), Box<dyn Error>> {
-    unsafe { std::env::set_var("SEEKER_QWEN_DIFF_DUMP", "1"); }
+    unsafe {
+        std::env::set_var("SEEKER_QWEN_DIFF_DUMP", "1");
+    }
     let _ = engine.forward(
         weights,
         |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
@@ -2600,23 +2781,30 @@ fn embed_norm_dump(
     println!("token_embd: n_embd={n_embd}, n_vocab={n_vocab}, dtype={dtype:?}");
 
     // Sample a bunch of token indices including 12656 and 198649.
-    let sample_tokens: Vec<u32> =
-        vec![0, 100, 1000, 9707, 11, 12656, 100000, 198649, 220, 248044, 248046];
+    let sample_tokens: Vec<u32> = vec![
+        0, 100, 1000, 9707, 11, 12656, 100000, 198649, 220, 248044, 248046,
+    ];
 
     for &tok in &sample_tokens {
-        if tok as usize >= n_vocab { continue; }
+        if tok as usize >= n_vocab {
+            continue;
+        }
         let out = engine.forward(
             weights,
             |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
                 let token_buf = ctx.alloc_scratch(4)?;
                 let host_ptr = ctx.scratch.host_ptr.ok_or("no host ptr")?;
-                unsafe { *(host_ptr.add(token_buf.offset as usize) as *mut u32) = tok; }
+                unsafe {
+                    *(host_ptr.add(token_buf.offset as usize) as *mut u32) = tok;
+                }
                 let residual = ctx.alloc_tensor([n_embd as u64, 1, 1, 1], GgmlType::F32)?;
-                crate::inference::ops::elementwise::record_get_rows(ctx, token_embd, token_buf, 1, residual)?;
+                crate::inference::ops::elementwise::record_get_rows(
+                    ctx, token_embd, token_buf, 1, residual,
+                )?;
                 Ok(residual.range())
             },
         )?;
-        let norm_sq: f32 = out.iter().map(|x| x*x).sum();
+        let norm_sq: f32 = out.iter().map(|x| x * x).sum();
         let mean: f32 = out.iter().sum::<f32>() / n_embd as f32;
         let max_abs = out.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         println!(
@@ -2639,9 +2827,9 @@ fn norm_weights_dump(
             let name = format!("blk.{layer}.{kind}.weight");
             let view = weights.view(&name)?;
             let n = view.dims[0] as usize;
-            let base = weights.debug_host_base(&view).ok_or(
-                "host-side weight reads unsupported (weights are device-local)",
-            )?;
+            let base = weights
+                .debug_host_base(&view)
+                .ok_or("host-side weight reads unsupported (weights are device-local)")?;
             let mut sum_sq = 0f32;
             let mut max_abs = 0f32;
             let mut mean = 0f32;
@@ -2681,24 +2869,29 @@ fn wq_dump_test(
 
     println!("wq dump: K={n_embd}, M={wq_out}");
 
-    let out = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
-        // Use the actual model embedding for token 9707 (= "Hello") + attn_norm
-        // to feed a realistic x_norm. Embedding lookup → rms_norm → wq.
-        let token_buf = ctx.alloc_scratch(4)?;
-        let host_ptr = ctx.scratch.host_ptr.ok_or("no host ptr")?;
-        unsafe {
-            *(host_ptr.add(token_buf.offset as usize) as *mut u32) = 9707u32;
-        }
-        let residual = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
-        let token_embd = weights.view("token_embd.weight")?;
-        crate::inference::ops::elementwise::record_get_rows(ctx, token_embd, token_buf, 1, residual)?;
-        let attn_norm = weights.view("blk.3.attn_norm.weight")?;
-        let x_norm = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
-        crate::inference::ops::rms_norm::record(ctx, residual, attn_norm, x_norm, 1e-6)?;
-        let q_full = ctx.alloc_tensor([wq_out, 1, 1, 1], GgmlType::F32)?;
-        crate::inference::ops::matmul::record(ctx, wq, x_norm, q_full)?;
-        Ok(q_full.range())
-    })?;
+    let out = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            // Use the actual model embedding for token 9707 (= "Hello") + attn_norm
+            // to feed a realistic x_norm. Embedding lookup → rms_norm → wq.
+            let token_buf = ctx.alloc_scratch(4)?;
+            let host_ptr = ctx.scratch.host_ptr.ok_or("no host ptr")?;
+            unsafe {
+                *(host_ptr.add(token_buf.offset as usize) as *mut u32) = 9707u32;
+            }
+            let residual = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
+            let token_embd = weights.view("token_embd.weight")?;
+            crate::inference::ops::elementwise::record_get_rows(
+                ctx, token_embd, token_buf, 1, residual,
+            )?;
+            let attn_norm = weights.view("blk.3.attn_norm.weight")?;
+            let x_norm = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
+            crate::inference::ops::rms_norm::record(ctx, residual, attn_norm, x_norm, 1e-6)?;
+            let q_full = ctx.alloc_tensor([wq_out, 1, 1, 1], GgmlType::F32)?;
+            crate::inference::ops::matmul::record(ctx, wq, x_norm, q_full)?;
+            Ok(q_full.range())
+        },
+    )?;
 
     let head_dim = 256;
     let n_head = 16;
@@ -2712,22 +2905,28 @@ fn wq_dump_test(
     let mut g_max_global = 0f32;
     for h in 0..n_head {
         let base = h * 512;
-        let mut q_mean = 0f32; let mut q_max = 0f32;
-        let mut g_mean = 0f32; let mut g_max = 0f32;
+        let mut q_mean = 0f32;
+        let mut q_max = 0f32;
+        let mut g_mean = 0f32;
+        let mut g_max = 0f32;
         for d in 0..head_dim {
             let qv = out[base + d].abs();
             let gv = out[base + head_dim + d].abs();
-            q_mean += qv; g_mean += gv;
+            q_mean += qv;
+            g_mean += gv;
             q_max = q_max.max(qv);
             g_max = g_max.max(gv);
         }
-        q_mean /= head_dim as f32; g_mean /= head_dim as f32;
+        q_mean /= head_dim as f32;
+        g_mean /= head_dim as f32;
         println!("  {h:3}  {q_mean:7.3}  {q_max:7.3}  {g_mean:7.3}    {g_max:7.3}");
-        q_mean_global += q_mean; g_mean_global += g_mean;
+        q_mean_global += q_mean;
+        g_mean_global += g_mean;
         q_max_global = q_max_global.max(q_max);
         g_max_global = g_max_global.max(g_max);
     }
-    q_mean_global /= n_head as f32; g_mean_global /= n_head as f32;
+    q_mean_global /= n_head as f32;
+    g_mean_global /= n_head as f32;
     println!("  ALL  q_mean={q_mean_global:.3}, q_max={q_max_global:.3}");
     println!("       g_mean={g_mean_global:.3}, g_max={g_max_global:.3}");
     // Sigmoid distribution for gate values
@@ -2737,16 +2936,46 @@ fn wq_dump_test(
         for d in 0..head_dim {
             let g = out[base + head_dim + d];
             let s = 1.0 / (1.0 + (-g).exp());
-            let bin = if s < 0.1 { 0 } else if s < 0.3 { 1 } else if s < 0.7 { 2 } else if s < 0.9 { 3 } else { 4 };
+            let bin = if s < 0.1 {
+                0
+            } else if s < 0.3 {
+                1
+            } else if s < 0.7 {
+                2
+            } else if s < 0.9 {
+                3
+            } else {
+                4
+            };
             bins[bin] += 1;
         }
     }
     println!("Sigmoid(gate) distribution:");
-    println!("  [0, 0.1) : {} ({:.1}%)", bins[0], 100.0 * bins[0] as f32 / (n_head * head_dim) as f32);
-    println!("  [0.1, 0.3) : {} ({:.1}%)", bins[1], 100.0 * bins[1] as f32 / (n_head * head_dim) as f32);
-    println!("  [0.3, 0.7) : {} ({:.1}%)", bins[2], 100.0 * bins[2] as f32 / (n_head * head_dim) as f32);
-    println!("  [0.7, 0.9) : {} ({:.1}%)", bins[3], 100.0 * bins[3] as f32 / (n_head * head_dim) as f32);
-    println!("  [0.9, 1.0] : {} ({:.1}%)", bins[4], 100.0 * bins[4] as f32 / (n_head * head_dim) as f32);
+    println!(
+        "  [0, 0.1) : {} ({:.1}%)",
+        bins[0],
+        100.0 * bins[0] as f32 / (n_head * head_dim) as f32
+    );
+    println!(
+        "  [0.1, 0.3) : {} ({:.1}%)",
+        bins[1],
+        100.0 * bins[1] as f32 / (n_head * head_dim) as f32
+    );
+    println!(
+        "  [0.3, 0.7) : {} ({:.1}%)",
+        bins[2],
+        100.0 * bins[2] as f32 / (n_head * head_dim) as f32
+    );
+    println!(
+        "  [0.7, 0.9) : {} ({:.1}%)",
+        bins[3],
+        100.0 * bins[3] as f32 / (n_head * head_dim) as f32
+    );
+    println!(
+        "  [0.9, 1.0] : {} ({:.1}%)",
+        bins[4],
+        100.0 * bins[4] as f32 / (n_head * head_dim) as f32
+    );
     Ok(())
 }
 
@@ -2760,7 +2989,7 @@ fn gdn_batch_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
 ) -> Result<(), Box<dyn Error>> {
-    use crate::inference::ops::ssm::{record_gated_delta_net, GdnStrides};
+    use crate::inference::ops::ssm::{GdnStrides, record_gated_delta_net};
 
     let s_v: u64 = 128;
     let num_v: u64 = 2; // heads
@@ -2867,7 +3096,7 @@ fn gdn_batch_smoke_test(
             let state_in = ctx.alloc_scratch(state_floats * elem)?;
             unsafe {
                 std::ptr::write_bytes(
-                    host_ptr.add(state_in.offset as usize) as *mut u8,
+                    host_ptr.add(state_in.offset as usize),
                     0,
                     state_in.size as usize,
                 );
@@ -2885,12 +3114,24 @@ fn gdn_batch_smoke_test(
                 num_v as u32,
                 num_v as u32,
                 l as u32,
-                b as u32, // n_seqs = B
+                b as u32,           // n_seqs = B
                 attn_floats as u32, // s_off: state region starts after all B attn outputs
                 scale,
-                GdnStrides { s1: s_v as u32, s2: (s_v * num_v) as u32, s3: (s_v * num_v * l) as u32 },
-                GdnStrides { s1: s_v as u32, s2: (s_v * num_v) as u32, s3: (s_v * num_v * l) as u32 },
-                GdnStrides { s1: 1, s2: num_v as u32, s3: (num_v * l) as u32 },
+                GdnStrides {
+                    s1: s_v as u32,
+                    s2: (s_v * num_v) as u32,
+                    s3: (s_v * num_v * l) as u32,
+                },
+                GdnStrides {
+                    s1: s_v as u32,
+                    s2: (s_v * num_v) as u32,
+                    s3: (s_v * num_v * l) as u32,
+                },
+                GdnStrides {
+                    s1: 1,
+                    s2: num_v as u32,
+                    s3: (num_v * l) as u32,
+                },
                 s_v as u32,
                 1, // k_snapshots = 1
             )?;
@@ -2943,7 +3184,7 @@ fn gdn_smoke_test(
     engine: &mut Engine,
     weights: &crate::inference::weights::WeightsHandle,
 ) -> Result<(), Box<dyn Error>> {
-    use crate::inference::ops::ssm::{record_gated_delta_net, GdnStrides};
+    use crate::inference::ops::ssm::{GdnStrides, record_gated_delta_net};
 
     // Production S_V (smaller values give ROWS_PER_LANE = S_V/32 = 0 and
     // the shader silently returns zeros). num_v small for fast reference.
@@ -3073,7 +3314,7 @@ fn gdn_smoke_test(
             let gdn_state_in = ctx.alloc_scratch(state_floats * elem)?;
             unsafe {
                 std::ptr::write_bytes(
-                    host_ptr.add(gdn_state_in.offset as usize) as *mut u8,
+                    host_ptr.add(gdn_state_in.offset as usize),
                     0,
                     gdn_state_in.size as usize,
                 );
@@ -3143,7 +3384,11 @@ fn gdn_smoke_test(
         max_err, wt, wh, wc, gpu_out[widx], ref_out[widx]
     );
     let max_ref = ref_out.iter().fold(0f32, |a, &b| a.max(b.abs()));
-    println!("  max_abs_ref = {:.4}, relative_err = {:.4e}", max_ref, max_err / max_ref.max(1e-12));
+    println!(
+        "  max_abs_ref = {:.4}, relative_err = {:.4e}",
+        max_ref,
+        max_err / max_ref.max(1e-12)
+    );
     if max_err / max_ref.max(1e-12) < 1e-3 {
         println!("  RESULT: PASS (GDN math matches CPU reference)");
     } else {
@@ -3190,69 +3435,109 @@ fn moe_diag_test(
     println!("MoE diag — stage={stage}, token={token}, n_embd={n_embd}, ff={ff}");
 
     let stage_clone = stage.to_string();
-    let out = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
-        // 1. Embedding lookup.
-        let token_buf = ctx.alloc_scratch(4)?;
-        let host = ctx.scratch.host_ptr.unwrap();
-        unsafe { *(host.add(token_buf.offset as usize) as *mut u32) = token; }
-        let residual = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
-        elementwise::record_get_rows(ctx, token_embd, token_buf, 1, residual)?;
+    let out = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            // 1. Embedding lookup.
+            let token_buf = ctx.alloc_scratch(4)?;
+            let host = ctx.scratch.host_ptr.unwrap();
+            unsafe {
+                *(host.add(token_buf.offset as usize) as *mut u32) = token;
+            }
+            let residual = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
+            elementwise::record_get_rows(ctx, token_embd, token_buf, 1, residual)?;
 
-        // 2. post_attn_norm
-        let x_norm = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
-        rms_norm::record(ctx, residual, post_attn_norm, x_norm, 1e-6)?;
-        if stage_clone == "xnorm" { return Ok(x_norm.range()); }
+            // 2. post_attn_norm
+            let x_norm = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, residual, post_attn_norm, x_norm, 1e-6)?;
+            if stage_clone == "xnorm" {
+                return Ok(x_norm.range());
+            }
 
-        // 3. Router logits
-        let gate_logits = ctx.alloc_tensor([n_experts as u64, 1, 1, 1], GgmlType::F32)?;
-        matmul::record(ctx, ffn_gate_inp, x_norm, gate_logits)?;
-        if stage_clone == "logits" { return Ok(gate_logits.range()); }
+            // 3. Router logits
+            let gate_logits = ctx.alloc_tensor([n_experts as u64, 1, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, ffn_gate_inp, x_norm, gate_logits)?;
+            if stage_clone == "logits" {
+                return Ok(gate_logits.range());
+            }
 
-        // 4. topk
-        let ids = ctx.alloc_scratch((n_experts as u64) * 4)?;
-        let weights_buf = ctx.alloc_scratch((n_expert_used as u64) * 4)?;
-        moe::record_topk_moe(
-            ctx, gate_logits, weights_buf, ids,
-            moe::TopkMoeParams {
-                n_experts, n_expert_used,
-                gating_func: moe::GATING_SOFTMAX,
-                with_norm: false,
-            },
-        )?;
-        if stage_clone == "weights" { return Ok(weights_buf); }
-        if stage_clone == "ids" { return Ok(ids); }
+            // 4. topk
+            let ids = ctx.alloc_scratch((n_experts as u64) * 4)?;
+            let weights_buf = ctx.alloc_scratch((n_expert_used as u64) * 4)?;
+            moe::record_topk_moe(
+                ctx,
+                gate_logits,
+                weights_buf,
+                ids,
+                moe::TopkMoeParams {
+                    n_experts,
+                    n_expert_used,
+                    gating_func: moe::GATING_SOFTMAX,
+                    with_norm: false,
+                },
+            )?;
+            if stage_clone == "weights" {
+                return Ok(weights_buf);
+            }
+            if stage_clone == "ids" {
+                return Ok(ids);
+            }
 
-        // 5. gate matvec_id
-        let gate = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
-        moe::record_matvec_q4k_id(ctx, ffn_gate_exps, x_norm, ids, gate, n_expert_used)?;
-        if stage_clone == "gate" { return Ok(gate.range()); }
+            // 5. gate matvec_id
+            let gate = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
+            moe::record_matvec_q4k_id(ctx, ffn_gate_exps, x_norm, ids, gate, n_expert_used)?;
+            if stage_clone == "gate" {
+                return Ok(gate.range());
+            }
 
-        // 6. up matvec_id
-        let up = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
-        moe::record_matvec_q4k_id(ctx, ffn_up_exps, x_norm, ids, up, n_expert_used)?;
-        if stage_clone == "up" { return Ok(up.range()); }
+            // 6. up matvec_id
+            let up = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
+            moe::record_matvec_q4k_id(ctx, ffn_up_exps, x_norm, ids, up, n_expert_used)?;
+            if stage_clone == "up" {
+                return Ok(up.range());
+            }
 
-        // 7. SwiGLU
-        let gate_silu = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
-        elementwise::record_silu(ctx, gate, gate_silu)?;
-        let ffn_h = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
-        elementwise::record_mul(ctx, gate_silu, up, ffn_h)?;
-        if stage_clone == "ffnh" { return Ok(ffn_h.range()); }
+            // 7. SwiGLU
+            let gate_silu = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
+            elementwise::record_silu(ctx, gate, gate_silu)?;
+            let ffn_h = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
+            elementwise::record_mul(ctx, gate_silu, up, ffn_h)?;
+            if stage_clone == "ffnh" {
+                return Ok(ffn_h.range());
+            }
 
-        // 8. Fused down
-        let routed = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
-        moe::record_moe_down_q5k(ctx, ffn_down_exps, ffn_h, ids, weights_buf, routed, n_expert_used)?;
-        Ok(routed.range())
-    })?;
+            // 8. Fused down
+            let routed = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
+            moe::record_moe_down_q5k(
+                ctx,
+                ffn_down_exps,
+                ffn_h,
+                ids,
+                weights_buf,
+                routed,
+                n_expert_used,
+            )?;
+            Ok(routed.range())
+        },
+    )?;
 
     let n = out.len();
     let finite = out.iter().filter(|x| x.is_finite()).count();
     let nan = out.iter().filter(|x| x.is_nan()).count();
     let inf = out.iter().filter(|x| x.is_infinite()).count();
-    let max_abs = out.iter().filter(|x| x.is_finite()).fold(0f32, |a, &b| a.max(b.abs()));
+    let max_abs = out
+        .iter()
+        .filter(|x| x.is_finite())
+        .fold(0f32, |a, &b| a.max(b.abs()));
     let mean_abs = if finite > 0 {
-        out.iter().filter(|x| x.is_finite()).map(|x| x.abs()).sum::<f32>() / finite as f32
-    } else { 0.0 };
+        out.iter()
+            .filter(|x| x.is_finite())
+            .map(|x| x.abs())
+            .sum::<f32>()
+            / finite as f32
+    } else {
+        0.0
+    };
     println!("  total: {n}, finite: {finite}, NaN: {nan}, Inf: {inf}");
     println!("  max |x|  : {max_abs:.6}");
     println!("  mean |x| : {mean_abs:.6}");
@@ -3260,9 +3545,7 @@ fn moe_diag_test(
     println!("  last 8  : {:?}", &out[n - 8.min(n)..]);
     if stage == "ids" {
         // Re-interpret as u32 — ids are stored as u32
-        let bytes = unsafe {
-            std::slice::from_raw_parts(out.as_ptr() as *const u32, out.len())
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u32, out.len()) };
         println!("  first 8 ids (u32 reinterpret): {:?}", &bytes[..8]);
     }
     Ok(())
@@ -3312,71 +3595,77 @@ fn moe_smoke_test(
         "MoE smoke test setup: n_embd={n_embd}, ff={ff}, n_experts={n_experts}, n_expert_used={n_expert_used}"
     );
 
-    let output = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
-        // 1. Synthetic x_norm — deterministic, varied.
-        let x_norm = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
-        let host_ptr = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
-        unsafe {
-            let p = host_ptr.add(x_norm.byte_offset as usize) as *mut f32;
-            for i in 0..n_embd as usize {
-                *p.add(i) = (i as f32 * 0.01).sin();
+    let output = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            // 1. Synthetic x_norm — deterministic, varied.
+            let x_norm = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
+            let host_ptr = ctx.scratch.host_ptr.ok_or("scratch not host-visible")?;
+            unsafe {
+                let p = host_ptr.add(x_norm.byte_offset as usize) as *mut f32;
+                for i in 0..n_embd as usize {
+                    *p.add(i) = (i as f32 * 0.01).sin();
+                }
             }
-        }
 
-        // 2. Router logits = ffn_gate_inp @ x_norm. F32 weights, F32 input;
-        //    matmul::record dispatches mul_mat_vec_f32 (N=1).
-        let gate_logits = ctx.alloc_tensor([n_experts as u64, 1, 1, 1], GgmlType::F32)?;
-        matmul::record(ctx, ffn_gate_inp, x_norm, gate_logits)?;
+            // 2. Router logits = ffn_gate_inp @ x_norm. F32 weights, F32 input;
+            //    matmul::record dispatches mul_mat_vec_f32 (N=1).
+            let gate_logits = ctx.alloc_tensor([n_experts as u64, 1, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, ffn_gate_inp, x_norm, gate_logits)?;
 
-        // 3. topk_moe → ids[n_experts] (n_expert_used valid prefix) + weights[n_expert_used].
-        //    The ids buffer is sized n_experts per token per the shader's ids_offset math.
-        let ids = ctx.alloc_scratch((n_experts as u64) * 4)?;
-        let weights_buf = ctx.alloc_scratch((n_expert_used as u64) * 4)?;
-        moe::record_topk_moe(
-            ctx,
-            gate_logits,
-            weights_buf,
-            ids,
-            moe::TopkMoeParams {
-                n_experts,
+            // 3. topk_moe → ids[n_experts] (n_expert_used valid prefix) + weights[n_expert_used].
+            //    The ids buffer is sized n_experts per token per the shader's ids_offset math.
+            let ids = ctx.alloc_scratch((n_experts as u64) * 4)?;
+            let weights_buf = ctx.alloc_scratch((n_expert_used as u64) * 4)?;
+            moe::record_topk_moe(
+                ctx,
+                gate_logits,
+                weights_buf,
+                ids,
+                moe::TopkMoeParams {
+                    n_experts,
+                    n_expert_used,
+                    gating_func: moe::GATING_SOFTMAX,
+                    with_norm: false,
+                },
+            )?;
+
+            // 4 + 5. Per-expert gate and up matvecs (Q4_K, expert-indirect).
+            let gate = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
+            moe::record_matvec_q4k_id(ctx, ffn_gate_exps, x_norm, ids, gate, n_expert_used)?;
+            let up = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
+            moe::record_matvec_q4k_id(ctx, ffn_up_exps, x_norm, ids, up, n_expert_used)?;
+
+            // 6 + 7. SwiGLU: silu(gate) * up → ffn_h.
+            let gate_silu = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
+            elementwise::record_silu(ctx, gate, gate_silu)?;
+            let ffn_h = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
+            elementwise::record_mul(ctx, gate_silu, up, ffn_h)?;
+
+            // 8. Fused down: routing-weighted sum across experts in one dispatch.
+            let output = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
+            moe::record_moe_down_q5k(
+                ctx,
+                ffn_down_exps,
+                ffn_h,
+                ids,
+                weights_buf,
+                output,
                 n_expert_used,
-                gating_func: moe::GATING_SOFTMAX,
-                with_norm: false,
-            },
-        )?;
+            )?;
 
-        // 4 + 5. Per-expert gate and up matvecs (Q4_K, expert-indirect).
-        let gate = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
-        moe::record_matvec_q4k_id(ctx, ffn_gate_exps, x_norm, ids, gate, n_expert_used)?;
-        let up = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
-        moe::record_matvec_q4k_id(ctx, ffn_up_exps, x_norm, ids, up, n_expert_used)?;
-
-        // 6 + 7. SwiGLU: silu(gate) * up → ffn_h.
-        let gate_silu = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
-        elementwise::record_silu(ctx, gate, gate_silu)?;
-        let ffn_h = ctx.alloc_tensor([ff, n_expert_used as u64, 1, 1], GgmlType::F32)?;
-        elementwise::record_mul(ctx, gate_silu, up, ffn_h)?;
-
-        // 8. Fused down: routing-weighted sum across experts in one dispatch.
-        let output = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
-        moe::record_moe_down_q5k(
-            ctx,
-            ffn_down_exps,
-            ffn_h,
-            ids,
-            weights_buf,
-            output,
-            n_expert_used,
-        )?;
-
-        Ok(output.range())
-    })?;
+            Ok(output.range())
+        },
+    )?;
 
     let nonzero = output.iter().filter(|x| x.abs() > 1e-9).count();
     let non_finite = output.iter().filter(|x| !x.is_finite()).count();
     let max_abs = output.iter().fold(0f32, |a, &b| a.max(b.abs()));
     let sum: f32 = output.iter().sum();
-    println!("  output[0..8]                = {:?}", &output[..8.min(output.len())]);
+    println!(
+        "  output[0..8]                = {:?}",
+        &output[..8.min(output.len())]
+    );
     println!(
         "  output[{}..{}] = {:?}",
         output.len() - 8.min(output.len()),
@@ -3391,7 +3680,7 @@ fn moe_smoke_test(
         println!("  RESULT: FAIL — NaN/Inf in output");
     } else if nonzero == 0 {
         println!("  RESULT: FAIL — output is all zeros");
-    } else if max_abs < 1e-6 || max_abs > 1e6 {
+    } else if !(1e-6..=1e6).contains(&max_abs) {
         println!("  RESULT: SUSPECT — magnitudes outside expected range");
     } else {
         println!("  RESULT: pass (non-NaN, non-zero, reasonable magnitude)");
@@ -3419,32 +3708,35 @@ fn mm_cm_smoke_test(
     // SAFETY: single-threaded test; std::env mutation is fine in this context.
     unsafe { std::env::set_var("SEEKER_MM_CM", "1") };
 
-    let logits = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
-        let a = ctx.alloc_tensor([k, m, 1, 1], GgmlType::F16)?;
-        let b = ctx.alloc_tensor([k, n, 1, 1], GgmlType::F32)?;
-        let d = ctx.alloc_tensor([m, n, 1, 1], GgmlType::F32)?;
-        let host_ptr = ctx.scratch.host_ptr.unwrap();
-        unsafe {
-            // A[m, k] = (m + 0.1 * k) as F16. Stored A[k, m] in ggml.
-            // memory[m*k_idx + k_idx... wait, A is laid out K as ne[0], M as ne[1]
-            //   → A_mem[m*K + k] = A_mathematical[k, m] = (m + 0.1 * k) ?
-            // Let's just use: A_mem[i] = i * 0.01 (any deterministic pattern).
-            let a_ptr = host_ptr.add(a.byte_offset as usize) as *mut u16;
-            for i in 0..(k * m) as usize {
-                *a_ptr.add(i) = f32_to_f16_bits(i as f32 * 0.01);
-            }
-            // B[n, k] memory: B_mem[n * K + k] = (n + 1) * (k + 1) * 0.1
-            let b_ptr = host_ptr.add(b.byte_offset as usize) as *mut f32;
-            for n_i in 0..n as usize {
-                for k_i in 0..k as usize {
-                    *b_ptr.add(n_i * k as usize + k_i) =
-                        (n_i as f32 + 1.0) * (k_i as f32 + 1.0) * 0.1;
+    let logits = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let a = ctx.alloc_tensor([k, m, 1, 1], GgmlType::F16)?;
+            let b = ctx.alloc_tensor([k, n, 1, 1], GgmlType::F32)?;
+            let d = ctx.alloc_tensor([m, n, 1, 1], GgmlType::F32)?;
+            let host_ptr = ctx.scratch.host_ptr.unwrap();
+            unsafe {
+                // A[m, k] = (m + 0.1 * k) as F16. Stored A[k, m] in ggml.
+                // memory[m*k_idx + k_idx... wait, A is laid out K as ne[0], M as ne[1]
+                //   → A_mem[m*K + k] = A_mathematical[k, m] = (m + 0.1 * k) ?
+                // Let's just use: A_mem[i] = i * 0.01 (any deterministic pattern).
+                let a_ptr = host_ptr.add(a.byte_offset as usize) as *mut u16;
+                for i in 0..(k * m) as usize {
+                    *a_ptr.add(i) = f32_to_f16_bits(i as f32 * 0.01);
+                }
+                // B[n, k] memory: B_mem[n * K + k] = (n + 1) * (k + 1) * 0.1
+                let b_ptr = host_ptr.add(b.byte_offset as usize) as *mut f32;
+                for n_i in 0..n as usize {
+                    for k_i in 0..k as usize {
+                        *b_ptr.add(n_i * k as usize + k_i) =
+                            (n_i as f32 + 1.0) * (k_i as f32 + 1.0) * 0.1;
+                    }
                 }
             }
-        }
-        matmul::record(ctx, a, b, d)?;
-        Ok(d.range())
-    })?;
+            matmul::record(ctx, a, b, d)?;
+            Ok(d.range())
+        },
+    )?;
 
     // CPU reference: D[m, n] = sum_k A_mem[m*K + k] * B_mem[n*K + k]
     // (column-major output: D_mem[n * M + m]).
@@ -3453,7 +3745,8 @@ fn mm_cm_smoke_test(
         for m_i in 0..m as usize {
             let mut s = 0f32;
             for k_i in 0..k as usize {
-                let a_val = f16_bits_to_f32(f32_to_f16_bits((m_i * k as usize + k_i) as f32 * 0.01));
+                let a_val =
+                    f16_bits_to_f32(f32_to_f16_bits((m_i * k as usize + k_i) as f32 * 0.01));
                 let b_val = (n_i as f32 + 1.0) * (k_i as f32 + 1.0) * 0.1;
                 s += a_val * b_val;
             }
@@ -3499,28 +3792,31 @@ fn matmul_smoke_test(
     let m: u64 = 49152;
     let k: u64 = 576;
     let n: u64 = 4;
-    let logits = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
-        let a = ctx.alloc_tensor([k, m, 1, 1], GgmlType::F16)?;
-        let b = ctx.alloc_tensor([k, n, 1, 1], GgmlType::F32)?;
-        let d = ctx.alloc_tensor([m, n, 1, 1], GgmlType::F32)?;
-        let host_ptr = ctx.scratch.host_ptr.unwrap();
-        unsafe {
-            // A = all 1.0 (F16)
-            let a_ptr = host_ptr.add(a.byte_offset as usize) as *mut u16;
-            for i in 0..(k * m) as usize {
-                *a_ptr.add(i) = f32_to_f16_bits(1.0);
-            }
-            // B = column index per row: B[k, n] = n+1
-            let b_ptr = host_ptr.add(b.byte_offset as usize) as *mut f32;
-            for col in 0..n as usize {
-                for row in 0..k as usize {
-                    *b_ptr.add(col * k as usize + row) = (col + 1) as f32;
+    let logits = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let a = ctx.alloc_tensor([k, m, 1, 1], GgmlType::F16)?;
+            let b = ctx.alloc_tensor([k, n, 1, 1], GgmlType::F32)?;
+            let d = ctx.alloc_tensor([m, n, 1, 1], GgmlType::F32)?;
+            let host_ptr = ctx.scratch.host_ptr.unwrap();
+            unsafe {
+                // A = all 1.0 (F16)
+                let a_ptr = host_ptr.add(a.byte_offset as usize) as *mut u16;
+                for i in 0..(k * m) as usize {
+                    *a_ptr.add(i) = f32_to_f16_bits(1.0);
+                }
+                // B = column index per row: B[k, n] = n+1
+                let b_ptr = host_ptr.add(b.byte_offset as usize) as *mut f32;
+                for col in 0..n as usize {
+                    for row in 0..k as usize {
+                        *b_ptr.add(col * k as usize + row) = (col + 1) as f32;
+                    }
                 }
             }
-        }
-        matmul::record(ctx, a, b, d)?;
-        Ok(d.range())
-    })?;
+            matmul::record(ctx, a, b, d)?;
+            Ok(d.range())
+        },
+    )?;
 
     // Expected: D[m, n] = sum_k A[k,m] * B[k,n] = sum_k 1.0 * (n+1) = K * (n+1)
     // So col 0 (n=0): all values = K*1 = 576. col 1: 1152. col 2: 1728. col 3: 2304.
@@ -3535,7 +3831,10 @@ fn matmul_smoke_test(
         let col_max = col_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let col_first = col_slice[0];
         let col_last = col_slice[col_slice.len() - 1];
-        println!("  col{col}: nonzero={col_nonzero}/{m}, max={col_max}, first={col_first}, last={col_last} (expected {})", k * (col + 1) as u64);
+        println!(
+            "  col{col}: nonzero={col_nonzero}/{m}, max={col_max}, first={col_first}, last={col_last} (expected {})",
+            k * (col + 1) as u64
+        );
     }
     Ok(())
 }
@@ -3549,37 +3848,47 @@ fn get_rows_smoke_test(
     use crate::inference::ops::elementwise;
     // Embedding table: 4 rows × hidden=576 F32. Row i is value (i*100 + j).
     let hidden: u64 = 576;
-    let n_rows: u64 = 49152;  // production size
+    let n_rows: u64 = 49152; // production size
     let n_indices: u64 = 4;
-    let logits = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
-        // F16 table — matches production token_embd.
-        let table = ctx.alloc_tensor([hidden, n_rows, 1, 1], GgmlType::F16)?;
-        let indices_buf = ctx.alloc_scratch(n_indices * 4)?;
-        let dst = ctx.alloc_tensor([hidden, n_indices, 1, 1], GgmlType::F32)?;
-        // Fill F16 table: position(j, i) = i*100 + j as F16
-        let host_ptr = ctx.scratch.host_ptr.unwrap();
-        unsafe {
-            let table_ptr = host_ptr.add(table.byte_offset as usize) as *mut u16;
-            for i in 0..n_rows {
-                for j in 0..hidden {
-                    let v = ((i * 100 + j) % 50000) as f32;
-                    *table_ptr.add((i * hidden + j) as usize) = f32_to_f16_bits(v);
+    let logits = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            // F16 table — matches production token_embd.
+            let table = ctx.alloc_tensor([hidden, n_rows, 1, 1], GgmlType::F16)?;
+            let indices_buf = ctx.alloc_scratch(n_indices * 4)?;
+            let dst = ctx.alloc_tensor([hidden, n_indices, 1, 1], GgmlType::F32)?;
+            // Fill F16 table: position(j, i) = i*100 + j as F16
+            let host_ptr = ctx.scratch.host_ptr.unwrap();
+            unsafe {
+                let table_ptr = host_ptr.add(table.byte_offset as usize) as *mut u16;
+                for i in 0..n_rows {
+                    for j in 0..hidden {
+                        let v = ((i * 100 + j) % 50000) as f32;
+                        *table_ptr.add((i * hidden + j) as usize) = f32_to_f16_bits(v);
+                    }
                 }
+                let indices_data: [u32; 4] = [0, 1, 2, 3];
+                std::ptr::copy_nonoverlapping(
+                    indices_data.as_ptr(),
+                    host_ptr.add(indices_buf.offset as usize) as *mut u32,
+                    indices_data.len(),
+                );
             }
-            let indices_data: [u32; 4] = [0, 1, 2, 3];
-            std::ptr::copy_nonoverlapping(indices_data.as_ptr(), host_ptr.add(indices_buf.offset as usize) as *mut u32, indices_data.len());
-        }
-        elementwise::record_get_rows(ctx, table, indices_buf, n_indices as u32, dst)?;
-        Ok(dst.range())
-    })?;
+            elementwise::record_get_rows(ctx, table, indices_buf, n_indices as u32, dst)?;
+            Ok(dst.range())
+        },
+    )?;
     let nonzero = logits.iter().filter(|x| **x != 0.0).count();
     println!("get_rows test: hidden={hidden}, n_rows={n_rows}, n_indices={n_indices}");
     println!("  total values: {}", logits.len());
-    println!("  non-zero:     {nonzero} (expected {})", hidden * n_indices);
+    println!(
+        "  non-zero:     {nonzero} (expected {})",
+        hidden * n_indices
+    );
     for t in 0..n_indices {
-        let row = &logits[(t * hidden) as usize..((t+1) * hidden) as usize];
+        let row = &logits[(t * hidden) as usize..((t + 1) * hidden) as usize];
         println!("  row{t} first 4: {:?}", &row[..4]);
-        println!("  row{t} last 4:  {:?}", &row[row.len()-4..]);
+        println!("  row{t} last 4:  {:?}", &row[row.len() - 4..]);
     }
     Ok(())
 }
@@ -3597,20 +3906,31 @@ fn rms_norm_smoke_test(
     // mean(x²)=1, rsqrt(1+eps)≈1, output should be all 1.0.
     let hidden: u64 = 576;
     let l: u64 = 4;
-    let logits = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
-        let src = ctx.alloc_tensor([hidden, l, 1, 1], GgmlType::F32)?;
-        let weight = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
-        let dst = ctx.alloc_tensor([hidden, l, 1, 1], GgmlType::F32)?;
-        let src_data: Vec<f32> = vec![1.0; (hidden * l) as usize];
-        let weight_data: Vec<f32> = vec![1.0; hidden as usize];
-        let host_ptr = ctx.scratch.host_ptr.unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(src_data.as_ptr(), host_ptr.add(src.byte_offset as usize) as *mut f32, src_data.len());
-            std::ptr::copy_nonoverlapping(weight_data.as_ptr(), host_ptr.add(weight.byte_offset as usize) as *mut f32, weight_data.len());
-        }
-        rms_norm::record(ctx, src, weight, dst, 1e-5)?;
-        Ok(dst.range())
-    })?;
+    let logits = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let src = ctx.alloc_tensor([hidden, l, 1, 1], GgmlType::F32)?;
+            let weight = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
+            let dst = ctx.alloc_tensor([hidden, l, 1, 1], GgmlType::F32)?;
+            let src_data: Vec<f32> = vec![1.0; (hidden * l) as usize];
+            let weight_data: Vec<f32> = vec![1.0; hidden as usize];
+            let host_ptr = ctx.scratch.host_ptr.unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_data.as_ptr(),
+                    host_ptr.add(src.byte_offset as usize) as *mut f32,
+                    src_data.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    weight_data.as_ptr(),
+                    host_ptr.add(weight.byte_offset as usize) as *mut f32,
+                    weight_data.len(),
+                );
+            }
+            rms_norm::record(ctx, src, weight, dst, 1e-5)?;
+            Ok(dst.range())
+        },
+    )?;
     // Expected (per row):
     // row0: x=[1,2,3,4], mean(x^2) = 30/4 = 7.5, rsqrt = 0.3651 → [0.365, 0.730, 1.095, 1.461]
     // row1: x=[2,4,6,8], mean=120/4=30, rsqrt = 0.1826 → [0.365, 0.730, 1.095, 1.461]
@@ -3623,7 +3943,7 @@ fn rms_norm_smoke_test(
     println!("  non-zero:     {nonzero}");
     println!("  ~1.0 values:  {close_to_one}");
     println!("  first 4: {:?}", &logits[..4]);
-    println!("  last 4:  {:?}", &logits[logits.len()-4..]);
+    println!("  last 4:  {:?}", &logits[logits.len() - 4..]);
     Ok(())
 }
 
@@ -3641,24 +3961,30 @@ fn quant_roundtrip_test(
     let nhkv: u64 = 3;
     let l: u64 = 4;
     let nel = (hd * nhkv * l) as usize;
-    let logits = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
-        let f32_src = ctx.alloc_tensor([hd, nhkv, l, 1], GgmlType::F32)?;
-        let cache_buf = ctx.alloc_tensor([hd, nhkv, l, 1], cache_dtype)?;
-        let f32_dst = ctx.alloc_tensor([hd, nhkv, l, 1], GgmlType::F32)?;
-        // fill src: value = (i % 100) / 100.0 (range [0, 1))
-        let src_data: Vec<f32> = (0..nel).map(|i| (i as f32 % 100.0) / 100.0).collect();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                src_data.as_ptr(),
-                ctx.scratch.host_ptr.unwrap().add(f32_src.byte_offset as usize) as *mut f32,
-                nel,
-            );
-        }
-        record_cast(ctx, f32_src, cache_buf)?;
-        crate::inference::command::record_global_barrier(ctx.device, ctx.cmd);
-        record_cast(ctx, cache_buf, f32_dst)?;
-        Ok(f32_dst.range())
-    })?;
+    let logits = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let f32_src = ctx.alloc_tensor([hd, nhkv, l, 1], GgmlType::F32)?;
+            let cache_buf = ctx.alloc_tensor([hd, nhkv, l, 1], cache_dtype)?;
+            let f32_dst = ctx.alloc_tensor([hd, nhkv, l, 1], GgmlType::F32)?;
+            // fill src: value = (i % 100) / 100.0 (range [0, 1))
+            let src_data: Vec<f32> = (0..nel).map(|i| (i as f32 % 100.0) / 100.0).collect();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_data.as_ptr(),
+                    ctx.scratch
+                        .host_ptr
+                        .unwrap()
+                        .add(f32_src.byte_offset as usize) as *mut f32,
+                    nel,
+                );
+            }
+            record_cast(ctx, f32_src, cache_buf)?;
+            crate::inference::command::record_global_barrier(ctx.device, ctx.cmd);
+            record_cast(ctx, cache_buf, f32_dst)?;
+            Ok(f32_dst.range())
+        },
+    )?;
     let expected: Vec<f32> = (0..nel).map(|i| (i as f32 % 100.0) / 100.0).collect();
     let mut max_err = 0.0f32;
     for (a, b) in logits.iter().zip(expected.iter()) {
@@ -3667,8 +3993,8 @@ fn quant_roundtrip_test(
     println!("quant roundtrip via {dt_name}:");
     println!("  src first 4: {:?}", &expected[..4]);
     println!("  dst first 4: {:?}", &logits[..4]);
-    println!("  src last 4:  {:?}", &expected[nel-4..]);
-    println!("  dst last 4:  {:?}", &logits[nel-4..]);
+    println!("  src last 4:  {:?}", &expected[nel - 4..]);
+    println!("  dst last 4:  {:?}", &logits[nel - 4..]);
     println!("  max abs err: {max_err}");
     Ok(())
 }
@@ -3708,7 +4034,10 @@ fn kquant_matmul_test(
         .ok_or_else(|| format!("tensor {full_name} not found"))?;
     let k = a.dims[0]; // contracting dim
     let m = a.dims[1]; // output rows
-    println!("kquant matmul test: {full_name} dtype={:?} K={k} M={m}", a.dtype);
+    println!(
+        "kquant matmul test: {full_name} dtype={:?} K={k} M={m}",
+        a.dtype
+    );
 
     // Raw quant bytes — weights are per-tensor device-local now, so go through
     // the debug host-base accessor (same as the other gpu_debug harnesses).
@@ -3716,26 +4045,26 @@ fn kquant_matmul_test(
         .debug_host_base(&a)
         .ok_or("host-side weight reads unsupported (weights are device-local)")?;
     let raw: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            base.add(a.byte_offset as usize),
-            a.byte_size as usize,
-        )
+        std::slice::from_raw_parts(base.add(a.byte_offset as usize), a.byte_size as usize)
     };
 
     // Deterministic input vector b[i] = sin(i * 0.01) — varied, bounded.
     let b_host: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01).sin()).collect();
 
     // GPU matmul.
-    let gpu = engine.forward(weights, |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
-        let b = ctx.alloc_tensor([k, 1, 1, 1], GgmlType::F32)?;
-        let d = ctx.alloc_tensor([m, 1, 1, 1], GgmlType::F32)?;
-        unsafe {
-            let bp = ctx.scratch.host_ptr.unwrap().add(b.byte_offset as usize) as *mut f32;
-            std::ptr::copy_nonoverlapping(b_host.as_ptr(), bp, b_host.len());
-        }
-        matmul::record(ctx, a, b, d)?;
-        Ok(d.range())
-    })?;
+    let gpu = engine.forward(
+        weights,
+        |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
+            let b = ctx.alloc_tensor([k, 1, 1, 1], GgmlType::F32)?;
+            let d = ctx.alloc_tensor([m, 1, 1, 1], GgmlType::F32)?;
+            unsafe {
+                let bp = ctx.scratch.host_ptr.unwrap().add(b.byte_offset as usize) as *mut f32;
+                std::ptr::copy_nonoverlapping(b_host.as_ptr(), bp, b_host.len());
+            }
+            matmul::record(ctx, a, b, d)?;
+            Ok(d.range())
+        },
+    )?;
 
     // CPU reference: dequant each row of A, dot with b.
     let cpu: Vec<f32> = (0..m)
@@ -3755,7 +4084,9 @@ fn kquant_matmul_test(
             worst_row = row;
         }
     }
-    let bad = (0..m as usize).filter(|&r| (gpu[r] - cpu[r]).abs() > 0.01).count();
+    let bad = (0..m as usize)
+        .filter(|&r| (gpu[r] - cpu[r]).abs() > 0.01)
+        .count();
     println!("  gpu[0..4]    = {:?}", &gpu[..4.min(gpu.len())]);
     println!("  cpu[0..4]    = {:?}", &cpu[..4.min(cpu.len())]);
     println!("  max abs err  = {max_abs} (worst row {worst_row})");
@@ -3797,10 +4128,12 @@ fn dequant_kquant_row(dtype: GgmlType, raw: &[u8], row: u64, k: usize, out: &mut
                     let d2 = d * sc2 as f32;
                     let mm2 = dmin * m2 as f32;
                     let q = &qs[j / 2..];
+                    #[allow(clippy::needless_range_loop)]
                     for l in 0..32 {
                         out[y] = d1 * (q[l] & 0xF) as f32 - mm1;
                         y += 1;
                     }
+                    #[allow(clippy::needless_range_loop)]
                     for l in 0..32 {
                         out[y] = d2 * (q[l] >> 4) as f32 - mm2;
                         y += 1;
@@ -3825,10 +4158,17 @@ fn dequant_kquant_row(dtype: GgmlType, raw: &[u8], row: u64, k: usize, out: &mut
                     let y_b = blk * 256 + n * 128;
                     for l in 0..32 {
                         let is = l / 16;
-                        let q1 = (((ql[ql_b + l] & 0xF) | (((qh[qh_b + l] >> 0) & 3) << 4)) as i8) as i32 - 32;
-                        let q2 = (((ql[ql_b + l + 32] & 0xF) | (((qh[qh_b + l] >> 2) & 3) << 4)) as i8) as i32 - 32;
-                        let q3 = (((ql[ql_b + l] >> 4) | (((qh[qh_b + l] >> 4) & 3) << 4)) as i8) as i32 - 32;
-                        let q4 = (((ql[ql_b + l + 32] >> 4) | (((qh[qh_b + l] >> 6) & 3) << 4)) as i8) as i32 - 32;
+                        let q1 =
+                            (((ql[ql_b + l] & 0xF) | ((qh[qh_b + l] & 3) << 4)) as i8) as i32 - 32;
+                        let q2 = (((ql[ql_b + l + 32] & 0xF) | (((qh[qh_b + l] >> 2) & 3) << 4))
+                            as i8) as i32
+                            - 32;
+                        let q3 = (((ql[ql_b + l] >> 4) | (((qh[qh_b + l] >> 4) & 3) << 4)) as i8)
+                            as i32
+                            - 32;
+                        let q4 = (((ql[ql_b + l + 32] >> 4) | (((qh[qh_b + l] >> 6) & 3) << 4))
+                            as i8) as i32
+                            - 32;
                         out[y_b + l] = d * (sc[sc_b + is] as i8 as f32) * q1 as f32;
                         out[y_b + l + 32] = d * (sc[sc_b + is + 2] as i8 as f32) * q2 as f32;
                         out[y_b + l + 64] = d * (sc[sc_b + is + 4] as i8 as f32) * q3 as f32;
@@ -3965,7 +4305,11 @@ fn vision_token_ids(
             format!("tokenizer has no {s} token — this model is not vision-capable").into()
         })
     };
-    Ok((tid("<|vision_start|>")?, tid("<|image_pad|>")?, tid("<|vision_end|>")?))
+    Ok((
+        tid("<|vision_start|>")?,
+        tid("<|image_pad|>")?,
+        tid("<|vision_end|>")?,
+    ))
 }
 
 /// Build the decoder input tokens for `seeker run` across the four combos of
@@ -4046,7 +4390,17 @@ fn build_run_tokens(
                 let after_tokens = encode(after, false)?;
                 let (tokens, start) =
                     assemble_image_tokens(&before_tokens, vstart, ipad, vend, n_tok, &after_tokens);
-                (tokens, Some(ImageSetup { mmproj_path, vcfg, pimg, nx, ny, start }))
+                (
+                    tokens,
+                    Some(ImageSetup {
+                        mmproj_path,
+                        vcfg,
+                        pimg,
+                        nx,
+                        ny,
+                        start,
+                    }),
+                )
             }
             None => (encode(&rendered, false)?, None),
         }
@@ -4055,12 +4409,26 @@ fn build_run_tokens(
         match img {
             Some((mmproj_path, vcfg, pimg, nx, ny, n_tok)) => {
                 let (vstart, ipad, vend) = vision_token_ids(bundle)?;
-                let prefix: Vec<u32> =
-                    bundle.add_bos_default.then_some(bundle.bos_id).flatten().into_iter().collect();
+                let prefix: Vec<u32> = bundle
+                    .add_bos_default
+                    .then_some(bundle.bos_id)
+                    .flatten()
+                    .into_iter()
+                    .collect();
                 let suffix = encode(&args.prompt, false)?;
                 let (tokens, start) =
                     assemble_image_tokens(&prefix, vstart, ipad, vend, n_tok, &suffix);
-                (tokens, Some(ImageSetup { mmproj_path, vcfg, pimg, nx, ny, start }))
+                (
+                    tokens,
+                    Some(ImageSetup {
+                        mmproj_path,
+                        vcfg,
+                        pimg,
+                        nx,
+                        ny,
+                        start,
+                    }),
+                )
             }
             None => (encode(&args.prompt, add_special)?, None),
         }
@@ -4101,7 +4469,10 @@ async fn resolve_model_path(args: &RunArgs) -> Result<download::Resolved, Box<dy
             } else {
                 download::find_sidecar_mmproj(&model)
             };
-            Ok(download::Resolved { main: model, mmproj })
+            Ok(download::Resolved {
+                main: model,
+                mmproj,
+            })
         }
         _ => unreachable!("clap group invariant"),
     }

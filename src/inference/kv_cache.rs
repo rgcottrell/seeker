@@ -341,8 +341,6 @@ impl KvCache {
     pub fn truncate(&mut self, new_pos: u32) {
         self.position = new_pos.min(self.position);
     }
-
-
 }
 
 impl KvCache {
@@ -372,8 +370,8 @@ impl KvCache {
         ssm_gdn_states: Vec<crate::inference::buffer::BufferRange>,
         ssm_region: Option<(vk::Buffer, Option<*mut u8>, u64)>,
     ) -> Self {
-        let ssm_region = ssm_region
-            .map(|(buf, hp, size)| Region::borrowed(buf, hp, size, alignment));
+        let ssm_region =
+            ssm_region.map(|(buf, hp, size)| Region::borrowed(buf, hp, size, alignment));
         Self {
             config,
             region: Region::borrowed(buffer, host_ptr, buffer_size, alignment),
@@ -427,7 +425,7 @@ fn validate_dtype(ty: GgmlType, side: &str) -> Result<(), Box<dyn Error>> {
 
 fn validate_head_dim(head_dim: u32, ty: GgmlType, side: &str) -> Result<(), Box<dyn Error>> {
     let (block_size, _) = ty.block_layout();
-    if (head_dim as usize) % block_size != 0 {
+    if !(head_dim as usize).is_multiple_of(block_size) {
         return Err(format!(
             "KV cache {side} dtype {ty:?} requires head_dim ({head_dim}) to be a multiple of block_size {block_size}",
         )
@@ -755,7 +753,10 @@ impl BatchKvCache {
             return;
         };
         for layer in 0..self.n_ssm_layers() as u32 {
-            for r in [self.conv_state_slot(layer, slot), self.gdn_state_slot(layer, slot)] {
+            for r in [
+                self.conv_state_slot(layer, slot),
+                self.gdn_state_slot(layer, slot),
+            ] {
                 // SAFETY: `r` is a sub-range of the HOST_VISIBLE|HOST_COHERENT
                 // ssm_region that `host` maps from offset 0.
                 unsafe {
@@ -835,16 +836,24 @@ impl BatchKvCache {
     /// existing single-sequence forward path; afterwards copy its `position`
     /// back into `self.positions[slot]`.
     pub fn slot_kvcache(&self, slot: u32) -> KvCache {
-        let k_layers = (0..self.n_layer).map(|l| self.slot_k_view(slot, l)).collect();
-        let v_layers = (0..self.n_layer).map(|l| self.slot_v_view(slot, l)).collect();
+        let k_layers = (0..self.n_layer)
+            .map(|l| self.slot_k_view(slot, l))
+            .collect();
+        let v_layers = (0..self.n_layer)
+            .map(|l| self.slot_v_view(slot, l))
+            .collect();
         // Point the borrowed cache at this slot's per-sequence SSM state so a
         // hybrid prefill persists its final conv/GDN state into the batch slab
         // (the batched decode continues from it). Zero-initialized by
         // allocate_ssm_state, so the prefill still starts from a fresh state.
         let n_ssm = self.n_ssm_layers();
         let (ssm_conv_states, ssm_gdn_states, ssm_region) = if n_ssm > 0 {
-            let conv = (0..n_ssm as u32).map(|l| self.conv_state_slot(l, slot)).collect();
-            let gdn = (0..n_ssm as u32).map(|l| self.gdn_state_slot(l, slot)).collect();
+            let conv = (0..n_ssm as u32)
+                .map(|l| self.conv_state_slot(l, slot))
+                .collect();
+            let gdn = (0..n_ssm as u32)
+                .map(|l| self.gdn_state_slot(l, slot))
+                .collect();
             let r = self.ssm_region.as_ref().expect("SSM state allocated");
             (conv, gdn, Some((r.buffer, r.host_ptr, r.size)))
         } else {

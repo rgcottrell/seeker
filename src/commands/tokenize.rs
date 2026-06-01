@@ -9,14 +9,18 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::commands::download::{resolve_hf, HfResolveArgs};
+use crate::commands::download::{HfResolveArgs, resolve_hf};
 use crate::gguf::GgufFile;
-use crate::tokenizer::{build_tokenizer, TokenizerBundle};
+use crate::tokenizer::{TokenizerBundle, build_tokenizer};
 
 #[derive(Args)]
 pub struct TokenizeArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]". (short: -hf, -hfr)
-    #[arg(long = "hf-repo", required_unless_present = "model", conflicts_with = "model")]
+    #[arg(
+        long = "hf-repo",
+        required_unless_present = "model",
+        conflicts_with = "model"
+    )]
     hf_repo: Option<String>,
 
     /// Specific file to tokenize within the repo. (short: -hff)
@@ -55,11 +59,13 @@ pub async fn run(args: TokenizeArgs) -> Result<(), Box<dyn Error>> {
     let bundle = build_tokenizer(&gguf)?;
 
     let text = read_text(args.text)?;
-    let add_special = args.add_special
-        || bundle.add_bos_default
-        || bundle.add_eos_default;
+    let add_special = args.add_special || bundle.add_bos_default || bundle.add_eos_default;
 
-    let TokenizerBundle { tokenizer, model_kind, .. } = bundle;
+    let TokenizerBundle {
+        tokenizer,
+        model_kind,
+        ..
+    } = bundle;
     tracing::debug!(model = %model_kind, add_special, "encoding");
 
     let encoding = tokenizer

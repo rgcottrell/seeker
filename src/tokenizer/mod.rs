@@ -22,8 +22,8 @@ mod unigram;
 pub use bundle::{Tokenizer, TokenizerBundle};
 pub use error::TokenizerError;
 
-use tokenizers::processors::template::TemplateProcessing;
 use tokenizers::processors::PostProcessorWrapper;
+use tokenizers::processors::template::TemplateProcessing;
 use tokenizers::tokenizer::AddedToken;
 
 use crate::gguf::GgufFile;
@@ -65,7 +65,14 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
         other => return Err(TokenizerError::UnsupportedModel(other.to_string())),
     };
 
-    install_specials(&mut tokenizer, &tokens, token_types.as_deref(), bos_id, eos_id, unk_id);
+    install_specials(
+        &mut tokenizer,
+        &tokens,
+        token_types.as_deref(),
+        bos_id,
+        eos_id,
+        unk_id,
+    );
 
     Ok(TokenizerBundle {
         tokenizer,
@@ -208,10 +215,10 @@ fn install_specials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokenizers::models::bpe::{Vocab as BpeVocab, BPE};
     use tokenizers::models::ModelWrapper;
-    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+    use tokenizers::models::bpe::{BPE, Vocab as BpeVocab};
     use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 
     /// Build a ByteLevel+BPE tokenizer with one token per vocab entry and no
     /// merges — mirrors the `gpt2` path closely enough to exercise special-token
@@ -310,8 +317,15 @@ mod tests {
         let gguf = crate::gguf::GgufFile::open(&path).expect("open gguf");
         let bundle = build_tokenizer(&gguf).expect("build tokenizer");
 
-        let enc = bundle.tokenizer.encode("<|start_header_id|>", false).unwrap();
-        assert_eq!(enc.get_ids(), &[128006], "start_header_id must be one token");
+        let enc = bundle
+            .tokenizer
+            .encode("<|start_header_id|>", false)
+            .unwrap();
+        assert_eq!(
+            enc.get_ids(),
+            &[128006],
+            "start_header_id must be one token"
+        );
         let enc = bundle.tokenizer.encode("<|end_header_id|>", false).unwrap();
         assert_eq!(enc.get_ids(), &[128007], "end_header_id must be one token");
     }

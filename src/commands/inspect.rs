@@ -1,15 +1,19 @@
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
-use crate::commands::download::{resolve_hf, HfResolveArgs};
+use crate::commands::download::{HfResolveArgs, resolve_hf};
 use crate::gguf::{GgufFile, MetadataValue, TensorInfo};
 
 #[derive(Args)]
 pub struct InspectArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]". (short: -hf, -hfr)
-    #[arg(long = "hf-repo", required_unless_present = "model", conflicts_with = "model")]
+    #[arg(
+        long = "hf-repo",
+        required_unless_present = "model",
+        conflicts_with = "model"
+    )]
     hf_repo: Option<String>,
 
     /// Specific file to inspect within the repo. (short: -hff)
@@ -170,7 +174,12 @@ fn print_tensors(g: &GgufFile) {
     let dims: Vec<String> = tensors.iter().map(|t| fmt_dims(&t.dims)).collect();
 
     let idx_w = tensors.len().saturating_sub(1).to_string().len().max(3);
-    let name_w = tensors.iter().map(|t| t.name.len()).max().unwrap_or(0).max(4);
+    let name_w = tensors
+        .iter()
+        .map(|t| t.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
     let type_w = types.iter().map(|s| s.len()).max().unwrap_or(0).max(4);
     let dims_w = dims.iter().map(|s| s.len()).max().unwrap_or(0).max(4);
     let offset_w = tensors
@@ -275,7 +284,10 @@ mod tests {
 
     #[test]
     fn fmt_short_string() {
-        assert_eq!(fmt_value(&MetadataValue::String("llama".into())), "\"llama\"");
+        assert_eq!(
+            fmt_value(&MetadataValue::String("llama".into())),
+            "\"llama\""
+        );
     }
 
     #[test]
@@ -300,8 +312,7 @@ mod tests {
 
     #[test]
     fn fmt_long_array_truncates_to_eight() {
-        let arr =
-            MetadataValue::Array((0u32..20).map(MetadataValue::U32).collect::<Vec<_>>());
+        let arr = MetadataValue::Array((0u32..20).map(MetadataValue::U32).collect::<Vec<_>>());
         let out = fmt_value(&arr);
         assert_eq!(out, "[0, 1, 2, 3, 4, 5, 6, 7, … 12 more]");
     }
@@ -330,7 +341,10 @@ mod tests {
     #[test]
     fn json_scalar_values_map_to_native_types() {
         assert_eq!(value_to_json(&MetadataValue::U32(42)), json!(42));
-        assert_eq!(value_to_json(&MetadataValue::F32(500000.0)), json!(500000.0));
+        assert_eq!(
+            value_to_json(&MetadataValue::F32(500000.0)),
+            json!(500000.0)
+        );
         assert_eq!(value_to_json(&MetadataValue::Bool(true)), json!(true));
         assert_eq!(
             value_to_json(&MetadataValue::String("llama".into())),
@@ -353,7 +367,10 @@ mod tests {
         let v = value_to_json(&arr);
         let obj = v.as_object().expect("summary object");
         assert_eq!(obj.get("totalCount"), Some(&json!(50)));
-        let preview = obj.get("preview").and_then(|p| p.as_array()).expect("preview array");
+        let preview = obj
+            .get("preview")
+            .and_then(|p| p.as_array())
+            .expect("preview array");
         assert_eq!(preview.len(), ARRAY_HEAD);
         assert_eq!(preview[0], json!(0));
         assert_eq!(preview[ARRAY_HEAD - 1], json!(ARRAY_HEAD as u32 - 1));

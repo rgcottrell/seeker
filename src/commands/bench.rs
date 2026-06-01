@@ -19,17 +19,21 @@ use std::time::Instant;
 
 use clap::Args;
 
-use crate::commands::download::{resolve_hf, HfResolveArgs};
+use crate::commands::download::{HfResolveArgs, resolve_hf};
 use crate::gguf::{GgmlType, GgufFile};
-use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
-use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
+use crate::inference::kv_cache::{KvCacheConfig, parse_dtype};
+use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::tokenizer::build_tokenizer;
 
 #[derive(Args)]
 pub struct BenchArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]".
-    #[arg(long = "hf-repo", required_unless_present = "model", conflicts_with = "model")]
+    #[arg(
+        long = "hf-repo",
+        required_unless_present = "model",
+        conflicts_with = "model"
+    )]
     hf_repo: Option<String>,
 
     /// Specific file within the repo.
@@ -147,12 +151,8 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         max_seq_len,
     };
     let dims = model.cache_dims();
-    let mut cache = engine.allocate_kv_cache(
-        dims.n_layer,
-        dims.head_dim,
-        dims.n_head_kv,
-        cache_config,
-    )?;
+    let mut cache =
+        engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
     // Hybrid models (qwen35moe etc.) need persistent SSM/GDN recurrent state
     // carried across forwards — including across chunked-prefill ubatches and
     // decode steps. Without this the SSM state resets every forward (decode
@@ -212,7 +212,9 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         let tail_pos = cache.position;
         let logits = engine.forward(model.weights(), |ctx| {
             model
-                .record_forward(ctx, &mut cache, tail, tail_pos, /*compute_logits=*/ true)
+                .record_forward(
+                    ctx, &mut cache, tail, tail_pos, /*compute_logits=*/ true,
+                )
                 .map(|view| {
                     view.expect("compute_logits=true must return logits")
                         .range()
@@ -235,7 +237,13 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         );
         next
     } else {
-        engine.forward_sampled(&*model, &mut cache, &prompt_tokens, position_offset, &mut sampler)?
+        engine.forward_sampled(
+            &*model,
+            &mut cache,
+            &prompt_tokens,
+            position_offset,
+            &mut sampler,
+        )?
     };
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
 

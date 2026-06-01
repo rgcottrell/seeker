@@ -34,7 +34,7 @@ pub fn content_to_text(content: &Value) -> Result<String, String> {
                     Some(other) => {
                         return Err(format!(
                             "unsupported content part type {other:?} — this server is text-only"
-                        ))
+                        ));
                     }
                     None => return Err("content array part missing `type`".to_string()),
                 }
@@ -99,9 +99,7 @@ pub fn content_to_text_and_images(content: &Value) -> Result<(String, Vec<Vec<u8
                         images.push(decode_image_url(url)?);
                         text.push_str(MEDIA_MARKER);
                     }
-                    Some(other) => {
-                        return Err(format!("unsupported content part type {other:?}"))
-                    }
+                    Some(other) => return Err(format!("unsupported content part type {other:?}")),
                     None => return Err("content array part missing `type`".to_string()),
                 }
             }
@@ -204,7 +202,10 @@ pub fn value_messages_to_chat(messages: &[Value]) -> Result<Vec<ChatMessage>, St
 /// "one system message, CLI wins when absent" and llama-server's behavior).
 pub fn apply_default_system(messages: &mut Vec<ChatMessage>, default: Option<&str>) {
     if let Some(sys) = default {
-        let has_system = messages.first().map(|m| m.role == "system").unwrap_or(false);
+        let has_system = messages
+            .first()
+            .map(|m| m.role == "system")
+            .unwrap_or(false);
         if !has_system {
             messages.insert(0, ChatMessage::system(sys));
         }
@@ -252,9 +253,9 @@ pub fn prompt_value_to_tokens(
                 // Array of string segments — encode the concatenation.
                 let mut joined = String::new();
                 for v in arr {
-                    let s = v
-                        .as_str()
-                        .ok_or_else(|| "prompt array must be all strings or all ints".to_string())?;
+                    let s = v.as_str().ok_or_else(|| {
+                        "prompt array must be all strings or all ints".to_string()
+                    })?;
                     joined.push_str(s);
                 }
                 encode(bundle, &joined, add_special)
@@ -277,7 +278,10 @@ pub fn encode(bundle: &TokenizerBundle, text: &str, add_special: bool) -> Result
 /// prompt when absent) and encode the result to token ids — the prompt the
 /// engine prefills for chat / messages requests. Errors (no template, render
 /// failure, unsupported content) bubble up for a `400`.
-pub fn render_and_encode(state: &AppState, mut messages: Vec<ChatMessage>) -> Result<Vec<u32>, String> {
+pub fn render_and_encode(
+    state: &AppState,
+    mut messages: Vec<ChatMessage>,
+) -> Result<Vec<u32>, String> {
     let template = state
         .chat_template()
         .ok_or("this model has no chat template — use the completion endpoints")?;
@@ -327,9 +331,9 @@ pub fn render_and_encode_mm(
     if images.len() > 1 {
         return Err("only one image per request is supported".into());
     }
-    let vcfg = state.vision_config().ok_or(
-        "this server has no vision model (mmproj); image input is unsupported",
-    )?;
+    let vcfg = state
+        .vision_config()
+        .ok_or("this server has no vision model (mmproj); image input is unsupported")?;
     let pcfg = PreprocessConfig::qwen3vl_default(
         vcfg.patch_size,
         vcfg.spatial_merge_size,
@@ -368,7 +372,8 @@ mod tests {
     fn content_string_and_array_forms() {
         assert_eq!(content_to_text(&json!("hi")).unwrap(), "hi");
         assert_eq!(
-            content_to_text(&json!([{"type":"text","text":"a"},{"type":"text","text":"b"}])).unwrap(),
+            content_to_text(&json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]))
+                .unwrap(),
             "ab"
         );
         assert!(content_to_text(&json!([{"type":"image_url","image_url":{}}])).is_err());
@@ -405,17 +410,15 @@ mod tests {
 
     #[test]
     fn openai_mm_collects_across_messages() {
-        let msgs = vec![
-            OpenAiMessage {
-                role: "user".into(),
-                content: json!([
-                    {"type": "image_url", "image_url": {"url": "data:x;base64,aGk="}},
-                    {"type": "text", "text": "hi"}
-                ]),
-                name: None,
-                tool_call_id: None,
-            },
-        ];
+        let msgs = vec![OpenAiMessage {
+            role: "user".into(),
+            content: json!([
+                {"type": "image_url", "image_url": {"url": "data:x;base64,aGk="}},
+                {"type": "text", "text": "hi"}
+            ]),
+            name: None,
+            tool_call_id: None,
+        }];
         let (chat, images) = openai_messages_to_chat_mm(&msgs).unwrap();
         assert_eq!(chat[0].content, format!("{MEDIA_MARKER}hi"));
         assert_eq!(images.len(), 1);

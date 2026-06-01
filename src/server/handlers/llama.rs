@@ -1,15 +1,15 @@
 //! llama-server native handlers: completion, infill, tokenize, detokenize,
 //! embedding, apply-template.
 
+use axum::Json;
 use axum::extract::State;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 use crate::chat_template;
 use crate::server::convert::{self, prompt_value_to_tokens, value_messages_to_chat};
 use crate::server::error;
-use crate::server::inference::{collect, GenConfig};
+use crate::server::inference::{GenConfig, collect};
 use crate::server::state::AppState;
 use crate::server::stream::llama_completion_stream;
 use crate::server::types::llama::{
@@ -17,7 +17,10 @@ use crate::server::types::llama::{
     DetokenizeRequest, DetokenizeResponse, InfillRequest, TokenizeRequest, TokenizeResponse,
 };
 
-pub async fn completion(State(state): State<AppState>, Json(req): Json<CompletionRequest>) -> Response {
+pub async fn completion(
+    State(state): State<AppState>,
+    Json(req): Json<CompletionRequest>,
+) -> Response {
     let Some(handle) = state.inference() else {
         return error::no_model_openai();
     };

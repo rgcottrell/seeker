@@ -2,12 +2,12 @@
 //! callers (the CLI shim, future tests, future embedded uses) can mount the
 //! same set of routes without going through `run`.
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use super::handlers::{anthropic, llama, ops, openai};
+use super::handlers::{anthropic, llama, openai, ops};
 use super::state::AppState;
 
 /// Build the router with all stub endpoints wired in.
@@ -42,7 +42,10 @@ pub fn build_router(cors: bool, state: AppState) -> Router {
         .route("/v1/rerank", post(openai::rerank))
         .route("/v1/reranking", post(openai::rerank))
         .route("/audio/transcriptions", post(openai::audio_transcriptions))
-        .route("/v1/audio/transcriptions", post(openai::audio_transcriptions))
+        .route(
+            "/v1/audio/transcriptions",
+            post(openai::audio_transcriptions),
+        )
         // -------------------- Anthropic --------------------
         .route("/v1/messages", post(anthropic::messages))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
@@ -89,7 +92,12 @@ mod tests {
 
     #[tokio::test]
     async fn generation_endpoints_503_without_model() {
-        for uri in ["/v1/chat/completions", "/v1/completions", "/completion", "/v1/messages"] {
+        for uri in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/completion",
+            "/v1/messages",
+        ] {
             assert_eq!(
                 status("POST", uri, "{}").await,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -100,7 +108,12 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_endpoints_501() {
-        for uri in ["/v1/embeddings", "/embedding", "/v1/rerank", "/v1/audio/transcriptions"] {
+        for uri in [
+            "/v1/embeddings",
+            "/embedding",
+            "/v1/rerank",
+            "/v1/audio/transcriptions",
+        ] {
             assert_eq!(
                 status("POST", uri, "{}").await,
                 StatusCode::NOT_IMPLEMENTED,

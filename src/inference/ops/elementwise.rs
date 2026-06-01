@@ -28,14 +28,7 @@ pub fn record_add(
     b: TensorView,
     dst: TensorView,
 ) -> Result<(), Box<dyn Error>> {
-    record_binary_f32(
-        ctx,
-        "add_f32",
-        shaders::ADD_F32_SPV.as_bytes(),
-        a,
-        b,
-        dst,
-    )
+    record_binary_f32(ctx, "add_f32", shaders::ADD_F32_SPV.as_bytes(), a, b, dst)
 }
 
 pub fn record_mul(
@@ -44,14 +37,7 @@ pub fn record_mul(
     b: TensorView,
     dst: TensorView,
 ) -> Result<(), Box<dyn Error>> {
-    record_binary_f32(
-        ctx,
-        "mul_f32",
-        shaders::MUL_F32_SPV.as_bytes(),
-        a,
-        b,
-        dst,
-    )
+    record_binary_f32(ctx, "mul_f32", shaders::MUL_F32_SPV.as_bytes(), a, b, dst)
 }
 
 pub fn record_sub(
@@ -60,14 +46,7 @@ pub fn record_sub(
     b: TensorView,
     dst: TensorView,
 ) -> Result<(), Box<dyn Error>> {
-    record_binary_f32(
-        ctx,
-        "sub_f32",
-        shaders::SUB_F32_SPV.as_bytes(),
-        a,
-        b,
-        dst,
-    )
+    record_binary_f32(ctx, "sub_f32", shaders::SUB_F32_SPV.as_bytes(), a, b, dst)
 }
 
 fn record_binary_f32(
@@ -132,15 +111,23 @@ pub fn record_moe_residual_fuse(
     push[4..8].copy_from_slice(&hidden.to_ne_bytes()); // KY = broadcast period
 
     let key = PipelineKey::dense("moe_residual_fuse_f32", 5, GENERIC_PARAMS_BYTES, Vec::new());
-    let pipeline = *ctx
-        .pipelines
-        .get(ctx.device, key, shaders::MOE_RESIDUAL_FUSE_F32_SPV.as_bytes())?;
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::MOE_RESIDUAL_FUSE_F32_SPV.as_bytes(),
+    )?;
     let workgroups = [nelements.div_ceil(512), 1, 1];
     super::bind_and_dispatch(
         ctx,
         &pipeline,
         &[0, 1, 2, 3, 4],
-        &[residual_in.range(), routed.range(), shared.range(), gate.range(), residual_out.range()],
+        &[
+            residual_in.range(),
+            routed.range(),
+            shared.range(),
+            gate.range(),
+            residual_out.range(),
+        ],
         &push,
         workgroups,
     )?;
@@ -249,7 +236,13 @@ pub fn record_swiglu_split(
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::SWIGLU_F32_SPV.as_bytes())?;
-    record_glu_dispatch(ctx, pipeline, &push, n_elements, &[a.range(), b.range(), dst.range()])?;
+    record_glu_dispatch(
+        ctx,
+        pipeline,
+        &push,
+        n_elements,
+        &[a.range(), b.range(), dst.range()],
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
@@ -282,9 +275,22 @@ pub fn record_sigmoid_mul_split(
     const SIGMOID_MUL_PARAMS_BYTES: u32 = 16 * 4;
     let mut push = [0u8; SIGMOID_MUL_PARAMS_BYTES as usize];
     let fields: [u32; 16] = [
-        n_elements as u32, ne00, ne00, 2, 0, 0,
-        nb01, nb02, nb03, ne01, ne02,
-        nb01, nb02, nb03, ne01, ne02,
+        n_elements as u32,
+        ne00,
+        ne00,
+        2,
+        0,
+        0,
+        nb01,
+        nb02,
+        nb03,
+        ne01,
+        ne02,
+        nb01,
+        nb02,
+        nb03,
+        ne01,
+        ne02,
     ];
     for (i, v) in fields.iter().enumerate() {
         push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
@@ -294,7 +300,13 @@ pub fn record_sigmoid_mul_split(
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::SIGMOID_MUL_F32_SPV.as_bytes())?;
-    record_glu_dispatch(ctx, pipeline, &push, n_elements, &[a.range(), b.range(), dst.range()])?;
+    record_glu_dispatch(
+        ctx,
+        pipeline,
+        &push,
+        n_elements,
+        &[a.range(), b.range(), dst.range()],
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
@@ -314,14 +326,7 @@ fn record_glu_dispatch(
     let wg_x = total_wgs.min(max_x);
     let wg_y = total_wgs.div_ceil(max_x);
     let workgroups = [wg_x, wg_y, 1];
-    super::bind_and_dispatch(
-        ctx,
-        &pipeline,
-        &[0, 1, 2],
-        bindings,
-        push,
-        workgroups,
-    )
+    super::bind_and_dispatch(ctx, &pipeline, &[0, 1, 2], bindings, push, workgroups)
 }
 
 /// Fused SSM post-GDN normalize + silu(z) gate. Combines
@@ -329,6 +334,7 @@ fn record_glu_dispatch(
 /// dispatch — saves the intermediate `attn_normed` allocation, the
 /// rms_norm dispatch, and one barrier per SSM layer. Dispatches one
 /// workgroup per `(head, token)` pair.
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 pub fn record_ssm_norm_gate(
     ctx: &mut DispatchContext,
     gdn_attn: TensorView,
@@ -360,9 +366,9 @@ pub fn record_ssm_norm_gate(
     }
 
     let key = PipelineKey::dense("ssm_norm_gate_f32", 4, SSM_NORM_GATE_PUSH_BYTES, Vec::new());
-    let pipeline = *ctx
-        .pipelines
-        .get(ctx.device, key, shaders::SSM_NORM_GATE_F32_SPV.as_bytes())?;
+    let pipeline =
+        *ctx.pipelines
+            .get(ctx.device, key, shaders::SSM_NORM_GATE_F32_SPV.as_bytes())?;
     let workgroups = [num_v, l, 1];
     super::bind_and_dispatch(
         ctx,
@@ -388,7 +394,9 @@ pub fn record_ssm_alpha_fuse(
     dst: TensorView,
     num_v: u32,
 ) -> Result<(), Box<dyn Error>> {
-    record_ssm_alpha_fuse_inner(ctx, alpha_pre, bias, ssm_a, dst, num_v, /*fence=*/ true)
+    record_ssm_alpha_fuse_inner(
+        ctx, alpha_pre, bias, ssm_a, dst, num_v, /*fence=*/ true,
+    )
 }
 
 /// As [`record_ssm_alpha_fuse`] but skips the trailing barrier — caller is
@@ -401,7 +409,9 @@ pub fn record_ssm_alpha_fuse_nofence(
     dst: TensorView,
     num_v: u32,
 ) -> Result<(), Box<dyn Error>> {
-    record_ssm_alpha_fuse_inner(ctx, alpha_pre, bias, ssm_a, dst, num_v, /*fence=*/ false)
+    record_ssm_alpha_fuse_inner(
+        ctx, alpha_pre, bias, ssm_a, dst, num_v, /*fence=*/ false,
+    )
 }
 
 fn record_ssm_alpha_fuse_inner(
@@ -424,9 +434,9 @@ fn record_ssm_alpha_fuse_inner(
     push[4..8].copy_from_slice(&num_v.to_ne_bytes()); // KY
 
     let key = PipelineKey::dense("ssm_alpha_fuse_f32", 4, GENERIC_PARAMS_BYTES, Vec::new());
-    let pipeline = *ctx
-        .pipelines
-        .get(ctx.device, key, shaders::SSM_ALPHA_FUSE_F32_SPV.as_bytes())?;
+    let pipeline =
+        *ctx.pipelines
+            .get(ctx.device, key, shaders::SSM_ALPHA_FUSE_F32_SPV.as_bytes())?;
     let total_wgs = (n_elements as u32).div_ceil(512);
     let max_x: u32 = 65535;
     let wg_x = total_wgs.min(max_x);
@@ -540,12 +550,7 @@ fn record_l2_norm_inner(
     debug_assert_eq!(src.dtype, GgmlType::F32);
     debug_assert_eq!(dst.dtype, GgmlType::F32);
     let push = super::unary_params_bytes(&src, &dst, eps, 0.0);
-    let key = PipelineKey::dense(
-        "l2_norm_f32",
-        2,
-        super::UNARY_PARAMS_BYTES,
-        Vec::new(),
-    );
+    let key = PipelineKey::dense("l2_norm_f32", 2, super::UNARY_PARAMS_BYTES, Vec::new());
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::L2_NORM_F32_SPV.as_bytes())?;
@@ -657,8 +662,18 @@ pub fn record_get_rows(
         byte_offset: indices.offset,
         byte_size: indices.size,
         dims: [indices_len as u64, 1, 1, 1],
-        byte_stride: [4, 4 * indices_len as u64, 4 * indices_len as u64, 4 * indices_len as u64],
-        element_stride: [1, indices_len as u64, indices_len as u64, indices_len as u64],
+        byte_stride: [
+            4,
+            4 * indices_len as u64,
+            4 * indices_len as u64,
+            4 * indices_len as u64,
+        ],
+        element_stride: [
+            1,
+            indices_len as u64,
+            indices_len as u64,
+            indices_len as u64,
+        ],
         dtype: GgmlType::I32,
     };
     let mut push = binary_params_bytes(&src, &indices_view, &dst, 0.0, 0.0, 0);
@@ -671,36 +686,58 @@ pub fn record_get_rows(
     // All variants here declare only bindings [0,1,2] (slangc -O3 strips
     // the unused packed16 alias from the quant kernels' scalar path).
     let (name, spirv, elems_per_x) = match (src.dtype, dst.dtype) {
-        (GgmlType::F32, GgmlType::F32) => ("get_rows_f32", shaders::GET_ROWS_F32_SPV.as_bytes(), 512),
-        (GgmlType::F16, GgmlType::F16) => ("get_rows_f16", shaders::GET_ROWS_F16_SPV.as_bytes(), 512),
-        (GgmlType::F16, GgmlType::F32) => {
-            ("get_rows_f16_f32", shaders::GET_ROWS_F16_F32_SPV.as_bytes(), 512)
+        (GgmlType::F32, GgmlType::F32) => {
+            ("get_rows_f32", shaders::GET_ROWS_F32_SPV.as_bytes(), 512)
         }
+        (GgmlType::F16, GgmlType::F16) => {
+            ("get_rows_f16", shaders::GET_ROWS_F16_SPV.as_bytes(), 512)
+        }
+        (GgmlType::F16, GgmlType::F32) => (
+            "get_rows_f16_f32",
+            shaders::GET_ROWS_F16_F32_SPV.as_bytes(),
+            512,
+        ),
         (GgmlType::BF16, GgmlType::F32) => {
             ("get_rows_bf16", shaders::GET_ROWS_BF16_SPV.as_bytes(), 512)
         }
-        (GgmlType::I32, GgmlType::I32) => ("get_rows_i32", shaders::GET_ROWS_I32_SPV.as_bytes(), 512),
-        (GgmlType::Q6_K, GgmlType::F32) => {
-            ("get_rows_q6_k", shaders::GET_ROWS_Q6_K_DEFAULT_SPV.as_bytes(), 256)
+        (GgmlType::I32, GgmlType::I32) => {
+            ("get_rows_i32", shaders::GET_ROWS_I32_SPV.as_bytes(), 512)
         }
-        (GgmlType::Q4_0, GgmlType::F32) => {
-            ("get_rows_quant_q4_0", shaders::GET_ROWS_QUANT_Q4_0_SPV.as_bytes(), 1024)
-        }
-        (GgmlType::Q4_1, GgmlType::F32) => {
-            ("get_rows_quant_q4_1", shaders::GET_ROWS_QUANT_Q4_1_SPV.as_bytes(), 1024)
-        }
-        (GgmlType::Q5_0, GgmlType::F32) => {
-            ("get_rows_quant_q5_0", shaders::GET_ROWS_QUANT_Q5_0_SPV.as_bytes(), 1024)
-        }
-        (GgmlType::Q5_1, GgmlType::F32) => {
-            ("get_rows_quant_q5_1", shaders::GET_ROWS_QUANT_Q5_1_SPV.as_bytes(), 1024)
-        }
-        (GgmlType::Q8_0, GgmlType::F32) => {
-            ("get_rows_quant_q8_0", shaders::GET_ROWS_QUANT_Q8_0_SPV.as_bytes(), 1024)
-        }
-        (GgmlType::IQ4_NL, GgmlType::F32) => {
-            ("get_rows_quant_iq4_nl", shaders::GET_ROWS_QUANT_IQ4_NL_SPV.as_bytes(), 1024)
-        }
+        (GgmlType::Q6_K, GgmlType::F32) => (
+            "get_rows_q6_k",
+            shaders::GET_ROWS_Q6_K_DEFAULT_SPV.as_bytes(),
+            256,
+        ),
+        (GgmlType::Q4_0, GgmlType::F32) => (
+            "get_rows_quant_q4_0",
+            shaders::GET_ROWS_QUANT_Q4_0_SPV.as_bytes(),
+            1024,
+        ),
+        (GgmlType::Q4_1, GgmlType::F32) => (
+            "get_rows_quant_q4_1",
+            shaders::GET_ROWS_QUANT_Q4_1_SPV.as_bytes(),
+            1024,
+        ),
+        (GgmlType::Q5_0, GgmlType::F32) => (
+            "get_rows_quant_q5_0",
+            shaders::GET_ROWS_QUANT_Q5_0_SPV.as_bytes(),
+            1024,
+        ),
+        (GgmlType::Q5_1, GgmlType::F32) => (
+            "get_rows_quant_q5_1",
+            shaders::GET_ROWS_QUANT_Q5_1_SPV.as_bytes(),
+            1024,
+        ),
+        (GgmlType::Q8_0, GgmlType::F32) => (
+            "get_rows_quant_q8_0",
+            shaders::GET_ROWS_QUANT_Q8_0_SPV.as_bytes(),
+            1024,
+        ),
+        (GgmlType::IQ4_NL, GgmlType::F32) => (
+            "get_rows_quant_iq4_nl",
+            shaders::GET_ROWS_QUANT_IQ4_NL_SPV.as_bytes(),
+            1024,
+        ),
         (s, d) => return Err(format!("get_rows: unsupported src/dst combo {s:?}/{d:?}").into()),
     };
 

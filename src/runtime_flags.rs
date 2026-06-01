@@ -48,7 +48,9 @@ fn env_u32(key: &'static str) -> Option<u32> {
 /// `record_inner` matmul gate for the cooperative-matrix prefill
 /// kernel (`SEEKER_MM_CM=0` to disable). Default-on.
 pub static MM_CM_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("SEEKER_MM_CM").map(|v| v == "0").unwrap_or(false)
+    std::env::var("SEEKER_MM_CM")
+        .map(|v| v == "0")
+        .unwrap_or(false)
 });
 
 /// `SEEKER_MM_SPLIT_K=<n>` — force/disable lm_head matvec split-K.
@@ -68,8 +70,7 @@ pub static FA_SPLIT_DISABLED: LazyLock<bool> =
 
 /// `SEEKER_FA_SPLIT_KNUM=<n>` — pin the flash-attention split-K factor.
 /// Read per decode forward; cache to avoid a per-token getenv + parse.
-pub static FA_SPLIT_KNUM: LazyLock<Option<u32>> =
-    LazyLock::new(|| env_u32("SEEKER_FA_SPLIT_KNUM"));
+pub static FA_SPLIT_KNUM: LazyLock<Option<u32>> = LazyLock::new(|| env_u32("SEEKER_FA_SPLIT_KNUM"));
 
 // ─── Debug flags (gpu_debug) ─────────────────────────────────────────
 

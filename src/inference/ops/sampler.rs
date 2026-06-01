@@ -19,7 +19,7 @@ use crate::inference::sample::SamplerConfig;
 use crate::inference::weights::TensorView;
 use crate::shaders;
 
-use super::{fastdiv_values, unary_params_bytes, UNARY_PARAMS_BYTES};
+use super::{UNARY_PARAMS_BYTES, fastdiv_values, unary_params_bytes};
 
 const GENERIC_PARAMS_BYTES: u32 = 6 * 4;
 const SUM_ROWS_PARAMS_BYTES: u32 = 15 * 4;
@@ -91,18 +91,18 @@ pub fn record_chain(
     // single one for the common chat config (top_k=40).
     const FUSED_K_CAP: u64 = 256;
     let k_actual = kept_logits.dims[0];
-    if let Some(cand) = candidates {
-        if k_actual <= FUSED_K_CAP {
-            return record_sample_categorical(
-                ctx,
-                kept_logits,
-                cand,
-                config.top_p,
-                config.min_p,
-                config.temperature,
-                uniform,
-            );
-        }
+    if let Some(cand) = candidates
+        && k_actual <= FUSED_K_CAP
+    {
+        return record_sample_categorical(
+            ctx,
+            kept_logits,
+            cand,
+            config.top_p,
+            config.min_p,
+            config.temperature,
+            uniform,
+        );
     }
 
     // Fallback (top_k disabled, or K > FUSED_K_CAP — neither happens
@@ -146,7 +146,10 @@ fn record_sample_categorical(
     debug_assert_eq!(sorted_logits.dtype, GgmlType::F32);
     debug_assert_eq!(candidates.dtype, GgmlType::I32);
     let k: u32 = sorted_logits.dims[0] as u32;
-    assert!(k > 0 && k <= 256, "fused categorical requires 0 < k ≤ 256, got {k}");
+    assert!(
+        k > 0 && k <= 256,
+        "fused categorical requires 0 < k ≤ 256, got {k}"
+    );
 
     // Push constants — must match the `CatParams` struct in
     // `sample_categorical.slang`: u32 k + four f32s (top_p/min_p/temp/
@@ -157,7 +160,11 @@ fn record_sample_categorical(
     push[0..4].copy_from_slice(&k.to_ne_bytes());
     push[4..8].copy_from_slice(&(1.0f32 / temperature.max(1e-9)).to_ne_bytes());
     push[8..12].copy_from_slice(&top_p.to_ne_bytes());
-    let log_min_p = if min_p > 0.0 { min_p.ln() } else { f32::NEG_INFINITY };
+    let log_min_p = if min_p > 0.0 {
+        min_p.ln()
+    } else {
+        f32::NEG_INFINITY
+    };
     push[12..16].copy_from_slice(&log_min_p.to_ne_bytes());
     // Field 4 (uniform) is now sourced from DecodeDyn; leave the push slot at 0.
 
@@ -187,9 +194,11 @@ fn record_sample_categorical(
         // Order in the shader: BLOCK_SIZE, TOP_P_ON, MIN_P_ON, TEMP_ON.
         vec![block_size, top_p_on, min_p_on, temp_on],
     );
-    let pipeline = *ctx
-        .pipelines
-        .get(ctx.device, key, shaders::SAMPLE_CATEGORICAL_F32_SPV.as_bytes())?;
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::SAMPLE_CATEGORICAL_F32_SPV.as_bytes(),
+    )?;
     let dyn_range = ctx.decode_dyn;
     super::bind_and_dispatch(
         ctx,
@@ -260,9 +269,11 @@ pub fn record_greedy(
     reduce_push[0..4].copy_from_slice(&num_wg.to_ne_bytes()); // KX = N partials
     reduce_push[4..8].copy_from_slice(&1u32.to_ne_bytes());
     let reduce_key = PipelineKey::dense("argmax_reduce_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
-    let reduce_pipeline = *ctx
-        .pipelines
-        .get(ctx.device, reduce_key, shaders::ARGMAX_REDUCE_F32_SPV.as_bytes())?;
+    let reduce_pipeline = *ctx.pipelines.get(
+        ctx.device,
+        reduce_key,
+        shaders::ARGMAX_REDUCE_F32_SPV.as_bytes(),
+    )?;
     super::bind_and_dispatch(
         ctx,
         &reduce_pipeline,
@@ -397,7 +408,12 @@ fn record_apply_logit_bias(
     let mut push = [0u8; LOGIT_BIAS_PARAMS_BYTES as usize];
     push[0..4].copy_from_slice(&n.to_ne_bytes());
 
-    let key = PipelineKey::dense("apply_logit_bias_f32", 2, LOGIT_BIAS_PARAMS_BYTES, Vec::new());
+    let key = PipelineKey::dense(
+        "apply_logit_bias_f32",
+        2,
+        LOGIT_BIAS_PARAMS_BYTES,
+        Vec::new(),
+    );
     let pipeline = *ctx.pipelines.get(
         ctx.device,
         key,
@@ -469,17 +485,10 @@ fn record_apply_penalties(
     push[8..12].copy_from_slice(&freq_p.to_ne_bytes());
     push[12..16].copy_from_slice(&presence_p.to_ne_bytes());
 
-    let key = PipelineKey::dense(
-        "apply_penalties_f32",
-        3,
-        PENALTY_PARAMS_BYTES,
-        Vec::new(),
-    );
-    let pipeline = *ctx.pipelines.get(
-        ctx.device,
-        key,
-        shaders::APPLY_PENALTIES_F32_SPV.as_bytes(),
-    )?;
+    let key = PipelineKey::dense("apply_penalties_f32", 3, PENALTY_PARAMS_BYTES, Vec::new());
+    let pipeline =
+        *ctx.pipelines
+            .get(ctx.device, key, shaders::APPLY_PENALTIES_F32_SPV.as_bytes())?;
     let workgroups = [max_pairs.div_ceil(256), 1, 1];
     let dyn_range = ctx.decode_dyn;
     super::bind_and_dispatch(
@@ -546,15 +555,17 @@ fn record_top_k(
         // off (name + binding count + push size), so different (first,
         // last) variants share the pipeline — good.
         let key = PipelineKey::dense("topk_argsort_f32", 4, TOPK_PARAMS_BYTES, Vec::new());
-        let pipeline = *ctx.pipelines.get(
-            ctx.device,
-            key,
-            shaders::TOPK_ARGSORT_F32_SPV.as_bytes(),
-        )?;
+        let pipeline =
+            *ctx.pipelines
+                .get(ctx.device, key, shaders::TOPK_ARGSORT_F32_SPV.as_bytes())?;
         // For the first pass, prev_intermediate isn't initialized — but it's
         // not read in that case (first_pass=1 means the shader reads data_a
         // only). Bind logits to data_s slot too to keep the descriptor valid.
-        let s_binding = if is_first { logits.range() } else { prev_intermediate.range() };
+        let s_binding = if is_first {
+            logits.range()
+        } else {
+            prev_intermediate.range()
+        };
         let workgroups = [num_wg, 1, 1];
         super::bind_and_dispatch(
             ctx,
@@ -595,7 +606,15 @@ fn topk_params_bytes(
     last_pass: u32,
 ) -> [u8; TOPK_PARAMS_BYTES as usize] {
     let mut out = [0u8; TOPK_PARAMS_BYTES as usize];
-    let fields = [orig_ncols, ncols_input, ncols_output, k, nrows, first_pass, last_pass];
+    let fields = [
+        orig_ncols,
+        ncols_input,
+        ncols_output,
+        k,
+        nrows,
+        first_pass,
+        last_pass,
+    ];
     for (i, v) in fields.iter().enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
     }
@@ -670,7 +689,13 @@ fn record_get_rows_i32(
         element_stride: [1, 1, l, l],
         dtype: GgmlType::I32,
     };
-    super::elementwise::record_get_rows(ctx, table_reshaped, indices.range(), l as u32, dst_reshaped)
+    super::elementwise::record_get_rows(
+        ctx,
+        table_reshaped,
+        indices.range(),
+        l as u32,
+        dst_reshaped,
+    )
 }
 
 /// `α·x + β` over a 1-D tensor via `scale.slang`.
@@ -741,23 +766,23 @@ fn soft_max_params_bytes(kx: u32) -> [u8; SOFT_MAX_PARAMS_BYTES as usize] {
         out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
         *w += 4;
     };
-    put_u(&mut out, &mut w, kx);          // KX
-    put_u(&mut out, &mut w, 0);           // KY (no mask)
-    put_u(&mut out, &mut w, kx);          // ne00
-    put_u(&mut out, &mut w, 1);           // ne01
-    put_u(&mut out, &mut w, 1);           // ne02
-    put_u(&mut out, &mut w, 0);           // ne12 (mask, unused)
-    put_u(&mut out, &mut w, 0);           // ne13 (mask, unused)
-    put_u(&mut out, &mut w, 0);           // nb11
-    put_u(&mut out, &mut w, 0);           // nb12
-    put_u(&mut out, &mut w, 0);           // nb13
-    put_f(&mut out, &mut w, 1.0);         // scale
-    put_f(&mut out, &mut w, 0.0);         // max_bias
-    put_f(&mut out, &mut w, 0.0);         // m0
-    put_f(&mut out, &mut w, 0.0);         // m1
-    put_u(&mut out, &mut w, 0);           // n_head_log2
-    put_u(&mut out, &mut w, 1);           // nrows_x
-    put_u(&mut out, &mut w, 0);           // has_sinks
+    put_u(&mut out, &mut w, kx); // KX
+    put_u(&mut out, &mut w, 0); // KY (no mask)
+    put_u(&mut out, &mut w, kx); // ne00
+    put_u(&mut out, &mut w, 1); // ne01
+    put_u(&mut out, &mut w, 1); // ne02
+    put_u(&mut out, &mut w, 0); // ne12 (mask, unused)
+    put_u(&mut out, &mut w, 0); // ne13 (mask, unused)
+    put_u(&mut out, &mut w, 0); // nb11
+    put_u(&mut out, &mut w, 0); // nb12
+    put_u(&mut out, &mut w, 0); // nb13
+    put_f(&mut out, &mut w, 1.0); // scale
+    put_f(&mut out, &mut w, 0.0); // max_bias
+    put_f(&mut out, &mut w, 0.0); // m0
+    put_f(&mut out, &mut w, 0.0); // m1
+    put_u(&mut out, &mut w, 0); // n_head_log2
+    put_u(&mut out, &mut w, 1); // nrows_x
+    put_u(&mut out, &mut w, 0); // has_sinks
     out
 }
 
@@ -829,8 +854,8 @@ fn sum_rows_params_bytes(
     };
 
     put_u(&mut out, &mut w, n_cols);
-    put_u(&mut out, &mut w, src.dims[1] as u32);     // ne01
-    put_u(&mut out, &mut w, src.dims[2] as u32);     // ne02
+    put_u(&mut out, &mut w, src.dims[1] as u32); // ne01
+    put_u(&mut out, &mut w, src.dims[2] as u32); // ne02
     put_u(&mut out, &mut w, src.element_stride[1] as u32); // nb01
     put_u(&mut out, &mut w, src.element_stride[2] as u32); // nb02
     put_u(&mut out, &mut w, src.element_stride[3] as u32); // nb03
@@ -838,7 +863,7 @@ fn sum_rows_params_bytes(
     put_u(&mut out, &mut w, dst.element_stride[2] as u32); // nb12
     put_u(&mut out, &mut w, dst.element_stride[3] as u32); // nb13
     put_f(&mut out, &mut w, weight);
-    put_u(&mut out, &mut w, 0);                            // misalign_offsets
+    put_u(&mut out, &mut w, 0); // misalign_offsets
     // fastdiv(ne01 * ne02) and fastdiv(ne01)
     let (mp, l) = fastdiv_values((src.dims[1] * src.dims[2]) as u32);
     put_u(&mut out, &mut w, mp);

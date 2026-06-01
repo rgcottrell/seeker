@@ -125,7 +125,10 @@ fn build_view(t: &crate::gguf::TensorInfo, buffer: vk::Buffer) -> TensorView {
 
 /// Borrow a tensor's bytes from the GGUF, erroring if the slice length
 /// disagrees with the header.
-fn tensor_bytes<'a>(gguf: &'a GgufFile, t: &crate::gguf::TensorInfo) -> Result<&'a [u8], Box<dyn Error>> {
+fn tensor_bytes<'a>(
+    gguf: &'a GgufFile,
+    t: &crate::gguf::TensorInfo,
+) -> Result<&'a [u8], Box<dyn Error>> {
     let data = gguf
         .tensor_data(&t.name)
         .ok_or_else(|| format!("tensor {} has no data slice", t.name))?;
@@ -233,7 +236,11 @@ pub fn upload(
 
     // Tear down upload-only resources regardless of success.
     staging.destroy(&device.device);
-    unsafe { device.device.free_command_buffers(cmd_pool, std::slice::from_ref(&cmd)) };
+    unsafe {
+        device
+            .device
+            .free_command_buffers(cmd_pool, std::slice::from_ref(&cmd))
+    };
     upload_result?;
 
     Ok(WeightsHandle {

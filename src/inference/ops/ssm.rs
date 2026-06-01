@@ -35,6 +35,7 @@ const SSM_CONV_PUSH_BYTES: u32 = 11 * 4;
 /// element conv state prefix in `src` before this dispatch (zeros on
 /// the first forward; the trailing window of the previous forward in
 /// streaming decode).
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 pub fn record_ssm_conv(
     ctx: &mut DispatchContext,
     src: TensorView,
@@ -48,13 +49,23 @@ pub fn record_ssm_conv(
     fuse_silu: bool,
 ) -> Result<(), Box<dyn Error>> {
     record_ssm_conv_inner(
-        ctx, src, kernel, dst, n_channels, n_padded_tokens, n_tokens, n_seqs, kernel_size,
-        fuse_silu, /*fence=*/ true,
+        ctx,
+        src,
+        kernel,
+        dst,
+        n_channels,
+        n_padded_tokens,
+        n_tokens,
+        n_seqs,
+        kernel_size,
+        fuse_silu,
+        /*fence=*/ true,
     )
 }
 
 /// As [`record_ssm_conv`] but skips the trailing barrier — caller fences
 /// `dst` before any downstream read.
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 pub fn record_ssm_conv_nofence(
     ctx: &mut DispatchContext,
     src: TensorView,
@@ -68,11 +79,21 @@ pub fn record_ssm_conv_nofence(
     fuse_silu: bool,
 ) -> Result<(), Box<dyn Error>> {
     record_ssm_conv_inner(
-        ctx, src, kernel, dst, n_channels, n_padded_tokens, n_tokens, n_seqs, kernel_size,
-        fuse_silu, /*fence=*/ false,
+        ctx,
+        src,
+        kernel,
+        dst,
+        n_channels,
+        n_padded_tokens,
+        n_tokens,
+        n_seqs,
+        kernel_size,
+        fuse_silu,
+        /*fence=*/ false,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 fn record_ssm_conv_inner(
     ctx: &mut DispatchContext,
     src: TensorView,
@@ -124,7 +145,11 @@ fn record_ssm_conv_inner(
     // Spec-const ordering: BLOCK_SIZE, TOKENS_PER_WG, FUSE_SILU
     // (declared in this order in shaders/compute/ssm_conv.slang).
     let key = PipelineKey::dense(
-        if fuse_silu { "ssm_conv_f32_silu" } else { "ssm_conv_f32" },
+        if fuse_silu {
+            "ssm_conv_f32_silu"
+        } else {
+            "ssm_conv_f32"
+        },
         3,
         SSM_CONV_PUSH_BYTES,
         vec![32, 16, fuse_silu as u32],
@@ -169,6 +194,7 @@ pub struct GdnStrides {
 /// `n_heads * S_V * S_V * n_seqs` floats hold the updated state.
 ///
 /// `state_in` is the previous-call state of the same shape.
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 pub fn record_gated_delta_net(
     ctx: &mut DispatchContext,
     q: TensorView,
@@ -207,24 +233,24 @@ pub fn record_gated_delta_net(
         out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
         *w += 4;
     }
-    put_u(&mut push, &mut w, head_count_v);   // H
+    put_u(&mut push, &mut w, head_count_v); // H
     put_u(&mut push, &mut w, n_tokens);
     put_u(&mut push, &mut w, n_seqs);
-    put_u(&mut push, &mut w, s_off_elem);     // s_off (in element units)
-    put_u(&mut push, &mut w, q_strides.s1);   // sq1
-    put_u(&mut push, &mut w, q_strides.s2);   // sq2
-    put_u(&mut push, &mut w, q_strides.s3);   // sq3
+    put_u(&mut push, &mut w, s_off_elem); // s_off (in element units)
+    put_u(&mut push, &mut w, q_strides.s1); // sq1
+    put_u(&mut push, &mut w, q_strides.s2); // sq2
+    put_u(&mut push, &mut w, q_strides.s3); // sq3
     put_u(&mut push, &mut w, v_strides.s1);
     put_u(&mut push, &mut w, v_strides.s2);
     put_u(&mut push, &mut w, v_strides.s3);
     put_u(&mut push, &mut w, b_strides.s1);
     put_u(&mut push, &mut w, b_strides.s2);
     put_u(&mut push, &mut w, b_strides.s3);
-    put_u(&mut push, &mut w, head_count_k);   // neq1: wrap Q/K head index for GQA-like repeat
-    put_u(&mut push, &mut w, 1);              // rq3 = 1 for our text-only single-batch path
+    put_u(&mut push, &mut w, head_count_k); // neq1: wrap Q/K head index for GQA-like repeat
+    put_u(&mut push, &mut w, 1); // rq3 = 1 for our text-only single-batch path
     put_f(&mut push, &mut w, scale);
-    put_u(&mut push, &mut w, k_snapshots);    // K — number of per-token state snapshots
-    put_u(&mut push, &mut w, 0);              // padding to round up to 18*4
+    put_u(&mut push, &mut w, k_snapshots); // K — number of per-token state snapshots
+    put_u(&mut push, &mut w, 0); // padding to round up to 18*4
 
     // Spec constants: S_V, KDA=0 (per-token scalar gate, not per-element),
     // SUBGROUP_SIZE=32, LANES_PER_COLUMN=32.

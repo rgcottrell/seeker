@@ -19,7 +19,7 @@ pub(super) fn compute_byte_size(
 ) -> Result<usize, GgufError> {
     let (elements_per_block, bytes_per_block) = ggml_type.block_layout();
     let elements: u64 = dims.iter().product();
-    if elements % elements_per_block as u64 != 0 {
+    if !elements.is_multiple_of(elements_per_block as u64) {
         return Err(GgufError::BadTensorShape {
             name: name.to_string(),
             elements,

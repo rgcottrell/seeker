@@ -1,9 +1,9 @@
+use tokenizers::TokenizerImpl;
 use tokenizers::decoders::DecoderWrapper;
 use tokenizers::models::ModelWrapper;
 use tokenizers::normalizers::NormalizerWrapper;
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::processors::PostProcessorWrapper;
-use tokenizers::TokenizerImpl;
 
 /// `tokenizers::Tokenizer` is just `TokenizerImpl<Wrappers…>`; this concrete
 /// alias keeps every signature in the module short and uniform.

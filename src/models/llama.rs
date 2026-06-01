@@ -120,7 +120,11 @@ impl Model for LlamaModel {
         let p = &self.params;
         // Per-pass token count: bounded by n_ubatch, or the whole context when
         // chunking is disabled (n_ubatch == 0 ⇒ a single full-prompt pass).
-        let l = if n_ubatch == 0 { max_seq_len.max(1) } else { n_ubatch } as u64;
+        let l = if n_ubatch == 0 {
+            max_seq_len.max(1)
+        } else {
+            n_ubatch
+        } as u64;
         let hidden = p.n_embd as u64;
         let n_kv = p.n_embd_kv() as u64;
         let n_ff = p.n_ff as u64;
@@ -208,13 +212,7 @@ impl Model for LlamaModel {
         // adds. Everything else allocated below the loop checkpoint is
         // reclaimed on `scratch_restore` between layers.
         let residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
-        elementwise::record_get_rows(
-            ctx,
-            self.weights.token_embd,
-            token_buf,
-            l,
-            residual,
-        )?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, l, residual)?;
         let layer_checkpoint = ctx.scratch_checkpoint();
 
         let rope_params = rope::RopeParams::llama_default(p.rope_dim, p.rope_freq_base);
@@ -304,7 +302,9 @@ impl Model for LlamaModel {
 
             // attn_out = flash_attn(Q, K, V, mask) → [hidden, L]
             let attn_out = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
-            flash_attn::record(ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params, total_len)?;
+            flash_attn::record(
+                ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params, total_len,
+            )?;
             // (mask is Option<TensorView>: Some for prefill chunks, None for
             // single-token decode — see the prologue.)
 
@@ -367,12 +367,23 @@ impl Model for LlamaModel {
             byte_offset: residual.byte_offset + (l as u64 - 1) * hidden * elem_size,
             byte_size: hidden * elem_size,
             dims: [hidden, 1, 1, 1],
-            byte_stride: [elem_size, hidden * elem_size, hidden * elem_size, hidden * elem_size],
+            byte_stride: [
+                elem_size,
+                hidden * elem_size,
+                hidden * elem_size,
+                hidden * elem_size,
+            ],
             element_stride: [1, hidden, hidden, hidden],
             dtype: residual.dtype,
         };
         let final_norm = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
-        rms_norm::record(ctx, residual_last, self.weights.output_norm, final_norm, p.rms_eps)?;
+        rms_norm::record(
+            ctx,
+            residual_last,
+            self.weights.output_norm,
+            final_norm,
+            p.rms_eps,
+        )?;
 
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
         let last_logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
@@ -497,8 +508,16 @@ impl Model for LlamaModel {
             let v_attn = batch.batched_v_attn_view(layer_idx as u32);
             let attn_out = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
             flash_attn::record_batched(
-                ctx, q_attn, k_attn, v_attn, attn_out, fa_params, &kv_lens, fa_dyn_range,
-                Some(slots), /*query_lens=*/ None,
+                ctx,
+                q_attn,
+                k_attn,
+                v_attn,
+                attn_out,
+                fa_params,
+                &kv_lens,
+                fa_dyn_range,
+                Some(slots),
+                /*query_lens=*/ None,
             )?;
 
             let proj = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
@@ -525,7 +544,13 @@ impl Model for LlamaModel {
         // Final norm + lm_head over ALL B columns (each column is its
         // sequence's last — and only — token this step).
         let final_norm = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
-        rms_norm::record(ctx, residual, self.weights.output_norm, final_norm, p.rms_eps)?;
+        rms_norm::record(
+            ctx,
+            residual,
+            self.weights.output_norm,
+            final_norm,
+            p.rms_eps,
+        )?;
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
         let logits = ctx.alloc_tensor([vocab, b, 1, 1], GgmlType::F32)?;
         matmul::record(ctx, lm_head, final_norm, logits)?;
@@ -558,7 +583,9 @@ impl Model for LlamaModel {
             return Err("record_forward_unified: empty batch".into());
         }
         if positions.len() != tokens.len() || slots.len() != b {
-            return Err("record_forward_unified: tokens/positions/seq_lens/slots length mismatch".into());
+            return Err(
+                "record_forward_unified: tokens/positions/seq_lens/slots length mismatch".into(),
+            );
         }
         if seq_lens.iter().map(|&l| l as u64).sum::<u64>() != n_total {
             return Err("record_forward_unified: sum(seq_lens) != tokens.len()".into());
@@ -575,7 +602,11 @@ impl Model for LlamaModel {
         // Per-sequence flat offsets (prefix sum), causal lengths, query lengths.
         let q_starts: Vec<u64> = seq_lens
             .iter()
-            .scan(0u64, |a, &l| { let s = *a; *a += l as u64; Some(s) })
+            .scan(0u64, |a, &l| {
+                let s = *a;
+                *a += l as u64;
+                Some(s)
+            })
             .collect();
         // base_s = the seq's first token's absolute position; kv after this step.
         let kv_lens: Vec<u32> = (0..b)
@@ -590,7 +621,13 @@ impl Model for LlamaModel {
         write_u32(ctx, positions_buf, positions)?;
 
         let residual = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
-        elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, n_total as u32, residual)?;
+        elementwise::record_get_rows(
+            ctx,
+            self.weights.token_embd,
+            token_buf,
+            n_total as u32,
+            residual,
+        )?;
         let fa_dyn_range = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
         let layer_checkpoint = ctx.scratch_checkpoint();
 
@@ -640,13 +677,28 @@ impl Model for LlamaModel {
                         byte_size: l * tok_stride,
                         dims: [head_dim, n_head_kv, l, 1],
                         byte_stride: [elem, elem * head_dim, tok_stride, tok_stride * l],
-                        element_stride: [1, head_dim, head_dim * n_head_kv, head_dim * n_head_kv * l],
+                        element_stride: [
+                            1,
+                            head_dim,
+                            head_dim * n_head_kv,
+                            head_dim * n_head_kv * l,
+                        ],
                         ..t
                     }
                 };
                 let base_pos = positions[q_starts[s] as usize];
-                cache_io::record_write(ctx, chunk(k_natural), batch.slot_k_view(slots[s], layer_idx as u32), base_pos)?;
-                cache_io::record_write(ctx, chunk(v_natural), batch.slot_v_view(slots[s], layer_idx as u32), base_pos)?;
+                cache_io::record_write(
+                    ctx,
+                    chunk(k_natural),
+                    batch.slot_k_view(slots[s], layer_idx as u32),
+                    base_pos,
+                )?;
+                cache_io::record_write(
+                    ctx,
+                    chunk(v_natural),
+                    batch.slot_v_view(slots[s], layer_idx as u32),
+                    base_pos,
+                )?;
             }
 
             // Varlen attention: each sequence's L_s query rows attend causally
@@ -656,8 +708,16 @@ impl Model for LlamaModel {
             let v_attn = batch.batched_v_attn_view(layer_idx as u32);
             let attn_out = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
             flash_attn::record_batched(
-                ctx, q_attn, k_attn, v_attn, attn_out, fa_params, &kv_lens, fa_dyn_range,
-                Some(slots), Some(&query_lens),
+                ctx,
+                q_attn,
+                k_attn,
+                v_attn,
+                attn_out,
+                fa_params,
+                &kv_lens,
+                fa_dyn_range,
+                Some(slots),
+                Some(&query_lens),
             )?;
 
             let proj = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
@@ -696,14 +756,23 @@ impl Model for LlamaModel {
                     .dst_offset(last_hidden.byte_offset + s as u64 * hidden * elem)
                     .size(hidden * elem);
                 ctx.device.device.cmd_copy_buffer(
-                    ctx.cmd, residual.buffer, last_hidden.buffer, std::slice::from_ref(&copy),
+                    ctx.cmd,
+                    residual.buffer,
+                    last_hidden.buffer,
+                    std::slice::from_ref(&copy),
                 );
             }
         }
         record_global_barrier(ctx.device, ctx.cmd);
 
         let final_norm = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
-        rms_norm::record(ctx, last_hidden, self.weights.output_norm, final_norm, p.rms_eps)?;
+        rms_norm::record(
+            ctx,
+            last_hidden,
+            self.weights.output_norm,
+            final_norm,
+            p.rms_eps,
+        )?;
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
         let logits = ctx.alloc_tensor([vocab, b as u64, 1, 1], GgmlType::F32)?;
         matmul::record(ctx, lm_head, final_norm, logits)?;
@@ -717,14 +786,25 @@ impl Model for LlamaModel {
 
 /// A single-column `[head_dim, n_head_kv, 1]` view of a `[head_dim, n_head_kv,
 /// B]` tensor (sequence `s`), for the per-sequence KV cache write.
-fn column_view(t: TensorView, s: u64, col_stride: u64, head_dim: u64, n_head_kv: u64) -> TensorView {
+fn column_view(
+    t: TensorView,
+    s: u64,
+    col_stride: u64,
+    head_dim: u64,
+    n_head_kv: u64,
+) -> TensorView {
     let elem = t.byte_stride[0];
     TensorView {
         buffer: t.buffer,
         byte_offset: t.byte_offset + s * col_stride,
         byte_size: head_dim * n_head_kv * elem,
         dims: [head_dim, n_head_kv, 1, 1],
-        byte_stride: [elem, elem * head_dim, elem * head_dim * n_head_kv, elem * head_dim * n_head_kv],
+        byte_stride: [
+            elem,
+            elem * head_dim,
+            elem * head_dim * n_head_kv,
+            elem * head_dim * n_head_kv,
+        ],
         element_stride: [1, head_dim, head_dim * n_head_kv, head_dim * n_head_kv],
         dtype: t.dtype,
     }
@@ -733,7 +813,13 @@ fn column_view(t: TensorView, s: u64, col_stride: u64, head_dim: u64, n_head_kv:
 /// Reinterpret a contiguous `[head_dim, n_head, B]` (post-RoPE) Q as the
 /// `[head_dim, 1, n_head, B]` flash-attn batched-decode layout (one query row
 /// per head per sequence; batch stride = hidden).
-fn batched_q_attn_view(t: TensorView, head_dim: u64, n_head: u64, b: u64, hidden: u64) -> TensorView {
+fn batched_q_attn_view(
+    t: TensorView,
+    head_dim: u64,
+    n_head: u64,
+    b: u64,
+    hidden: u64,
+) -> TensorView {
     let elem = t.byte_stride[0];
     TensorView {
         buffer: t.buffer,
@@ -785,7 +871,11 @@ fn write_causal_mask(
             let mut buf: Vec<f32> = vec![0.0; n];
             for i in 0..l {
                 for jc in 0..l {
-                    buf[i * l + jc] = if unmasked(i, jc) { 0.0 } else { f32::NEG_INFINITY };
+                    buf[i * l + jc] = if unmasked(i, jc) {
+                        0.0
+                    } else {
+                        f32::NEG_INFINITY
+                    };
                 }
             }
             unsafe {
@@ -835,7 +925,12 @@ fn reshape_for_rope(t: TensorView, head_dim: u64, n_heads: u64, l: u64) -> Tenso
         byte_offset: t.byte_offset,
         byte_size: t.byte_size,
         dims: [head_dim, n_heads, l, 1],
-        byte_stride: [elem, elem * head_dim, elem * head_dim * n_heads, elem * head_dim * n_heads * l],
+        byte_stride: [
+            elem,
+            elem * head_dim,
+            elem * head_dim * n_heads,
+            elem * head_dim * n_heads * l,
+        ],
         element_stride: [1, head_dim, head_dim * n_heads, head_dim * n_heads * l],
         dtype: t.dtype,
     }
@@ -854,7 +949,12 @@ fn permute_to_attn(t: TensorView, head_dim: u64, l: u64, n_heads: u64) -> Tensor
         // memory[d, h, t] = t * (head_dim * n_heads) + h * head_dim + d
         // we want view[d, t, h] = same offset
         // nb0 = 1, nb1 (per-t) = head_dim * n_heads, nb2 (per-h) = head_dim
-        byte_stride: [elem, elem * head_dim * n_heads, elem * head_dim, elem * head_dim * n_heads * l],
+        byte_stride: [
+            elem,
+            elem * head_dim * n_heads,
+            elem * head_dim,
+            elem * head_dim * n_heads * l,
+        ],
         element_stride: [1, head_dim * n_heads, head_dim, head_dim * n_heads * l],
         dtype: t.dtype,
     }
@@ -862,9 +962,7 @@ fn permute_to_attn(t: TensorView, head_dim: u64, l: u64, n_heads: u64) -> Tensor
 
 fn parse_params(gguf: &GgufFile) -> Result<LlamaParams, Box<dyn Error>> {
     let u32_key = |k: &'static str| -> Result<u32, Box<dyn Error>> {
-        let v = gguf
-            .get(k)
-            .ok_or(ModelError::MissingMetadata(k))?;
+        let v = gguf.get(k).ok_or(ModelError::MissingMetadata(k))?;
         coerce_u32(v).ok_or_else(|| {
             ModelError::BadMetadata {
                 key: k,
@@ -874,9 +972,7 @@ fn parse_params(gguf: &GgufFile) -> Result<LlamaParams, Box<dyn Error>> {
         })
     };
     let f32_key = |k: &'static str| -> Result<f32, Box<dyn Error>> {
-        let v = gguf
-            .get(k)
-            .ok_or(ModelError::MissingMetadata(k))?;
+        let v = gguf.get(k).ok_or(ModelError::MissingMetadata(k))?;
         coerce_f32(v).ok_or_else(|| {
             ModelError::BadMetadata {
                 key: k,

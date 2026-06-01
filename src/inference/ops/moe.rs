@@ -89,20 +89,20 @@ pub fn record_topk_moe(
         out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
         *w += 4;
     }
-    put_u(&mut push, &mut w, n_tokens);                     // n_rows
-    put_u(&mut push, &mut w, params.n_experts);             // n_experts_push (only read when nexperts_use_push=true)
+    put_u(&mut push, &mut w, n_tokens); // n_rows
+    put_u(&mut push, &mut w, params.n_experts); // n_experts_push (only read when nexperts_use_push=true)
     put_u(&mut push, &mut w, params.n_expert_used);
     // clamp_min / clamp_max bound the weight SUM before normalization.
     // llama.cpp defaults to ±infinity (ggml-vulkan.cpp:11611), i.e.
     // effectively unbounded. Setting these to 0.0 force-divides by 0 and
     // produces NaN routed-expert output when with_norm=true.
-    put_f(&mut push, &mut w, f32::NEG_INFINITY);            // clamp_min
-    put_f(&mut push, &mut w, f32::INFINITY);                // clamp_max
+    put_f(&mut push, &mut w, f32::NEG_INFINITY); // clamp_min
+    put_f(&mut push, &mut w, f32::INFINITY); // clamp_max
     put_u(&mut push, &mut w, params.gating_func);
-    put_u(&mut push, &mut w, 0);                            // has_bias
+    put_u(&mut push, &mut w, 0); // has_bias
     put_u(&mut push, &mut w, if params.with_norm { 1 } else { 0 });
-    put_f(&mut push, &mut w, 1.0);                          // output_scale
-    put_f(&mut push, &mut w, 0.0);                          // output_bias
+    put_f(&mut push, &mut w, 1.0); // output_scale
+    put_f(&mut push, &mut w, 0.0); // output_bias
 
     // Spec constants: WARP_SIZE, n_experts_spec, nexperts_use_push.
     // Pinning n_experts_spec at the actual count avoids the runtime
@@ -170,7 +170,12 @@ pub fn record_matvec_q4k_id(
     n_expert_used: u32,
 ) -> Result<(), Box<dyn Error>> {
     record_matvec_kquant_id(
-        ctx, a, b, ids, dst, n_expert_used,
+        ctx,
+        a,
+        b,
+        ids,
+        dst,
+        n_expert_used,
         "mul_mat_vec_q4_k_id",
         shaders::MUL_MAT_VEC_Q4_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ true,
@@ -189,7 +194,12 @@ pub fn record_matvec_q4k_id_nofence(
     n_expert_used: u32,
 ) -> Result<(), Box<dyn Error>> {
     record_matvec_kquant_id(
-        ctx, a, b, ids, dst, n_expert_used,
+        ctx,
+        a,
+        b,
+        ids,
+        dst,
+        n_expert_used,
         "mul_mat_vec_q4_k_id",
         shaders::MUL_MAT_VEC_Q4_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ true,
@@ -211,7 +221,12 @@ pub fn record_matvec_q5k_id(
     n_expert_used: u32,
 ) -> Result<(), Box<dyn Error>> {
     record_matvec_kquant_id(
-        ctx, a, b, ids, dst, n_expert_used,
+        ctx,
+        a,
+        b,
+        ids,
+        dst,
+        n_expert_used,
         "mul_mat_vec_q5_k_id",
         shaders::MUL_MAT_VEC_Q5_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ false, // Q5_K matvec uses B_TYPEV2 (binding 5)
@@ -230,7 +245,12 @@ pub fn record_matvec_q5k_id_nofence(
     n_expert_used: u32,
 ) -> Result<(), Box<dyn Error>> {
     record_matvec_kquant_id(
-        ctx, a, b, ids, dst, n_expert_used,
+        ctx,
+        a,
+        b,
+        ids,
+        dst,
+        n_expert_used,
         "mul_mat_vec_q5_k_id",
         shaders::MUL_MAT_VEC_Q5_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ false,
@@ -253,7 +273,12 @@ pub fn record_matvec_q6k_id(
     n_expert_used: u32,
 ) -> Result<(), Box<dyn Error>> {
     record_matvec_kquant_id(
-        ctx, a, b, ids, dst, n_expert_used,
+        ctx,
+        a,
+        b,
+        ids,
+        dst,
+        n_expert_used,
         "mul_mat_vec_q6_k_id",
         shaders::MUL_MAT_VEC_Q6_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ true,
@@ -272,7 +297,12 @@ pub fn record_matvec_q6k_id_nofence(
     n_expert_used: u32,
 ) -> Result<(), Box<dyn Error>> {
     record_matvec_kquant_id(
-        ctx, a, b, ids, dst, n_expert_used,
+        ctx,
+        a,
+        b,
+        ids,
+        dst,
+        n_expert_used,
         "mul_mat_vec_q6_k_id",
         shaders::MUL_MAT_VEC_Q6_K_ID_SPV.as_bytes(),
         /* b_alias_v4= */ true,
@@ -281,6 +311,7 @@ pub fn record_matvec_q6k_id_nofence(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 fn record_matvec_kquant_id(
     ctx: &mut DispatchContext,
     a: TensorView,
@@ -473,6 +504,7 @@ pub fn record_moe_down_q8_0(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 fn record_moe_down_impl(
     ctx: &mut DispatchContext,
     down_exps: TensorView,

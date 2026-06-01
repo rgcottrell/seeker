@@ -32,7 +32,10 @@ pub fn save(
     tokens: &[u32],
     messages: &[ChatMessage],
 ) -> Result<(), Box<dyn Error>> {
-    let k0 = cache.k_layers.first().ok_or("prompt-cache: cache has no layers")?;
+    let k0 = cache
+        .k_layers
+        .first()
+        .ok_or("prompt-cache: cache has no layers")?;
     let v0 = &cache.v_layers[0];
     let position = cache.position;
     let k_stride = k0.byte_stride[2]; // bytes per token position, all heads
@@ -83,7 +86,9 @@ pub fn save(
         f.write_all(unsafe { live_slice(host, v.byte_offset, v_live) })?;
     }
     if let Some(r) = &cache.ssm_region {
-        let p = r.host_ptr.ok_or("prompt-cache: SSM region not host-visible")?;
+        let p = r
+            .host_ptr
+            .ok_or("prompt-cache: SSM region not host-visible")?;
         f.write_all(unsafe { std::slice::from_raw_parts(p, r.size as usize) })?;
     }
     f.flush()?;
@@ -94,6 +99,7 @@ pub fn save(
 /// messages. `Ok(None)` means there is no cache file yet (a normal first run).
 /// `Err` means the file is missing-but-unreadable, corrupt, or for a different
 /// model/config — the caller should warn and start fresh.
+#[allow(clippy::type_complexity)]
 pub fn load(
     path: &Path,
     arch: &str,
@@ -168,16 +174,22 @@ pub fn load(
     for (k, v) in cache.k_layers.iter().zip(&cache.v_layers) {
         // SAFETY: spans validated above to lie within each view's allocation.
         let kb = r.take(k_live)?;
-        unsafe { std::ptr::copy_nonoverlapping(kb.as_ptr(), host.add(k.byte_offset as usize), k_live) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(kb.as_ptr(), host.add(k.byte_offset as usize), k_live)
+        };
         let vb = r.take(v_live)?;
-        unsafe { std::ptr::copy_nonoverlapping(vb.as_ptr(), host.add(v.byte_offset as usize), v_live) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(vb.as_ptr(), host.add(v.byte_offset as usize), v_live)
+        };
     }
     if has_ssm {
         let sr = cache.ssm_region.as_ref().unwrap();
         if ssm_size != sr.size {
             return Err("prompt-cache: SSM region size mismatch — ignoring".into());
         }
-        let p = sr.host_ptr.ok_or("prompt-cache: SSM region not host-visible")?;
+        let p = sr
+            .host_ptr
+            .ok_or("prompt-cache: SSM region not host-visible")?;
         let sb = r.take(ssm_size as usize)?;
         unsafe { std::ptr::copy_nonoverlapping(sb.as_ptr(), p, ssm_size as usize) };
     }
@@ -207,7 +219,10 @@ impl<'a> Reader<'a> {
         Self { d, pos: 0 }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], Box<dyn Error>> {
-        let end = self.pos.checked_add(n).ok_or("prompt-cache: length overflow")?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or("prompt-cache: length overflow")?;
         if end > self.d.len() {
             return Err("prompt-cache: file truncated".into());
         }

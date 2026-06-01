@@ -6,10 +6,10 @@
 use std::error::Error;
 
 use tokenizers::decoders::DecoderWrapper;
-use tokenizers::models::unigram::Unigram;
 use tokenizers::models::ModelWrapper;
-use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
+use tokenizers::models::unigram::Unigram;
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 
 use crate::gguf::GgufFile;
 use crate::tokenizer::bundle::Tokenizer;
@@ -26,9 +26,7 @@ pub(super) fn build(
         return Err(TokenizerError::WrongFieldType("tokenizer.ggml.scores"));
     }
     let token_types = read_optional_i32_array(gguf, "tokenizer.ggml.token_type");
-    let byte_fallback = token_types
-        .as_ref()
-        .is_some_and(|tt| tt.iter().any(|t| *t == 6 /* BYTE */));
+    let byte_fallback = token_types.as_ref().is_some_and(|tt| tt.contains(&6));
 
     let vocab: Vec<(String, f64)> = tokens
         .iter()

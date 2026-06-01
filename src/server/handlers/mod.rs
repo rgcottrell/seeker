@@ -4,5 +4,5 @@
 
 pub mod anthropic;
 pub mod llama;
-pub mod ops;
 pub mod openai;
+pub mod ops;

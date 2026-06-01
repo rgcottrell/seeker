@@ -46,6 +46,7 @@ use std::error::Error;
 use ash::vk;
 
 use crate::gguf::GgmlType;
+use crate::inference::Engine;
 use crate::inference::buffer::BufferRange;
 use crate::inference::command::record_compute_barrier;
 use crate::inference::context::DispatchContext;
@@ -55,7 +56,6 @@ use crate::inference::ops::elementwise::{record_add, record_mul};
 use crate::inference::ops::matmul;
 use crate::inference::pipeline::PipelineKey;
 use crate::inference::weights::{TensorView, WeightsHandle};
-use crate::inference::Engine;
 use crate::shaders;
 use crate::vision::preprocess::PreprocessedImage;
 
@@ -283,9 +283,11 @@ impl VisionEncoder {
             let f32v = |name: String| -> Result<TensorView, Box<dyn Error>> {
                 let v = weights.view(&name)?;
                 if v.dtype != GgmlType::F32 {
-                    return Err(
-                        format!("vision block {il}: expected F32 {name}, got {:?}", v.dtype).into(),
-                    );
+                    return Err(format!(
+                        "vision block {il}: expected F32 {name}, got {:?}",
+                        v.dtype
+                    )
+                    .into());
                 }
                 Ok(v)
             };
@@ -311,16 +313,20 @@ impl VisionEncoder {
         let mat = |name: &str| -> Result<TensorView, Box<dyn Error>> {
             let v = weights.view(name)?;
             if v.dtype != GgmlType::BF16 && v.dtype != GgmlType::F16 && v.dtype != GgmlType::F32 {
-                return Err(
-                    format!("vision merger: expected BF16/F16/F32 {name}, got {:?}", v.dtype).into(),
-                );
+                return Err(format!(
+                    "vision merger: expected BF16/F16/F32 {name}, got {:?}",
+                    v.dtype
+                )
+                .into());
             }
             Ok(v)
         };
         let f32v = |name: &str| -> Result<TensorView, Box<dyn Error>> {
             let v = weights.view(name)?;
             if v.dtype != GgmlType::F32 {
-                return Err(format!("vision merger: expected F32 {name}, got {:?}", v.dtype).into());
+                return Err(
+                    format!("vision merger: expected F32 {name}, got {:?}", v.dtype).into(),
+                );
             }
             Ok(v)
         };
@@ -546,9 +552,27 @@ impl VisionEncoder {
         record_fill_zero(ctx, q_c)?;
         record_fill_zero(ctx, k_c)?;
         record_fill_zero(ctx, v_c)?;
-        record_copy_pad_head(ctx, qkv_fa_view(&qkv, head_dim, n_head, n_pos, 0), &q_c, head_dim, hd_pad)?;
-        record_copy_pad_head(ctx, qkv_fa_view(&qkv, head_dim, n_head, n_pos, n_embd), &k_c, head_dim, hd_pad)?;
-        record_copy_pad_head(ctx, qkv_fa_view(&qkv, head_dim, n_head, n_pos, 2 * n_embd), &v_c, head_dim, hd_pad)?;
+        record_copy_pad_head(
+            ctx,
+            qkv_fa_view(&qkv, head_dim, n_head, n_pos, 0),
+            &q_c,
+            head_dim,
+            hd_pad,
+        )?;
+        record_copy_pad_head(
+            ctx,
+            qkv_fa_view(&qkv, head_dim, n_head, n_pos, n_embd),
+            &k_c,
+            head_dim,
+            hd_pad,
+        )?;
+        record_copy_pad_head(
+            ctx,
+            qkv_fa_view(&qkv, head_dim, n_head, n_pos, 2 * n_embd),
+            &v_c,
+            head_dim,
+            hd_pad,
+        )?;
         if want("qcopy") {
             return Ok(q_c);
         }
@@ -628,7 +652,11 @@ impl VisionEncoder {
     ) -> Result<TensorView, Box<dyn Error>> {
         let n_embd = self.n_embd;
         let n_pos = x.dims[1] as usize;
-        debug_assert_eq!(n_pos % 4, 0, "merger needs n_pos divisible by 4 (2x2 merge)");
+        debug_assert_eq!(
+            n_pos % 4,
+            0,
+            "merger needs n_pos divisible by 4 (2x2 merge)"
+        );
         let n_merged = n_pos / 4;
         let merge_in = 4 * n_embd;
         let proj = self.projection_dim;
@@ -765,8 +793,9 @@ pub fn encode_image_chunked(
     // single-submit path (byte-identical, fewer fence waits). Attention work
     // ~ n_pos² per block.
     if n_pos * n_pos * nblocks as u64 <= vision_submit_budget() {
-        return engine
-            .forward(weights, |ctx| Ok(encoder.encode_image(ctx, img, host_weights)?.range()));
+        return engine.forward(weights, |ctx| {
+            Ok(encoder.encode_image(ctx, img, host_weights)?.range())
+        });
     }
 
     let n_embd = encoder.n_embd as u64;
@@ -777,9 +806,20 @@ pub fn encode_image_chunked(
         vk::BufferUsageFlags::STORAGE_BUFFER,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-    let carry_range = BufferRange { buffer: carry.buffer, offset: 0, size: n_embd * n_pos * 4 };
-    let result =
-        encode_chunked_submits(engine, weights, encoder, img, host_weights, carry_range, nblocks);
+    let carry_range = BufferRange {
+        buffer: carry.buffer,
+        offset: 0,
+        size: n_embd * n_pos * 4,
+    };
+    let result = encode_chunked_submits(
+        engine,
+        weights,
+        encoder,
+        img,
+        host_weights,
+        carry_range,
+        nblocks,
+    );
     let mut carry = carry;
     carry.destroy(&engine.device.device);
     result
@@ -837,7 +877,9 @@ fn encode_chunked_submits(
     }
 
     // Final submit: merger reads carry → embeddings, read back to host.
-    engine.forward(weights, |ctx| Ok(encoder.record_merger(ctx, carry_view())?.range()))
+    engine.forward(weights, |ctx| {
+        Ok(encoder.record_merger(ctx, carry_view())?.range())
+    })
 }
 
 /// View the Q/K/V section (base_row 0 / n_embd / 2*n_embd) of the fused `qkv`
@@ -864,7 +906,12 @@ fn qkv_fa_view(
             qkv.byte_stride[0] * head_dim as u64,
             qkv.byte_stride[0] * head_dim as u64 * n_head as u64,
         ],
-        element_stride: [1, row_pitch, head_dim as u64, head_dim as u64 * n_head as u64],
+        element_stride: [
+            1,
+            row_pitch,
+            head_dim as u64,
+            head_dim as u64 * n_head as u64,
+        ],
         dtype: GgmlType::F32,
     }
 }
@@ -878,13 +925,14 @@ fn record_fill_zero(ctx: &mut DispatchContext, dst: TensorView) -> Result<(), Bo
     push[0..4].copy_from_slice(&nelements.to_ne_bytes()); // KX
     // param1 (offset 8) = 0.0 -> already zero.
     let key = PipelineKey::dense("fill_f32", 1, GENERIC_PARAMS_BYTES, Vec::new());
-    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::FILL_F32_SPV.as_bytes())?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::FILL_F32_SPV.as_bytes())?;
     let workgroups = [nelements.div_ceil(512), 1, 1];
     bind_and_dispatch(ctx, &pipeline, &[0], &[dst.range()], &push, workgroups)?;
     record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
-
 
 /// Gather the real `head_dim` channels of each head from the padded flash_attn
 /// output `fa_out` `[hd_pad*n_head, n_pos]` (row `head*hd_pad + d`) into
@@ -909,7 +957,12 @@ fn record_gather_unpad_heads(
         byte_offset: fa_out.byte_offset,
         byte_size: fa_out.byte_size,
         dims: [head_dim as u64, n_head as u64, n_pos as u64, 1],
-        byte_stride: [4, 4 * hd_pad as u64, 4 * pad_col, 4 * pad_col * n_pos as u64],
+        byte_stride: [
+            4,
+            4 * hd_pad as u64,
+            4 * pad_col,
+            4 * pad_col * n_pos as u64,
+        ],
         element_stride: [1, hd_pad as u64, pad_col, pad_col * n_pos as u64],
         dtype: GgmlType::F32,
     };
@@ -957,10 +1010,19 @@ fn record_layernorm_affine(
     push[0..4].copy_from_slice(&ne00.to_ne_bytes()); // KX
     push[8..12].copy_from_slice(&eps.to_ne_bytes()); // param1 = eps
     let key = PipelineKey::dense("norm_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
-    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::NORM_F32_SPV.as_bytes())?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::NORM_F32_SPV.as_bytes())?;
     let rows = (src.dims[1].max(1) * src.dims[2].max(1) * src.dims[3].max(1)) as u32;
     let workgroups = row_workgroups(rows);
-    bind_and_dispatch(ctx, &pipeline, &[0, 1], &[src.range(), dst.range()], &push, workgroups)?;
+    bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, dst.range());
 
     let w_bcast = broadcast_col_view(&weight, ne00 as u64);
@@ -1080,7 +1142,9 @@ fn record_vision_rope(
     debug_assert_eq!(w, ROPE_PARAMS_BYTES as usize);
 
     let key = PipelineKey::dense("rope_vision_f32", 4, ROPE_PARAMS_BYTES, Vec::new());
-    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::ROPE_VISION_F32_SPV.as_bytes())?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::ROPE_VISION_F32_SPV.as_bytes())?;
     // Shader: numthreads(1,256,1); i0 = 2*y so y spans n_dims/2 pairs; row = x +
     // 32768*z. Bindings: 0=A, 1=pos, 2=freq_factor (unused; bind pos), 3=D.
     let pairs = (ne00 / 2).max(1);
@@ -1145,10 +1209,19 @@ fn record_copy_contiguous(
         crate::inference::ops::UNARY_PARAMS_BYTES,
         Vec::new(),
     );
-    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::COPY_F32_SPV.as_bytes())?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::COPY_F32_SPV.as_bytes())?;
     let nelements: u32 = dst.dims.iter().product::<u64>() as u32;
     let workgroups = [nelements.div_ceil(512), 1, 1];
-    bind_and_dispatch(ctx, &pipeline, &[0, 1], &[src.range(), dst.range()], &push, workgroups)?;
+    bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
@@ -1203,9 +1276,18 @@ fn record_gelu(
     let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
     push[0..4].copy_from_slice(&nelements.to_ne_bytes()); // KX
     let key = PipelineKey::dense("gelu_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
-    let pipeline = *ctx.pipelines.get(ctx.device, key, shaders::GELU_F32_SPV.as_bytes())?;
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::GELU_F32_SPV.as_bytes())?;
     let workgroups = [nelements.div_ceil(512), 1, 1];
-    bind_and_dispatch(ctx, &pipeline, &[0, 1], &[src.range(), dst.range()], &push, workgroups)?;
+    bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
     record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
@@ -1264,6 +1346,7 @@ fn i32_to_bytes(data: &[i32]) -> Vec<u8> {
 /// oracle. Implements the SAME math from the (up-converted f32)
 /// [`BlockHostWeights`] with plain loops. `x` is `[n_embd, n_pos]`
 /// (idx = c + n_embd*t).
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 pub fn block_cpu(
     bw: &BlockHostWeights,
     x: &[f32],
@@ -1483,7 +1566,7 @@ fn layernorm_affine_cpu(
 /// Tanh-approximation GELU, matching `ggml_gelu` / `gelu.slang`:
 /// `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
 fn gelu_tanh(x: f32) -> f32 {
-    const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
     const COEF_A: f32 = 0.044715;
     let inner = SQRT_2_OVER_PI * (x + COEF_A * x * x * x);
     0.5 * x * (1.0 + inner.tanh())
@@ -1681,20 +1764,12 @@ pub fn f16_to_f32(bits: u16) -> f32 {
         (mant as f32) * (2.0f32).powi(-24)
     } else if exp == 0x1f {
         // inf / NaN
-        if mant == 0 {
-            f32::INFINITY
-        } else {
-            f32::NAN
-        }
+        if mant == 0 { f32::INFINITY } else { f32::NAN }
     } else {
         // normal: (1 + mant/1024) * 2^(exp-15)
         (1.0f32 + (mant as f32) / 1024.0) * (2.0f32).powi(exp as i32 - 15)
     };
-    if sign == 1 {
-        -val
-    } else {
-        val
-    }
+    if sign == 1 { -val } else { val }
 }
 
 /// `bias[c] + pos_embd_resized_reordered[c, tok]` as a flat `[n_embd,
@@ -1752,6 +1827,7 @@ pub fn patch_embed_cpu(
         }
         for m in 0..n_embd {
             let mut acc = 0f32;
+            #[allow(clippy::needless_range_loop)]
             for kk in 0..k {
                 let wv = hw.patch_embd_0[kk + k * m] + hw.patch_embd_1[kk + k * m];
                 acc += wv * col[kk];
@@ -1952,7 +2028,12 @@ fn alloc_scratch_write(
 
 /// Build a dense (contiguous) F32 [`TensorView`] over a scratch range.
 fn dense_view(range: &BufferRange, dims: [u64; 4]) -> TensorView {
-    let es = [1u64, dims[0], dims[0] * dims[1], dims[0] * dims[1] * dims[2]];
+    let es = [
+        1u64,
+        dims[0],
+        dims[0] * dims[1],
+        dims[0] * dims[1] * dims[2],
+    ];
     TensorView {
         buffer: range.buffer,
         byte_offset: range.offset,
@@ -1977,6 +2058,7 @@ mod tests {
         let npy = 4;
         let n = npx * npy;
         let mut seen = vec![false; n];
+        #[allow(clippy::needless_range_loop)]
         for tok in 0..n {
             let (pw, ph) = token_to_patch(tok, npx);
             assert!(pw < npx && ph < npy, "tok {tok} -> ({pw},{ph}) out of grid");
@@ -2021,10 +2103,22 @@ mod tests {
     fn merge_map_exact_4x4() {
         let npx = 4;
         let expected = [
-            (0, 0), (1, 0), (0, 1), (1, 1),
-            (2, 0), (3, 0), (2, 1), (3, 1),
-            (0, 2), (1, 2), (0, 3), (1, 3),
-            (2, 2), (3, 2), (2, 3), (3, 3),
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (1, 1),
+            (2, 0),
+            (3, 0),
+            (2, 1),
+            (3, 1),
+            (0, 2),
+            (1, 2),
+            (0, 3),
+            (1, 3),
+            (2, 2),
+            (3, 2),
+            (2, 3),
+            (3, 3),
         ];
         for (tok, &want) in expected.iter().enumerate() {
             assert_eq!(token_to_patch(tok, npx), want, "tok {tok}");
@@ -2039,6 +2133,7 @@ mod tests {
         let npy = 4;
         let n = npx * npy;
         let mut seen = vec![false; n];
+        #[allow(clippy::needless_range_loop)]
         for tok in 0..n {
             let (pw, ph) = token_to_patch(tok, npx);
             assert!(pw < npx && ph < npy, "tok {tok} -> ({pw},{ph})");
@@ -2063,6 +2158,7 @@ mod tests {
             }
         }
         let out = resize_position_embeddings_reordered(&base, n_embd, side, side);
+        #[allow(clippy::needless_range_loop)]
         for tok in 0..(side * side) {
             let (pw, ph) = token_to_patch(tok, side);
             assert_eq!(out[tok], (pw + 100 * ph) as f32, "tok {tok}");
@@ -2094,6 +2190,7 @@ mod tests {
             let x_min = ((x - support0 + po) as i64).max(0) as usize;
             let x_max = ((x + support0 + po) as i64).min(src_w as i64) as usize;
             let (mut val, mut tw) = (0f32, 0f32);
+            #[allow(clippy::needless_range_loop)]
             for sx in x_min..x_max {
                 let w = tri((sx as f32 - x + po) * invscale0);
                 if w <= 0.0 {
@@ -2102,14 +2199,18 @@ mod tests {
                 val += src[sx] * w;
                 tw += w;
             }
-            if tw > 0.0 {
-                val / tw
-            } else {
-                0.0
-            }
+            if tw > 0.0 { val / tw } else { 0.0 }
         };
-        assert!((sample(0) - 30.0 / 1.75).abs() < 1e-5, "dst0 got {}", sample(0));
-        assert!((sample(1) - 57.5 / 1.75).abs() < 1e-5, "dst1 got {}", sample(1));
+        assert!(
+            (sample(0) - 30.0 / 1.75).abs() < 1e-5,
+            "dst0 got {}",
+            sample(0)
+        );
+        assert!(
+            (sample(1) - 57.5 / 1.75).abs() < 1e-5,
+            "dst1 got {}",
+            sample(1)
+        );
     }
 
     // ---- Slice 3 (ViT block) CPU unit tests ----
@@ -2145,7 +2246,11 @@ mod tests {
         assert!(gelu_tanh(0.0).abs() < 1e-7);
         assert!((gelu_tanh(10.0) - 10.0).abs() < 1e-3);
         assert!(gelu_tanh(-10.0).abs() < 1e-4);
-        assert!((gelu_tanh(1.0) - 0.841_192).abs() < 1e-4, "got {}", gelu_tanh(1.0));
+        assert!(
+            (gelu_tanh(1.0) - 0.841_192).abs() < 1e-4,
+            "got {}",
+            gelu_tanh(1.0)
+        );
         assert!(gelu_tanh(0.5) > gelu_tanh(-0.5));
     }
 
@@ -2170,7 +2275,11 @@ mod tests {
         let mut seen = vec![0u8; 3 * n_embd];
         for hd in 0..n_head {
             for d in 0..head_dim {
-                for base in [hd * head_dim, n_embd + hd * head_dim, 2 * n_embd + hd * head_dim] {
+                for base in [
+                    hd * head_dim,
+                    n_embd + hd * head_dim,
+                    2 * n_embd + hd * head_dim,
+                ] {
                     assert!(base + d < 3 * n_embd);
                     seen[base + d] += 1;
                 }
@@ -2228,10 +2337,15 @@ mod tests {
             ffn_down_w: vec![0.0; n_ff * n_embd],
             ffn_down_b: vec![0.0; n_embd],
         };
-        let x: Vec<f32> = (0..n_embd * n_pos).map(|i| (i as f32) * 0.1 - 1.0).collect();
+        let x: Vec<f32> = (0..n_embd * n_pos)
+            .map(|i| (i as f32) * 0.1 - 1.0)
+            .collect();
         let out = block_cpu(&bw, &x, n_embd, n_head, n_ff, 1e-6, gw, gh);
         for (o, xi) in out.iter().zip(x.iter()) {
-            assert!((o - xi).abs() < 1e-5, "zero-weight block not identity: {o} vs {xi}");
+            assert!(
+                (o - xi).abs() < 1e-5,
+                "zero-weight block not identity: {o} vs {xi}"
+            );
         }
     }
 
@@ -2257,7 +2371,9 @@ mod tests {
             mm2_b: vec![10.0, 20.0, 30.0, 40.0],
         };
         // Arbitrary, non-degenerate input — output must NOT depend on it.
-        let x: Vec<f32> = (0..n_embd * n_pos).map(|i| (i as f32) * 0.07 - 1.3).collect();
+        let x: Vec<f32> = (0..n_embd * n_pos)
+            .map(|i| (i as f32) * 0.07 - 1.3)
+            .collect();
         let out = merger_cpu(&mh, &x, n_embd, 1e-6);
         assert_eq!(out.len(), proj * n_merged, "merger output shape");
         for b in 0..n_merged {
@@ -2303,7 +2419,9 @@ mod tests {
             ffn_down_w: vec![0.0; n_ff * n_embd],
             ffn_down_b: vec![0.0; n_embd],
         };
-        let x: Vec<f32> = (0..n_embd * n_pos).map(|i| (i as f32) * 0.05 - 1.0).collect();
+        let x: Vec<f32> = (0..n_embd * n_pos)
+            .map(|i| (i as f32) * 0.05 - 1.0)
+            .collect();
         let out = block_cpu(&bw, &x, n_embd, n_head, n_ff, 1e-6, gw, gh);
         for (o, xi) in out.iter().zip(x.iter()) {
             assert!((o - xi).abs() < 1e-5, "2x2 residual mismatch: {o} vs {xi}");

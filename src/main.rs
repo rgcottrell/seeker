@@ -17,11 +17,11 @@ mod commands;
 #[allow(dead_code)]
 mod gguf;
 #[allow(dead_code)]
-mod runtime_flags;
-#[allow(dead_code)]
 mod inference;
 #[allow(dead_code)]
 mod models;
+#[allow(dead_code)]
+mod runtime_flags;
 #[allow(dead_code)]
 mod server;
 mod tokenizer;
@@ -124,7 +124,13 @@ mod tests {
     fn rewrites_system_prompt_shorts() {
         assert_eq!(
             rewrite_shorts(["seeker", "chat", "-sys", "Be terse.", "-sysf=p.txt"]),
-            vec!["seeker", "chat", "--system-prompt", "Be terse.", "--system-prompt-file=p.txt"]
+            vec![
+                "seeker",
+                "chat",
+                "--system-prompt",
+                "Be terse.",
+                "--system-prompt-file=p.txt"
+            ]
         );
     }
 
@@ -159,17 +165,32 @@ mod tests {
     #[test]
     fn rewrites_equals_form_and_hfr_alias() {
         let rewritten = rewrite_shorts(["seeker", "download", "-hfr=org/name:Q4_K_M"]);
-        assert_eq!(rewritten, vec!["seeker", "download", "--hf-repo=org/name:Q4_K_M"]);
+        assert_eq!(
+            rewritten,
+            vec!["seeker", "download", "--hf-repo=org/name:Q4_K_M"]
+        );
     }
 
     #[test]
     fn leaves_unrelated_args_alone() {
         let rewritten = rewrite_shorts([
-            "seeker", "download", "--hf-repo", "org/name", "--offline", "-help",
+            "seeker",
+            "download",
+            "--hf-repo",
+            "org/name",
+            "--offline",
+            "-help",
         ]);
         assert_eq!(
             rewritten,
-            vec!["seeker", "download", "--hf-repo", "org/name", "--offline", "-help"]
+            vec![
+                "seeker",
+                "download",
+                "--hf-repo",
+                "org/name",
+                "--offline",
+                "-help"
+            ]
         );
     }
 }

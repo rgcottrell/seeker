@@ -14,7 +14,9 @@ pub enum TokenizerError {
     #[error("GGUF field `{0}` has unexpected type")]
     WrongFieldType(&'static str),
 
-    #[error("unsupported tokenizer.ggml.model: `{0}`; only `gpt2` (BPE) and `llama` (Unigram) are wired up")]
+    #[error(
+        "unsupported tokenizer.ggml.model: `{0}`; only `gpt2` (BPE) and `llama` (Unigram) are wired up"
+    )]
     UnsupportedModel(String),
 
     #[error("tokenizer.ggml.tokens is empty")]

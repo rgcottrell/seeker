@@ -301,7 +301,7 @@ mod tests {
             self
         }
         fn pad_to_alignment(mut self, alignment: usize) -> Self {
-            while self.0.len() % alignment != 0 {
+            while !self.0.len().is_multiple_of(alignment) {
                 self.0.push(0);
             }
             self
@@ -317,7 +317,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_magic() {
-        let bytes = b"NOPE\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let bytes =
+            b"NOPE\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
         let err = parse_index(bytes).unwrap_err();
         assert!(matches!(err, GgufError::BadMagic(_)));
     }
@@ -337,7 +338,10 @@ mod tests {
 
     #[test]
     fn parses_empty_v3_header() {
-        let bytes = GgufBuilder::new().header(3, 0, 0).pad_to_alignment(32).finish();
+        let bytes = GgufBuilder::new()
+            .header(3, 0, 0)
+            .pad_to_alignment(32)
+            .finish();
         let p = parse_index(&bytes).unwrap();
         assert_eq!(p.version, 3);
         assert_eq!(p.alignment, 32);
@@ -360,7 +364,9 @@ mod tests {
             .finish();
         let p = parse_index(&bytes).unwrap();
         assert_eq!(p.alignment, 64);
-        assert!(matches!(p.metadata.get("general.name"), Some(MetadataValue::String(s)) if s == "test"));
+        assert!(
+            matches!(p.metadata.get("general.name"), Some(MetadataValue::String(s)) if s == "test")
+        );
     }
 
     #[test]
@@ -370,7 +376,7 @@ mod tests {
             .string("tokenizer.ggml.tokens")
             .u32(MetadataValueType::Array as u32)
             .u32(MetadataValueType::String as u32) // inner type
-            .u64(3)                                 // length
+            .u64(3) // length
             .string("hello")
             .string("world")
             .string("!")
@@ -392,13 +398,13 @@ mod tests {
         let bytes = GgufBuilder::new()
             .header(3, 1, 0)
             .string("x")
-            .u32(2)                              // n_dims
+            .u32(2) // n_dims
             .u64(4)
             .u64(2)
             .u32(GgmlType::F32 as u32)
             .u64(0)
             .pad_to_alignment(32)
-            .raw(&[0u8; 32])                     // tensor data
+            .raw(&[0u8; 32]) // tensor data
             .finish();
         let p = parse_index(&bytes).unwrap();
         assert_eq!(p.tensors.len(), 1);
@@ -413,9 +419,9 @@ mod tests {
     fn alignment_padding_positions_tensor_data() {
         // Empty header, no metadata, no tensors. Then 32-byte alignment.
         let bytes = GgufBuilder::new()
-            .header(3, 0, 0)            // 4 + 4 + 8 + 8 = 24 bytes
-            .pad_to_alignment(32)        // pad 8 bytes to reach offset 32
-            .raw(&[0u8; 64])             // tensor data area
+            .header(3, 0, 0) // 4 + 4 + 8 + 8 = 24 bytes
+            .pad_to_alignment(32) // pad 8 bytes to reach offset 32
+            .raw(&[0u8; 64]) // tensor data area
             .finish();
         let p = parse_index(&bytes).unwrap();
         assert_eq!(p.tensor_data_start, 32);

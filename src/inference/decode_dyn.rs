@@ -135,12 +135,7 @@ pub fn write_field_ctx<T: Copy>(
 /// Host-write a single field of an already-allocated `DecodeDyn` slot.
 /// Used by the replay path which has already resolved the mapped
 /// pointer once at the top of the call.
-pub fn write_field<T: Copy>(
-    host_ptr: *mut u8,
-    range_offset: u64,
-    field_offset: usize,
-    value: T,
-) {
+pub fn write_field<T: Copy>(host_ptr: *mut u8, range_offset: u64, field_offset: usize, value: T) {
     debug_assert!(field_offset + std::mem::size_of::<T>() <= DecodeDyn::SIZE as usize);
     unsafe {
         let dst = host_ptr.add(range_offset as usize + field_offset) as *mut T;

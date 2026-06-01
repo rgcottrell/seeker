@@ -51,7 +51,10 @@ fn done_sentinel() -> Event {
 /// Generic adapter: drive an SSE stream from the worker's reply channel,
 /// mapping each `GenEvent` to zero-or-more SSE frames via `frame`. Ends the
 /// stream after the terminal event's frames drain.
-fn event_stream<F>(rx: Receiver<GenEvent>, frame: F) -> impl Stream<Item = Result<Event, Infallible>>
+fn event_stream<F>(
+    rx: Receiver<GenEvent>,
+    frame: F,
+) -> impl Stream<Item = Result<Event, Infallible>>
 where
     F: FnMut(GenEvent) -> Vec<Event> + Send + 'static,
 {
@@ -108,7 +111,10 @@ pub fn openai_chat_stream(
         };
         match ev {
             GenEvent::Started { .. } => {
-                vec![data(base(json!({"role": "assistant", "content": ""}), json!(null)))]
+                vec![data(base(
+                    json!({"role": "assistant", "content": ""}),
+                    json!(null),
+                ))]
             }
             GenEvent::Delta(t) => vec![data(base(json!({"content": t}), json!(null)))],
             GenEvent::Done { stop_reason, .. } => vec![
@@ -141,7 +147,10 @@ pub fn openai_completion_stream(
             GenEvent::Started { .. } => vec![],
             GenEvent::Delta(t) => vec![data(base(&t, json!(null)))],
             GenEvent::Done { stop_reason, .. } => {
-                vec![data(base("", json!(stop_reason.openai_finish()))), done_sentinel()]
+                vec![
+                    data(base("", json!(stop_reason.openai_finish()))),
+                    done_sentinel(),
+                ]
             }
             GenEvent::Error(e) => vec![
                 data(json!({"error": {"message": e, "type": "server_error"}})),

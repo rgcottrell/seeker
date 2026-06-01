@@ -20,7 +20,7 @@ use crate::inference::pipeline::PipelineKey;
 use crate::inference::weights::TensorView;
 use crate::shaders;
 
-use super::{unary_params_bytes, UNARY_PARAMS_BYTES};
+use super::{UNARY_PARAMS_BYTES, unary_params_bytes};
 
 pub fn record_cast(
     ctx: &mut DispatchContext,
@@ -62,11 +62,7 @@ pub fn record_cast(
     // non-IQ; LSX=16 with shmem init for IQ4_NL, but still one block).
     let nelements: u64 = src.dims.iter().product();
     let per_wg = pick.elements_per_workgroup;
-    let workgroups = [
-        ((nelements + per_wg - 1) / per_wg) as u32,
-        1,
-        1,
-    ];
+    let workgroups = [nelements.div_ceil(per_wg) as u32, 1, 1];
 
     super::bind_and_dispatch(
         ctx,
@@ -96,15 +92,30 @@ enum ShaderKind {
 fn pick_shader(src: GgmlType, dst: GgmlType) -> Result<ShaderPick, Box<dyn Error>> {
     use GgmlType::*;
     fn plain(name: &'static str, spirv: &'static [u8]) -> ShaderPick {
-        ShaderPick { name, spirv, elements_per_workgroup: 512, kind: ShaderKind::Plain }
+        ShaderPick {
+            name,
+            spirv,
+            elements_per_workgroup: 512,
+            kind: ShaderKind::Plain,
+        }
     }
     fn to_quant(name: &'static str, spirv: &'static [u8]) -> ShaderPick {
         // copy_to_quant: 32 threads × QUANT_K=32 = 1024 elements / WG.
-        ShaderPick { name, spirv, elements_per_workgroup: 1024, kind: ShaderKind::CopyToQuant }
+        ShaderPick {
+            name,
+            spirv,
+            elements_per_workgroup: 1024,
+            kind: ShaderKind::CopyToQuant,
+        }
     }
     fn from_quant(name: &'static str, spirv: &'static [u8]) -> ShaderPick {
         // copy_from_quant: one workgroup processes one block = QUANT_K=32 elements.
-        ShaderPick { name, spirv, elements_per_workgroup: 32, kind: ShaderKind::CopyFromQuant }
+        ShaderPick {
+            name,
+            spirv,
+            elements_per_workgroup: 32,
+            kind: ShaderKind::CopyFromQuant,
+        }
     }
     Ok(match (src, dst) {
         (F32, F32) => plain("copy_f32", shaders::COPY_F32_SPV.as_bytes()),
@@ -115,21 +126,56 @@ fn pick_shader(src: GgmlType, dst: GgmlType) -> Result<ShaderPick, Box<dyn Error
         (BF16, F32) => plain("copy_bf16_to_f32", shaders::COPY_BF16_TO_F32_SPV.as_bytes()),
         (F32, I32) => plain("copy_f32_to_i32", shaders::COPY_F32_TO_I32_SPV.as_bytes()),
 
-        (F32, Q4_0) => to_quant("copy_to_quant_q4_0", shaders::COPY_TO_QUANT_Q4_0_SPV.as_bytes()),
-        (F32, Q4_1) => to_quant("copy_to_quant_q4_1", shaders::COPY_TO_QUANT_Q4_1_SPV.as_bytes()),
-        (F32, Q5_0) => to_quant("copy_to_quant_q5_0", shaders::COPY_TO_QUANT_Q5_0_SPV.as_bytes()),
-        (F32, Q5_1) => to_quant("copy_to_quant_q5_1", shaders::COPY_TO_QUANT_Q5_1_SPV.as_bytes()),
-        (F32, Q8_0) => to_quant("copy_to_quant_q8_0", shaders::COPY_TO_QUANT_Q8_0_SPV.as_bytes()),
-        (F32, IQ4_NL) => to_quant("copy_to_quant_iq4_nl", shaders::COPY_TO_QUANT_IQ4_NL_SPV.as_bytes()),
+        (F32, Q4_0) => to_quant(
+            "copy_to_quant_q4_0",
+            shaders::COPY_TO_QUANT_Q4_0_SPV.as_bytes(),
+        ),
+        (F32, Q4_1) => to_quant(
+            "copy_to_quant_q4_1",
+            shaders::COPY_TO_QUANT_Q4_1_SPV.as_bytes(),
+        ),
+        (F32, Q5_0) => to_quant(
+            "copy_to_quant_q5_0",
+            shaders::COPY_TO_QUANT_Q5_0_SPV.as_bytes(),
+        ),
+        (F32, Q5_1) => to_quant(
+            "copy_to_quant_q5_1",
+            shaders::COPY_TO_QUANT_Q5_1_SPV.as_bytes(),
+        ),
+        (F32, Q8_0) => to_quant(
+            "copy_to_quant_q8_0",
+            shaders::COPY_TO_QUANT_Q8_0_SPV.as_bytes(),
+        ),
+        (F32, IQ4_NL) => to_quant(
+            "copy_to_quant_iq4_nl",
+            shaders::COPY_TO_QUANT_IQ4_NL_SPV.as_bytes(),
+        ),
 
-        (Q4_0, F32) => from_quant("copy_from_quant_q4_0", shaders::COPY_FROM_QUANT_Q4_0_SPV.as_bytes()),
-        (Q4_1, F32) => from_quant("copy_from_quant_q4_1", shaders::COPY_FROM_QUANT_Q4_1_SPV.as_bytes()),
-        (Q5_0, F32) => from_quant("copy_from_quant_q5_0", shaders::COPY_FROM_QUANT_Q5_0_SPV.as_bytes()),
-        (Q5_1, F32) => from_quant("copy_from_quant_q5_1", shaders::COPY_FROM_QUANT_Q5_1_SPV.as_bytes()),
-        (Q8_0, F32) => from_quant("copy_from_quant_q8_0", shaders::COPY_FROM_QUANT_Q8_0_SPV.as_bytes()),
-        (IQ4_NL, F32) => from_quant("copy_from_quant_iq4_nl", shaders::COPY_FROM_QUANT_IQ4_NL_SPV.as_bytes()),
+        (Q4_0, F32) => from_quant(
+            "copy_from_quant_q4_0",
+            shaders::COPY_FROM_QUANT_Q4_0_SPV.as_bytes(),
+        ),
+        (Q4_1, F32) => from_quant(
+            "copy_from_quant_q4_1",
+            shaders::COPY_FROM_QUANT_Q4_1_SPV.as_bytes(),
+        ),
+        (Q5_0, F32) => from_quant(
+            "copy_from_quant_q5_0",
+            shaders::COPY_FROM_QUANT_Q5_0_SPV.as_bytes(),
+        ),
+        (Q5_1, F32) => from_quant(
+            "copy_from_quant_q5_1",
+            shaders::COPY_FROM_QUANT_Q5_1_SPV.as_bytes(),
+        ),
+        (Q8_0, F32) => from_quant(
+            "copy_from_quant_q8_0",
+            shaders::COPY_FROM_QUANT_Q8_0_SPV.as_bytes(),
+        ),
+        (IQ4_NL, F32) => from_quant(
+            "copy_from_quant_iq4_nl",
+            shaders::COPY_FROM_QUANT_IQ4_NL_SPV.as_bytes(),
+        ),
 
         _ => return Err(format!("cast {src:?} → {dst:?} not supported").into()),
     })
 }
-

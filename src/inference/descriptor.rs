@@ -50,7 +50,11 @@ impl DescriptorAllocator {
         indices: &[u32],
         bindings: &[BufferRange],
     ) -> Result<vk::DescriptorSet, Box<dyn Error>> {
-        assert_eq!(indices.len(), bindings.len(), "indices/bindings length mismatch");
+        assert_eq!(
+            indices.len(),
+            bindings.len(),
+            "indices/bindings length mismatch"
+        );
         let layouts = [set_layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.pool)

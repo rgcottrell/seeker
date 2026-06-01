@@ -1,14 +1,14 @@
 //! Anthropic Messages API handlers.
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 use crate::server::convert::{self, anthropic_to_chat};
 use crate::server::error;
-use crate::server::inference::{collect, GenConfig, GenOutput};
+use crate::server::inference::{GenConfig, GenOutput, collect};
 use crate::server::state::AppState;
 use crate::server::stream::{anthropic_messages_stream, gen_id};
 use crate::server::types::anthropic::{

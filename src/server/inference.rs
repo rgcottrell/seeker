@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::gguf::{GgmlType, GgufFile};
+use crate::inference::Engine;
 use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
 use crate::inference::sample::{Sampler, SamplerConfig};
-use crate::inference::Engine;
-use crate::tokenizer::{build_tokenizer, Tokenizer};
+use crate::tokenizer::{Tokenizer, build_tokenizer};
 use crate::vision::encoder::{HostWeights, VisionEncoder};
 use crate::vision::preprocess::PreprocessedImage;
 
@@ -505,8 +505,15 @@ fn build_vision(engine: &Engine, mmproj_path: &Path) -> Result<VisionCtx, Box<dy
         cfg.eps,
     )?;
     let host_weights = HostWeights::from_gguf(&gguf)?;
-    let vision = crate::vision::VisionModel { config: cfg, weights };
-    Ok(VisionCtx { vision, encoder, host_weights })
+    let vision = crate::vision::VisionModel {
+        config: cfg,
+        weights,
+    };
+    Ok(VisionCtx {
+        vision,
+        encoder,
+        host_weights,
+    })
 }
 
 /// Worker entry point. Loads the model, signals readiness, then runs the
@@ -677,10 +684,13 @@ impl Worker {
         let first = {
             let mut sc = self.batch.slot_kvcache(idx as u32);
             sc.position = start_pos;
-            match self
-                .engine
-                .forward_sampled(&*self.model, &mut sc, &delta, start_pos, &mut sampler)
-            {
+            match self.engine.forward_sampled(
+                &*self.model,
+                &mut sc,
+                &delta,
+                start_pos,
+                &mut sampler,
+            ) {
                 Ok(t) => {
                     self.batch.positions[idx] = sc.position;
                     t
@@ -734,7 +744,12 @@ impl Worker {
         };
         // Stream the first (prefill) token now; it's fed back at the first
         // batched step. The rest advance in `decode_step`.
-        process_token(&self.model.tokenizer().tokenizer, &self.eog_ids, &mut seq, first);
+        process_token(
+            &self.model.tokenizer().tokenizer,
+            &self.eog_ids,
+            &mut seq,
+            first,
+        );
         self.active.push(seq);
     }
 
@@ -744,11 +759,23 @@ impl Worker {
     /// [`Self::schedule_step`] alongside other requests' decode, so a long
     /// prompt never blocks the worker. Failure → terminal frame + slab released.
     fn admit_unified(&mut self, job: GenJob) {
-        let GenJob { tokens: new_tokens, config, image: _, reply } = job;
-        let GenConfig { sampler: cfg, max_tokens, stop, ignore_eos, id_slot } = config;
+        let GenJob {
+            tokens: new_tokens,
+            config,
+            image: _,
+            reply,
+        } = job;
+        let GenConfig {
+            sampler: cfg,
+            max_tokens,
+            stop,
+            ignore_eos,
+            id_slot,
+        } = config;
         let prompt_tokens = new_tokens.len() as u32;
         if new_tokens.is_empty() {
-            let _ = reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
+            let _ =
+                reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
             return;
         }
         let Some(idx) = self.select_free_slab(&new_tokens, id_slot) else {
@@ -776,14 +803,23 @@ impl Worker {
         let num_computed = if pure_extension {
             // Reuse [0, common); prefill [common, prompt). If the whole prompt
             // is cached, rewind one so there's a last token to sample from.
-            if common < new_tokens.len() { common as u32 } else { common as u32 - 1 }
+            if common < new_tokens.len() {
+                common as u32
+            } else {
+                common as u32 - 1
+            }
         } else {
             self.batch.reset_slot(idx as u32);
             0
         };
         self.batch.positions[idx] = num_computed;
         self.slots[idx].active = true;
-        tracing::debug!(slab = idx, prompt = prompt_tokens, reused = num_computed, "serve: admit (unified)");
+        tracing::debug!(
+            slab = idx,
+            prompt = prompt_tokens,
+            reused = num_computed,
+            "serve: admit (unified)"
+        );
 
         self.active.push(ActiveSeq {
             slab: idx as u32,
@@ -825,7 +861,10 @@ impl Worker {
             self.engine.allocate_scratch(need)?;
             self.scratch_bytes = need;
         }
-        let vc = self.vision.as_ref().expect("vision present (checked above)");
+        let vc = self
+            .vision
+            .as_ref()
+            .expect("vision present (checked above)");
         let (encoder, host_weights, weights) = (&vc.encoder, &vc.host_weights, &vc.vision.weights);
         let pimg = &image.pimg;
         crate::vision::encoder::encode_image_chunked(
@@ -844,8 +883,19 @@ impl Worker {
     /// per-slab `rope_lag` keeps its positions continuous past the image. No
     /// prefix-reuse (always a fresh prefill) for image turns in this first cut.
     fn admit_image(&mut self, job: GenJob) {
-        let GenJob { tokens: new_tokens, config, image, reply } = job;
-        let GenConfig { sampler: cfg, max_tokens, stop, ignore_eos, id_slot } = config;
+        let GenJob {
+            tokens: new_tokens,
+            config,
+            image,
+            reply,
+        } = job;
+        let GenConfig {
+            sampler: cfg,
+            max_tokens,
+            stop,
+            ignore_eos,
+            id_slot,
+        } = config;
         let Some(image) = image else { return }; // only routed here when Some
         if self.vision.is_none() {
             let _ = reply.blocking_send(GenEvent::Error(
@@ -855,7 +905,8 @@ impl Worker {
         }
         let prompt_tokens = new_tokens.len() as u32;
         if new_tokens.is_empty() {
-            let _ = reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
+            let _ =
+                reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
             return;
         }
         let ctx = self.batch.config.max_seq_len;
@@ -937,7 +988,10 @@ impl Worker {
         };
         self.slots[idx].active = true;
 
-        if reply.blocking_send(GenEvent::Started { prompt_tokens }).is_err() {
+        if reply
+            .blocking_send(GenEvent::Started { prompt_tokens })
+            .is_err()
+        {
             self.slots[idx].active = false;
             self.slots[idx].prior_tokens = new_tokens;
             return;
@@ -964,7 +1018,12 @@ impl Worker {
             num_computed: self.batch.positions[idx],
             started: true,
         };
-        process_token(&self.model.tokenizer().tokenizer, &self.eog_ids, &mut seq, first);
+        process_token(
+            &self.model.tokenizer().tokenizer,
+            &self.eog_ids,
+            &mut seq,
+            first,
+        );
         self.active.push(seq);
     }
 
@@ -1065,7 +1124,9 @@ impl Worker {
             Err(e) => {
                 let msg = e.to_string();
                 for &(i, _) in &parts {
-                    let _ = self.active[i].reply.blocking_send(GenEvent::Error(msg.clone()));
+                    let _ = self.active[i]
+                        .reply
+                        .blocking_send(GenEvent::Error(msg.clone()));
                     self.active[i].disconnected = true;
                     self.active[i].terminal = Some(StopReason::ContextFull);
                 }
@@ -1079,8 +1140,7 @@ impl Worker {
         // advanced `num_computed` (their column is unused).
         for (k, &(i, nn)) in parts.iter().enumerate() {
             self.active[i].num_computed += nn;
-            let caught_up =
-                self.active[i].num_computed as usize == logical_len(&self.active[i]);
+            let caught_up = self.active[i].num_computed as usize == logical_len(&self.active[i]);
             if !caught_up {
                 continue;
             }
@@ -1164,7 +1224,9 @@ impl Worker {
                 // all and let eviction reset their slabs.
                 let msg = e.to_string();
                 for &i in &parts {
-                    let _ = self.active[i].reply.blocking_send(GenEvent::Error(msg.clone()));
+                    let _ = self.active[i]
+                        .reply
+                        .blocking_send(GenEvent::Error(msg.clone()));
                     self.active[i].disconnected = true; // suppress a duplicate Done
                     self.active[i].terminal = Some(StopReason::ContextFull);
                 }

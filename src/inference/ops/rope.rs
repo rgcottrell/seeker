@@ -105,7 +105,7 @@ fn record_inner(
         *w += 4;
     }
 
-    put_u(&mut push, &mut w, 0);             // rope_mode = NORM
+    put_u(&mut push, &mut w, 0); // rope_mode = NORM
     put_u(&mut push, &mut w, nrows);
     put_u(&mut push, &mut w, params.n_dims);
     put_f(&mut push, &mut w, params.freq_scale);
@@ -115,13 +115,13 @@ fn record_inner(
     put_f(&mut push, &mut w, params.corr_dims[0]);
     put_f(&mut push, &mut w, params.corr_dims[1]);
     put_f(&mut push, &mut w, theta_scale);
-    put_u(&mut push, &mut w, 0);             // has_ff
+    put_u(&mut push, &mut w, 0); // has_ff
     for _ in 0..4 {
-        put_i(&mut push, &mut w, 0);         // sections[4]
+        put_i(&mut push, &mut w, 0); // sections[4]
     }
-    put_u(&mut push, &mut w, 0);             // is_imrope
-    put_u(&mut push, &mut w, 0);             // is_back
-    put_u(&mut push, &mut w, 0);             // set_rows_stride
+    put_u(&mut push, &mut w, 0); // is_imrope
+    put_u(&mut push, &mut w, 0); // is_back
+    put_u(&mut push, &mut w, 0); // set_rows_stride
     put_u(&mut push, &mut w, ne00);
     put_u(&mut push, &mut w, ne01);
     put_u(&mut push, &mut w, ne02);
@@ -131,8 +131,8 @@ fn record_inner(
     put_u(&mut push, &mut w, dst.element_stride[1] as u32); // nb11
     put_u(&mut push, &mut w, dst.element_stride[2] as u32); // nb12
     put_u(&mut push, &mut w, dst.element_stride[3] as u32); // nb13
-    put_u(&mut push, &mut w, 0);             // a_offset
-    put_u(&mut push, &mut w, 0);             // d_offset
+    put_u(&mut push, &mut w, 0); // a_offset
+    put_u(&mut push, &mut w, 0); // d_offset
 
     let key = PipelineKey::dense("rope_norm_f32", 5, ROPE_PARAMS_BYTES, Vec::new());
     let pipeline = *ctx

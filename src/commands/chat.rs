@@ -20,11 +20,11 @@ use rustyline::{Completer, Editor, Helper, Hinter};
 use crate::chat_template::{self, ChatMessage};
 use crate::commands::chat_cache;
 use crate::commands::download;
-use crate::commands::download::{resolve_hf, HfResolveArgs};
+use crate::commands::download::{HfResolveArgs, resolve_hf};
 use crate::gguf::{GgmlType, GgufFile, MetadataValue};
-use crate::inference::kv_cache::{parse_dtype, KvCacheConfig};
-use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::inference::Engine;
+use crate::inference::kv_cache::{KvCacheConfig, parse_dtype};
+use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::tokenizer::build_tokenizer;
 use crate::vision::encoder::{HostWeights, VisionEncoder};
 
@@ -70,7 +70,7 @@ static GENERATION_CANCELLED: AtomicBool = AtomicBool::new(false);
 /// and ignored (Ctrl+C then falls back to the default action).
 #[cfg(unix)]
 fn spawn_interrupt_watcher() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     match signal(SignalKind::interrupt()) {
         Ok(mut sigint) => {
             tokio::spawn(async move {
@@ -94,7 +94,11 @@ const BANNER: &str = r#"███████ ███████ ████
 #[derive(Args)]
 pub struct ChatArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]". (short: -hf, -hfr)
-    #[arg(long = "hf-repo", required_unless_present = "model", conflicts_with = "model")]
+    #[arg(
+        long = "hf-repo",
+        required_unless_present = "model",
+        conflicts_with = "model"
+    )]
     hf_repo: Option<String>,
 
     /// Specific file within the repo. (short: -hff)
@@ -206,12 +210,20 @@ pub struct ChatArgs {
     frequency_penalty: f32,
 
     /// Repetition penalty (multiply/divide repeated logits; 1.0 = off).
-    #[arg(long = "repeat-penalty", alias = "repetition-penalty", default_value_t = 1.0)]
+    #[arg(
+        long = "repeat-penalty",
+        alias = "repetition-penalty",
+        default_value_t = 1.0
+    )]
     repeat_penalty: f32,
 
     /// How many trailing tokens contribute to penalties. `-1` = the whole
     /// context (`--ctx-size`); `0` = disabled. (llama.cpp's `--repeat-last-n`.)
-    #[arg(long = "penalty-last-n", default_value_t = 64, allow_hyphen_values = true)]
+    #[arg(
+        long = "penalty-last-n",
+        default_value_t = 64,
+        allow_hyphen_values = true
+    )]
     penalty_last_n: i32,
 
     /// Never stop on an end-of-generation token; generate until `--max-tokens`.
@@ -308,9 +320,12 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let path = resolved.main.clone();
     let gguf = GgufFile::open(&path)?;
     let bundle = build_tokenizer(&gguf)?;
-    let chat_template = bundle.chat_template.clone().ok_or_else(|| -> Box<dyn Error> {
-        "model has no `tokenizer.chat_template` — use `seeker run` for base completions".into()
-    })?;
+    let chat_template = bundle
+        .chat_template
+        .clone()
+        .ok_or_else(|| -> Box<dyn Error> {
+            "model has no `tokenizer.chat_template` — use `seeker run` for base completions".into()
+        })?;
 
     let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
@@ -320,7 +335,11 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     // The mmproj vision sidecar (if resolved and not `--no-mmproj`). The vision
     // tower is built lazily on the first `/image` (see `ChatSession::attach_image`)
     // so a text-only session never uploads the projector.
-    let mmproj_path = if args.no_mmproj { None } else { resolved.mmproj.clone() };
+    let mmproj_path = if args.no_mmproj {
+        None
+    } else {
+        resolved.mmproj.clone()
+    };
 
     // Size the scratch (compute buffer) for this model + n_ubatch (and the
     // full ctx for heterogeneous caches), replacing the Engine::new
@@ -340,12 +359,8 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         max_seq_len: args.ctx_size,
     };
     let dims = model.cache_dims();
-    let mut cache = engine.allocate_kv_cache(
-        dims.n_layer,
-        dims.head_dim,
-        dims.n_head_kv,
-        cache_config,
-    )?;
+    let mut cache =
+        engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
     if let Some(ssm) = model.ssm_state_dims() {
         cache.allocate_ssm_state(
             &engine.device,
@@ -428,26 +443,36 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let history = if args.no_history {
         None
     } else {
-        args.history_file
-            .clone()
-            .or_else(default_history_path)
+        args.history_file.clone().or_else(default_history_path)
     };
 
     let result = if std::io::stdin().is_terminal() {
         // Ctrl+C during a reply should stop that reply, not the program.
         spawn_interrupt_watcher();
-        run_interactive(&mut session, &gguf, &path, history.as_deref(), args.multiline_input)
+        run_interactive(
+            &mut session,
+            &gguf,
+            &path,
+            history.as_deref(),
+            args.multiline_input,
+        )
     } else {
         run_piped(&mut session)
     };
 
     // Persist the session for next time (best-effort; never fail the run).
-    if let Some(p) = &args.prompt_cache {
-        if !args.prompt_cache_ro {
-            match chat_cache::save(p, &arch, &session.cache, &session.prior_tokens, &session.messages) {
-                Ok(()) => tracing::info!(path = %p.display(), "prompt cache saved"),
-                Err(e) => tracing::warn!("prompt-cache save failed: {e}"),
-            }
+    if let Some(p) = &args.prompt_cache
+        && !args.prompt_cache_ro
+    {
+        match chat_cache::save(
+            p,
+            &arch,
+            &session.cache,
+            &session.prior_tokens,
+            &session.messages,
+        ) {
+            Ok(()) => tracing::info!(path = %p.display(), "prompt cache saved"),
+            Err(e) => tracing::warn!("prompt-cache save failed: {e}"),
         }
     }
     result
@@ -490,7 +515,10 @@ async fn resolve_model_path(args: &ChatArgs) -> Result<download::Resolved, Box<d
             } else {
                 download::find_sidecar_mmproj(&model)
             };
-            Ok(download::Resolved { main: model, mmproj })
+            Ok(download::Resolved {
+                main: model,
+                mmproj,
+            })
         }
         _ => unreachable!("clap group invariant"),
     }
@@ -921,7 +949,8 @@ impl ChatSession {
         // the normal text path applies. When it is in the delta, the prefill
         // runs single-pass through `forward_image_sampled` (no chunking), so grow
         // the scratch to fit the whole delta first.
-        let image_in_delta = matches!((&self.image, image_start), (Some(_), Some(s)) if common <= s);
+        let image_in_delta =
+            matches!((&self.image, image_start), (Some(_), Some(s)) if common <= s);
         // Local pad offset only when the block is in the delta (else `s < common`
         // for a cached image would underflow this usize).
         let img_start_in_delta = image_start.filter(|_| image_in_delta).map(|s| s - common);
@@ -1191,8 +1220,15 @@ impl ChatSession {
             cfg.eps,
         )?;
         let host_weights = HostWeights::from_gguf(&gguf)?;
-        let vision = crate::vision::VisionModel { config: cfg, weights };
-        self.vision_ctx = Some(VisionCtx { vision, encoder, host_weights });
+        let vision = crate::vision::VisionModel {
+            config: cfg,
+            weights,
+        };
+        self.vision_ctx = Some(VisionCtx {
+            vision,
+            encoder,
+            host_weights,
+        });
         Ok(())
     }
 
@@ -1201,12 +1237,20 @@ impl ChatSession {
     /// for the confirmation line. Errors if an image is already attached.
     fn attach_image(&mut self, path: &Path) -> Result<(usize, usize, usize), Box<dyn Error>> {
         if self.image.is_some() {
-            return Err("this conversation already has an image — /clear to start over \
+            return Err(
+                "this conversation already has an image — /clear to start over \
                         (one image per conversation for now)"
-                .into());
+                    .into(),
+            );
         }
         self.ensure_vision()?;
-        let cfg = self.vision_ctx.as_ref().expect("ensure_vision built it").vision.config.clone();
+        let cfg = self
+            .vision_ctx
+            .as_ref()
+            .expect("ensure_vision built it")
+            .vision
+            .config
+            .clone();
         let pcfg = crate::vision::preprocess::PreprocessConfig::qwen3vl_default(
             cfg.patch_size,
             cfg.spatial_merge_size,
@@ -1233,7 +1277,12 @@ impl ChatSession {
             &pimg,
             host_weights,
         )?;
-        self.pending_image = Some(EncodedImage { embeddings, nx, ny, n_tok });
+        self.pending_image = Some(EncodedImage {
+            embeddings,
+            nx,
+            ny,
+            n_tok,
+        });
         Ok((nx, ny, n_tok))
     }
 
@@ -1265,7 +1314,7 @@ impl ChatSession {
     /// after a `/clear`. A system prompt is preserved across the clear (like
     /// llama.cpp) — only the user/assistant turns are dropped.
     fn clear(&mut self) {
-        let system = self.system_prompt().map(|s| ChatMessage::system(s));
+        let system = self.system_prompt().map(ChatMessage::system);
         self.messages.clear();
         if let Some(s) = system {
             self.messages.push(s);
@@ -1301,10 +1350,10 @@ fn device_name() -> String {
     {
         if let Ok(s) = std::fs::read_to_string("/proc/cpuinfo") {
             for line in s.lines() {
-                if let Some(rest) = line.strip_prefix("model name") {
-                    if let Some(v) = rest.split(':').nth(1) {
-                        return v.trim().to_string();
-                    }
+                if let Some(rest) = line.strip_prefix("model name")
+                    && let Some(v) = rest.split(':').nth(1)
+                {
+                    return v.trim().to_string();
                 }
             }
         }
@@ -1396,10 +1445,10 @@ fn run_interactive(
 ) -> Result<(), Box<dyn Error>> {
     let mut editor = Editor::new()?;
     editor.set_helper(Some(ChatHelper { multiline }));
-    if let Some(p) = history {
-        if let Err(e) = editor.load_history(p) {
-            tracing::debug!(path = %p.display(), error = %e, "history load");
-        }
+    if let Some(p) = history
+        && let Err(e) = editor.load_history(p)
+    {
+        tracing::debug!(path = %p.display(), error = %e, "history load");
     }
 
     print_banner(gguf, path);
@@ -1511,13 +1560,18 @@ fn run_turn(
         Ok(stats) => {
             println!(); // terminate the streamed reply line
             if stats.shifted_turns > 0 {
-                println!("[context shift: dropped {} oldest turn(s)]", stats.shifted_turns);
+                println!(
+                    "[context shift: dropped {} oldest turn(s)]",
+                    stats.shifted_turns
+                );
             }
             if stats.interrupted {
                 println!("[interrupted]");
             }
             if stats.ctx_full {
-                println!("[context full — reply truncated at --ctx-size; /clear, raise --ctx-size, or use --context-shift]");
+                println!(
+                    "[context full — reply truncated at --ctx-size; /clear, raise --ctx-size, or use --context-shift]"
+                );
             }
             println!(); // blank line between the reply and the stats
             print_stats(&stats);
@@ -1689,7 +1743,10 @@ mod tests {
         assert_eq!(parse_logit_bias("15043+2.0"), Ok((15043, 2.0)));
         assert_eq!(parse_logit_bias("7-1.5"), Ok((7, -1.5)));
         assert_eq!(parse_logit_bias("5=1.5"), Ok((5, 1.5)));
-        assert_eq!(parse_logit_bias("128009-inf"), Ok((128009, f32::NEG_INFINITY)));
+        assert_eq!(
+            parse_logit_bias("128009-inf"),
+            Ok((128009, f32::NEG_INFINITY))
+        );
         assert_eq!(parse_logit_bias("9=inf"), Ok((9, f32::INFINITY)));
         // Missing id / non-numeric id / no bias → errors, not panics.
         assert!(parse_logit_bias("+1").is_err());
@@ -1704,7 +1761,9 @@ mod tests {
         // Open then closed again (thinking disabled → empty block) is closed.
         assert!(!prompt_opens_think("<think>\n\n</think>\n\n"));
         // A prior closed turn followed by a new open block is open.
-        assert!(prompt_opens_think("<think>\na\n</think>\nb<|im_start|>assistant\n<think>\n"));
+        assert!(prompt_opens_think(
+            "<think>\na\n</think>\nb<|im_start|>assistant\n<think>\n"
+        ));
         // No think markers at all (e.g. Llama) → closed.
         assert!(!prompt_opens_think("<|im_start|>assistant\n"));
     }

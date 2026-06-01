@@ -173,6 +173,7 @@ fn main() {
             for (k, v) in &variant.defines {
                 cmd.arg(format!("-D{k}={v}"));
             }
+            #[rustfmt::skip]
             cmd.args([
                 "-target", "spirv",
                 "-profile", "spirv_1_6",
@@ -197,9 +198,9 @@ fn main() {
             ])
             .arg(&spv_path);
 
-            let status = cmd.status().unwrap_or_else(|e| {
-                panic!("failed to spawn slangc for {}: {e}", path.display())
-            });
+            let status = cmd
+                .status()
+                .unwrap_or_else(|e| panic!("failed to spawn slangc for {}: {e}", path.display()));
 
             if !status.success() {
                 panic!(

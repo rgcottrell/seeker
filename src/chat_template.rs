@@ -33,40 +33,39 @@ fn unknown_method_callback(
     };
     match name {
         "startswith" => {
-            let prefix = args
-                .get(0)
-                .and_then(|a| a.as_str())
-                .ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, "startswith: expected string arg"))?;
+            let prefix = args.first().and_then(|a| a.as_str()).ok_or_else(|| {
+                MjError::new(
+                    ErrorKind::InvalidOperation,
+                    "startswith: expected string arg",
+                )
+            })?;
             Ok(Value::from(s.starts_with(prefix)))
         }
         "endswith" => {
-            let suffix = args
-                .get(0)
-                .and_then(|a| a.as_str())
-                .ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, "endswith: expected string arg"))?;
+            let suffix = args.first().and_then(|a| a.as_str()).ok_or_else(|| {
+                MjError::new(ErrorKind::InvalidOperation, "endswith: expected string arg")
+            })?;
             Ok(Value::from(s.ends_with(suffix)))
         }
         "split" => {
             // .split(sep) — like Python: splits at every occurrence.
             // .split() — like Python: splits on whitespace, collapsing runs.
-            let parts: Vec<String> = match args.get(0).and_then(|a| a.as_str()) {
+            let parts: Vec<String> = match args.first().and_then(|a| a.as_str()) {
                 Some(sep) if !sep.is_empty() => s.split(sep).map(|p| p.to_string()).collect(),
                 _ => s.split_whitespace().map(|p| p.to_string()).collect(),
             };
             Ok(Value::from(parts))
         }
-        "strip" => Ok(Value::from(strip_str(s, args.get(0), true, true))),
-        "lstrip" => Ok(Value::from(strip_str(s, args.get(0), true, false))),
-        "rstrip" => Ok(Value::from(strip_str(s, args.get(0), false, true))),
+        "strip" => Ok(Value::from(strip_str(s, args.first(), true, true))),
+        "lstrip" => Ok(Value::from(strip_str(s, args.first(), true, false))),
+        "rstrip" => Ok(Value::from(strip_str(s, args.first(), false, true))),
         "replace" => {
-            let old = args
-                .get(0)
-                .and_then(|a| a.as_str())
-                .ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, "replace: expected old"))?;
-            let new = args
-                .get(1)
-                .and_then(|a| a.as_str())
-                .ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, "replace: expected new"))?;
+            let old = args.first().and_then(|a| a.as_str()).ok_or_else(|| {
+                MjError::new(ErrorKind::InvalidOperation, "replace: expected old")
+            })?;
+            let new = args.get(1).and_then(|a| a.as_str()).ok_or_else(|| {
+                MjError::new(ErrorKind::InvalidOperation, "replace: expected new")
+            })?;
             Ok(Value::from(s.replace(old, new)))
         }
         _ => Err(MjError::from(ErrorKind::UnknownMethod)),
@@ -76,9 +75,7 @@ fn unknown_method_callback(
 /// Helper for strip/lstrip/rstrip. When `chars` is None, strip whitespace
 /// (matches Python); otherwise strip any character contained in `chars`.
 fn strip_str(s: &str, chars: Option<&Value>, left: bool, right: bool) -> String {
-    let trim_chars: Option<Vec<char>> = chars
-        .and_then(|v| v.as_str())
-        .map(|c| c.chars().collect());
+    let trim_chars: Option<Vec<char>> = chars.and_then(|v| v.as_str()).map(|c| c.chars().collect());
     let is_trim = |ch: char| match &trim_chars {
         Some(set) => set.contains(&ch),
         None => ch.is_whitespace(),
@@ -95,7 +92,7 @@ fn strip_str(s: &str, chars: Option<&Value>, left: bool, right: bool) -> String 
         }
     }
     if right {
-        while let Some(c) = s[start..end].chars().rev().next() {
+        while let Some(c) = s[start..end].chars().next_back() {
             if is_trim(c) {
                 end -= c.len_utf8();
             } else {
@@ -280,9 +277,18 @@ mod tests {
             &serde_json::Map::new(),
         )
         .expect("render");
-        assert!(out.contains("<|im_start|>system\nYou are a helpful AI assistant"), "missing default system block: {out:?}");
-        assert!(out.contains("<|im_start|>user\nHello<|im_end|>"), "missing user turn: {out:?}");
-        assert!(out.ends_with("<|im_start|>assistant\n"), "missing assistant opener: {out:?}");
+        assert!(
+            out.contains("<|im_start|>system\nYou are a helpful AI assistant"),
+            "missing default system block: {out:?}"
+        );
+        assert!(
+            out.contains("<|im_start|>user\nHello<|im_end|>"),
+            "missing user turn: {out:?}"
+        );
+        assert!(
+            out.ends_with("<|im_start|>assistant\n"),
+            "missing assistant opener: {out:?}"
+        );
     }
 
     /// An assistant turn's `reasoning_content` must not leak into a
@@ -297,8 +303,15 @@ mod tests {
             ChatMessage::assistant("the final answer", Some("hidden chain of thought".into())),
             ChatMessage::user("q2"),
         ];
-        let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "", &serde_json::Map::new())
-            .expect("render");
+        let out = render(
+            SMOLLM2_TEMPLATE,
+            &messages,
+            true,
+            "",
+            "",
+            &serde_json::Map::new(),
+        )
+        .expect("render");
         assert!(
             out.contains("<|im_start|>assistant\nthe final answer<|im_end|>"),
             "answer should round-trip into history: {out:?}"
@@ -311,14 +324,24 @@ mod tests {
 
     #[test]
     fn system_constructor_renders_as_system_turn() {
-        let messages = vec![
-            ChatMessage::system("Be terse."),
-            ChatMessage::user("hi"),
-        ];
-        let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "", &serde_json::Map::new())
-            .expect("render");
-        assert!(out.contains("<|im_start|>system\nBe terse.<|im_end|>"), "{out:?}");
-        assert!(!out.contains("You are a helpful AI assistant"), "default not skipped: {out:?}");
+        let messages = vec![ChatMessage::system("Be terse."), ChatMessage::user("hi")];
+        let out = render(
+            SMOLLM2_TEMPLATE,
+            &messages,
+            true,
+            "",
+            "",
+            &serde_json::Map::new(),
+        )
+        .expect("render");
+        assert!(
+            out.contains("<|im_start|>system\nBe terse.<|im_end|>"),
+            "{out:?}"
+        );
+        assert!(
+            !out.contains("You are a helpful AI assistant"),
+            "default not skipped: {out:?}"
+        );
     }
 
     #[test]
@@ -331,17 +354,34 @@ mod tests {
             },
             ChatMessage::user("hi"),
         ];
-        let out = render(SMOLLM2_TEMPLATE, &messages, true, "", "", &serde_json::Map::new())
-            .expect("render");
-        assert!(out.contains("<|im_start|>system\nBe terse.<|im_end|>"), "{out:?}");
+        let out = render(
+            SMOLLM2_TEMPLATE,
+            &messages,
+            true,
+            "",
+            "",
+            &serde_json::Map::new(),
+        )
+        .expect("render");
+        assert!(
+            out.contains("<|im_start|>system\nBe terse.<|im_end|>"),
+            "{out:?}"
+        );
         assert!(!out.contains("You are a helpful AI assistant"), "{out:?}");
     }
 
     #[test]
     fn add_generation_prompt_false_omits_assistant_opener() {
         let messages = vec![ChatMessage::user("hi")];
-        let out = render(SMOLLM2_TEMPLATE, &messages, false, "", "", &serde_json::Map::new())
-            .expect("render");
+        let out = render(
+            SMOLLM2_TEMPLATE,
+            &messages,
+            false,
+            "",
+            "",
+            &serde_json::Map::new(),
+        )
+        .expect("render");
         assert!(!out.contains("<|im_start|>assistant\n"), "{out:?}");
         assert!(out.ends_with("<|im_start|>user\nhi<|im_end|>\n"), "{out:?}");
     }
@@ -365,7 +405,8 @@ mod tests {
     #[test]
     fn strftime_now_function_is_available_to_templates() {
         // A template gating on `strftime_now is defined` must take the true branch.
-        let tmpl = "{% if strftime_now is defined %}{{ strftime_now('%Y') }}{% else %}NONE{% endif %}";
+        let tmpl =
+            "{% if strftime_now is defined %}{{ strftime_now('%Y') }}{% else %}NONE{% endif %}";
         let out = render(tmpl, &[], false, "", "", &serde_json::Map::new()).expect("render");
         assert_ne!(out, "NONE", "strftime_now should be defined in the env");
         assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");

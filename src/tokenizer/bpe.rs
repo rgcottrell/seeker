@@ -6,10 +6,10 @@
 use std::error::Error;
 
 use tokenizers::decoders::DecoderWrapper;
-use tokenizers::models::bpe::{Vocab as BpeVocab, BPE};
 use tokenizers::models::ModelWrapper;
-use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::models::bpe::{BPE, Vocab as BpeVocab};
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 
 use crate::gguf::GgufFile;
 use crate::tokenizer::bundle::Tokenizer;
@@ -42,8 +42,10 @@ pub(super) fn build(tokens: &[String], gguf: &GgufFile) -> Result<Tokenizer, Tok
         .map_err(|e| TokenizerError::Inner(e as Box<dyn Error + Send + Sync>))?;
 
     let mut tokenizer = Tokenizer::new(ModelWrapper::BPE(bpe));
-    let bl = ByteLevel::new(/* add_prefix_space */ false, /* trim_offsets */ true, /* use_regex */ true);
-    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::ByteLevel(bl.clone())));
+    let bl = ByteLevel::new(
+        /* add_prefix_space */ false, /* trim_offsets */ true, /* use_regex */ true,
+    );
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::ByteLevel(bl)));
     tokenizer.with_decoder(Some(DecoderWrapper::ByteLevel(bl)));
     Ok(tokenizer)
 }

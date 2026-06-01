@@ -108,7 +108,14 @@ impl<'a> DispatchContext<'a> {
     /// the production path. Used to bisect release-only nondeterminism by
     /// comparing the recorded bytes across two runs of the same input.
     pub fn dump(&mut self, label: &str, t: TensorView) {
-        self.dump_range(label, BufferRange { buffer: t.buffer, offset: t.byte_offset, size: t.byte_size });
+        self.dump_range(
+            label,
+            BufferRange {
+                buffer: t.buffer,
+                offset: t.byte_offset,
+                size: t.byte_size,
+            },
+        );
     }
 
     /// [`dump`](Self::dump) for a raw [`BufferRange`] (e.g. scratch slots that
@@ -132,9 +139,12 @@ impl<'a> DispatchContext<'a> {
             .dst_offset(offset)
             .size(r.size);
         unsafe {
-            self.device
-                .device
-                .cmd_copy_buffer(self.cmd, r.buffer, dump_buf, std::slice::from_ref(&copy));
+            self.device.device.cmd_copy_buffer(
+                self.cmd,
+                r.buffer,
+                dump_buf,
+                std::slice::from_ref(&copy),
+            );
         }
     }
 }
@@ -198,20 +208,26 @@ impl<'a> DispatchContext<'a> {
         // without a cast dispatch. This rules out the cast as a source of
         // discrepancy.
         if crate::runtime_flags::qwen_diff_direct() {
-            self.taps.push((name.to_string(), BufferRange {
-                buffer: src.buffer,
-                offset: src.byte_offset,
-                size: n_elements * 4,
-            }));
+            self.taps.push((
+                name.to_string(),
+                BufferRange {
+                    buffer: src.buffer,
+                    offset: src.byte_offset,
+                    size: n_elements * 4,
+                },
+            ));
             return Ok(());
         }
         let dst = self.alloc_tensor(src.dims, GgmlType::F32)?;
         crate::inference::ops::cast::record_cast(self, src, dst)?;
-        self.taps.push((name.to_string(), BufferRange {
-            buffer: dst.buffer,
-            offset: dst.byte_offset,
-            size: n_elements * 4,
-        }));
+        self.taps.push((
+            name.to_string(),
+            BufferRange {
+                buffer: dst.buffer,
+                offset: dst.byte_offset,
+                size: n_elements * 4,
+            },
+        ));
         Ok(())
     }
 

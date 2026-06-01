@@ -120,9 +120,7 @@ impl SamplerConfig {
 
     /// True if at least one penalty term is non-identity.
     pub fn any_penalty(&self) -> bool {
-        self.repeat_penalty != 1.0
-            || self.frequency_penalty != 0.0
-            || self.presence_penalty != 0.0
+        self.repeat_penalty != 1.0 || self.frequency_penalty != 0.0 || self.presence_penalty != 0.0
     }
 
     /// Hash of every config field that affects the recorded GPU graph
@@ -413,8 +411,8 @@ impl Sampler {
         let u = self.draw_uniform();
         let mut cum = 0.0f32;
         let mut chosen = kept.len() - 1; // clamp to last on FP shortfall
-        for j in 0..probs.len() {
-            cum += probs[j];
+        for (j, &p) in probs.iter().enumerate() {
+            cum += p;
             if cum >= u {
                 chosen = j;
                 break;
