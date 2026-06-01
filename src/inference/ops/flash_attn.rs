@@ -49,16 +49,20 @@ pub const FA_MAX_K_NUM: u32 = 16;
 /// workgroup walk all `n_pos` keys serially; past ~14k keys that one dispatch
 /// trips the RADV/Strix-Halo per-dispatch watchdog (the device is lost). We
 /// split the KV (split-K, direct dispatch, partials sized at the actual small
-/// k_num) so each split walks ≤ this many keys. 12k leaves margin under the
-/// observed ~14.3k cliff. Override with `SEEKER_FA_VISION_WALK` (also used to
-/// force the split at small n_pos for validation against the single-pass path).
+/// k_num) so each split walks ≤ this many keys. EMPIRICAL: on Strix Halo the
+/// scalar F32 vision FA faults when a workgroup walks ≳ a few-thousand keys
+/// (walk 8052 → device lost; 3220 and 2684 → fine), so 3000 keeps each split's
+/// walk safely short. Lower = more splits = shorter walks = safer, but larger
+/// partials (≈ (hd+2)·n·heads·k_num) — 3000 fits the 40k-float/token scratch
+/// budget up to the 4096-token image cap. Override with `SEEKER_FA_VISION_WALK`
+/// (also used to force the split at small n_pos to validate against single-pass).
 /// Only read on the vision path (mask=None, n>1), never on the decode hot path.
 fn vision_fa_kv_walk() -> u32 {
     std::env::var("SEEKER_FA_VISION_WALK")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&w| w > 0)
-        .unwrap_or(12_000)
+        .unwrap_or(3_000)
 }
 
 /// Same heuristic as `pick_k_num`, clamped to `FA_MAX_K_NUM`. Used by
