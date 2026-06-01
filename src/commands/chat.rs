@@ -1226,9 +1226,13 @@ impl ChatSession {
         }
         let vc = self.vision_ctx.as_ref().expect("ensure_vision built it");
         let (encoder, host_weights, weights) = (&vc.encoder, &vc.host_weights, &vc.vision.weights);
-        let embeddings = self
-            .engine
-            .forward(weights, |ctx| Ok(encoder.encode_image(ctx, &pimg, host_weights)?.range()))?;
+        let embeddings = crate::vision::encoder::encode_image_chunked(
+            &mut self.engine,
+            weights,
+            encoder,
+            &pimg,
+            host_weights,
+        )?;
         self.pending_image = Some(EncodedImage { embeddings, nx, ny, n_tok });
         Ok((nx, ny, n_tok))
     }

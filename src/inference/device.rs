@@ -185,9 +185,29 @@ impl Device {
         // occur during instance creation/destruction itself.
         #[cfg(any(debug_assertions, feature = "gpu_debug"))]
         let mut debug_info = validation::build_create_info();
+        // GPU-Assisted Validation (opt-in via `SEEKER_GPUAV`): instruments shaders
+        // to catch out-of-bounds buffer/descriptor access that core + sync
+        // validation can't see (a shader reading/writing past a binding). Very
+        // slow — debugging only. The features array + struct must outlive
+        // `create_instance`.
+        #[cfg(any(debug_assertions, feature = "gpu_debug"))]
+        let gpuav_features = [
+            vk::ValidationFeatureEnableEXT::GPU_ASSISTED,
+            vk::ValidationFeatureEnableEXT::GPU_ASSISTED_RESERVE_BINDING_SLOT,
+        ];
+        #[cfg(any(debug_assertions, feature = "gpu_debug"))]
+        let mut gpuav_info =
+            vk::ValidationFeaturesEXT::default().enabled_validation_features(&gpuav_features);
+        #[cfg(any(debug_assertions, feature = "gpu_debug"))]
+        let gpuav_enabled = validation_enabled && std::env::var("SEEKER_GPUAV").is_ok();
         #[cfg(any(debug_assertions, feature = "gpu_debug"))]
         if validation_enabled {
             instance_info = instance_info.push(&mut debug_info);
+        }
+        #[cfg(any(debug_assertions, feature = "gpu_debug"))]
+        if gpuav_enabled {
+            instance_info = instance_info.push(&mut gpuav_info);
+            tracing::info!("Vulkan GPU-Assisted Validation enabled (SEEKER_GPUAV=1)");
         }
 
         let instance = unsafe { entry.create_instance(&instance_info, None) }?;

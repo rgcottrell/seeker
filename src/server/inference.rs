@@ -827,8 +827,13 @@ impl Worker {
         let vc = self.vision.as_ref().expect("vision present (checked above)");
         let (encoder, host_weights, weights) = (&vc.encoder, &vc.host_weights, &vc.vision.weights);
         let pimg = &image.pimg;
-        self.engine
-            .forward(weights, |ctx| Ok(encoder.encode_image(ctx, pimg, host_weights)?.range()))
+        crate::vision::encoder::encode_image_chunked(
+            &mut self.engine,
+            weights,
+            encoder,
+            pimg,
+            host_weights,
+        )
     }
 
     /// Admit an image chat request: encode the image, prefill the whole prompt

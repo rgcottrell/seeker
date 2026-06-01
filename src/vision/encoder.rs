@@ -43,15 +43,19 @@
 
 use std::error::Error;
 
+use ash::vk;
+
 use crate::gguf::GgmlType;
 use crate::inference::buffer::BufferRange;
 use crate::inference::command::record_compute_barrier;
 use crate::inference::context::DispatchContext;
+use crate::inference::memory::Region;
 use crate::inference::ops::bind_and_dispatch;
 use crate::inference::ops::elementwise::{record_add, record_mul};
 use crate::inference::ops::matmul;
 use crate::inference::pipeline::PipelineKey;
 use crate::inference::weights::{TensorView, WeightsHandle};
+use crate::inference::Engine;
 use crate::shaders;
 use crate::vision::preprocess::PreprocessedImage;
 
@@ -716,6 +720,124 @@ pub fn stage_vision_positions(
 ) -> Result<BufferRange, Box<dyn Error>> {
     let positions = build_vision_positions(grid_w as usize, grid_h as usize);
     alloc_scratch_write(ctx, &i32_to_bytes(&positions))
+}
+
+/// Per-submit attention-work budget (in `n_pos² · n_blocks_per_submit` units)
+/// for the chunked vision encode. The vision attention is full/bidirectional,
+/// so each block's flash-attn dispatch costs ~`n_pos²`; past a per-submit
+/// threshold a RADV/Strix-Halo compute submit faults (the fence still signals,
+/// but the output is corrupted and a device loss is deferred to the next
+/// submit). Empirically a submit survives ~250M `n_pos²·blocks`; we budget 150M
+/// for margin. NOTE: a *single* block at n_pos ≳ 14.3k (n_pos² ≳ 205M) faults
+/// on its own — beyond that even one-block-per-submit can't help (needs a
+/// KV-chunked attention, or capping `SEEKER_IMG_MAX_TOKENS`). Override the
+/// budget with `SEEKER_VISION_SUBMIT_BUDGET`.
+fn vision_submit_budget() -> u64 {
+    std::env::var("SEEKER_VISION_SUBMIT_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(150_000_000)
+}
+
+/// Encode an image through the vision tower, splitting the ViT block stack
+/// across MULTIPLE GPU submits when the whole forward would exceed
+/// [`vision_submit_budget`] (large images). The residual `[n_embd, n_pos]` is
+/// carried across submits in a dedicated persistent buffer — `engine.forward`
+/// resets the scratch region each call, so it can't hold cross-submit state.
+///
+/// Numerically identical to the single-submit [`VisionEncoder::encode_image`]:
+/// the same ops in the same order, just fenced into smaller submits (the carry
+/// round-trips through the persistent buffer via exact F32 copies). Falls back
+/// to the single submit when the whole encode fits one. Returns the merged
+/// embeddings `[proj_dim, n_tok]` as host f32.
+pub fn encode_image_chunked(
+    engine: &mut Engine,
+    weights: &WeightsHandle,
+    encoder: &VisionEncoder,
+    img: &PreprocessedImage,
+    host_weights: &HostWeights,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    let n_pos = (img.grid_w as u64) * (img.grid_h as u64);
+    let nblocks = encoder.blocks.len();
+
+    // Whole tower fits one submit (small/medium image): use the validated
+    // single-submit path (byte-identical, fewer fence waits). Attention work
+    // ~ n_pos² per block.
+    if n_pos * n_pos * nblocks as u64 <= vision_submit_budget() {
+        return engine
+            .forward(weights, |ctx| Ok(encoder.encode_image(ctx, img, host_weights)?.range()));
+    }
+
+    let n_embd = encoder.n_embd as u64;
+    // Persistent residual carry, separate from the per-submit scratch.
+    let carry = Region::new(
+        &engine.device,
+        n_embd * n_pos * 4,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    let carry_range = BufferRange { buffer: carry.buffer, offset: 0, size: n_embd * n_pos * 4 };
+    let result =
+        encode_chunked_submits(engine, weights, encoder, img, host_weights, carry_range, nblocks);
+    let mut carry = carry;
+    carry.destroy(&engine.device.device);
+    result
+}
+
+/// The multi-submit body of [`encode_image_chunked`] (split out so the `engine`
+/// borrow is released before the caller frees the carry buffer): patch-embed
+/// (one submit) → block groups (one submit each, ≤ budget/n_pos blocks) →
+/// merger (final submit, read back to host). `carry` is the persistent
+/// `[n_embd, n_pos]` residual buffer.
+#[allow(clippy::too_many_arguments)]
+fn encode_chunked_submits(
+    engine: &mut Engine,
+    weights: &WeightsHandle,
+    encoder: &VisionEncoder,
+    img: &PreprocessedImage,
+    host_weights: &HostWeights,
+    carry: BufferRange,
+    nblocks: usize,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    let n_pos = (img.grid_w as u64) * (img.grid_h as u64);
+    let n_embd = encoder.n_embd as u64;
+    let f32t = GgmlType::F32;
+    let carry_view = || dense_view(&carry, [n_embd, n_pos, 1, 1]);
+    // Blocks per submit so that `n_pos² · group` stays under the budget (≥1).
+    let group = ((vision_submit_budget() / (n_pos * n_pos)).max(1)) as usize;
+
+    // Submit 1: patch-embed → carry.
+    engine.forward(weights, |ctx| {
+        let embed = encoder.record_patch_embed(ctx, img, host_weights)?;
+        record_copy_contiguous(ctx, embed, carry_view())?;
+        ctx.alloc_scratch(4) // dummy readback range (unused)
+    })?;
+
+    // Block groups: load carry → run ≤`group` blocks (scratch ping-pong) → store carry.
+    let mut il = 0usize;
+    while il < nblocks {
+        let end = (il + group).min(nblocks);
+        engine.forward(weights, |ctx| {
+            let positions = stage_vision_positions(ctx, img.grid_w, img.grid_h)?;
+            let mut cur = ctx.alloc_tensor([n_embd, n_pos, 1, 1], f32t)?;
+            let mut nxt = ctx.alloc_tensor([n_embd, n_pos, 1, 1], f32t)?;
+            record_copy_contiguous(ctx, carry_view(), cur)?;
+            let cp = ctx.scratch_checkpoint();
+            for l in il..end {
+                let out = encoder.record_block(ctx, cur, l as u32, positions)?;
+                record_copy_contiguous(ctx, out, nxt)?;
+                ctx.scratch_restore(cp);
+                std::mem::swap(&mut cur, &mut nxt);
+            }
+            record_copy_contiguous(ctx, cur, carry_view())?;
+            ctx.alloc_scratch(4) // dummy readback range (unused)
+        })?;
+        il = end;
+    }
+
+    // Final submit: merger reads carry → embeddings, read back to host.
+    engine.forward(weights, |ctx| Ok(encoder.record_merger(ctx, carry_view())?.range()))
 }
 
 /// View the Q/K/V section (base_row 0 / n_embd / 2*n_embd) of the fused `qkv`

@@ -271,8 +271,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             n_image_tokens = setup.nx * setup.ny,
             "encoding image through vision tower",
         );
-        let embeddings = engine
-            .forward(&vision_weights, |ctx| Ok(encoder.encode_image(ctx, pimg, &host_weights)?.range()))?;
+        let embeddings = crate::vision::encoder::encode_image_chunked(
+            &mut engine,
+            &vision_weights,
+            &encoder,
+            pimg,
+            &host_weights,
+        )?;
         Some(ImagePrefill {
             embeddings,
             start: setup.start,
