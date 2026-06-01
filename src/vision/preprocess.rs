@@ -76,13 +76,17 @@ impl PreprocessConfig {
         image_std: [f32; 3],
     ) -> PreprocessConfig {
         let patch_area = patch_size * patch_size * spatial_merge_size * spatial_merge_size;
+        let max_tokens = std::env::var("SEEKER_IMG_MAX_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(QWEN3VL_DEFAULT_MAX_TOKENS);
         PreprocessConfig {
             patch_size,
             spatial_merge_size,
             image_mean,
             image_std,
             min_pixels: QWEN3VL_DEFAULT_MIN_TOKENS * patch_area,
-            max_pixels: QWEN3VL_DEFAULT_MAX_TOKENS * patch_area,
+            max_pixels: max_tokens * patch_area,
         }
     }
 

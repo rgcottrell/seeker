@@ -812,14 +812,14 @@ impl Worker {
     /// f32 (column = merged token). Grows the scratch for the tower's working
     /// set first. Errors if no vision tower is loaded.
     fn encode_image(&mut self, image: &ServeImage) -> Result<Vec<f32>, Box<dyn Error>> {
-        let vc = self
-            .vision
-            .as_ref()
-            .ok_or("no vision model loaded (mmproj)")?;
+        if self.vision.is_none() {
+            return Err("no vision model loaded (mmproj)".into());
+        }
         let n_pos = (image.pimg.grid_w as u64) * (image.pimg.grid_h as u64);
-        let nlayers = vc.vision.config.n_layer as u64;
-        // Mirror `vision_scratch_estimate` (commands::run / chat).
-        let need = (28_000u64 * n_pos * (nlayers + 2) * 4).max(64 << 20);
+        // Mirror `vision_scratch_estimate` (commands::run / chat): `encode_image`
+        // reclaims each stage's scratch between layers, so the working set is
+        // O(n_pos) — ~28k floats/token for the largest stage, budget 32k.
+        let need = (32_000u64 * n_pos * 4).max(64 << 20);
         if need > self.scratch_bytes {
             self.engine.allocate_scratch(need)?;
             self.scratch_bytes = need;
@@ -827,13 +827,8 @@ impl Worker {
         let vc = self.vision.as_ref().expect("vision present (checked above)");
         let (encoder, host_weights, weights) = (&vc.encoder, &vc.host_weights, &vc.vision.weights);
         let pimg = &image.pimg;
-        self.engine.forward(weights, |ctx| {
-            let mut x = encoder.record_patch_embed(ctx, pimg, host_weights)?;
-            for il in 0..encoder.blocks.len() as u32 {
-                x = encoder.record_block(ctx, x, il, pimg.grid_w, pimg.grid_h)?;
-            }
-            Ok(encoder.record_merger(ctx, x)?.range())
-        })
+        self.engine
+            .forward(weights, |ctx| Ok(encoder.encode_image(ctx, pimg, host_weights)?.range()))
     }
 
     /// Admit an image chat request: encode the image, prefill the whole prompt

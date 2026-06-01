@@ -440,9 +440,13 @@ impl VisionEncoder {
 
     /// Record ONE Qwen3-VL ViT transformer block (layer `layer_idx`) on the
     /// GPU. Input/output are both F32 `[n_embd, n_patches]` in the 2x2-block
-    /// token order Slice 2 produces. `grid_w`/`grid_h` are the patch grid dims
-    /// (before merge), needed for the 2D vision-RoPE positions (which must match
-    /// Slice 2's patch ordering).
+    /// token order Slice 2 produces. `positions` is the staged vision-RoPE
+    /// positions buffer ([`stage_vision_positions`]); it depends only on the
+    /// patch grid (not the layer), so the caller builds it once and passes the
+    /// same range to every block. Keeping it out of `record_block` is also what
+    /// lets [`VisionEncoder::encode_image`] reclaim each block's scratch between
+    /// layers without a host-write-into-reused-scratch hazard (the positions are
+    /// the only host-staged input inside the block loop).
     ///
     /// Faithful port of the per-block body of `clip_graph_qwen3vl::build`
     /// (`/home/bob/tools/llama.cpp/src/tools/mtmd/models/qwen3vl.cpp:80-148`)
@@ -473,8 +477,7 @@ impl VisionEncoder {
         ctx: &mut DispatchContext,
         x: TensorView,
         layer_idx: u32,
-        grid_w: u32,
-        grid_h: u32,
+        positions: BufferRange,
     ) -> Result<TensorView, Box<dyn Error>> {
         let n_embd = self.n_embd;
         let n_head = self.n_head;
@@ -512,12 +515,10 @@ impl VisionEncoder {
         }
 
         // --- 3. vision M-RoPE on Q (rows 0..n_embd) and K (n_embd..2*n_embd) ---
-        let positions = build_vision_positions(grid_w as usize, grid_h as usize);
-        let pos_range = alloc_scratch_write(ctx, &i32_to_bytes(&positions))?;
         let q_view = qkv_section_view(&qkv, head_dim, n_head, n_pos, 0);
         let k_view = qkv_section_view(&qkv, head_dim, n_head, n_pos, n_embd);
-        record_vision_rope(ctx, q_view, pos_range, head_dim)?;
-        record_vision_rope(ctx, k_view, pos_range, head_dim)?;
+        record_vision_rope(ctx, q_view, positions, head_dim)?;
+        record_vision_rope(ctx, k_view, positions, head_dim)?;
         if want("rope") {
             return Ok(qkv);
         }
@@ -666,12 +667,55 @@ impl VisionEncoder {
         img: &PreprocessedImage,
         host_weights: &HostWeights,
     ) -> Result<TensorView, Box<dyn Error>> {
-        let mut x = self.record_patch_embed(ctx, img, host_weights)?;
+        let n_embd = self.n_embd as u64;
+        let n_pos = (img.grid_w as u64) * (img.grid_h as u64);
+        let f32 = GgmlType::F32;
+
+        // Persistent buffers, allocated up front so resetting the scratch bump
+        // cursor after each stage never frees them: two `[n_embd, n_pos]`
+        // ping-pong carriers for the residual stream, plus the grid-invariant
+        // vision-RoPE positions (built once; identical for every block).
+        let mut cur = ctx.alloc_tensor([n_embd, n_pos, 1, 1], f32)?;
+        let mut nxt = ctx.alloc_tensor([n_embd, n_pos, 1, 1], f32)?;
+        let positions = stage_vision_positions(ctx, img.grid_w, img.grid_h)?;
+
+        // Everything allocated past this checkpoint is per-stage scratch we
+        // reclaim once the stage's result is copied into a carrier. This keeps
+        // the working set O(n_pos) instead of O(n_layer · n_pos): without it the
+        // bump allocator accumulates every block's intermediates and a
+        // max-resolution image would reserve tens of GB of scratch — past the
+        // device's max buffer size, losing the device. Reclaim is safe because
+        // the command buffer runs in recorded order with compute barriers
+        // between ops, and `positions` (the only host-staged input in the loop)
+        // lives in the persistent region above, never in reclaimed scratch.
+        let cp = ctx.scratch_checkpoint();
+
+        let embed = self.record_patch_embed(ctx, img, host_weights)?;
+        record_copy_contiguous(ctx, embed, cur)?;
+        ctx.scratch_restore(cp);
+
         for il in 0..self.blocks.len() as u32 {
-            x = self.record_block(ctx, x, il, img.grid_w, img.grid_h)?;
+            let out = self.record_block(ctx, cur, il, positions)?;
+            record_copy_contiguous(ctx, out, nxt)?;
+            ctx.scratch_restore(cp);
+            std::mem::swap(&mut cur, &mut nxt);
         }
-        self.record_merger(ctx, x)
+
+        self.record_merger(ctx, cur)
     }
+}
+
+/// Build the grid-invariant Qwen3-VL vision-RoPE positions for a
+/// `grid_w × grid_h` patch grid and stage them into scratch. The positions
+/// depend only on the grid (every layer reuses them), so callers build them
+/// once and hand the range to each [`VisionEncoder::record_block`].
+pub fn stage_vision_positions(
+    ctx: &mut DispatchContext,
+    grid_w: u32,
+    grid_h: u32,
+) -> Result<BufferRange, Box<dyn Error>> {
+    let positions = build_vision_positions(grid_w as usize, grid_h as usize);
+    alloc_scratch_write(ctx, &i32_to_bytes(&positions))
 }
 
 /// View the Q/K/V section (base_row 0 / n_embd / 2*n_embd) of the fused `qkv`

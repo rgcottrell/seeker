@@ -271,13 +271,8 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             n_image_tokens = setup.nx * setup.ny,
             "encoding image through vision tower",
         );
-        let embeddings = engine.forward(&vision_weights, |ctx| {
-            let mut x = encoder.record_patch_embed(ctx, pimg, &host_weights)?;
-            for il in 0..encoder.blocks.len() as u32 {
-                x = encoder.record_block(ctx, x, il, pimg.grid_w, pimg.grid_h)?;
-            }
-            Ok(encoder.record_merger(ctx, x)?.range())
-        })?;
+        let embeddings = engine
+            .forward(&vision_weights, |ctx| Ok(encoder.encode_image(ctx, pimg, &host_weights)?.range()))?;
         Some(ImagePrefill {
             embeddings,
             start: setup.start,
@@ -1704,7 +1699,9 @@ fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
                 element_stride: es,
                 dtype: crate::gguf::GgmlType::F32,
             };
-            let out = encoder.record_block(ctx, x, 0, grid_w, grid_h)?;
+            let positions =
+                crate::vision::encoder::stage_vision_positions(ctx, grid_w, grid_h)?;
+            let out = encoder.record_block(ctx, x, 0, positions)?;
             Ok(out.range())
         },
     )?;
@@ -1910,8 +1907,10 @@ fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
         &weights,
         |ctx| -> Result<crate::inference::buffer::BufferRange, Box<dyn Error>> {
             let mut x = encoder.record_patch_embed(ctx, &img, &hw)?;
+            let positions =
+                crate::vision::encoder::stage_vision_positions(ctx, grid_w, grid_h)?;
             for il in 0..nlayers as u32 {
-                x = encoder.record_block(ctx, x, il, grid_w, grid_h)?;
+                x = encoder.record_block(ctx, x, il, positions)?;
             }
             if run_merger {
                 x = encoder.record_merger(ctx, x)?;
@@ -3912,12 +3911,14 @@ struct ImagePrefill {
 }
 
 /// Conservative scratch estimate for the vision tower's single forward (mirrors
-/// `vision_encode_smoke`): ~28k floats/token/block across all blocks plus the
-/// patch-embed + merger stages, floored at 64 MiB.
+/// `commands::chat` / `server`). [`VisionEncoder::encode_image`] reclaims each
+/// stage's scratch between layers, so the working set is O(n_pos), NOT
+/// O(n_layer · n_pos): the persistent residual carriers + RoPE positions plus
+/// the single largest stage, ~28k floats/token; budget 32k for margin. Floored
+/// at 64 MiB.
 fn vision_scratch_estimate(setup: &ImageSetup) -> u64 {
     let n_pos = (setup.pimg.grid_w as u64) * (setup.pimg.grid_h as u64);
-    let nlayers = setup.vcfg.n_layer as u64;
-    (28_000u64 * n_pos * (nlayers + 2) * 4).max(64 << 20)
+    (32_000u64 * n_pos * 4).max(64 << 20)
 }
 
 /// The media placeholder llama.cpp's mtmd uses (`mtmd_default_marker()`). With

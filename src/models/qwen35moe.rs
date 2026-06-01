@@ -423,33 +423,67 @@ impl Model for Qwen35MoeModel {
             .logits)
     }
 
-    fn record_forward_image(
+    fn record_forward_image_chunk(
         &self,
         ctx: &mut DispatchContext,
         cache: &mut KvCache,
-        tokens: &[u32],
-        position_offset: u32,
+        chunk_tokens: &[u32],
+        chunk_global_start: usize,
         image_embeddings: &[f32],
-        image_start: usize,
+        image_global_start: usize,
         image_nx: usize,
         image_ny: usize,
+        prompt_pos0: u32,
+        compute_logits: bool,
     ) -> Result<Option<TensorView>, Box<dyn Error>> {
-        let span = ImageSpan {
-            start: image_start,
-            n_tok: image_nx * image_ny,
-            nx: image_nx,
-            ny: image_ny,
+        let n_embd = self.params.n_embd as usize;
+        let n_tok = image_nx * image_ny;
+        if image_embeddings.len() != n_embd * n_tok {
+            return Err(format!(
+                "image embeddings len {} != n_embd {} * n_tok {} — the vision \
+                 projection_dim must equal the text model's embedding_length",
+                image_embeddings.len(),
+                n_embd,
+                n_tok
+            )
+            .into());
+        }
+        let l = chunk_tokens.len();
+        let span = ImageSpan { start: image_global_start, n_tok, nx: image_nx, ny: image_ny };
+
+        // M-RoPE base lags the KV-slot cursor by the lag accrued *before* this
+        // image (text-only ⇒ 0). Held constant across the prefill's chunks —
+        // the caller advances `rope_position_lag` only after the whole prefill —
+        // so every chunk builds positions off the same global base.
+        let rope_base0 = prompt_pos0.saturating_sub(cache.rope_position_lag);
+        let positions =
+            build_decoder_mrope_positions_window(rope_base0, Some(span), chunk_global_start, l);
+
+        // Which image columns (global [g, g+n_tok)) fall in this chunk's global
+        // range [chunk_global_start, +l)? Splice just those, at their chunk-local
+        // residual column.
+        let g = image_global_start;
+        let ov_start = chunk_global_start.max(g);
+        let ov_end = (chunk_global_start + l).min(g + n_tok);
+        let splice = if ov_start < ov_end {
+            let col0 = ov_start - g;
+            let count = ov_end - ov_start;
+            let sub = &image_embeddings[col0 * n_embd..(col0 + count) * n_embd];
+            Some((sub, ov_start - chunk_global_start))
+        } else {
+            None
         };
+
         Ok(self
             .forward_impl(
                 ctx,
                 cache,
-                tokens,
-                position_offset,
-                /*compute_logits=*/ true,
+                chunk_tokens,
+                /*position_offset=*/ cache.position,
+                compute_logits,
                 /*full_logits=*/ false,
                 /*checkpoint=*/ false,
-                Some(DecoderImage { embeddings: image_embeddings, span }),
+                Some(ForwardImage { positions: &positions, splice }),
             )?
             .logits)
     }
@@ -553,26 +587,20 @@ impl Qwen35MoeModel {
         compute_logits: bool,
         full_logits: bool,
         checkpoint: bool,
-        image: Option<DecoderImage<'_>>,
+        image: Option<ForwardImage<'_>>,
     ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
         let p = &self.params;
         let l = tokens.len() as u32;
         if l == 0 {
             return Err("empty prompt".into());
         }
-        if let Some(img) = image.as_ref() {
-            if img.embeddings.len() != p.n_embd as usize * img.span.n_tok {
-                return Err(format!(
-                    "image embeddings len {} != n_embd {} * n_tok {} — the vision \
-                     projection_dim must equal the text model's embedding_length",
-                    img.embeddings.len(),
-                    p.n_embd,
-                    img.span.n_tok
-                )
-                .into());
-            }
-            if img.span.start + img.span.n_tok > tokens.len() {
-                return Err("image span overruns the token sequence".into());
+        if let Some(fi) = image.as_ref() {
+            debug_assert_eq!(fi.positions.len(), 4 * l as usize, "image positions must be 4*l");
+            if let Some((emb, start)) = fi.splice {
+                let cols = emb.len() / p.n_embd as usize;
+                if start + cols > l as usize {
+                    return Err("image splice overruns the chunk".into());
+                }
             }
         }
 
@@ -607,21 +635,19 @@ impl Qwen35MoeModel {
         // resolves to the linear text position.
         let positions_buf = ctx.alloc_scratch(4 * (l as u64) * 4)?;
         // M-RoPE positions, axis-major `pos[axis*l + tok]`. For text-only this
-        // is the linear position replicated to all 4 axes (so imrope 0≡1); when
-        // an image is present each image token gets its (t, y, x, z) grid
-        // position and trailing text resumes at base+max(nx,ny). See
-        // `build_decoder_mrope_positions`.
-        let image_spans: &[ImageSpan] = match image.as_ref() {
-            Some(img) => std::slice::from_ref(&img.span),
-            None => &[],
+        // is the linear position replicated to all 4 axes (so imrope 0≡1). For an
+        // image chunk the caller precomputes them globally (the image's 2D cursor
+        // is continuous across chunks), so we use those verbatim. The text base
+        // lags the KV-slot count (`position_offset`) by `rope_position_lag` once
+        // an image was prefilled; text-only ⇒ lag 0 ⇒ `rope_base == position_offset`
+        // (the validated text path, unchanged).
+        let positions: Vec<u32> = match image.as_ref() {
+            Some(fi) => fi.positions.to_vec(),
+            None => {
+                let rope_base = position_offset.saturating_sub(cache.rope_position_lag);
+                build_decoder_mrope_positions(l as usize, rope_base, &[])
+            }
         };
-        // The M-RoPE base is the *logical* position cursor, which lags the
-        // KV-slot count (`position_offset`) by `rope_position_lag` once any
-        // image has been prefilled: an image advances the cursor by
-        // `max(nx,ny)` but consumes `n_tok = nx*ny` KV slots. Text-only ⇒ lag 0
-        // ⇒ `rope_base == position_offset` (the validated text path, unchanged).
-        let rope_base = position_offset.saturating_sub(cache.rope_position_lag);
-        let positions = build_decoder_mrope_positions(l as usize, rope_base, image_spans);
         write_u32(ctx, positions_buf, &positions)?;
 
         // Snapshot the replay-input offsets so the persistent-decode-cmdbuf
@@ -650,31 +676,31 @@ impl Qwen35MoeModel {
 
         let residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
         elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, l, residual)?;
-        // Splice the vision embeddings over the `<|image_pad|>` rows. The image
-        // tokens are `n_tok` consecutive columns from `span.start`, and both the
-        // vision output and the residual are n_embd-contiguous per column, so
+        // Splice the vision embeddings over the `<|image_pad|>` rows that fall in
+        // THIS chunk: `count` consecutive columns from chunk-local `start`. Both
+        // the vision output and the residual are n_embd-contiguous per column, so
         // this is a contiguous F32 block copy over `residual`'s sub-columns
         // (get_rows already barriered `residual`, so the overwrite is ordered).
-        if let Some(img) = image.as_ref() {
-            let n_tok = img.span.n_tok as u64;
-            let emb_buf = ctx.alloc_scratch((img.embeddings.len() as u64) * 4)?;
-            write_f32(ctx, emb_buf, img.embeddings)?;
+        if let Some((emb, start)) = image.as_ref().and_then(|fi| fi.splice) {
+            let count = (emb.len() / p.n_embd as usize) as u64;
+            let emb_buf = ctx.alloc_scratch((emb.len() as u64) * 4)?;
+            write_f32(ctx, emb_buf, emb)?;
             let img_src = TensorView {
                 buffer: emb_buf.buffer,
                 byte_offset: emb_buf.offset,
                 byte_size: emb_buf.size,
-                dims: [hidden, n_tok, 1, 1],
-                byte_stride: [4, hidden * 4, hidden * n_tok * 4, hidden * n_tok * 4],
-                element_stride: [1, hidden, hidden * n_tok, hidden * n_tok],
+                dims: [hidden, count, 1, 1],
+                byte_stride: [4, hidden * 4, hidden * count * 4, hidden * count * 4],
+                element_stride: [1, hidden, hidden * count, hidden * count],
                 dtype: GgmlType::F32,
             };
             let img_dst = TensorView {
                 buffer: residual.buffer,
-                byte_offset: residual.byte_offset + (img.span.start as u64) * hidden * 4,
-                byte_size: n_tok * hidden * 4,
-                dims: [hidden, n_tok, 1, 1],
-                byte_stride: [4, hidden * 4, hidden * n_tok * 4, hidden * n_tok * 4],
-                element_stride: [1, hidden, hidden * n_tok, hidden * n_tok],
+                byte_offset: residual.byte_offset + (start as u64) * hidden * 4,
+                byte_size: count * hidden * 4,
+                dims: [hidden, count, 1, 1],
+                byte_stride: [4, hidden * 4, hidden * count * 4, hidden * count * 4],
+                element_stride: [1, hidden, hidden * count, hidden * count],
                 dtype: GgmlType::F32,
             };
             cast::record_cast(ctx, img_src, img_dst)?;
@@ -812,7 +838,6 @@ impl Qwen35MoeModel {
         // ubatch). cache.position is still advanced.
         if !compute_logits {
             cache_io::advance(cache, l);
-            advance_rope_lag(cache, image.as_ref());
             return Ok(crate::models::ForwardFullOut {
                 logits: None,
                 residual,
@@ -856,7 +881,6 @@ impl Qwen35MoeModel {
         });
 
         cache_io::advance(cache, l);
-        advance_rope_lag(cache, image.as_ref());
         Ok(crate::models::ForwardFullOut { logits, residual })
     }
 
@@ -3659,26 +3683,21 @@ pub struct ImageSpan {
     pub ny: usize,
 }
 
-/// One image's contribution to a decoder prefill: the vision-tower output
-/// `[n_embd, n_tok]` (host f32, column = merged token, n_embd contiguous per
-/// column — same layout as the get_rows residual) plus its [`ImageSpan`] in the
-/// token sequence. Threaded into [`Qwen35MoeModel::forward_impl`] as
-/// `Option<DecoderImage>`; `None` is the unchanged text path.
-#[derive(Clone, Copy)]
-pub struct DecoderImage<'a> {
-    pub embeddings: &'a [f32],
-    pub span: ImageSpan,
-}
-
-/// After a forward that spliced an image, advance the cache's M-RoPE lag by
-/// `n_tok - max(nx,ny)` (the gap between KV slots consumed and logical
-/// positions advanced). No-op for text-only forwards (`image == None`), so the
-/// text path is unchanged. Called right after `cache_io::advance`.
-fn advance_rope_lag(cache: &mut KvCache, image: Option<&DecoderImage<'_>>) {
-    if let Some(img) = image {
-        let m = img.span.nx.max(img.span.ny) as u32;
-        cache.rope_position_lag += img.span.n_tok as u32 - m;
-    }
+/// One chunk's image contribution to [`Qwen35MoeModel::forward_impl`]. Carries
+/// the precomputed 4-axis M-RoPE positions for the chunk's tokens (built
+/// globally so the image's 2D cursor is continuous across chunks) and, when any
+/// image-pad tokens fall in this chunk, the vision-tower embedding columns to
+/// splice + the chunk-local residual column where they start. `None` (text
+/// path) builds positions internally and skips the splice — byte-identical to
+/// the validated text-only forward. The caller advances `rope_position_lag`
+/// once after the whole prefill (not per chunk), so `forward_impl` never touches
+/// it: the global positions already encode the lag.
+struct ForwardImage<'a> {
+    /// `4 * tokens.len()` axis-major M-RoPE positions for this chunk's tokens.
+    positions: &'a [u32],
+    /// `(embeddings [n_embd, count], chunk-local start column)` for the image
+    /// columns in this chunk, or `None` if none fall here.
+    splice: Option<(&'a [f32], usize)>,
 }
 
 /// Build the 4-axis M-RoPE decoder positions for a token sequence that may
@@ -3727,9 +3746,94 @@ pub fn build_decoder_mrope_positions(l: usize, pos0: u32, images: &[ImageSpan]) 
     out
 }
 
+/// Windowed variant of [`build_decoder_mrope_positions`] for **chunked** image
+/// prefill: build the 4-axis M-RoPE positions for the global token window
+/// `[window_start, window_start + window_len)` only, in chunk-local axis-major
+/// layout (`out[axis*window_len + t]`, `t` the chunk-local index). `image`'s
+/// `start` is a GLOBAL token index, so the image's 2D cursor stays continuous
+/// across chunks and an image straddling a chunk boundary is handled correctly
+/// (the formula is closed-form per token, not a left-to-right replay).
+///
+/// Single-image only (the current one-image-per-conversation scope) and assumes
+/// every non-image token advances the cursor by 1 — identical to
+/// `build_decoder_mrope_positions` for a `start..start+n` window, which the unit
+/// tests assert. `pos0` is the rope base of global token 0.
+pub fn build_decoder_mrope_positions_window(
+    pos0: u32,
+    image: Option<ImageSpan>,
+    window_start: usize,
+    window_len: usize,
+) -> Vec<u32> {
+    let mut out = vec![0u32; 4 * window_len];
+    for t in 0..window_len {
+        let j = window_start + t;
+        let (a0, a1, a2, a3) = match image {
+            // Inside the image span: token k shares t=base, with y/x the merged
+            // grid row/col (raster order), z=0.
+            Some(im) if j >= im.start && j < im.start + im.n_tok => {
+                let k = j - im.start;
+                let base = pos0 + im.start as u32;
+                (base, base + (k / im.nx) as u32, base + (k % im.nx) as u32, 0)
+            }
+            // After the image: the cursor advanced by max(nx,ny) over the whole
+            // image (not n_tok), then 1 per trailing text token.
+            Some(im) if j >= im.start + im.n_tok => {
+                let after = (j - (im.start + im.n_tok)) as u32;
+                let c = pos0 + im.start as u32 + im.nx.max(im.ny) as u32 + after;
+                (c, c, c, c)
+            }
+            // Before the image (or text-only): linear position on all axes.
+            _ => {
+                let c = pos0 + j as u32;
+                (c, c, c, c)
+            }
+        };
+        out[t] = a0;
+        out[window_len + t] = a1;
+        out[2 * window_len + t] = a2;
+        out[3 * window_len + t] = a3;
+    }
+    out
+}
+
 #[cfg(test)]
 mod vision_pos_tests {
-    use super::{build_decoder_mrope_positions, ImageSpan};
+    use super::{build_decoder_mrope_positions, build_decoder_mrope_positions_window, ImageSpan};
+
+    /// The windowed builder must agree with the full builder for every window of
+    /// a single-image sequence — including windows that start/end inside the
+    /// image (chunk boundaries straddling the image). This is the invariant
+    /// chunked prefill relies on.
+    #[test]
+    fn windowed_matches_full_for_all_splits() {
+        let img = ImageSpan { start: 2, n_tok: 6, nx: 3, ny: 2 };
+        let l = 2 + 6 + 3; // leading text + image + trailing text
+        let pos0 = 7;
+        let full = build_decoder_mrope_positions(l, pos0, &[img]);
+        for ws in 0..=l {
+            for we in ws..=l {
+                let wl = we - ws;
+                let win = build_decoder_mrope_positions_window(pos0, Some(img), ws, wl);
+                for axis in 0..4 {
+                    for t in 0..wl {
+                        assert_eq!(
+                            win[axis * wl + t],
+                            full[axis * l + (ws + t)],
+                            "mismatch axis {axis} window [{ws},{we}) tok {t}"
+                        );
+                    }
+                }
+            }
+        }
+        // Text-only window agrees too.
+        let full_t = build_decoder_mrope_positions(l, pos0, &[]);
+        let win_t = build_decoder_mrope_positions_window(pos0, None, 3, 4);
+        for axis in 0..4 {
+            for t in 0..4 {
+                assert_eq!(win_t[axis * 4 + t], full_t[axis * l + (3 + t)]);
+            }
+        }
+    }
 
     /// Extract the four per-token axis values at a local token index.
     fn at(p: &[u32], l: usize, tok: usize) -> (u32, u32, u32, u32) {

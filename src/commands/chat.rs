@@ -497,15 +497,15 @@ async fn resolve_model_path(args: &ChatArgs) -> Result<download::Resolved, Box<d
 }
 
 /// Conservative scratch estimate for the vision tower's single forward (mirrors
-/// `vision_encode_smoke` / `commands::run`): ~28k floats/token/block across all
-/// blocks plus the patch-embed + merger stages, floored at 64 MiB.
-fn vision_scratch_estimate(
-    cfg: &crate::vision::VisionConfig,
-    pimg: &crate::vision::preprocess::PreprocessedImage,
-) -> u64 {
+/// `commands::run` / `server`). [`VisionEncoder::encode_image`] reclaims each
+/// stage's scratch between layers (checkpoint/restore), so the working set is
+/// the persistent residual carriers + RoPE positions plus the single largest
+/// stage — O(n_pos), NOT O(n_layer · n_pos). The per-token high-water across
+/// the stages is ~28k floats; budget 32k for margin (copy ops, alignment).
+/// Floored at 64 MiB.
+fn vision_scratch_estimate(pimg: &crate::vision::preprocess::PreprocessedImage) -> u64 {
     let n_pos = (pimg.grid_w as u64) * (pimg.grid_h as u64);
-    let nlayers = cfg.n_layer as u64;
-    (28_000u64 * n_pos * (nlayers + 2) * 4).max(64 << 20)
+    (32_000u64 * n_pos * 4).max(64 << 20)
 }
 
 /// All conversation state plus the GPU resources needed to advance it.
@@ -1219,20 +1219,16 @@ impl ChatSession {
         let n_tok = pimg.n_tokens as usize;
 
         // Grow the scratch for the vision tower's working set, then encode.
-        let need = vision_scratch_estimate(&cfg, &pimg);
+        let need = vision_scratch_estimate(&pimg);
         if need > self.scratch_bytes {
             self.engine.allocate_scratch(need)?;
             self.scratch_bytes = need;
         }
         let vc = self.vision_ctx.as_ref().expect("ensure_vision built it");
         let (encoder, host_weights, weights) = (&vc.encoder, &vc.host_weights, &vc.vision.weights);
-        let embeddings = self.engine.forward(weights, |ctx| {
-            let mut x = encoder.record_patch_embed(ctx, &pimg, host_weights)?;
-            for il in 0..encoder.blocks.len() as u32 {
-                x = encoder.record_block(ctx, x, il, pimg.grid_w, pimg.grid_h)?;
-            }
-            Ok(encoder.record_merger(ctx, x)?.range())
-        })?;
+        let embeddings = self
+            .engine
+            .forward(weights, |ctx| Ok(encoder.encode_image(ctx, &pimg, host_weights)?.range()))?;
         self.pending_image = Some(EncodedImage { embeddings, nx, ny, n_tok });
         Ok((nx, ny, n_tok))
     }
@@ -1543,11 +1539,27 @@ fn print_stats(stats: &ReplyStats) {
     }
 }
 
+/// Expand a leading `~` / `~/` to `$HOME`. The chat REPL parses its own command
+/// arguments, so — unlike a shell — it must do tilde expansion itself; otherwise
+/// `/image ~/pic.png` tries to open a file literally named `~/pic.png`. Only the
+/// bare `~` and `~/…` forms are handled (the `~user` form needs a passwd lookup
+/// and is rare); anything else, or an unset `$HOME`, is returned unchanged.
+fn expand_tilde(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if path == "~" => home,
+        Ok(home) if path.starts_with("~/") => {
+            format!("{}/{}", home.trim_end_matches('/'), &path[2..])
+        }
+        _ => path.to_string(),
+    }
+}
+
 fn handle_read(session: &mut ChatSession, path: &str) {
     if path.is_empty() {
         println!("usage: /read <path>");
         return;
     }
+    let path = &expand_tilde(path);
     match fs::read_to_string(path) {
         Ok(content) => {
             let trimmed = content.trim();
@@ -1566,13 +1578,14 @@ fn handle_read(session: &mut ChatSession, path: &str) {
 /// the next user message (the message then carries the `<__media__>` marker, so
 /// the vision block is spliced into that turn's prefill). Vision models only.
 fn handle_image(session: &mut ChatSession, arg: &str) {
-    // Tolerate surrounding quotes (paths with spaces pasted with quotes).
-    let path = arg.trim().trim_matches('"').trim_matches('\'');
+    // Tolerate surrounding quotes (paths with spaces pasted with quotes), then
+    // expand a leading `~` (the REPL isn't a shell, so it must do this itself).
+    let path = expand_tilde(arg.trim().trim_matches('"').trim_matches('\''));
     if path.is_empty() {
         println!("usage: /image <path-to-image>");
         return;
     }
-    match session.attach_image(Path::new(path)) {
+    match session.attach_image(Path::new(&path)) {
         Ok((nx, ny, n_tok)) => println!(
             "(image attached: {nx}×{ny} merged grid, {n_tok} tokens — sent with your next message)"
         ),
@@ -1589,6 +1602,7 @@ fn handle_glob(session: &mut ChatSession, pattern: &str) {
         println!("usage: /glob <pattern>");
         return;
     }
+    let pattern = &expand_tilde(pattern);
     let paths = match glob::glob(pattern) {
         Ok(paths) => paths,
         Err(e) => {
@@ -1628,7 +1642,24 @@ fn handle_glob(session: &mut ChatSession, pattern: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_continuations, parse_logit_bias, prompt_opens_think};
+    use super::{expand_tilde, join_continuations, parse_logit_bias, prompt_opens_think};
+
+    #[test]
+    fn expand_tilde_forms() {
+        // SAFETY: single-threaded within this test; no other test reads $HOME.
+        unsafe { std::env::set_var("HOME", "/home/bob") };
+        assert_eq!(expand_tilde("~/map.jpg"), "/home/bob/map.jpg");
+        assert_eq!(expand_tilde("~"), "/home/bob");
+        assert_eq!(expand_tilde("~/a/b.png"), "/home/bob/a/b.png");
+        // Non-leading or unrelated `~` is left alone, as are absolute/relative paths.
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("rel/path"), "rel/path");
+        assert_eq!(expand_tilde("dir/~/x"), "dir/~/x");
+        assert_eq!(expand_tilde("~user/x"), "~user/x");
+        // Trailing slash on $HOME doesn't double up.
+        unsafe { std::env::set_var("HOME", "/home/bob/") };
+        assert_eq!(expand_tilde("~/map.jpg"), "/home/bob/map.jpg");
+    }
 
     #[test]
     fn join_continuations_default_mode() {

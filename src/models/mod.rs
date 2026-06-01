@@ -104,24 +104,32 @@ pub trait Model: Send + Sync {
         compute_logits: bool,
     ) -> Result<Option<TensorView>, Box<dyn Error>>;
 
-    /// Record a prefill forward for a token sequence that contains one image,
-    /// splicing the vision-tower embeddings into the residual at the
-    /// `<|image_pad|>` rows and using the qwen-vl M-RoPE decoder positions
-    /// (interleaved). `image_embeddings` is the encoder output `[n_embd, n_tok]`
-    /// (column = merged token, n_embd contiguous), `image_start` is the local
-    /// index of the first image-pad token, and `image_nx`/`image_ny` are the
-    /// merged grid dims (`n_tok = nx*ny`). Returns the last-token logits.
-    /// Default unsupported (text-only / non-VL models).
-    fn record_forward_image(
+    /// Record ONE chunk of an image-containing prefill (chunked so a large image
+    /// + prompt doesn't run as one oversized forward — which TDR-hangs the GPU).
+    /// `chunk_tokens` are this chunk's tokens; `chunk_global_start` is the global
+    /// prompt index of `chunk_tokens[0]`. `image_embeddings` is the FULL encoder
+    /// output `[n_embd, n_tok]` (column = merged token, n_embd contiguous); the
+    /// model splices only the columns whose `<|image_pad|>` slots fall in this
+    /// chunk. `image_global_start` is the first image-pad token's global index,
+    /// `image_nx`/`image_ny` the merged grid (`n_tok = nx*ny`), `prompt_pos0` the
+    /// absolute position of global token 0 (so the M-RoPE 2D cursor is continuous
+    /// across chunks). `compute_logits` is true only for the final chunk (which
+    /// samples). Advances `cache.position` by the chunk length; does NOT touch
+    /// `rope_position_lag` (the caller sets it once after the whole prefill).
+    /// Returns the last-token logits when `compute_logits`. Default unsupported.
+    #[allow(clippy::too_many_arguments)]
+    fn record_forward_image_chunk(
         &self,
         _ctx: &mut DispatchContext,
         _cache: &mut KvCache,
-        _tokens: &[u32],
-        _position_offset: u32,
+        _chunk_tokens: &[u32],
+        _chunk_global_start: usize,
         _image_embeddings: &[f32],
-        _image_start: usize,
+        _image_global_start: usize,
         _image_nx: usize,
         _image_ny: usize,
+        _prompt_pos0: u32,
+        _compute_logits: bool,
     ) -> Result<Option<TensorView>, Box<dyn Error>> {
         Err("model does not support image input".into())
     }
