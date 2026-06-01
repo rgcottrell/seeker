@@ -19,10 +19,14 @@ Do not commit unless `scripts/check.sh` passes. CI
 
 A source-controlled `pre-push` hook (`.githooks/pre-push`) runs the gate
 automatically before any push, so WIP commits stay frictionless but a branch is
-verified before it leaves your machine. Enable it once per clone:
+verified before it leaves your machine.
+
+`build.rs` self-installs it on the first build (sets `core.hooksPath` →
+`.githooks`, npm-`postinstall`-style; best-effort, idempotent, never clobbers an
+existing override). If you somehow push without ever building, enable it by hand:
 
 ```sh
-scripts/install-hooks.sh   # sets core.hooksPath -> .githooks
+scripts/install-hooks.sh
 ```
 
 Bypass a single push with `git push --no-verify`.

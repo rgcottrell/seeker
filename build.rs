@@ -87,8 +87,38 @@ fn parse_variants(source: &str, path: &Path) -> Vec<Variant> {
     variants
 }
 
+/// Point git at the source-controlled hooks in `.githooks/` (the Rust analog of
+/// an npm `postinstall` hook install — build scripts always run once on a fresh
+/// clone before any cache exists). Best-effort and idempotent: skips outside a
+/// git work tree (vendored/release builds with no `.git`), skips if git is
+/// missing, and never clobbers an already-set `core.hooksPath`. Bypass any
+/// single push with `git push --no-verify`.
+fn ensure_git_hooks_path(repo_dir: &str) {
+    if !Path::new(repo_dir).join(".git").exists() {
+        return;
+    }
+    // Only configure when unset — respect a deliberate override.
+    if let Ok(out) = Command::new("git")
+        .args(["-C", repo_dir, "config", "--get", "core.hooksPath"])
+        .output()
+        && out.status.success()
+        && !out.stdout.is_empty()
+    {
+        return;
+    }
+    if Command::new("git")
+        .args(["-C", repo_dir, "config", "core.hooksPath", ".githooks"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        println!("cargo:warning=enabled git pre-push gate (core.hooksPath=.githooks)");
+    }
+}
+
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    ensure_git_hooks_path(&manifest_dir);
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let shaders_dir = Path::new(&manifest_dir).join("shaders");
     let compute_dir = shaders_dir.join("compute");
