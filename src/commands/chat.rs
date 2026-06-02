@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Args;
+use rustyline::completion::{Completer, FilenameCompleter, Pair, unescape};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Completer, Editor, Helper, Hinter};
+use rustyline::{CompletionType, Config, Context, Editor, Helper, Hinter};
 
 use crate::chat_template::{self, ChatMessage};
 use crate::commands::chat_cache;
@@ -636,14 +637,62 @@ fn prompt_opens_think(rendered: &str) -> bool {
     }
 }
 
-/// rustyline line-editor helper: colors the prompt/input and decides when a
-/// line is complete (multi-line input). Completion / hints are no-ops.
-#[derive(Completer, Helper, Hinter)]
+/// rustyline line-editor helper: colors the prompt/input, decides when a line
+/// is complete (multi-line input), and Tab-completes filesystem paths for the
+/// path-argument commands. Hints are a no-op.
+#[derive(Helper, Hinter)]
 struct ChatHelper {
     /// `--multiline-input`: when true Enter inserts a newline and a trailing
     /// `\` submits; when false (default) a trailing `\` continues to the next
     /// line and a bare Enter submits.
     multiline: bool,
+    /// Filesystem completer used only inside a [`PATH_COMMANDS`] argument. It
+    /// expands `~/` to read the home dir but leaves the `~` literal in the
+    /// inserted text (and backslash-escapes spaces / shell break chars) —
+    /// submit-time [`normalize_path_arg`] undoes that and expands the `~`.
+    completer: FilenameCompleter,
+}
+
+/// Commands whose sole argument is a filesystem path. Typing one of these
+/// followed by whitespace puts the line into filename-completion mode (Tab
+/// expands a partial path, like llama-cli); plain chat and other commands get
+/// no completion, so Tab stays inert mid-conversation.
+const PATH_COMMANDS: [&str; 3] = ["/read", "/glob", "/image"];
+
+/// True when `pos` sits in the path-argument region of a [`PATH_COMMANDS`]
+/// line — i.e. `^\s*/(read|glob|image)[ \t]…`. Gates filename completion so it
+/// only fires where a path is expected. The separator is a literal space/tab,
+/// not any whitespace: in `--multiline-input` mode the buffer can hold a `\n`
+/// right after the command, and we don't want completion firing once the
+/// cursor has moved onto a fresh continuation line.
+fn in_path_arg(line: &str, pos: usize) -> bool {
+    let head = line[..pos].trim_start();
+    PATH_COMMANDS.iter().any(|cmd| {
+        head.strip_prefix(cmd)
+            .is_some_and(|rest| rest.starts_with([' ', '\t']))
+    })
+}
+
+impl Completer for ChatHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        if in_path_arg(line, pos) {
+            // Delegate to rustyline's FilenameCompleter: space is a word-break
+            // char so it isolates just the path token at the cursor (the
+            // leading `/image ` is excluded), then lists matching entries. With
+            // the default `with-dirs` feature it reads `~/…` from $HOME while
+            // keeping `~` literal in the replacement.
+            self.completer.complete(line, pos, ctx)
+        } else {
+            Ok((pos, Vec::new()))
+        }
+    }
 }
 
 impl Validator for ChatHelper {
@@ -1443,8 +1492,17 @@ fn run_interactive(
     history: Option<&Path>,
     multiline: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let mut editor = Editor::new()?;
-    editor.set_helper(Some(ChatHelper { multiline }));
+    // `List` completion = bash/readline style (complete to the longest common
+    // prefix, list candidates when ambiguous), matching llama-cli's feel; the
+    // rustyline default is `Circular` (cycle through matches on each Tab).
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut editor = Editor::with_config(config)?;
+    editor.set_helper(Some(ChatHelper {
+        multiline,
+        completer: FilenameCompleter::new(),
+    }));
     if let Some(p) = history
         && let Err(e) = editor.load_history(p)
     {
@@ -1612,12 +1670,26 @@ fn expand_tilde(path: &str) -> String {
     }
 }
 
+/// Normalize a (possibly Tab-completed) literal-path argument into a real
+/// filesystem path. rustyline's `FilenameCompleter` inserts paths in shell
+/// style — break chars (spaces, `(`, `$`, …) backslash-escaped, or completed
+/// inside quotes — but the REPL isn't a shell, so a literal-path command must
+/// undo that itself: drop surrounding quotes, remove the escaping backslashes,
+/// then expand a leading `~`. Used by `/read` and `/image`. `/glob` does NOT
+/// use this — there a `\` is meaningful to the glob crate (a glob escape), so
+/// it keeps backslashes and only strips quotes.
+fn normalize_path_arg(arg: &str) -> String {
+    let arg = arg.trim().trim_matches('"').trim_matches('\'');
+    let unescaped = unescape(arg, Some('\\'));
+    expand_tilde(&unescaped)
+}
+
 fn handle_read(session: &mut ChatSession, path: &str) {
     if path.is_empty() {
         println!("usage: /read <path>");
         return;
     }
-    let path = &expand_tilde(path);
+    let path = &normalize_path_arg(path);
     match fs::read_to_string(path) {
         Ok(content) => {
             let trimmed = content.trim();
@@ -1636,9 +1708,9 @@ fn handle_read(session: &mut ChatSession, path: &str) {
 /// the next user message (the message then carries the `<__media__>` marker, so
 /// the vision block is spliced into that turn's prefill). Vision models only.
 fn handle_image(session: &mut ChatSession, arg: &str) {
-    // Tolerate surrounding quotes (paths with spaces pasted with quotes), then
-    // expand a leading `~` (the REPL isn't a shell, so it must do this itself).
-    let path = expand_tilde(arg.trim().trim_matches('"').trim_matches('\''));
+    // Unquote / unescape a Tab-completed path and expand a leading `~` (the
+    // REPL isn't a shell, so it must do this itself). See `normalize_path_arg`.
+    let path = normalize_path_arg(arg);
     if path.is_empty() {
         println!("usage: /image <path-to-image>");
         return;
@@ -1660,7 +1732,11 @@ fn handle_glob(session: &mut ChatSession, pattern: &str) {
         println!("usage: /glob <pattern>");
         return;
     }
-    let pattern = &expand_tilde(pattern);
+    // Strip surrounding quotes a Tab-completion may have left, but keep any
+    // backslashes — here `\` is a glob escape (e.g. `foo\*.txt` for a literal
+    // `*`), so unescaping like the literal-path commands would corrupt the
+    // pattern. A completed `\ ` is a glob-literal space either way.
+    let pattern = &expand_tilde(pattern.trim_matches('"').trim_matches('\''));
     let paths = match glob::glob(pattern) {
         Ok(paths) => paths,
         Err(e) => {
@@ -1700,7 +1776,52 @@ fn handle_glob(session: &mut ChatSession, pattern: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_tilde, join_continuations, parse_logit_bias, prompt_opens_think};
+    use super::{
+        expand_tilde, in_path_arg, join_continuations, normalize_path_arg, parse_logit_bias,
+        prompt_opens_think,
+    };
+
+    #[test]
+    fn in_path_arg_gates_completion() {
+        // Fires once a path command is followed by a space/tab, anywhere the
+        // cursor sits past that separator.
+        assert!(in_path_arg("/image ", 7));
+        assert!(in_path_arg("/image ~/p", 10));
+        assert!(in_path_arg("/read foo", 9));
+        assert!(in_path_arg("/read\tfoo", 9)); // tab separator
+        assert!(in_path_arg("  /glob *.png", 13)); // leading space tolerated
+        // Not yet at the argument: still typing the command name, or no space.
+        assert!(!in_path_arg("/imag", 5));
+        assert!(!in_path_arg("/image", 6));
+        assert!(!in_path_arg("/imagefoo ", 10)); // not a real command
+        // A newline is NOT a path separator: in multiline mode the buffer can
+        // hold `/image\n` once the cursor moves to the next line — don't fire.
+        assert!(!in_path_arg("/image\n", 7));
+        // Plain chat and non-path commands never complete.
+        assert!(!in_path_arg("hello world", 11));
+        assert!(!in_path_arg("/system you are", 15));
+    }
+
+    #[test]
+    fn normalize_path_arg_reverses_completion() {
+        // SAFETY: single-threaded within this test; no other test reads $HOME.
+        unsafe { std::env::set_var("HOME", "/home/bob") };
+        // Backslash-escaped break chars (what FilenameCompleter inserts for an
+        // unquoted path) are unescaped back to the real name.
+        assert_eq!(normalize_path_arg("report\\ 2024.txt"), "report 2024.txt");
+        assert_eq!(normalize_path_arg("data\\(1\\).png"), "data(1).png");
+        // Surrounding quotes (a quote-completed path) are stripped, including
+        // the lone leading quote a completion inside an unclosed quote leaves.
+        assert_eq!(normalize_path_arg("\"My Docs/a.txt"), "My Docs/a.txt");
+        assert_eq!(normalize_path_arg("'My Docs/a.txt'"), "My Docs/a.txt");
+        // Tilde still expands, after unescaping.
+        assert_eq!(
+            normalize_path_arg("~/My\\ Pics/a.png"),
+            "/home/bob/My Pics/a.png"
+        );
+        // A plain path is untouched.
+        assert_eq!(normalize_path_arg("/abs/path.png"), "/abs/path.png");
+    }
 
     #[test]
     fn expand_tilde_forms() {
