@@ -34,6 +34,13 @@ const FA_BC: u32 = 32;
 /// matching llama.cpp's flash-attention fallback.
 const FA_SPLIT_CORE_COUNT_FALLBACK: u32 = 16;
 
+/// Largest head_dim the coopmat `flash_attn_cm1` path accepts. cm1's LDS no
+/// longer scales with head_dim on the K/V side (those are read coopmat-direct
+/// from global), but the per-thread register O accumulator does, and only
+/// head_dim ≤ 128 has been validated (Llama 64, qwen3-vl tower 96). qwen35moe
+/// text decode's 256 stays on the scalar path. Conservative tested ceiling.
+const CM1_MAX_HEAD_DIM: u32 = 128;
+
 /// Upper bound on the split-K workgroup count for any single flash-attn
 /// dispatch. Caps `pick_k_num` and sizes the per-call partials buffer
 /// so its (offset, size) descriptor binding stays stable across decode
@@ -135,30 +142,43 @@ pub fn record(
     // visible; `kv_actual = prefix_len + L`.
     let prefix_len = kv_actual.saturating_sub(q.dims[1] as u32);
 
-    // Cooperative-matrix flash-attention path (`flash_attn_cm1.slang`).
-    // Processes Br=16 query rows per workgroup using a 16×16 CoopMat
-    // fragment for QK^T. F16 KV only — softmax + PV stay scalar. Gated
-    // until it's been validated on more models; the shader had a Slang
-    // Load API bug we fixed alongside `mul_mm_cm.slang`, but it's never
-    // been exercised on real hardware before now.
+    // Cooperative-matrix flash-attention path (`flash_attn_cm1.slang`):
+    // 4 subgroups, register-held O accumulator, coopmat QK^T + PV, F16 KV.
+    // Opt-in for the masked text decoder (`SEEKER_FA_CM=1`) — near-neutral there
+    // since text prefill is matmul-bound; the big win is the maskless vision path
+    // below (default-on). Single-token decode passes `mask = None` and goes to
+    // the scalar split-K path; cm1 here handles the masked prefill batches.
     //
-    // Single-token decode passes `mask = None` and goes through the scalar
-    // path below, which owns the split-K decode optimization; cm1 only runs
-    // for the masked (prefill) batches it was designed for.
-    //
-    // cm1 still expects the legacy full `[kv_len, L]` mask layout, which only
-    // coincides with the new within-chunk `[L, L]` mask when there is no
-    // prefix (`prefix_len == 0`, i.e. the first/only ubatch). Fall back to the
-    // scalar path for chunked prefill at a non-zero offset until cm1 learns the
-    // within-chunk + offset contract.
+    // The masked decoder cm1 path expects the legacy full `[kv_len, L]` mask
+    // layout, which only coincides with the new within-chunk `[L, L]` mask when
+    // there's no prefix (`prefix_len == 0`, the first/only ubatch); chunked
+    // prefill at a non-zero offset falls back to the scalar path.
+    let cm1_head_ok =
+        params.head_dim_k <= CM1_MAX_HEAD_DIM && params.head_dim_v <= CM1_MAX_HEAD_DIM;
+
     if ctx.device.coop_matrix
         && k.dtype == GgmlType::F16
         && v.dtype == GgmlType::F16
         && *crate::runtime_flags::FA_CM
         && prefix_len == 0
+        && cm1_head_ok
         && let Some(m) = mask
     {
-        return record_cm1(ctx, q, k, v, m, out, params, kv_actual);
+        return record_cm1(ctx, q, k, v, Some(m), out, params, kv_actual);
+    }
+
+    // Vision coopmat FA (DEFAULT-ON): maskless full bidirectional attention over
+    // many query rows (n_pos). cm1 casts the F32 K/V to F16 (Bc-padded) and
+    // split-Ks the KV internally so even full-res (n_pos=16104) stays under the
+    // watchdog — ~5× faster than scalar on Strix Halo. `n == 1` (decode) is
+    // excluded (scalar split-K path). `SEEKER_FA_CM_VISION=0` opts out.
+    if ctx.device.coop_matrix
+        && !*crate::runtime_flags::FA_CM_VISION_DISABLED
+        && mask.is_none()
+        && q.dims[1] > 1
+        && cm1_head_ok
+    {
+        return record_cm1(ctx, q, k, v, None, out, params, kv_actual);
     }
 
     let (variant_name, variant_spv) = match k.dtype {
@@ -917,35 +937,150 @@ fn record_split_k_combine(
     Ok(())
 }
 
+/// Bc tile width baked into `flash_attn_cm1.slang`. The cm1 KV loop steps in
+/// blocks of this many keys; K/V must have at least `ceil(KV/Bc)*Bc` rows so the
+/// last block's direct coopmat loads stay in bounds.
+const CM1_BC: u64 = 64;
+
+/// Zero an F16 tensor's bytes via an F32-reinterpreted `fill_f32` dispatch
+/// (there's no F16 fill shader; zero bytes read as 0.0 in either dtype).
+fn fill_zero_f16(ctx: &mut DispatchContext, t: &TensorView) -> Result<(), Box<dyn Error>> {
+    const GENERIC_PARAMS_BYTES: u32 = 6 * 4;
+    debug_assert_eq!(t.byte_size % 4, 0, "F16 fill needs an even byte count");
+    let n_f32 = (t.byte_size / 4) as u32;
+    let view = TensorView {
+        buffer: t.buffer,
+        byte_offset: t.byte_offset,
+        byte_size: t.byte_size,
+        dims: [n_f32 as u64, 1, 1, 1],
+        byte_stride: [4, 4, 4, 4],
+        element_stride: [1, 1, 1, 1],
+        dtype: GgmlType::F32,
+    };
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&n_f32.to_ne_bytes());
+    let key = PipelineKey::dense("fill_f32", 1, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::FILL_F32_SPV.as_bytes())?;
+    let workgroups = [n_f32.div_ceil(512), 1, 1];
+    super::bind_and_dispatch(ctx, &pipeline, &[0], &[view.range()], &push, workgroups)?;
+    record_compute_barrier(ctx.device, ctx.cmd, view.range());
+    Ok(())
+}
+
+/// Cast an F32 `[hd, n_pos, n_head, 1]` (contiguous) K/V tensor to F16 in a
+/// buffer padded with `CM1_BC` extra rows at the end, so cm1's direct coopmat
+/// loads on the final KV block read in-bounds (the slack is zeroed; rows past
+/// `p.KV` are excluded from the softmax via the kernel's CLAMP, and the PV step
+/// multiplies them by P=0 — so the slack just needs to be finite). Returns a
+/// logical `[hd, n_pos, n_head, 1]` view whose `range()` spans the padded buffer.
+fn cast_kv_f16_padded(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+) -> Result<TensorView, Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    let hd = src.dims[0];
+    let np = src.dims[1];
+    let nh = src.dims[2].max(1);
+    let real_rows = np * nh;
+    let buf = ctx.alloc_tensor([hd, real_rows + CM1_BC, 1, 1], GgmlType::F16)?;
+
+    // Zero just the CM1_BC slack rows at the end (the cast overwrites the rest).
+    let slack = TensorView {
+        buffer: buf.buffer,
+        byte_offset: buf.byte_offset + real_rows * hd * 2,
+        byte_size: CM1_BC * hd * 2,
+        dims: [hd, CM1_BC, 1, 1],
+        byte_stride: [2, 2 * hd, 2 * hd * CM1_BC, 2 * hd * CM1_BC],
+        element_stride: [1, hd, hd * CM1_BC, hd * CM1_BC],
+        dtype: GgmlType::F16,
+    };
+    fill_zero_f16(ctx, &slack)?;
+
+    // Contiguous F32→F16 cast of the real rows: src and dst both flattened to
+    // [hd, n_pos*n_head, 1, 1] (src is contiguous, so this is the same memory).
+    let src_flat = TensorView {
+        dims: [hd, real_rows, 1, 1],
+        byte_stride: [4, 4 * hd, 4 * hd * real_rows, 4 * hd * real_rows],
+        element_stride: [1, hd, hd * real_rows, hd * real_rows],
+        ..src
+    };
+    let dst_flat = TensorView {
+        buffer: buf.buffer,
+        byte_offset: buf.byte_offset,
+        byte_size: real_rows * hd * 2,
+        dims: [hd, real_rows, 1, 1],
+        byte_stride: [2, 2 * hd, 2 * hd * real_rows, 2 * hd * real_rows],
+        element_stride: [1, hd, hd * real_rows, hd * real_rows],
+        dtype: GgmlType::F16,
+    };
+    crate::inference::ops::cast::record_cast(ctx, src_flat, dst_flat)?;
+
+    // Logical [hd, n_pos, n_head, 1] view with contiguous head stride; byte_size
+    // spans the whole padded buffer so the dispatch binding covers the slack.
+    Ok(TensorView {
+        buffer: buf.buffer,
+        byte_offset: buf.byte_offset,
+        byte_size: buf.byte_size,
+        dims: [hd, np, nh, 1],
+        byte_stride: [2, 2 * hd, 2 * hd * np, 2 * hd * np * nh],
+        element_stride: [1, hd, hd * np, hd * np * nh],
+        dtype: GgmlType::F16,
+    })
+}
+
 /// Cooperative-matrix flash-attention path (`flash_attn_cm1.slang`).
 ///
-/// Same push-constant layout as the scalar path, but:
-///   - Bc is fixed at 16 in the shader (not a spec constant) — only HSK,
-///     HSV, MASK_ENABLE are spec-tunable. Three spec constants total.
-///   - Workgroup processes `Br=16` query rows, so dispatch.x = ceil(N/16)
-///     (vs the scalar shader's one workgroup per query row).
-///   - The shader's `data_m` is `KV_TYPE` (F16). The model emits an F32
-///     causal mask, so we cast a transient F16 copy into scratch before
-///     dispatch. Mask is small (`L × L` per layer; F16 is 2× cheaper than
-///     F32) so the cast cost is negligible.
-///   - Pinned to wave32 (single subgroup, hardcoded in shader).
+/// 128-thread workgroup = 4 wave32 subgroups; spec constants HSK, HSV,
+/// MASK_ENABLE, CLAMP. Each workgroup owns `Br=16` query rows (dispatch.x =
+/// ceil(N/16)); grid.y packs (head, split-K index), grid.z is batch.
+///   - K/V are read coopmat-direct from global (no LDS staging). The decoder
+///     F16 cache is bound full so its last-block reads are in-bounds; vision F32
+///     activations are cast to F16 in a `CM1_BC`-padded buffer (zeroed slack).
+///   - `mask`: `Some` (masked prefill, cast F32→F16, `MASK_ENABLE=1`) or `None`
+///     (maskless vision, `MASK_ENABLE=0`; K is bound as the unused slot-3 dummy).
+///   - Long KV is split-K'd (each workgroup walks ≤ `vision_fa_kv_walk` keys),
+///     partials merged by `flash_attn_split_k_reduce`.
 #[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 fn record_cm1(
     ctx: &mut DispatchContext,
     q: TensorView,
     k: TensorView,
     v: TensorView,
-    mask: TensorView,
+    mask: Option<TensorView>,
     out: TensorView,
     params: FlashAttnParams,
     kv_actual: u32,
 ) -> Result<(), Box<dyn Error>> {
-    // Cast F32 mask → F16 in scratch. Mask layout is preserved (only the
-    // element dtype changes), so dims/strides flow through unchanged via
-    // `record_cast`.
-    let mask_f16 = ctx.alloc_tensor(mask.dims, GgmlType::F16)?;
-    crate::inference::ops::cast::record_cast(ctx, mask, mask_f16)?;
+    // cm1 reads K/V coopmat-direct from global. The decoder cache is already
+    // F16 and bound as the full max_seq_len layer, so its last-block reads are
+    // in-bounds — pass it through. The vision tower hands us F32 activations
+    // sized exactly to n_pos, so cast to F16 into a Bc-row-padded buffer (zeroed
+    // slack) so the last block's direct loads stay in bounds.
+    let k = if k.dtype == GgmlType::F16 {
+        k
+    } else {
+        cast_kv_f16_padded(ctx, k)?
+    };
+    let v = if v.dtype == GgmlType::F16 {
+        v
+    } else {
+        cast_kv_f16_padded(ctx, v)?
+    };
 
+    // Cast F32 mask → F16 in scratch (decoder/prefill). The vision tower attends
+    // bidirectionally with no mask (`MASK_ENABLE=0`); bind K as a harmless dummy
+    // for binding 3 since the shader never reads it in that case.
+    let mask_enable: u32 = if mask.is_some() { 1 } else { 0 };
+    let mask_buf = match mask {
+        Some(m) => {
+            let mask_f16 = ctx.alloc_tensor(m.dims, GgmlType::F16)?;
+            crate::inference::ops::cast::record_cast(ctx, m, mask_f16)?;
+            mask_f16
+        }
+        None => k,
+    };
     let n = q.dims[1] as u32;
     let kv = kv_actual;
     let ne1 = n;
@@ -957,9 +1092,14 @@ fn record_cm1(
     let nek3 = k.dims[3].max(1) as u32;
     let nev2 = v.dims[2] as u32;
     let nev3 = v.dims[3].max(1) as u32;
-    let nem1 = mask.dims[1] as u32;
-    let nem2 = mask.dims[2].max(1) as u32;
-    let nem3 = mask.dims[3].max(1) as u32;
+    let (nem1, nem2, nem3) = match mask {
+        Some(m) => (
+            m.dims[1] as u32,
+            m.dims[2].max(1) as u32,
+            m.dims[3].max(1) as u32,
+        ),
+        None => (1u32, 1u32, 1u32),
+    };
     let nb01 = q.element_stride[1] as u32;
     let nb02 = q.element_stride[2] as u32;
     let nb03 = q.element_stride[3] as u32;
@@ -969,6 +1109,24 @@ fn record_cm1(
     let nb21 = v.element_stride[1] as u32;
     let nb22 = v.element_stride[2] as u32;
     let nb23 = v.element_stride[3] as u32;
+
+    // ── cm1 split-K. Each workgroup walks only its KV sub-range so no single
+    // dispatch walks the whole cache (the per-dispatch watchdog cap the vision
+    // tower's full-res n_pos=16104 single pass would trip). Short KV → single
+    // pass (k_num=1, one block range covering all blocks).
+    let num_blocks = kv.div_ceil(CM1_BC as u32).max(1);
+    let (k_num, blocks_per_split) = if kv > vision_fa_kv_walk() {
+        let kf = kv.div_ceil(vision_fa_kv_walk()).clamp(2, num_blocks);
+        (kf, num_blocks.div_ceil(kf))
+    } else {
+        (1u32, num_blocks)
+    };
+    // The reduce kernel reads k_num from DecodeDyn (binding 3); set it (+ kv and
+    // blocks-per-split for parity with the scalar path).
+    let dyn_range = ctx.decode_dyn;
+    crate::inference::decode_dyn::write_field_ctx(ctx, ctx.decode_dyn, 0, kv)?;
+    crate::inference::decode_dyn::write_field_ctx(ctx, ctx.decode_dyn, 4, k_num)?;
+    crate::inference::decode_dyn::write_field_ctx(ctx, ctx.decode_dyn, 8, blocks_per_split)?;
 
     let mut push = [0u8; FA_PUSH_BYTES as usize];
     let mut w = 0;
@@ -1010,18 +1168,19 @@ fn record_cm1(
     put_f(&mut push, &mut w, 0.0);
     put_f(&mut push, &mut w, 0.0);
     put_u(&mut push, &mut w, params.gqa_ratio);
-    put_u(&mut push, &mut w, 1);
-    put_u(&mut push, &mut w, 1);
+    put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
+    put_u(&mut push, &mut w, k_num);
 
     let spec_constants = vec![
         params.head_dim_k, // HSK
         params.head_dim_v, // HSV
-        1,                 // MASK_ENABLE
+        mask_enable,       // MASK_ENABLE (0 for the maskless vision tower)
+        1,                 // CLAMP — KV need not be a multiple of Bc=64
     ];
 
     let key = PipelineKey {
         name: "flash_attn_cm1_f32_f16".to_string(),
-        binding_indices: vec![0, 1, 2, 3, 5],
+        binding_indices: vec![0, 1, 2, 3, 4, 5],
         push_size: FA_PUSH_BYTES,
         spec_constants,
         required_subgroup_size: Some(32),
@@ -1031,22 +1190,61 @@ fn record_cm1(
         key,
         shaders::FLASH_ATTN_CM1_F32_F16_SPV.as_bytes(),
     )?;
-    // Workgroup.x covers Br=16 query rows; .y is heads; .z is batch.
-    let workgroups = [n.div_ceil(16), ne2, ne3];
+
+    // Workgroup.x covers Br=16 query rows; .y packs (head, split); .z is batch.
+    if k_num <= 1 {
+        // Single pass → final normalized output to data_o (binding 5). Bind out
+        // to the unused partials slot (binding 4) too for a valid descriptor.
+        super::bind_and_dispatch(
+            ctx,
+            &pipeline,
+            &[0, 1, 2, 3, 4, 5],
+            &[
+                q.range(),
+                k.range(),
+                v.range(),
+                mask_buf.range(),
+                out.range(),
+                out.range(),
+            ],
+            &push,
+            [n.div_ceil(16), ne2, ne3],
+        )?;
+        record_compute_barrier(ctx.device, ctx.cmd, out.range());
+        return Ok(());
+    }
+
+    // Split-K → unnormalized partials (binding 4), merged by the reduce kernel.
+    // Sized at the actual k_num (vision is a fresh forward, never decode-replay).
+    let partials_floats =
+        (params.head_dim_v as u64 + 2) * n as u64 * ne2 as u64 * ne3 as u64 * k_num as u64;
+    let partials = ctx.alloc_tensor([partials_floats, 1, 1, 1], GgmlType::F32)?;
     super::bind_and_dispatch(
         ctx,
         &pipeline,
-        &[0, 1, 2, 3, 5],
+        &[0, 1, 2, 3, 4, 5],
         &[
             q.range(),
             k.range(),
             v.range(),
-            mask_f16.range(),
+            mask_buf.range(),
+            partials.range(),
             out.range(),
         ],
         &push,
-        workgroups,
+        [n.div_ceil(16), ne2 * k_num, ne3],
     )?;
-    record_compute_barrier(ctx.device, ctx.cmd, out.range());
+    record_compute_barrier(ctx.device, ctx.cmd, partials.range());
+    record_split_k_combine(
+        ctx,
+        partials,
+        out,
+        params.head_dim_v,
+        n,
+        ne2,
+        ne3,
+        k_num,
+        dyn_range,
+    )?;
     Ok(())
 }

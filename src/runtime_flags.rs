@@ -58,10 +58,19 @@ pub static MM_CM_DISABLED: LazyLock<bool> = LazyLock::new(|| {
 pub static MM_SPLIT_K: LazyLock<Option<u32>> = LazyLock::new(|| env_u32("SEEKER_MM_SPLIT_K"));
 
 /// `SEEKER_FA_CM=1` — route masked (prefill) flash-attention through the
-/// experimental cooperative-matrix kernel. Read per attention op; cache
-/// to keep it out of the getenv path.
+/// cooperative-matrix kernel. Opt-in (near-neutral on small-head text decode).
+/// The vision tower uses cm1 by default — see `FA_CM_VISION_DISABLED`.
 pub static FA_CM: LazyLock<bool> =
     LazyLock::new(|| std::env::var("SEEKER_FA_CM").is_ok_and(|v| v == "1"));
+
+/// Vision-tower flash-attention coopmat gate (`SEEKER_FA_CM_VISION=0` to fall
+/// back to the scalar split-K path). Default-on: the register-O coopmat cm1
+/// kernel encodes the full-res tower ~5× faster than scalar on Strix Halo.
+pub static FA_CM_VISION_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SEEKER_FA_CM_VISION")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+});
 
 /// `SEEKER_FA_SPLIT=0` — disable flash-attention split-K. Read per decode
 /// forward (in `pick_k_num`); cache to avoid a per-token getenv.
