@@ -307,6 +307,52 @@ struct block_iq4_xs_packed32 {
     uint      qs[32];        // QUANT_K_IQ4_XS/8
 };
 
+// ── TurboQuant KV quants (WHT-rotated PolarQuant, 128-element blocks) ─────
+// Dequant value = centroid[idx] * norm; the data stays in WHT-rotated space
+// (the inverse WHT is applied to the attention output, not here). Block byte
+// sizes (34/50/68) match the fork's `sizeof(block_turboN_0)` under scalar
+// layout (`-fvk-use-scalar-layout`). Bit packing per element index j (0..127):
+//   turbo2: 2-bit idx, 4/byte  → qs[j/4] bits [2*(j%4) .. +2)
+//   turbo3: 3-bit idx split    → low2 in qs[j/4] bits [2*(j%4)..+2), hi1 in signs[j/8] bit (j%8)
+//   turbo4: 4-bit idx, 2/byte  → qs[j/2] nibble (low for even j, high for odd)
+#define QUANT_K_TURBO2_0 128
+struct block_turbo2_0 {
+    float16_t norm;
+    uint8_t   qs[32];        // 2-bit × 128 = 256 bits = 32 bytes
+};                            // 2 + 32 = 34 bytes
+#define QUANT_K_TURBO3_0 128
+struct block_turbo3_0 {
+    float16_t norm;
+    uint8_t   qs[32];        // low 2 bits of each 3-bit index
+    uint8_t   signs[16];     // high bit of each 3-bit index (128 bits = 16 bytes)
+};                            // 2 + 32 + 16 = 50 bytes
+#define QUANT_K_TURBO4_0 128
+struct block_turbo4_0 {
+    float16_t norm;
+    float16_t rnorm;         // reserved (= 0) for ABI parity with the legacy layout
+    uint8_t   qs[64];        // 4-bit × 128 = 512 bits = 64 bytes
+};                            // 2 + 2 + 64 = 68 bytes
+
+// PolarQuant codebooks (Lloyd-Max for N(0, 1/128)). Guarded so only the tables
+// a shader actually uses (on either the K or V side) are emitted.
+#if defined(DATA_A_TURBO2_0) || defined(DATA_V_TURBO2_0)
+static const float turbo2_centroids[4] = { -0.133462, -0.039994, 0.039994, 0.133462 };
+#endif
+#if defined(DATA_A_TURBO3_0) || defined(DATA_V_TURBO3_0)
+static const float turbo3_centroids[8] = {
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685
+};
+#endif
+#if defined(DATA_A_TURBO4_0) || defined(DATA_V_TURBO4_0)
+static const float turbo4_centroids[16] = {
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926
+};
+#endif
+
 // ── DATA_A_X → A_TYPE selection ──────────────────────────────────────────
 // Consumer shader variants like `q4_k: DATA_A_Q4_K=1` get the right A_TYPE
 // and QUANT_K wired up automatically. Mirrors llama.cpp's macro convention.
@@ -442,6 +488,18 @@ struct block_iq4_xs_packed32 {
     #define A_TYPE_PACKED32 block_iq4_xs_packed32
     #define QUANT_K         QUANT_K_IQ4_XS
     #define QUANT_R         QUANT_R_IQ4_XS
+#elif defined(DATA_A_TURBO2_0)
+    #define A_TYPE          block_turbo2_0
+    #define QUANT_K         QUANT_K_TURBO2_0
+    #define QUANT_R         1
+#elif defined(DATA_A_TURBO3_0)
+    #define A_TYPE          block_turbo3_0
+    #define QUANT_K         QUANT_K_TURBO3_0
+    #define QUANT_R         1
+#elif defined(DATA_A_TURBO4_0)
+    #define A_TYPE          block_turbo4_0
+    #define QUANT_K         QUANT_K_TURBO4_0
+    #define QUANT_R         1
 #endif
 
 // ── Fallback defaults ────────────────────────────────────────────────────
@@ -503,7 +561,7 @@ float e8m0_to_fp32(uint x) {
 // We mirror llama.cpp's pattern: a `const` table next to a `groupshared`
 // copy, and a cooperative loop guarded by NEEDS_INIT_IQ_SHMEM.
 
-#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
+#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS) || defined(DATA_V_IQ4_NL)
 static const int8_t kvalues_iq4nl_const[16] = {
     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
     int8_t(  1),  int8_t(  13), int8_t( 25), int8_t( 38), int8_t( 53), int8_t( 69), int8_t( 89), int8_t(113),

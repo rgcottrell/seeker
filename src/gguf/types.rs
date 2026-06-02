@@ -38,6 +38,11 @@ pub enum GgmlType {
     TQ1_0 = 34,
     TQ2_0 = 35,
     MXFP4 = 39,
+    // TurboQuant KV-cache quants (Google TurboQuant): WHT-rotated + PolarQuant
+    // codebook, 128-element blocks. Values match the llama-cpp-turboquant fork.
+    Turbo2_0 = 42,
+    Turbo3_0 = 43,
+    Turbo4_0 = 44,
 }
 
 impl GgmlType {
@@ -75,6 +80,9 @@ impl GgmlType {
             34 => Self::TQ1_0,
             35 => Self::TQ2_0,
             39 => Self::MXFP4,
+            42 => Self::Turbo2_0,
+            43 => Self::Turbo3_0,
+            44 => Self::Turbo4_0,
             other => return Err(GgufError::UnknownGgmlType(other)),
         })
     }
@@ -115,6 +123,15 @@ impl GgmlType {
             Self::TQ1_0 => (256, 54),
             Self::TQ2_0 => (256, 66),
             Self::MXFP4 => (32, 17),
+
+            // TurboQuant KV quants: 128-element blocks. Byte sizes are the
+            // fork's `sizeof(block_turboN_0)` (authoritative static_asserts):
+            //   turbo2 = fp16 norm + 32B (2-bit×128)            = 34
+            //   turbo3 = fp16 norm + 32B (low2) + 16B (hi1)     = 50
+            //   turbo4 = fp16 norm + fp16 rnorm + 64B (4-bit×128) = 68
+            Self::Turbo2_0 => (128, 34),
+            Self::Turbo3_0 => (128, 50),
+            Self::Turbo4_0 => (128, 68),
         }
     }
 }

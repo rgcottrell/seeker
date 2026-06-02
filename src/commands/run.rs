@@ -49,7 +49,9 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 1)]
     max_tokens: u32,
 
-    /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1.
+    /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1
+    /// turbo2 turbo3 turbo4. K and V may differ (asymmetric cache). The turbo*
+    /// (TurboQuant) quants require head_dim % 128 == 0.
     #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
     cache_type_k: GgmlType,
 
@@ -411,12 +413,13 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     }
 
     // `max_seq_len` was computed above (used to size the scratch region).
+    let dims = model.cache_dims();
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
         v_dtype: args.cache_type_v,
         max_seq_len,
+        n_head: dims.n_head,
     };
-    let dims = model.cache_dims();
     let mut cache =
         engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
     // Hybrid models (qwen35moe etc.) also need persistent SSM/GDN
@@ -673,6 +676,7 @@ fn batch_decode_smoke_test(
         k_dtype: GgmlType::F16,
         v_dtype: GgmlType::F16,
         max_seq_len,
+        n_head: 0, // F16-only harness path; auto-asymmetric is turbo-only
     };
     let dims = model.cache_dims();
 
@@ -854,6 +858,7 @@ fn unified_forward_smoke_test(
         k_dtype: GgmlType::F16,
         v_dtype: GgmlType::F16,
         max_seq_len,
+        n_head: 0, // F16-only harness path; auto-asymmetric is turbo-only
     };
     let dims = model.cache_dims();
     println!(
@@ -1030,6 +1035,7 @@ fn unified_dump_test(
         k_dtype: GgmlType::F16,
         v_dtype: GgmlType::F16,
         max_seq_len: (prompt.len() + 16) as u32,
+        n_head: 0, // F16-only harness path; auto-asymmetric is turbo-only
     };
     let mut batch = BatchKvCache::new(
         &engine.device,
@@ -1149,6 +1155,7 @@ fn batch_decode_bench(
         k_dtype: GgmlType::F16,
         v_dtype: GgmlType::F16,
         max_seq_len: max_seq,
+        n_head: 0, // F16-only harness path; auto-asymmetric is turbo-only
     };
 
     println!(

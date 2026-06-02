@@ -14,6 +14,7 @@ pub mod rope;
 pub mod rope_multi;
 pub mod sampler;
 pub mod ssm;
+pub mod turbo_wht;
 
 use std::error::Error;
 

@@ -24,9 +24,10 @@ use std::error::Error;
 
 use crate::gguf::{GgmlType, GgufFile, MetadataValue};
 use crate::inference::context::DispatchContext;
-use crate::inference::kv_cache::KvCache;
+use crate::inference::kv_cache::{KvCache, is_turbo};
+use crate::inference::ops::turbo_wht::WhtDir;
 use crate::inference::ops::{
-    cache_io, cast, elementwise, flash_attn, matmul, moe, rms_norm, rope_multi, ssm,
+    cache_io, cast, elementwise, flash_attn, matmul, moe, rms_norm, rope_multi, ssm, turbo_wht,
 };
 use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
@@ -272,6 +273,7 @@ impl Model for Qwen35MoeModel {
             n_layer: self.params.n_main + mtp_slots,
             head_dim: self.params.head_dim_k,
             n_head_kv: self.params.n_head_kv,
+            n_head: self.params.n_head,
         }
     }
 
@@ -752,7 +754,11 @@ impl Qwen35MoeModel {
             gqa_ratio: (p.n_head / p.n_head_kv).max(1),
             scale,
         };
-        let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
+        // Bind the cache layers straight into flash-attn whenever the kernel has
+        // a variant for this (K, V) pair — all symmetric pairs and the exposed
+        // asymmetric ones. Unsupported asymmetric pairs fall back to F32
+        // materialization (record_read) below.
+        let cache_direct = flash_attn::supports_pair(cache.config.k_dtype, cache.config.v_dtype);
 
         // ─── Per-layer loop ───
         // All diagnostic toggles are behind the `gpu_debug` feature (see
@@ -1043,7 +1049,11 @@ impl Qwen35MoeModel {
             gqa_ratio: (p.n_head / p.n_head_kv).max(1),
             scale,
         };
-        let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
+        // Bind the cache layers straight into flash-attn whenever the kernel has
+        // a variant for this (K, V) pair — all symmetric pairs and the exposed
+        // asymmetric ones. Unsupported asymmetric pairs fall back to F32
+        // materialization (record_read) below.
+        let cache_direct = flash_attn::supports_pair(cache.config.k_dtype, cache.config.v_dtype);
         // Persistent MTP KV: the draft at absolute `position` attends to the
         // full prior context [0, position) (seeded from the prompt's main
         // hidden states + prior steps' drafts) plus itself.
@@ -1218,7 +1228,11 @@ impl Qwen35MoeModel {
             gqa_ratio: (p.n_head / p.n_head_kv).max(1),
             scale,
         };
-        let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
+        // Bind the cache layers straight into flash-attn whenever the kernel has
+        // a variant for this (K, V) pair — all symmetric pairs and the exposed
+        // asymmetric ones. Unsupported asymmetric pairs fall back to F32
+        // materialization (record_read) below.
+        let cache_direct = flash_attn::supports_pair(cache.config.k_dtype, cache.config.v_dtype);
 
         // Attention block writes K/V into the MTP slot for these positions.
         // Its attention output is discarded — we only want the KV side effect,
@@ -1918,13 +1932,39 @@ fn attention_block(
     } else {
         kv_len_u
     };
-    let q_perm = permute_to_attn(q_roped, head_dim_k, l as u64, n_head);
+    // TurboQuant: K/V are stored WHT-rotated. Forward-WHT the query (when K is
+    // turbo) so QK^T is computed in the rotated basis (<WHT Q, WHT K> = <Q,K>);
+    // the rotation is per-128-group so head_dim 128/256 both work.
+    let q_for_attn = if is_turbo(k_cache_layer.dtype) {
+        let qw = ctx.alloc_tensor([head_dim_k, n_head, l as u64, 1], GgmlType::F32)?;
+        turbo_wht::record(ctx, q_roped, qw, WhtDir::Forward)?;
+        qw
+    } else {
+        q_roped
+    };
+    let q_perm = permute_to_attn(q_for_attn, head_dim_k, l as u64, n_head);
     let k_perm = permute_to_attn(k_src, head_dim_k, kv_for_perm, n_head_kv);
     let v_perm = permute_to_attn(v_src, head_dim_v, kv_for_perm, n_head_kv);
-    let attn_out = ctx.alloc_tensor([hidden_v, l as u64, 1, 1], GgmlType::F32)?;
+    let attn_out_raw = ctx.alloc_tensor([hidden_v, l as u64, 1, 1], GgmlType::F32)?;
     flash_attn::record(
-        ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params, total_len,
+        ctx,
+        q_perm,
+        k_perm,
+        v_perm,
+        mask,
+        attn_out_raw,
+        fa_params,
+        total_len,
     )?;
+    // TurboQuant: the attention output is in V's rotated basis (O_rot =
+    // P·WHT(V) = WHT(P·V)); inverse-WHT it back when V is turbo.
+    let attn_out = if is_turbo(v_cache_layer.dtype) {
+        let ao = ctx.alloc_tensor([hidden_v, l as u64, 1, 1], GgmlType::F32)?;
+        turbo_wht::record(ctx, attn_out_raw, ao, WhtDir::Inverse)?;
+        ao
+    } else {
+        attn_out_raw
+    };
     ctx.tap(&format!("attn_pregate-{layer_idx}"), attn_out)?;
 
     // 8. Sigmoid-gate the attention output by q_gate, fused as one
@@ -3035,24 +3075,41 @@ fn attention_block_batch(
         )?;
     }
 
+    // TurboQuant: forward-WHT the query when this layer's K is turbo.
+    let q_for_attn = if is_turbo(batch.k_dtype(layer_idx)) {
+        let qw = ctx.alloc_tensor([head_dim_k, n_head, b, 1], GgmlType::F32)?;
+        turbo_wht::record(ctx, q_roped, qw, WhtDir::Forward)?;
+        qw
+    } else {
+        q_roped
+    };
+
     // Batched attention. The K/V views bind every slab; the flash reads each
     // sequence's slab via `DecodeDyn::slot` (= slots[s]).
-    let q_attn = batched_q_attn_view(q_roped, head_dim_k, n_head, b, hidden_v);
+    let q_attn = batched_q_attn_view(q_for_attn, head_dim_k, n_head, b, hidden_v);
     let k_attn = batch.batched_k_attn_view(layer_idx);
     let v_attn = batch.batched_v_attn_view(layer_idx);
-    let attn_out = ctx.alloc_tensor([hidden_v, b, 1, 1], GgmlType::F32)?;
+    let attn_out_raw = ctx.alloc_tensor([hidden_v, b, 1, 1], GgmlType::F32)?;
     flash_attn::record_batched(
         ctx,
         q_attn,
         k_attn,
         v_attn,
-        attn_out,
+        attn_out_raw,
         fa_params,
         kv_lens,
         fa_dyn_range,
         Some(slots),
         /*query_lens=*/ None,
     )?;
+    // TurboQuant: inverse-WHT the output (in V's rotated basis) when V is turbo.
+    let attn_out = if is_turbo(batch.v_dtype(layer_idx)) {
+        let ao = ctx.alloc_tensor([hidden_v, b, 1, 1], GgmlType::F32)?;
+        turbo_wht::record(ctx, attn_out_raw, ao, WhtDir::Inverse)?;
+        ao
+    } else {
+        attn_out_raw
+    };
 
     // Sigmoid-gate the attention output by q_gate.
     let q_gate_contig = ctx.alloc_tensor([head_dim_k, n_head, b, 1], GgmlType::F32)?;
@@ -3178,6 +3235,16 @@ fn attention_block_unified(
         cache_io::record_write(ctx, v_chunk, batch.slot_v_view(slots[s], layer_idx), base)?;
     }
 
+    // TurboQuant: forward-WHT the query when this layer's K is turbo (K/V stored
+    // WHT-rotated; the per-slot write above rotated K via copy_to_quant_turbo).
+    let q_for_attn = if is_turbo(batch.k_dtype(layer_idx)) {
+        let qw = ctx.alloc_tensor([head_dim_k, n_head, n_total, 1], GgmlType::F32)?;
+        turbo_wht::record(ctx, q_roped, qw, WhtDir::Forward)?;
+        qw
+    } else {
+        q_roped
+    };
+
     // Varlen attention: flat token-major Q view; the flash masks causally per
     // sequence over its own slab.
     let q_attn = TensorView {
@@ -3194,23 +3261,31 @@ fn attention_block_unified(
             head_dim_k,
             head_dim_k * n_head * n_total,
         ],
-        ..q_roped
+        ..q_for_attn
     };
     let k_attn = batch.batched_k_attn_view(layer_idx);
     let v_attn = batch.batched_v_attn_view(layer_idx);
-    let attn_out = ctx.alloc_tensor([hidden_v, n_total, 1, 1], GgmlType::F32)?;
+    let attn_out_raw = ctx.alloc_tensor([hidden_v, n_total, 1, 1], GgmlType::F32)?;
     flash_attn::record_batched(
         ctx,
         q_attn,
         k_attn,
         v_attn,
-        attn_out,
+        attn_out_raw,
         fa_params,
         kv_lens,
         fa_dyn_range,
         Some(slots),
         Some(seq_lens),
     )?;
+    // TurboQuant: inverse-WHT the output (in V's rotated basis) when V is turbo.
+    let attn_out = if is_turbo(batch.v_dtype(layer_idx)) {
+        let ao = ctx.alloc_tensor([hidden_v, n_total, 1, 1], GgmlType::F32)?;
+        turbo_wht::record(ctx, attn_out_raw, ao, WhtDir::Inverse)?;
+        ao
+    } else {
+        attn_out_raw
+    };
 
     // Sigmoid-gate by q_gate (per-token).
     let q_gate_contig = ctx.alloc_tensor([head_dim_k, n_head, n_total, 1], GgmlType::F32)?;

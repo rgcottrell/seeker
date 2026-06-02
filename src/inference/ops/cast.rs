@@ -34,7 +34,10 @@ pub fn record_cast(
     // binding slot — 2 for copy_from_quant, 3 for copy_to_quant.
     let (binding_indices, bindings): (Vec<u32>, Vec<crate::inference::buffer::BufferRange>) =
         match pick.kind {
-            ShaderKind::Plain => (vec![0, 1], vec![src.range(), dst.range()]),
+            // Turbo quantize has no packed16 alias — just src + dst, like Plain.
+            ShaderKind::Plain | ShaderKind::TurboQuant => {
+                (vec![0, 1], vec![src.range(), dst.range()])
+            }
             ShaderKind::CopyFromQuant => {
                 // src is the quant tensor; bind it again as packed16 at slot 2.
                 (vec![0, 1, 2], vec![src.range(), dst.range(), src.range()])
@@ -87,6 +90,9 @@ enum ShaderKind {
     Plain,
     CopyToQuant,
     CopyFromQuant,
+    /// F32 → TurboQuant: WHT-rotated PolarQuant, one thread per 128-block,
+    /// no packed16 alias. Shares copy_to_quant.slang's dispatch/index path.
+    TurboQuant,
 }
 
 fn pick_shader(src: GgmlType, dst: GgmlType) -> Result<ShaderPick, Box<dyn Error>> {
@@ -115,6 +121,15 @@ fn pick_shader(src: GgmlType, dst: GgmlType) -> Result<ShaderPick, Box<dyn Error
             spirv,
             elements_per_workgroup: 32,
             kind: ShaderKind::CopyFromQuant,
+        }
+    }
+    fn turbo(name: &'static str, spirv: &'static [u8]) -> ShaderPick {
+        // kv quantize: 32 threads × QUANT_K=128 = 4096 elements / workgroup.
+        ShaderPick {
+            name,
+            spirv,
+            elements_per_workgroup: 4096,
+            kind: ShaderKind::TurboQuant,
         }
     }
     Ok(match (src, dst) {
@@ -149,6 +164,19 @@ fn pick_shader(src: GgmlType, dst: GgmlType) -> Result<ShaderPick, Box<dyn Error
         (F32, IQ4_NL) => to_quant(
             "copy_to_quant_iq4_nl",
             shaders::COPY_TO_QUANT_IQ4_NL_SPV.as_bytes(),
+        ),
+
+        (F32, Turbo2_0) => turbo(
+            "copy_to_quant_turbo2",
+            shaders::COPY_TO_QUANT_TURBO2_SPV.as_bytes(),
+        ),
+        (F32, Turbo3_0) => turbo(
+            "copy_to_quant_turbo3",
+            shaders::COPY_TO_QUANT_TURBO3_SPV.as_bytes(),
+        ),
+        (F32, Turbo4_0) => turbo(
+            "copy_to_quant_turbo4",
+            shaders::COPY_TO_QUANT_TURBO4_SPV.as_bytes(),
         ),
 
         (Q4_0, F32) => from_quant(

@@ -145,12 +145,13 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         args.cache_type_k,
         args.cache_type_v,
     ))?;
+    let dims = model.cache_dims();
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
         v_dtype: args.cache_type_v,
         max_seq_len,
+        n_head: dims.n_head,
     };
-    let dims = model.cache_dims();
     let mut cache =
         engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
     // Hybrid models (qwen35moe etc.) need persistent SSM/GDN recurrent state

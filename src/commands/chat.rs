@@ -177,7 +177,9 @@ pub struct ChatArgs {
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: u32,
 
-    /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1.
+    /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1
+    /// turbo2 turbo3 turbo4. K and V may differ (asymmetric cache). The turbo*
+    /// (TurboQuant) quants require head_dim % 128 == 0.
     #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
     cache_type_k: GgmlType,
 
@@ -354,12 +356,13 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     );
     engine.allocate_scratch(scratch_bytes)?;
 
+    let dims = model.cache_dims();
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
         v_dtype: args.cache_type_v,
         max_seq_len: args.ctx_size,
+        n_head: dims.n_head,
     };
-    let dims = model.cache_dims();
     let mut cache =
         engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
     if let Some(ssm) = model.ssm_state_dims() {

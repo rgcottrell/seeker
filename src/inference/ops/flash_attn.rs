@@ -110,6 +110,174 @@ pub struct FlashAttnParams {
     pub scale: f32,     // 1 / sqrt(head_dim)
 }
 
+/// Whether the scalar flash-attn kernel has a compiled variant that can read
+/// this `(K, V)` cache dtype pair directly (zero-copy). Callers use this to
+/// decide between binding the cache layers straight into FA and materializing
+/// to F32 first. All homogeneous (K==V) pairs are supported; only the exposed
+/// heterogeneous pairs are.
+pub fn supports_pair(k: GgmlType, v: GgmlType) -> bool {
+    scalar_fa_variant(k, v).is_ok()
+}
+
+/// Pick the scalar `flash_attn.slang` SPV variant for a `(K, V)` cache dtype
+/// pair. K and V are selected independently by the shader (`DATA_A_*`/`K_TYPE`
+/// for K, `DATA_V_*`/`V_TYPE` for V), so the cache can be asymmetric. Homogeneous
+/// (K==V) pairs keep their historical `flash_attn_f32_<dt>` names; heterogeneous
+/// pairs are `flash_attn_f32_<K>_<V>` and only the exposed (compiled) combos are
+/// accepted — extend the `//@variants` block in flash_attn.slang and add an arm
+/// here to support a new pair.
+fn scalar_fa_variant(
+    k: GgmlType,
+    v: GgmlType,
+) -> Result<(&'static str, &'static [u8]), Box<dyn Error>> {
+    use GgmlType::*;
+    Ok(match (k, v) {
+        // Homogeneous K == V.
+        (F32, F32) => (
+            "flash_attn_f32_f32",
+            shaders::FLASH_ATTN_F32_F32_SPV.as_bytes(),
+        ),
+        (F16, F16) => (
+            "flash_attn_f32_f16",
+            shaders::FLASH_ATTN_F32_F16_SPV.as_bytes(),
+        ),
+        (BF16, BF16) => (
+            "flash_attn_f32_bf16",
+            shaders::FLASH_ATTN_F32_BF16_SPV.as_bytes(),
+        ),
+        (Q4_0, Q4_0) => (
+            "flash_attn_f32_q4_0",
+            shaders::FLASH_ATTN_F32_Q4_0_SPV.as_bytes(),
+        ),
+        (Q4_1, Q4_1) => (
+            "flash_attn_f32_q4_1",
+            shaders::FLASH_ATTN_F32_Q4_1_SPV.as_bytes(),
+        ),
+        (Q5_0, Q5_0) => (
+            "flash_attn_f32_q5_0",
+            shaders::FLASH_ATTN_F32_Q5_0_SPV.as_bytes(),
+        ),
+        (Q5_1, Q5_1) => (
+            "flash_attn_f32_q5_1",
+            shaders::FLASH_ATTN_F32_Q5_1_SPV.as_bytes(),
+        ),
+        (Q8_0, Q8_0) => (
+            "flash_attn_f32_q8_0",
+            shaders::FLASH_ATTN_F32_Q8_0_SPV.as_bytes(),
+        ),
+        (IQ4_NL, IQ4_NL) => (
+            "flash_attn_f32_iq4_nl",
+            shaders::FLASH_ATTN_F32_IQ4_NL_SPV.as_bytes(),
+        ),
+        // Heterogeneous K != V (precise K, compressed V).
+        (F16, Q8_0) => (
+            "flash_attn_f32_f16_q8_0",
+            shaders::FLASH_ATTN_F32_F16_Q8_0_SPV.as_bytes(),
+        ),
+        (F16, Q4_0) => (
+            "flash_attn_f32_f16_q4_0",
+            shaders::FLASH_ATTN_F32_F16_Q4_0_SPV.as_bytes(),
+        ),
+        (Q8_0, Q4_0) => (
+            "flash_attn_f32_q8_0_q4_0",
+            shaders::FLASH_ATTN_F32_Q8_0_Q4_0_SPV.as_bytes(),
+        ),
+        (Q8_0, Q4_1) => (
+            "flash_attn_f32_q8_0_q4_1",
+            shaders::FLASH_ATTN_F32_Q8_0_Q4_1_SPV.as_bytes(),
+        ),
+        (Q8_0, Q5_0) => (
+            "flash_attn_f32_q8_0_q5_0",
+            shaders::FLASH_ATTN_F32_Q8_0_Q5_0_SPV.as_bytes(),
+        ),
+        (Q8_0, Q5_1) => (
+            "flash_attn_f32_q8_0_q5_1",
+            shaders::FLASH_ATTN_F32_Q8_0_Q5_1_SPV.as_bytes(),
+        ),
+        (Q8_0, IQ4_NL) => (
+            "flash_attn_f32_q8_0_iq4_nl",
+            shaders::FLASH_ATTN_F32_Q8_0_IQ4_NL_SPV.as_bytes(),
+        ),
+        (Q5_1, Q4_0) => (
+            "flash_attn_f32_q5_1_q4_0",
+            shaders::FLASH_ATTN_F32_Q5_1_Q4_0_SPV.as_bytes(),
+        ),
+        (Q5_0, Q4_0) => (
+            "flash_attn_f32_q5_0_q4_0",
+            shaders::FLASH_ATTN_F32_Q5_0_Q4_0_SPV.as_bytes(),
+        ),
+        // TurboQuant: homogeneous + the {q8_0, turbo2, turbo3, turbo4} cross
+        // product (auto-asymmetric K=q8_0 + layer-adaptive Boundary-V mixes).
+        (Turbo2_0, Turbo2_0) => (
+            "flash_attn_f32_turbo2",
+            shaders::FLASH_ATTN_F32_TURBO2_SPV.as_bytes(),
+        ),
+        (Turbo3_0, Turbo3_0) => (
+            "flash_attn_f32_turbo3",
+            shaders::FLASH_ATTN_F32_TURBO3_SPV.as_bytes(),
+        ),
+        (Turbo4_0, Turbo4_0) => (
+            "flash_attn_f32_turbo4",
+            shaders::FLASH_ATTN_F32_TURBO4_SPV.as_bytes(),
+        ),
+        (Q8_0, Turbo2_0) => (
+            "flash_attn_f32_q8_0_turbo2",
+            shaders::FLASH_ATTN_F32_Q8_0_TURBO2_SPV.as_bytes(),
+        ),
+        (Q8_0, Turbo3_0) => (
+            "flash_attn_f32_q8_0_turbo3",
+            shaders::FLASH_ATTN_F32_Q8_0_TURBO3_SPV.as_bytes(),
+        ),
+        (Q8_0, Turbo4_0) => (
+            "flash_attn_f32_q8_0_turbo4",
+            shaders::FLASH_ATTN_F32_Q8_0_TURBO4_SPV.as_bytes(),
+        ),
+        (Turbo2_0, Q8_0) => (
+            "flash_attn_f32_turbo2_q8_0",
+            shaders::FLASH_ATTN_F32_TURBO2_Q8_0_SPV.as_bytes(),
+        ),
+        (Turbo3_0, Q8_0) => (
+            "flash_attn_f32_turbo3_q8_0",
+            shaders::FLASH_ATTN_F32_TURBO3_Q8_0_SPV.as_bytes(),
+        ),
+        (Turbo4_0, Q8_0) => (
+            "flash_attn_f32_turbo4_q8_0",
+            shaders::FLASH_ATTN_F32_TURBO4_Q8_0_SPV.as_bytes(),
+        ),
+        (Turbo2_0, Turbo3_0) => (
+            "flash_attn_f32_turbo2_turbo3",
+            shaders::FLASH_ATTN_F32_TURBO2_TURBO3_SPV.as_bytes(),
+        ),
+        (Turbo2_0, Turbo4_0) => (
+            "flash_attn_f32_turbo2_turbo4",
+            shaders::FLASH_ATTN_F32_TURBO2_TURBO4_SPV.as_bytes(),
+        ),
+        (Turbo3_0, Turbo2_0) => (
+            "flash_attn_f32_turbo3_turbo2",
+            shaders::FLASH_ATTN_F32_TURBO3_TURBO2_SPV.as_bytes(),
+        ),
+        (Turbo3_0, Turbo4_0) => (
+            "flash_attn_f32_turbo3_turbo4",
+            shaders::FLASH_ATTN_F32_TURBO3_TURBO4_SPV.as_bytes(),
+        ),
+        (Turbo4_0, Turbo2_0) => (
+            "flash_attn_f32_turbo4_turbo2",
+            shaders::FLASH_ATTN_F32_TURBO4_TURBO2_SPV.as_bytes(),
+        ),
+        (Turbo4_0, Turbo3_0) => (
+            "flash_attn_f32_turbo4_turbo3",
+            shaders::FLASH_ATTN_F32_TURBO4_TURBO3_SPV.as_bytes(),
+        ),
+        (kk, vv) => {
+            return Err(format!(
+                "flash_attn: no shader variant for K/V dtype pair (K={kk:?}, V={vv:?}); \
+                 add it to the //@variants block in flash_attn.slang and scalar_fa_variant"
+            )
+            .into());
+        }
+    })
+}
+
 /// Record flash attention.
 ///
 /// `q` is `[head_dim, L, n_head]` (permuted view of the post-RoPE Q tensor),
@@ -144,12 +312,9 @@ pub fn record(
     if let Some(m) = mask {
         debug_assert_eq!(m.dtype, GgmlType::F32, "mask is always F32 now");
     }
-    debug_assert_eq!(
-        k.dtype, v.dtype,
-        "flash_attn requires K and V to share a dtype (one variant per cache dtype, \
-         not per K/V combo). Materialize the odd side to match if you need a \
-         heterogeneous combo.",
-    );
+    // K and V may now differ (asymmetric cache): the scalar shader reads each
+    // side with its own dtype. The coopmat (cm1) fast paths below still require
+    // K==V==F16, so asymmetric/quant combos fall through to the scalar variant.
 
     // Length of the always-visible cached prefix preceding this batch's
     // query tokens (= position_offset). The host builds only the within-chunk
@@ -196,47 +361,7 @@ pub fn record(
         return record_cm1(ctx, q, k, v, None, out, params, kv_actual);
     }
 
-    let (variant_name, variant_spv) = match k.dtype {
-        GgmlType::F32 => (
-            "flash_attn_f32_f32",
-            shaders::FLASH_ATTN_F32_F32_SPV.as_bytes(),
-        ),
-        GgmlType::F16 => (
-            "flash_attn_f32_f16",
-            shaders::FLASH_ATTN_F32_F16_SPV.as_bytes(),
-        ),
-        GgmlType::BF16 => (
-            "flash_attn_f32_bf16",
-            shaders::FLASH_ATTN_F32_BF16_SPV.as_bytes(),
-        ),
-        GgmlType::Q4_0 => (
-            "flash_attn_f32_q4_0",
-            shaders::FLASH_ATTN_F32_Q4_0_SPV.as_bytes(),
-        ),
-        GgmlType::Q4_1 => (
-            "flash_attn_f32_q4_1",
-            shaders::FLASH_ATTN_F32_Q4_1_SPV.as_bytes(),
-        ),
-        GgmlType::Q5_0 => (
-            "flash_attn_f32_q5_0",
-            shaders::FLASH_ATTN_F32_Q5_0_SPV.as_bytes(),
-        ),
-        GgmlType::Q5_1 => (
-            "flash_attn_f32_q5_1",
-            shaders::FLASH_ATTN_F32_Q5_1_SPV.as_bytes(),
-        ),
-        GgmlType::Q8_0 => (
-            "flash_attn_f32_q8_0",
-            shaders::FLASH_ATTN_F32_Q8_0_SPV.as_bytes(),
-        ),
-        GgmlType::IQ4_NL => (
-            "flash_attn_f32_iq4_nl",
-            shaders::FLASH_ATTN_F32_IQ4_NL_SPV.as_bytes(),
-        ),
-        other => {
-            return Err(format!("flash_attn: no shader variant for K/V dtype {other:?}").into());
-        }
-    };
+    let (variant_name, variant_spv) = scalar_fa_variant(k.dtype, v.dtype)?;
 
     let n = q.dims[1] as u32; // L (rows of Q per head)
     // kv_actual is the caller-provided KV length to iterate over.
@@ -570,10 +695,8 @@ pub fn record_batched(
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(q.dtype, GgmlType::F32);
     debug_assert_eq!(out.dtype, GgmlType::F32);
-    debug_assert_eq!(
-        k.dtype, v.dtype,
-        "flash_attn requires K and V to share a dtype"
-    );
+    // K and V may differ (asymmetric cache) — the scalar shader reads each side
+    // with its own dtype.
     let b = kv_lens.len() as u32;
     debug_assert!(b >= 1, "record_batched needs at least one sequence");
     let varlen = query_lens.is_some();
@@ -605,47 +728,7 @@ pub fn record_batched(
         .collect();
     let max_rows = query_lens_vec.iter().copied().max().unwrap_or(1);
 
-    let (variant_name, variant_spv) = match k.dtype {
-        GgmlType::F32 => (
-            "flash_attn_f32_f32",
-            shaders::FLASH_ATTN_F32_F32_SPV.as_bytes(),
-        ),
-        GgmlType::F16 => (
-            "flash_attn_f32_f16",
-            shaders::FLASH_ATTN_F32_F16_SPV.as_bytes(),
-        ),
-        GgmlType::BF16 => (
-            "flash_attn_f32_bf16",
-            shaders::FLASH_ATTN_F32_BF16_SPV.as_bytes(),
-        ),
-        GgmlType::Q4_0 => (
-            "flash_attn_f32_q4_0",
-            shaders::FLASH_ATTN_F32_Q4_0_SPV.as_bytes(),
-        ),
-        GgmlType::Q4_1 => (
-            "flash_attn_f32_q4_1",
-            shaders::FLASH_ATTN_F32_Q4_1_SPV.as_bytes(),
-        ),
-        GgmlType::Q5_0 => (
-            "flash_attn_f32_q5_0",
-            shaders::FLASH_ATTN_F32_Q5_0_SPV.as_bytes(),
-        ),
-        GgmlType::Q5_1 => (
-            "flash_attn_f32_q5_1",
-            shaders::FLASH_ATTN_F32_Q5_1_SPV.as_bytes(),
-        ),
-        GgmlType::Q8_0 => (
-            "flash_attn_f32_q8_0",
-            shaders::FLASH_ATTN_F32_Q8_0_SPV.as_bytes(),
-        ),
-        GgmlType::IQ4_NL => (
-            "flash_attn_f32_iq4_nl",
-            shaders::FLASH_ATTN_F32_IQ4_NL_SPV.as_bytes(),
-        ),
-        other => {
-            return Err(format!("flash_attn: no shader variant for K/V dtype {other:?}").into());
-        }
-    };
+    let (variant_name, variant_spv) = scalar_fa_variant(k.dtype, v.dtype)?;
 
     let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
 

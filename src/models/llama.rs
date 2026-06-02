@@ -10,8 +10,9 @@ use std::error::Error;
 
 use crate::gguf::{GgmlType, GgufFile, MetadataValue};
 use crate::inference::context::DispatchContext;
-use crate::inference::kv_cache::KvCache;
-use crate::inference::ops::{cache_io, elementwise, flash_attn, matmul, rms_norm, rope};
+use crate::inference::kv_cache::{KvCache, is_turbo};
+use crate::inference::ops::turbo_wht::WhtDir;
+use crate::inference::ops::{cache_io, elementwise, flash_attn, matmul, rms_norm, rope, turbo_wht};
 use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
 
@@ -99,6 +100,7 @@ impl Model for LlamaModel {
             n_layer: self.params.n_layer,
             head_dim: self.params.head_dim(),
             n_head_kv: self.params.n_head_kv,
+            n_head: self.params.n_head,
         }
     }
 
@@ -183,11 +185,11 @@ impl Model for LlamaModel {
         let positions: Vec<u32> = (position_offset..position_offset + l).collect();
         write_u32(ctx, positions_buf, &positions)?;
 
-        // Homogeneous K=V cache: flash_attn binds the cache layer directly
-        // (no copy, no dequant) using its dtype-specialized variant —
-        // works for F32, F16, BF16, and all 6 cache quants. Heterogeneous
-        // K≠V (rare) falls back to materialize-then-attend.
-        let cache_direct = cache.config.k_dtype == cache.config.v_dtype;
+        // flash_attn binds the cache layer directly (no copy, no dequant) using
+        // its dtype-specialized variant whenever it has a variant for this (K, V)
+        // pair — all symmetric pairs and the exposed asymmetric ones. Unsupported
+        // asymmetric pairs (rare) fall back to materialize-then-attend.
+        let cache_direct = flash_attn::supports_pair(cache.config.k_dtype, cache.config.v_dtype);
 
         // Mask is always F32 regardless of cache dtype (the shader's
         // `data_m` binding is F32 across every variant since `e41661f`).
@@ -294,19 +296,44 @@ impl Model for LlamaModel {
                 )
             };
 
+            // TurboQuant: forward-WHT the query when K is turbo (K/V are stored
+            // WHT-rotated; <WHT Q, WHT K> = <Q,K>). head_dim must be % 128 == 0.
+            let q_for_attn = if is_turbo(cache.k_layers[layer_idx].dtype) {
+                let qw = ctx.alloc_tensor(q_roped.dims, GgmlType::F32)?;
+                turbo_wht::record(ctx, q_roped, qw, WhtDir::Forward)?;
+                qw
+            } else {
+                q_roped
+            };
+
             // Permute Q to [head_dim, L, n_head] and K/V to
             // [head_dim, total_len, n_head_kv] (flash_attn input layout).
-            let q_perm = permute_to_attn(q_roped, head_dim, l as u64, p.n_head as u64);
+            let q_perm = permute_to_attn(q_for_attn, head_dim, l as u64, p.n_head as u64);
             let k_perm = permute_to_attn(k_src, head_dim, kv_len_u, p.n_head_kv as u64);
             let v_perm = permute_to_attn(v_src, head_dim, kv_len_u, p.n_head_kv as u64);
 
             // attn_out = flash_attn(Q, K, V, mask) → [hidden, L]
-            let attn_out = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
+            let attn_out_raw = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
             flash_attn::record(
-                ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params, total_len,
+                ctx,
+                q_perm,
+                k_perm,
+                v_perm,
+                mask,
+                attn_out_raw,
+                fa_params,
+                total_len,
             )?;
             // (mask is Option<TensorView>: Some for prefill chunks, None for
             // single-token decode — see the prologue.)
+            // TurboQuant: inverse-WHT the output (in V's rotated basis) when V is turbo.
+            let attn_out = if is_turbo(cache.v_layers[layer_idx].dtype) {
+                let ao = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
+                turbo_wht::record(ctx, attn_out_raw, ao, WhtDir::Inverse)?;
+                ao
+            } else {
+                attn_out_raw
+            };
 
             // proj = wo @ attn_out → [hidden, L]
             let proj = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;

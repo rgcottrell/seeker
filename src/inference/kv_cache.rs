@@ -1,7 +1,10 @@
 //! KV cache. Per-layer K and V buffers persisting across `Engine::forward`
 //! calls so prompt prefill happens once and subsequent decode steps run in
-//! `O(1)` per token. K and V dtypes are independently configurable from the
-//! 9-entry list `{F32, F16, BF16, Q8_0, Q4_0, Q4_1, IQ4_NL, Q5_0, Q5_1}`.
+//! `O(1)` per token. K and V dtypes are independently configurable (the cache
+//! may be asymmetric, e.g. K=q8_0 / V=q4_0) from
+//! `{F32, F16, BF16, Q8_0, Q4_0, Q4_1, IQ4_NL, Q5_0, Q5_1}` plus the TurboQuant
+//! KV quants `{Turbo2_0, Turbo3_0, Turbo4_0}` (WHT-rotated PolarQuant; require
+//! head_dim % 128 == 0).
 
 use std::error::Error;
 use std::sync::Arc;
@@ -19,6 +22,10 @@ pub struct KvCacheConfig {
     pub k_dtype: GgmlType,
     pub v_dtype: GgmlType,
     pub max_seq_len: u32,
+    /// Number of attention (query) heads. Only used to derive the GQA ratio
+    /// (`n_head / n_head_kv`) for TurboQuant auto-asymmetric K-protection; `0`
+    /// disables it (treated as ratio 1). Non-turbo caches ignore it.
+    pub n_head: u32,
 }
 
 impl Default for KvCacheConfig {
@@ -27,6 +34,7 @@ impl Default for KvCacheConfig {
             k_dtype: GgmlType::F16,
             v_dtype: GgmlType::F16,
             max_seq_len: 2048,
+            n_head: 0,
         }
     }
 }
@@ -42,7 +50,25 @@ pub const SUPPORTED_DTYPES: &[(GgmlType, &str)] = &[
     (GgmlType::IQ4_NL, "iq4_nl"),
     (GgmlType::Q5_0, "q5_0"),
     (GgmlType::Q5_1, "q5_1"),
+    // TurboQuant KV quants (WHT-rotated PolarQuant, 128-element blocks).
+    // `validate_head_dim` enforces head_dim % 128 == 0 via the generic
+    // block-size divisibility check (covers qwen35moe's 256 = 2 blocks/head).
+    (GgmlType::Turbo2_0, "turbo2"),
+    (GgmlType::Turbo3_0, "turbo3"),
+    (GgmlType::Turbo4_0, "turbo4"),
 ];
+
+/// Whether `ty` is a TurboQuant KV quant (WHT-rotated PolarQuant). Turbo caches
+/// store K and V rotated, so the query must be forward-WHT-rotated before
+/// attention and the attention output inverse-WHT-rotated afterward (see
+/// `inference::ops::turbo_wht`). Gated per side: K-turbo drives the Q rotation,
+/// V-turbo drives the output rotation.
+pub fn is_turbo(ty: GgmlType) -> bool {
+    matches!(
+        ty,
+        GgmlType::Turbo2_0 | GgmlType::Turbo3_0 | GgmlType::Turbo4_0
+    )
+}
 
 pub fn parse_dtype(s: &str) -> Result<GgmlType, String> {
     SUPPORTED_DTYPES
@@ -122,12 +148,28 @@ impl KvCache {
         let head_dim_u = head_dim as u64;
         let n_head_kv_u = n_head_kv as u64;
 
-        let k_bytes = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, config.k_dtype);
-        let v_bytes = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, config.v_dtype);
+        // Per-layer K/V dtypes (turbo auto-asymmetric + layer-adaptive may make
+        // them differ across layers / sides). Non-turbo configs come back
+        // uniform. Each layer's TensorView carries its own dtype, so the write,
+        // flash-attn dispatch, and WHT gating all key off it per layer.
+        let (k_dtypes, v_dtypes) = resolve_layer_dtypes(
+            config.k_dtype,
+            config.v_dtype,
+            n_layer,
+            config.n_head,
+            n_head_kv,
+        );
+
         let align = device.limits.min_storage_buffer_offset_alignment.max(1);
-        let k_aligned = align_up(k_bytes, align);
-        let v_aligned = align_up(v_bytes, align);
-        let total = (n_layer as u64) * (k_aligned + v_aligned);
+        let k_aligned: Vec<u64> = k_dtypes
+            .iter()
+            .map(|&d| align_up(tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, d), align))
+            .collect();
+        let v_aligned: Vec<u64> = v_dtypes
+            .iter()
+            .map(|&d| align_up(tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, d), align))
+            .collect();
+        let total: u64 = k_aligned.iter().chain(v_aligned.iter()).sum();
 
         let region = Region::new(
             device,
@@ -139,25 +181,25 @@ impl KvCache {
         let mut k_layers = Vec::with_capacity(n_layer as usize);
         let mut v_layers = Vec::with_capacity(n_layer as usize);
         let mut cursor = 0u64;
-        for _ in 0..n_layer {
+        for il in 0..n_layer as usize {
             k_layers.push(make_view(
                 region.buffer,
                 cursor,
                 head_dim_u,
                 max_seq_len,
                 n_head_kv_u,
-                config.k_dtype,
+                k_dtypes[il],
             ));
-            cursor += k_aligned;
+            cursor += k_aligned[il];
             v_layers.push(make_view(
                 region.buffer,
                 cursor,
                 head_dim_u,
                 max_seq_len,
                 n_head_kv_u,
-                config.v_dtype,
+                v_dtypes[il],
             ));
-            cursor += v_aligned;
+            cursor += v_aligned[il];
         }
 
         Ok(Self {
@@ -423,6 +465,106 @@ fn validate_dtype(ty: GgmlType, side: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Resolve per-layer K/V dtypes from the base `(k, v)` config, applying
+/// TurboQuant's K-protection heuristics (ported from the llama-cpp-turboquant
+/// fork's `llama-kv-cache.cpp`):
+///
+/// 1. **Auto-asymmetric** — turbo-K quantization error is amplified by the GQA
+///    broadcast (one quantized K head feeds many query heads), catastrophically
+///    so at high ratios. When K is turbo, K==V, and `n_head/n_head_kv >= 6`,
+///    upgrade K to `Q8_0`. Opt out with `TURBO_AUTO_ASYMMETRIC=0`.
+/// 2. **Layer-adaptive "Boundary V"** — `TURBO_LAYER_ADAPTIVE` selects a mode
+///    (0=off, 1/2=q8_0 K+V on edge layers, 5/6=turbo4/turbo2 V mix, 7=q8_0 V on
+///    first2+last2 else turbo2). Mode 7 auto-enables when V is `turbo2` and
+///    `n_layer >= 8`. Opt out with `TURBO_LAYER_ADAPTIVE=0`.
+///
+/// Returns `(per-layer K dtypes, per-layer V dtypes)`, each length `n_layer`.
+/// Non-turbo base configs are returned unchanged (uniform).
+fn resolve_layer_dtypes(
+    base_k: GgmlType,
+    base_v: GgmlType,
+    n_layer: u32,
+    n_head: u32,
+    n_head_kv: u32,
+) -> (Vec<GgmlType>, Vec<GgmlType>) {
+    let nl = n_layer as usize;
+    let mut k = base_k;
+
+    // 1. Auto-asymmetric K upgrade.
+    if is_turbo(base_k) && base_k == base_v {
+        let gqa = n_head.checked_div(n_head_kv).unwrap_or(1);
+        let disabled = std::env::var("TURBO_AUTO_ASYMMETRIC").as_deref() == Ok("0");
+        if !disabled && gqa >= 6 {
+            tracing::warn!(
+                gqa_ratio = gqa,
+                n_head,
+                n_head_kv,
+                "turbo auto-asymmetric: upgrading K {:?} -> Q8_0 (high GQA amplifies turbo-K \
+                 error); disable with TURBO_AUTO_ASYMMETRIC=0",
+                base_k
+            );
+            k = GgmlType::Q8_0;
+        }
+    }
+
+    // 2. Layer-adaptive mode (env override, else auto-enable mode 7 for turbo2-V).
+    let mode: i32 = match std::env::var("TURBO_LAYER_ADAPTIVE") {
+        Ok(s) => s.trim().parse().unwrap_or(0),
+        Err(_) => {
+            if base_v == GgmlType::Turbo2_0 && nl >= 8 {
+                7
+            } else {
+                0
+            }
+        }
+    };
+    if mode != 0 {
+        tracing::info!(mode, "turbo layer-adaptive enabled");
+    }
+
+    let k_is_turbo = is_turbo(k);
+    let v_is_turbo = is_turbo(base_v);
+    let mut kd = vec![k; nl];
+    let mut vd = vec![base_v; nl];
+    for il in 0..nl {
+        match mode {
+            1 if k_is_turbo && nl >= 8 && (il < 4 || il >= nl - 4) => {
+                kd[il] = GgmlType::Q8_0;
+                vd[il] = GgmlType::Q8_0;
+            }
+            2 if k_is_turbo && nl >= 8 && il >= nl - 8 => {
+                kd[il] = GgmlType::Q8_0;
+                vd[il] = GgmlType::Q8_0;
+            }
+            5 if v_is_turbo && nl >= 8 => {
+                let boundary = il < 2 || il >= nl - 2;
+                vd[il] = if boundary {
+                    GgmlType::Turbo4_0
+                } else {
+                    GgmlType::Turbo2_0
+                };
+            }
+            6 if v_is_turbo && nl >= 8 => {
+                vd[il] = if il >= nl - 8 {
+                    GgmlType::Turbo4_0
+                } else {
+                    GgmlType::Turbo2_0
+                };
+            }
+            7 if v_is_turbo && nl >= 8 => {
+                let boundary = il < 2 || il >= nl - 2;
+                vd[il] = if boundary {
+                    GgmlType::Q8_0
+                } else {
+                    GgmlType::Turbo2_0
+                };
+            }
+            _ => {}
+        }
+    }
+    (kd, vd)
+}
+
 fn validate_head_dim(head_dim: u32, ty: GgmlType, side: &str) -> Result<(), Box<dyn Error>> {
     let (block_size, _) = ty.block_layout();
     if !(head_dim as usize).is_multiple_of(block_size) {
@@ -500,6 +642,22 @@ fn align_up(v: u64, alignment: u64) -> u64 {
     (v + alignment - 1) & !(alignment - 1)
 }
 
+/// Least common multiple (for slab strides that must satisfy both the device
+/// storage-buffer alignment and the quant block byte size).
+fn lcm(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 {
+        return a.max(b);
+    }
+    let mut x = a;
+    let mut y = b;
+    while y != 0 {
+        let t = y;
+        y = x % y;
+        x = t;
+    }
+    a / x * b // a/gcd*b
+}
+
 /// A KV cache holding `n_slots` independent sequence slabs in one shared buffer
 /// per layer, so a batched decode can address all active sequences through the
 /// flash-attn batch stride (`nb13`/`nb23`). Each slab has the identical natural
@@ -521,9 +679,16 @@ pub struct BatchKvCache {
     /// Byte offset of each layer's K slab-0 / V slab-0.
     k_base: Vec<u64>,
     v_base: Vec<u64>,
-    /// Per-slot slab stride in bytes (padded to `alignment`).
-    k_slab_stride: u64,
-    v_slab_stride: u64,
+    /// Per-layer slot slab stride in bytes (padded to `alignment`, and — for
+    /// block-quant turbo layers — to a multiple of the block byte size so the
+    /// flash-attn block addressing `elem/QUANT_K` lands on slot boundaries).
+    /// Per-layer because turbo K-protection (auto-asymmetric / Boundary-V) can
+    /// give layers different K/V dtypes (and hence slab sizes).
+    k_slab_stride: Vec<u64>,
+    v_slab_stride: Vec<u64>,
+    /// Per-layer resolved K/V dtypes (see [`resolve_layer_dtypes`]).
+    k_dtypes: Vec<GgmlType>,
+    v_dtypes: Vec<GgmlType>,
     /// Current write position (tokens) of each slot.
     pub positions: Vec<u32>,
     /// Per-slot M-RoPE position lag — how far the rope cursor trails
@@ -561,36 +726,44 @@ impl BatchKvCache {
         validate_dtype(config.v_dtype, "V")?;
         validate_head_dim(head_dim, config.k_dtype, "K")?;
         validate_head_dim(head_dim, config.v_dtype, "V")?;
-        for (ty, side) in [(config.k_dtype, "K"), (config.v_dtype, "V")] {
-            if ty.block_layout().0 != 1 {
-                return Err(format!(
-                    "BatchKvCache: quant {side} cache dtype {ty:?} not supported yet \
-                     (batched decode needs a flat per-element stride; use f16/bf16/f32)"
-                )
-                .into());
-            }
-        }
 
         let max_seq_len = config.max_seq_len as u64;
         let head_dim_u = head_dim as u64;
         let n_head_kv_u = n_head_kv as u64;
         let align = device.limits.min_storage_buffer_offset_alignment.max(1);
 
-        let k_slab = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, config.k_dtype);
-        let v_slab = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, config.v_dtype);
-        let k_slab_stride = align_up(k_slab, align);
-        let v_slab_stride = align_up(v_slab, align);
-        let k_block = k_slab_stride * n_slots as u64;
-        let v_block = v_slab_stride * n_slots as u64;
+        // Per-layer dtypes (turbo auto-asymmetric / Boundary-V). Uniform for
+        // non-turbo configs.
+        let (k_dtypes, v_dtypes) = resolve_layer_dtypes(
+            config.k_dtype,
+            config.v_dtype,
+            n_layer,
+            config.n_head,
+            n_head_kv,
+        );
+
+        // Per-slot slab stride for `dtype`. Padded to the storage-buffer
+        // alignment (so each slot's byte offset is descriptor-bindable for the
+        // per-slot prefill path) AND to a multiple of the block byte size (so
+        // flash-attn's `elem / QUANT_K` block index lands on slot boundaries for
+        // block-quant turbo). For block_size==1 the type size divides the
+        // alignment, so this reduces to `align_up(bytes, align)`.
+        let slab_stride = |dtype: GgmlType| -> u64 {
+            let (_, type_size) = dtype.block_layout();
+            let bytes = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, dtype);
+            align_up(bytes, lcm(align, type_size as u64))
+        };
+        let k_slab_stride: Vec<u64> = k_dtypes.iter().map(|&d| slab_stride(d)).collect();
+        let v_slab_stride: Vec<u64> = v_dtypes.iter().map(|&d| slab_stride(d)).collect();
 
         let mut k_base = Vec::with_capacity(n_layer as usize);
         let mut v_base = Vec::with_capacity(n_layer as usize);
         let mut cursor = 0u64;
-        for _ in 0..n_layer {
+        for il in 0..n_layer as usize {
             let kb = align_up(cursor, align);
-            cursor = kb + k_block;
+            cursor = kb + k_slab_stride[il] * n_slots as u64;
             let vb = align_up(cursor, align);
-            cursor = vb + v_block;
+            cursor = vb + v_slab_stride[il] * n_slots as u64;
             k_base.push(kb);
             v_base.push(vb);
         }
@@ -623,6 +796,8 @@ impl BatchKvCache {
             v_base,
             k_slab_stride,
             v_slab_stride,
+            k_dtypes,
+            v_dtypes,
             positions: vec![0; n_slots as usize],
             rope_lag: vec![0; n_slots as usize],
             ssm_region: None,
@@ -777,25 +952,33 @@ impl BatchKvCache {
 
     /// Single-slot natural `[head_dim, n_head_kv, max_seq_len]` K view (slab
     /// `slot`, layer `layer`) — identical layout to `KvCache::k_layers[layer]`.
+    /// Per-layer resolved K / V dtype (turbo K-protection may differ per layer).
+    pub fn k_dtype(&self, layer: u32) -> GgmlType {
+        self.k_dtypes[layer as usize]
+    }
+    pub fn v_dtype(&self, layer: u32) -> GgmlType {
+        self.v_dtypes[layer as usize]
+    }
+
     pub fn slot_k_view(&self, slot: u32, layer: u32) -> TensorView {
         make_view(
             self.buffer,
-            self.k_base[layer as usize] + slot as u64 * self.k_slab_stride,
+            self.k_base[layer as usize] + slot as u64 * self.k_slab_stride[layer as usize],
             self.head_dim as u64,
             self.config.max_seq_len as u64,
             self.n_head_kv as u64,
-            self.config.k_dtype,
+            self.k_dtypes[layer as usize],
         )
     }
 
     pub fn slot_v_view(&self, slot: u32, layer: u32) -> TensorView {
         make_view(
             self.buffer,
-            self.v_base[layer as usize] + slot as u64 * self.v_slab_stride,
+            self.v_base[layer as usize] + slot as u64 * self.v_slab_stride[layer as usize],
             self.head_dim as u64,
             self.config.max_seq_len as u64,
             self.n_head_kv as u64,
-            self.config.v_dtype,
+            self.v_dtypes[layer as usize],
         )
     }
 
@@ -809,12 +992,12 @@ impl BatchKvCache {
         batched_attn_view(
             self.buffer,
             self.k_base[layer as usize],
-            self.k_slab_stride,
+            self.k_slab_stride[layer as usize],
             self.head_dim as u64,
             self.config.max_seq_len as u64,
             self.n_head_kv as u64,
             self.n_slots,
-            self.config.k_dtype,
+            self.k_dtypes[layer as usize],
         )
     }
 
@@ -822,12 +1005,12 @@ impl BatchKvCache {
         batched_attn_view(
             self.buffer,
             self.v_base[layer as usize],
-            self.v_slab_stride,
+            self.v_slab_stride[layer as usize],
             self.head_dim as u64,
             self.config.max_seq_len as u64,
             self.n_head_kv as u64,
             self.n_slots,
-            self.config.v_dtype,
+            self.v_dtypes[layer as usize],
         )
     }
 
@@ -893,7 +1076,13 @@ impl Drop for BatchKvCache {
 
 /// Build a batched flash-attn K/V view: permuted `[head_dim, max_seq_len,
 /// n_head_kv, B]` with the slot as the (stride `slab_stride` bytes) batch
-/// dimension. Assumes a flat per-element stride (block_size == 1).
+/// dimension. The within-slab element strides are in true elements (matching
+/// `permute_to_attn`); flash-attn reads element-by-element and derives the
+/// block via `elem / QUANT_K`. The slot stride is block-granular: a slab spans
+/// `slab_stride_bytes / type_size` blocks, i.e. `block_size ×` that many
+/// element slots in the `elem / QUANT_K` addressing (slab strides are padded to
+/// a multiple of the block byte size, so this divides evenly). For block_size==1
+/// this reduces to the flat per-element stride.
 #[allow(clippy::too_many_arguments)]
 fn batched_attn_view(
     buffer: vk::Buffer,
@@ -905,13 +1094,19 @@ fn batched_attn_view(
     b: u32,
     dtype: GgmlType,
 ) -> TensorView {
-    let ts = dtype.block_layout().1 as u64; // type_size (block_size == 1)
-    let element_stride = [1u64, head_dim * n_head_kv, head_dim, slab_stride_bytes / ts];
+    let (block_size, type_size) = dtype.block_layout();
+    let bs = block_size as u64;
+    let ts = type_size as u64;
+    let slot_stride = bs * (slab_stride_bytes / ts);
+    let element_stride = [1u64, head_dim * n_head_kv, head_dim, slot_stride];
+    // FA addresses via `element_stride` (+ `elem/QUANT_K` for the block); the
+    // byte strides only feed the descriptor range, so the slot byte distance is
+    // the real `slab_stride_bytes`.
     let byte_stride = [
-        element_stride[0] * ts,
-        element_stride[1] * ts,
-        element_stride[2] * ts,
-        element_stride[3] * ts,
+        ts,
+        ts * head_dim * n_head_kv,
+        ts * head_dim,
+        slab_stride_bytes,
     ];
     TensorView {
         buffer,

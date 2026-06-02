@@ -403,12 +403,13 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     );
     engine.allocate_scratch(scratch_bytes)?;
 
+    let dims = model.cache_dims();
     let cache_config = KvCacheConfig {
         k_dtype: cfg.cache_type_k,
         v_dtype: cfg.cache_type_v,
         max_seq_len: cfg.ctx_size,
+        n_head: dims.n_head,
     };
-    let dims = model.cache_dims();
     let n_slots = cfg.n_slots.max(1);
     // One BatchKvCache with N slabs: idle slabs keep their conversation's
     // prefix (reuse); the active subset batches in one forward. Allocated

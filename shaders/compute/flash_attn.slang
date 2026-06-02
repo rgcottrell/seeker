@@ -14,16 +14,46 @@
 // cooperate across the head_size dim (HSK). The K/V iteration is
 // sequential over Bc-wide blocks.
 
+// K and V dtypes are selected INDEPENDENTLY: the K side via `DATA_A_<T>` (+ the
+// `K_TYPE` template for the f32/f16 cases), the V side via `DATA_V_<T>` (+ `V_TYPE`).
+// Homogeneous (K==V) variants keep their historical names (`flash_attn_f32_q8_0`, …)
+// so the Rust dispatch + SPV consts are unchanged; heterogeneous variants are named
+// `f32_<K>_<V>`. `read_k_element` switches on the `DATA_A_*`/`K_TYPE` (K) defines and
+// `read_v_element` on the `DATA_V_*`/`V_TYPE` (V) defines.
 //@variants
-//  f32_f32:    Q_TYPE=float    KV_TYPE=float       D_TYPE=float
-//  f32_f16:    Q_TYPE=float    KV_TYPE=float16_t   D_TYPE=float
-//  f32_bf16:   Q_TYPE=float    KV_TYPE=uint16_t    D_TYPE=float    DATA_KV_BF16=1
-//  f32_q4_0:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q4_0=1   DATA_KV_QUANT=1
-//  f32_q4_1:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q4_1=1   DATA_KV_QUANT=1
-//  f32_q5_0:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q5_0=1   DATA_KV_QUANT=1
-//  f32_q5_1:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q5_1=1   DATA_KV_QUANT=1
-//  f32_q8_0:   Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_Q8_0=1   DATA_KV_QUANT=1
-//  f32_iq4_nl: Q_TYPE=float    KV_TYPE=float       D_TYPE=float    DATA_A_IQ4_NL=1 DATA_KV_QUANT=1
+//  f32_f32:    Q_TYPE=float D_TYPE=float K_TYPE=float     V_TYPE=float
+//  f32_f16:    Q_TYPE=float D_TYPE=float K_TYPE=float16_t V_TYPE=float16_t
+//  f32_bf16:   Q_TYPE=float D_TYPE=float K_TYPE=float     V_TYPE=float     DATA_A_BF16=1  DATA_V_BF16=1
+//  f32_q4_0:   Q_TYPE=float D_TYPE=float K_TYPE=float     V_TYPE=float     DATA_A_Q4_0=1  DATA_V_Q4_0=1
+//  f32_q4_1:   Q_TYPE=float D_TYPE=float K_TYPE=float     V_TYPE=float     DATA_A_Q4_1=1  DATA_V_Q4_1=1
+//  f32_q5_0:   Q_TYPE=float D_TYPE=float K_TYPE=float     V_TYPE=float     DATA_A_Q5_0=1  DATA_V_Q5_0=1
+//  f32_q5_1:   Q_TYPE=float D_TYPE=float K_TYPE=float     V_TYPE=float     DATA_A_Q5_1=1  DATA_V_Q5_1=1
+//  f32_q8_0:   Q_TYPE=float D_TYPE=float K_TYPE=float     V_TYPE=float     DATA_A_Q8_0=1  DATA_V_Q8_0=1
+//  f32_iq4_nl: Q_TYPE=float D_TYPE=float K_TYPE=float     V_TYPE=float     DATA_A_IQ4_NL=1 DATA_V_IQ4_NL=1
+//  f32_f16_q8_0:    Q_TYPE=float D_TYPE=float K_TYPE=float16_t V_TYPE=float DATA_V_Q8_0=1
+//  f32_f16_q4_0:    Q_TYPE=float D_TYPE=float K_TYPE=float16_t V_TYPE=float DATA_V_Q4_0=1
+//  f32_q8_0_q4_0:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q8_0=1 DATA_V_Q4_0=1
+//  f32_q8_0_q4_1:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q8_0=1 DATA_V_Q4_1=1
+//  f32_q8_0_q5_0:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q8_0=1 DATA_V_Q5_0=1
+//  f32_q8_0_q5_1:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q8_0=1 DATA_V_Q5_1=1
+//  f32_q8_0_iq4_nl: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q8_0=1 DATA_V_IQ4_NL=1
+//  f32_q5_1_q4_0:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q5_1=1 DATA_V_Q4_0=1
+//  f32_q5_0_q4_0:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q5_0=1 DATA_V_Q4_0=1
+//  f32_turbo2:        Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO2_0=1 DATA_V_TURBO2_0=1
+//  f32_turbo3:        Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO3_0=1 DATA_V_TURBO3_0=1
+//  f32_turbo4:        Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO4_0=1 DATA_V_TURBO4_0=1
+//  f32_q8_0_turbo2:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q8_0=1 DATA_V_TURBO2_0=1
+//  f32_q8_0_turbo3:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q8_0=1 DATA_V_TURBO3_0=1
+//  f32_q8_0_turbo4:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_Q8_0=1 DATA_V_TURBO4_0=1
+//  f32_turbo2_q8_0:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO2_0=1 DATA_V_Q8_0=1
+//  f32_turbo3_q8_0:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO3_0=1 DATA_V_Q8_0=1
+//  f32_turbo4_q8_0:   Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO4_0=1 DATA_V_Q8_0=1
+//  f32_turbo2_turbo3: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO2_0=1 DATA_V_TURBO3_0=1
+//  f32_turbo2_turbo4: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO2_0=1 DATA_V_TURBO4_0=1
+//  f32_turbo3_turbo2: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO3_0=1 DATA_V_TURBO2_0=1
+//  f32_turbo3_turbo4: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO3_0=1 DATA_V_TURBO4_0=1
+//  f32_turbo4_turbo2: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO4_0=1 DATA_V_TURBO2_0=1
+//  f32_turbo4_turbo3: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO4_0=1 DATA_V_TURBO3_0=1
 //@end-variants
 
 import glsl;  // gl_SubgroupInvocationID, gl_LocalInvocationIndex
@@ -95,39 +125,63 @@ struct FaParams {
 // Q always F32.
 [[vk::binding(0, 0)]] StructuredBuffer<Q_TYPE> data_q;
 
-// K and V: type depends on cache dtype. The push-constant strides
-// (nb01/nb11/nb21 etc.) stay in ELEMENTS, the same units regardless of
-// dtype; for quants the dequant helpers below convert element-indices to
-// (block-index, intra-block-index) by dividing by QUANT_K=32.
-#if defined(DATA_KV_QUANT)
-    // Quant variants: block-struct bindings.
-    #if defined(DATA_A_Q4_0)
-        [[vk::binding(1, 0)]] StructuredBuffer<block_q4_0> data_k;
-        [[vk::binding(2, 0)]] StructuredBuffer<block_q4_0> data_v;
-    #elif defined(DATA_A_Q4_1)
-        [[vk::binding(1, 0)]] StructuredBuffer<block_q4_1> data_k;
-        [[vk::binding(2, 0)]] StructuredBuffer<block_q4_1> data_v;
-    #elif defined(DATA_A_Q5_0)
-        [[vk::binding(1, 0)]] StructuredBuffer<block_q5_0> data_k;
-        [[vk::binding(2, 0)]] StructuredBuffer<block_q5_0> data_v;
-    #elif defined(DATA_A_Q5_1)
-        [[vk::binding(1, 0)]] StructuredBuffer<block_q5_1> data_k;
-        [[vk::binding(2, 0)]] StructuredBuffer<block_q5_1> data_v;
-    #elif defined(DATA_A_Q8_0)
-        [[vk::binding(1, 0)]] StructuredBuffer<block_q8_0> data_k;
-        [[vk::binding(2, 0)]] StructuredBuffer<block_q8_0> data_v;
-    #elif defined(DATA_A_IQ4_NL)
-        [[vk::binding(1, 0)]] StructuredBuffer<block_iq4_nl> data_k;
-        [[vk::binding(2, 0)]] StructuredBuffer<block_iq4_nl> data_v;
-    #endif
-#elif defined(DATA_KV_BF16)
+// K and V types are selected INDEPENDENTLY (K via DATA_A_*/K_TYPE, V via
+// DATA_V_*/V_TYPE) so the cache can be asymmetric (e.g. K=q8_0, V=q4_0). The
+// push-constant strides (nb01/nb11/nb21 etc.) stay in ELEMENTS, the same units
+// regardless of dtype; for quants the read helpers below convert element-indices
+// to (block-index, intra-block-index) by dividing by the block size (32 for the
+// legacy quants). All block_* structs are unconditionally defined in types.slang.
+//
+// ---- K (binding 1) ----
+#if   defined(DATA_A_Q4_0)
+    [[vk::binding(1, 0)]] StructuredBuffer<block_q4_0> data_k;
+#elif defined(DATA_A_Q4_1)
+    [[vk::binding(1, 0)]] StructuredBuffer<block_q4_1> data_k;
+#elif defined(DATA_A_Q5_0)
+    [[vk::binding(1, 0)]] StructuredBuffer<block_q5_0> data_k;
+#elif defined(DATA_A_Q5_1)
+    [[vk::binding(1, 0)]] StructuredBuffer<block_q5_1> data_k;
+#elif defined(DATA_A_Q8_0)
+    [[vk::binding(1, 0)]] StructuredBuffer<block_q8_0> data_k;
+#elif defined(DATA_A_IQ4_NL)
+    [[vk::binding(1, 0)]] StructuredBuffer<block_iq4_nl> data_k;
+#elif defined(DATA_A_TURBO2_0)
+    [[vk::binding(1, 0)]] StructuredBuffer<block_turbo2_0> data_k;
+#elif defined(DATA_A_TURBO3_0)
+    [[vk::binding(1, 0)]] StructuredBuffer<block_turbo3_0> data_k;
+#elif defined(DATA_A_TURBO4_0)
+    [[vk::binding(1, 0)]] StructuredBuffer<block_turbo4_0> data_k;
+#elif defined(DATA_A_BF16)
     // BF16: raw uint16_t storage, expanded to F32 via bit shift on read.
     [[vk::binding(1, 0)]] StructuredBuffer<uint16_t> data_k;
+#else
+    // F32 or F16: K_TYPE templated directly.
+    [[vk::binding(1, 0)]] StructuredBuffer<K_TYPE> data_k;
+#endif
+//
+// ---- V (binding 2) ----
+#if   defined(DATA_V_Q4_0)
+    [[vk::binding(2, 0)]] StructuredBuffer<block_q4_0> data_v;
+#elif defined(DATA_V_Q4_1)
+    [[vk::binding(2, 0)]] StructuredBuffer<block_q4_1> data_v;
+#elif defined(DATA_V_Q5_0)
+    [[vk::binding(2, 0)]] StructuredBuffer<block_q5_0> data_v;
+#elif defined(DATA_V_Q5_1)
+    [[vk::binding(2, 0)]] StructuredBuffer<block_q5_1> data_v;
+#elif defined(DATA_V_Q8_0)
+    [[vk::binding(2, 0)]] StructuredBuffer<block_q8_0> data_v;
+#elif defined(DATA_V_IQ4_NL)
+    [[vk::binding(2, 0)]] StructuredBuffer<block_iq4_nl> data_v;
+#elif defined(DATA_V_TURBO2_0)
+    [[vk::binding(2, 0)]] StructuredBuffer<block_turbo2_0> data_v;
+#elif defined(DATA_V_TURBO3_0)
+    [[vk::binding(2, 0)]] StructuredBuffer<block_turbo3_0> data_v;
+#elif defined(DATA_V_TURBO4_0)
+    [[vk::binding(2, 0)]] StructuredBuffer<block_turbo4_0> data_v;
+#elif defined(DATA_V_BF16)
     [[vk::binding(2, 0)]] StructuredBuffer<uint16_t> data_v;
 #else
-    // F32 or F16: KV_TYPE templated directly.
-    [[vk::binding(1, 0)]] StructuredBuffer<KV_TYPE> data_k;
-    [[vk::binding(2, 0)]] StructuredBuffer<KV_TYPE> data_v;
+    [[vk::binding(2, 0)]] StructuredBuffer<V_TYPE> data_v;
 #endif
 
 // Mask is always F32 across every variant.
@@ -151,8 +205,10 @@ groupshared float Q_sh[HSK];
 groupshared float S_sh[Bc];
 
 // Per-element scalar K/V read returning F32. Inlined per dtype.
+// read_k_element switches on the K-side defines (DATA_A_*/K_TYPE);
+// read_v_element on the V-side defines (DATA_V_*/V_TYPE).
 float read_k_element(uint elem_idx) {
-#if defined(DATA_KV_BF16)
+#if defined(DATA_A_BF16)
     return asfloat(uint(data_k[elem_idx]) << 16);
 #elif defined(DATA_A_Q8_0)
     const uint ib  = elem_idx / 32;
@@ -196,33 +252,51 @@ float read_k_element(uint elem_idx) {
     if (d < 16) { nibble = uint(data_k[ib].qs[d])      & 0xFu; }
     else        { nibble = uint(data_k[ib].qs[d - 16]) >> 4;   }
     return float(data_k[ib].d) * float(kvalues_iq4nl[nibble]);
+#elif defined(DATA_A_TURBO2_0)
+    // WHT-rotated PolarQuant; value = centroid[idx] * norm. 128-elem blocks.
+    const uint ib  = elem_idx / 128;
+    const uint j   = elem_idx % 128;
+    const uint idx = (uint(data_k[ib].qs[j >> 2]) >> (2u * (j & 3u))) & 0x3u;
+    return turbo2_centroids[idx] * float(data_k[ib].norm);
+#elif defined(DATA_A_TURBO3_0)
+    const uint ib = elem_idx / 128;
+    const uint j  = elem_idx % 128;
+    const uint lo = (uint(data_k[ib].qs[j >> 2]) >> (2u * (j & 3u))) & 0x3u;
+    const uint hi = (uint(data_k[ib].signs[j >> 3]) >> (j & 7u)) & 0x1u;
+    return turbo3_centroids[(hi << 2) | lo] * float(data_k[ib].norm);
+#elif defined(DATA_A_TURBO4_0)
+    const uint ib  = elem_idx / 128;
+    const uint j   = elem_idx % 128;
+    const uint b8  = uint(data_k[ib].qs[j >> 1]);
+    const uint idx = ((j & 1u) == 0u) ? (b8 & 0xFu) : (b8 >> 4);
+    return turbo4_centroids[idx] * float(data_k[ib].norm);
 #else
     return float(data_k[elem_idx]);
 #endif
 }
 
 float read_v_element(uint elem_idx) {
-#if defined(DATA_KV_BF16)
+#if defined(DATA_V_BF16)
     return asfloat(uint(data_v[elem_idx]) << 16);
-#elif defined(DATA_A_Q8_0)
+#elif defined(DATA_V_Q8_0)
     const uint ib  = elem_idx / 32;
     const uint iqs = elem_idx % 32;
     return float(data_v[ib].d) * float(int(data_v[ib].qs[iqs]));
-#elif defined(DATA_A_Q4_0)
+#elif defined(DATA_V_Q4_0)
     const uint ib  = elem_idx / 32;
     const uint d   = elem_idx % 32;
     uint nibble;
     if (d < 16) { nibble = uint(data_v[ib].qs[d])      & 0xFu; }
     else        { nibble = uint(data_v[ib].qs[d - 16]) >> 4;   }
     return float(data_v[ib].d) * (float(nibble) - 8.0f);
-#elif defined(DATA_A_Q4_1)
+#elif defined(DATA_V_Q4_1)
     const uint ib  = elem_idx / 32;
     const uint d   = elem_idx % 32;
     uint nibble;
     if (d < 16) { nibble = uint(data_v[ib].qs[d])      & 0xFu; }
     else        { nibble = uint(data_v[ib].qs[d - 16]) >> 4;   }
     return float(data_v[ib].d) * float(nibble) + float(data_v[ib].m);
-#elif defined(DATA_A_Q5_0)
+#elif defined(DATA_V_Q5_0)
     const uint ib  = elem_idx / 32;
     const uint d   = elem_idx % 32;
     uint low_nibble;
@@ -231,7 +305,7 @@ float read_v_element(uint elem_idx) {
     const uint qh = uint(data_v[ib].qh[0]) | (uint(data_v[ib].qh[1]) << 16);
     const uint high_bit = (qh >> d) & 1u;
     return float(data_v[ib].d) * (float(low_nibble | (high_bit << 4)) - 16.0f);
-#elif defined(DATA_A_Q5_1)
+#elif defined(DATA_V_Q5_1)
     const uint ib  = elem_idx / 32;
     const uint d   = elem_idx % 32;
     uint low_nibble;
@@ -239,13 +313,30 @@ float read_v_element(uint elem_idx) {
     else        { low_nibble = uint(data_v[ib].qs[d - 16]) >> 4;   }
     const uint high_bit = (data_v[ib].qh >> d) & 1u;
     return float(data_v[ib].d) * float(low_nibble | (high_bit << 4)) + float(data_v[ib].m);
-#elif defined(DATA_A_IQ4_NL)
+#elif defined(DATA_V_IQ4_NL)
     const uint ib  = elem_idx / 32;
     const uint d   = elem_idx % 32;
     uint nibble;
     if (d < 16) { nibble = uint(data_v[ib].qs[d])      & 0xFu; }
     else        { nibble = uint(data_v[ib].qs[d - 16]) >> 4;   }
     return float(data_v[ib].d) * float(kvalues_iq4nl[nibble]);
+#elif defined(DATA_V_TURBO2_0)
+    const uint ib  = elem_idx / 128;
+    const uint j   = elem_idx % 128;
+    const uint idx = (uint(data_v[ib].qs[j >> 2]) >> (2u * (j & 3u))) & 0x3u;
+    return turbo2_centroids[idx] * float(data_v[ib].norm);
+#elif defined(DATA_V_TURBO3_0)
+    const uint ib = elem_idx / 128;
+    const uint j  = elem_idx % 128;
+    const uint lo = (uint(data_v[ib].qs[j >> 2]) >> (2u * (j & 3u))) & 0x3u;
+    const uint hi = (uint(data_v[ib].signs[j >> 3]) >> (j & 7u)) & 0x1u;
+    return turbo3_centroids[(hi << 2) | lo] * float(data_v[ib].norm);
+#elif defined(DATA_V_TURBO4_0)
+    const uint ib  = elem_idx / 128;
+    const uint j   = elem_idx % 128;
+    const uint b8  = uint(data_v[ib].qs[j >> 1]);
+    const uint idx = ((j & 1u) == 0u) ? (b8 & 0xFu) : (b8 >> 4);
+    return turbo4_centroids[idx] * float(data_v[ib].norm);
 #else
     return float(data_v[elem_idx]);
 #endif

@@ -328,6 +328,9 @@ pub struct CacheDims {
     pub n_layer: u32,
     pub head_dim: u32,
     pub n_head_kv: u32,
+    /// Number of attention (query) heads — for the GQA ratio used by
+    /// TurboQuant auto-asymmetric K-protection (see `KvCacheConfig::n_head`).
+    pub n_head: u32,
 }
 
 /// Construct the right `Model` for the given GGUF based on its

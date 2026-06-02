@@ -84,7 +84,8 @@ pub struct ServeArgs {
     #[arg(long = "parallel", default_value_t = 1)]
     parallel: u32,
 
-    /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1.
+    /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1
+    /// (quant + turbo* require the per-block BatchKvCache path).
     #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
     cache_type_k: GgmlType,
 

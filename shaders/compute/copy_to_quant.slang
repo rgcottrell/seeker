@@ -14,6 +14,9 @@
 //  q8_0:        DATA_A_Q8_0=1     D_TYPE=float   FLOAT_TYPE=float
 //  q1_0:        DATA_A_Q1_0=1     D_TYPE=float   FLOAT_TYPE=float
 //  iq4_nl:      DATA_A_IQ4_NL=1   D_TYPE=float   FLOAT_TYPE=float
+//  turbo2:      DATA_A_TURBO2_0=1 D_TYPE=float   FLOAT_TYPE=float
+//  turbo3:      DATA_A_TURBO3_0=1 D_TYPE=float   FLOAT_TYPE=float
+//  turbo4:      DATA_A_TURBO4_0=1 D_TYPE=float   FLOAT_TYPE=float
 //  set_rows_q4_0_i32: SET_ROWS=1  DATA_A_Q4_0=1   B_TYPE=uint   B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
 //  set_rows_q4_1_i32: SET_ROWS=1  DATA_A_Q4_1=1   B_TYPE=uint   B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
 //  set_rows_q5_0_i32: SET_ROWS=1  DATA_A_Q5_0=1   B_TYPE=uint   B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
@@ -26,6 +29,7 @@
 import glsl;  // gl_WorkGroupSize, gl_LocalInvocationIndex
 
 #include "types.slang"
+#include "turbo_consts.slang" // TURBO_S1/S2, TURBO_INV_SQRT_128, TURBO*_THRESH (turbo quantize)
 
 #if defined(SET_ROWS) && QUANT_K == 1
 static const uint BLOCK_SIZE = 512;
@@ -315,6 +319,120 @@ void quantize(uint dst_idx, uint src_idx) {
 #if defined(DATA_A_BF16)
 void quantize(uint dst_idx, uint src_idx) {
     data_q[dst_idx] = A_TYPE(fp32_to_bf16(data_s[src_idx]));
+}
+#endif
+
+// ── TurboQuant: WHT-rotated PolarQuant quantize-on-write (one thread/block) ──
+// Each thread owns a whole 128-element block (= one head's WHT group): L2
+// normalize → forward WHT (S1, butterfly, S2·1/√128) → nearest PolarQuant
+// centroid → pack indices + store the corrected fp16 norm `gnrm/√Σcentroid²`.
+// Matches the fork's copy_to_quant.comp SET_ROWS turbo path; the FA dequant in
+// flash_attn.slang is the exact inverse of this packing.
+#if defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO4_0)
+float turbo_forward_rotate(uint src, out float x[128]) {
+    float norm_sq = 0.0;
+    [unroll] for (uint j = 0; j < 128u; ++j) {
+        float v = data_s[src + j];
+        x[j] = v;
+        norm_sq += v * v;
+    }
+    float gnrm = sqrt(norm_sq);
+    float inv = (gnrm > 1e-10) ? (1.0 / gnrm) : 0.0;
+    [unroll] for (uint j = 0; j < 128u; ++j) { x[j] *= inv * TURBO_S1[j]; }
+    [unroll] for (uint h = 1u; h < 128u; h *= 2u) {
+        for (uint i = 0u; i < 128u; i += 2u * h) {
+            for (uint k = i; k < i + h; ++k) {
+                float a = x[k];
+                float b = x[k + h];
+                x[k]     = a + b;
+                x[k + h] = a - b;
+            }
+        }
+    }
+    [unroll] for (uint j = 0; j < 128u; ++j) { x[j] = x[j] * TURBO_INV_SQRT_128 * TURBO_S2[j]; }
+    return gnrm;
+}
+#endif
+
+#if defined(DATA_A_TURBO2_0)
+void quantize(uint dst_idx, uint src_idx) {
+    float x[128];
+    float gnrm = turbo_forward_rotate(src_idx, x);
+    float rs = 0.0;
+    [unroll] for (uint b = 0; b < 32u; ++b) {
+        uint byte = 0u;
+        [unroll] for (uint t = 0; t < 4u; ++t) {
+            float rv = x[b * 4u + t];
+            uint idx = rv < TURBO2_THRESH[0] ? 0u
+                     : rv < TURBO2_THRESH[1] ? 1u
+                     : rv < TURBO2_THRESH[2] ? 2u : 3u;
+            rs += turbo2_centroids[idx] * turbo2_centroids[idx];
+            byte |= idx << (2u * t);
+        }
+        data_q[dst_idx].qs[b] = uint8_t(byte);
+    }
+    float rn = sqrt(rs);
+    data_q[dst_idx].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
+}
+#endif
+
+#if defined(DATA_A_TURBO3_0)
+uint turbo3_index(float rv) {
+    return rv < TURBO3_THRESH[0] ? 0u
+         : rv < TURBO3_THRESH[1] ? 1u
+         : rv < TURBO3_THRESH[2] ? 2u
+         : rv < TURBO3_THRESH[3] ? 3u
+         : rv < TURBO3_THRESH[4] ? 4u
+         : rv < TURBO3_THRESH[5] ? 5u
+         : rv < TURBO3_THRESH[6] ? 6u : 7u;
+}
+void quantize(uint dst_idx, uint src_idx) {
+    float x[128];
+    float gnrm = turbo_forward_rotate(src_idx, x);
+    float rs = 0.0;
+    // low 2 bits → qs (4 per byte), accumulate reconstruction norm
+    [unroll] for (uint b = 0; b < 32u; ++b) {
+        uint byte = 0u;
+        [unroll] for (uint t = 0; t < 4u; ++t) {
+            uint idx = turbo3_index(x[b * 4u + t]);
+            rs += turbo3_centroids[idx] * turbo3_centroids[idx];
+            byte |= (idx & 0x3u) << (2u * t);
+        }
+        data_q[dst_idx].qs[b] = uint8_t(byte);
+    }
+    // high bit → signs (8 per byte)
+    [unroll] for (uint b = 0; b < 16u; ++b) {
+        uint sbyte = 0u;
+        [unroll] for (uint t = 0; t < 8u; ++t) {
+            uint idx = turbo3_index(x[b * 8u + t]);
+            sbyte |= ((idx >> 2) & 0x1u) << t;
+        }
+        data_q[dst_idx].signs[b] = uint8_t(sbyte);
+    }
+    float rn = sqrt(rs);
+    data_q[dst_idx].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
+}
+#endif
+
+#if defined(DATA_A_TURBO4_0)
+void quantize(uint dst_idx, uint src_idx) {
+    float x[128];
+    float gnrm = turbo_forward_rotate(src_idx, x);
+    data_q[dst_idx].rnorm = float16_t(0.0); // reserved
+    float rs = 0.0;
+    [unroll] for (uint b = 0; b < 64u; ++b) {
+        uint byte = 0u;
+        [unroll] for (uint t = 0; t < 2u; ++t) {
+            float rv = x[b * 2u + t];
+            uint idx = 0u;
+            [unroll] for (uint i = 0; i < 15u; ++i) { if (rv >= TURBO4_THRESH[i]) { idx = i + 1u; } }
+            rs += turbo4_centroids[idx] * turbo4_centroids[idx];
+            byte |= (idx & 0xFu) << (4u * t);
+        }
+        data_q[dst_idx].qs[b] = uint8_t(byte);
+    }
+    float rn = sqrt(rs);
+    data_q[dst_idx].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
 }
 #endif
 
