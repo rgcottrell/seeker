@@ -33,8 +33,12 @@ jobs:
         # build.rs compiles the .slang compute shaders with slangc. ash loads
         # Vulkan at runtime, so building/clippy need only slangc — no GPU.
         run: |
+          # Match the arch immediately followed by .tar.gz so we skip the
+          # `-debug-info` (no slangc) and `-glibc-*` variants and land on the
+          # generic release. The looser `linux-x86_64.*\.tar\.gz$` would match
+          # all of them and pick whichever the API returns first.
           url=$(curl -fsSL "https://api.github.com/repos/shader-slang/slang/releases/tags/v${SLANG_VERSION}" \
-            | jq -r '[.assets[] | select(.name | test("linux-x86_64.*\\.tar\\.gz$"))][0].browser_download_url')
+            | jq -r '.assets[] | select(.name | test("linux-x86_64\\.tar\\.gz$")) | .browser_download_url')
           echo "slang asset: $url"
           test -n "$url" && test "$url" != "null"
           curl -fsSL "$url" -o /tmp/slang.tar.gz

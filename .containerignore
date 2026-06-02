@@ -1,0 +1,7 @@
+# Keep the build context small: the multi-GB target/ dir and local model files
+# must never be uploaded to the builder.
+target/
+.git/
+.claude/
+models/
+*.gguf
