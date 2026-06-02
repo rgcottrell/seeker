@@ -268,6 +268,19 @@ fn scalar_fa_variant(
             "flash_attn_f32_turbo4_turbo3",
             shaders::FLASH_ATTN_F32_TURBO4_TURBO3_SPV.as_bytes(),
         ),
+        // Precise f16 K + compressed turbo V.
+        (F16, Turbo2_0) => (
+            "flash_attn_f32_f16_turbo2",
+            shaders::FLASH_ATTN_F32_F16_TURBO2_SPV.as_bytes(),
+        ),
+        (F16, Turbo3_0) => (
+            "flash_attn_f32_f16_turbo3",
+            shaders::FLASH_ATTN_F32_F16_TURBO3_SPV.as_bytes(),
+        ),
+        (F16, Turbo4_0) => (
+            "flash_attn_f32_f16_turbo4",
+            shaders::FLASH_ATTN_F32_F16_TURBO4_SPV.as_bytes(),
+        ),
         (kk, vv) => {
             return Err(format!(
                 "flash_attn: no shader variant for K/V dtype pair (K={kk:?}, V={vv:?}); \

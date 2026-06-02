@@ -67,6 +67,12 @@ pub struct BenchArgs {
     #[arg(long, default_value_t = 4)]
     warmup: u32,
 
+    /// Perplexity mode: instead of timing decode, teacher-force the model over
+    /// the prompt passage (each position's logits score the actual next token)
+    /// and report perplexity. Use to quantify KV-quant quality vs f16.
+    #[arg(long)]
+    perplexity: bool,
+
     /// Dump first-token logits to stderr (one `LOGIT <i> <f32>` line per
     /// value). Use for golden-output comparison across optimization steps:
     /// capture once on `main`, re-run after each change, diff.
@@ -154,6 +160,17 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
     };
     let mut cache =
         engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
+    eprintln!(
+        "KV cache: k={:?} v={:?} n_layer={} head_dim={} n_head_kv={} max_seq_len={} \u{2192} {} bytes ({:.1} MiB)",
+        args.cache_type_k,
+        args.cache_type_v,
+        dims.n_layer,
+        dims.head_dim,
+        dims.n_head_kv,
+        max_seq_len,
+        cache.region.size,
+        cache.region.size as f64 / (1024.0 * 1024.0),
+    );
     // Hybrid models (qwen35moe etc.) need persistent SSM/GDN recurrent state
     // carried across forwards — including across chunked-prefill ubatches and
     // decode steps. Without this the SSM state resets every forward (decode
@@ -182,6 +199,50 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         seed: 0,
         logit_bias: Vec::new(),
     });
+
+    // ── Perplexity mode ─────────────────────────────────────────────────
+    // Teacher-force the model over the prompt passage: feed one token at a
+    // time, and the last-token logits after feeding tokens[..=i] score the
+    // actual next token tokens[i+1]. PPL = exp(mean NLL). Quantifies KV-quant
+    // quality vs an f16 baseline on the identical text.
+    if args.perplexity {
+        if prompt_tokens.len() < 2 {
+            return Err("perplexity needs >= 2 prompt tokens".into());
+        }
+        let mut total_nll = 0.0f64;
+        let mut count = 0usize;
+        let t = Instant::now();
+        for i in 0..prompt_tokens.len() - 1 {
+            let pos = cache.position;
+            let logits = engine.forward(model.weights(), |ctx| {
+                model
+                    .record_forward(ctx, &mut cache, &prompt_tokens[i..i + 1], pos, true)
+                    .map(|v| v.expect("compute_logits=true must return logits").range())
+            })?;
+            // NLL of the true next token = logsumexp(logits) - logits[target].
+            let target = prompt_tokens[i + 1] as usize;
+            let maxv = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let lse = (maxv as f64)
+                + logits
+                    .iter()
+                    .map(|&v| ((v - maxv) as f64).exp())
+                    .sum::<f64>()
+                    .ln();
+            total_nll += lse - logits[target] as f64;
+            count += 1;
+        }
+        let mean_nll = total_nll / count as f64;
+        eprintln!(
+            "perplexity: k={:?} v={:?} tokens={} mean_nll={:.5} ppl={:.5}  ({:.1}s)",
+            args.cache_type_k,
+            args.cache_type_v,
+            count,
+            mean_nll,
+            mean_nll.exp(),
+            t.elapsed().as_secs_f64(),
+        );
+        return Ok(());
+    }
 
     // ── Prefill ─────────────────────────────────────────────────────────
     //

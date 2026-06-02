@@ -54,6 +54,9 @@
 //  f32_turbo3_turbo4: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO3_0=1 DATA_V_TURBO4_0=1
 //  f32_turbo4_turbo2: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO4_0=1 DATA_V_TURBO2_0=1
 //  f32_turbo4_turbo3: Q_TYPE=float D_TYPE=float K_TYPE=float V_TYPE=float DATA_A_TURBO4_0=1 DATA_V_TURBO3_0=1
+//  f32_f16_turbo2:    Q_TYPE=float D_TYPE=float K_TYPE=float16_t V_TYPE=float DATA_V_TURBO2_0=1
+//  f32_f16_turbo3:    Q_TYPE=float D_TYPE=float K_TYPE=float16_t V_TYPE=float DATA_V_TURBO3_0=1
+//  f32_f16_turbo4:    Q_TYPE=float D_TYPE=float K_TYPE=float16_t V_TYPE=float DATA_V_TURBO4_0=1
 //@end-variants
 
 import glsl;  // gl_SubgroupInvocationID, gl_LocalInvocationIndex
