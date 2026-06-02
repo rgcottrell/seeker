@@ -82,6 +82,24 @@ impl Qwen35MoeParams {
         i < self.n_main && (i + 1).is_multiple_of(self.full_attn_interval)
     }
 
+    /// Number of full-attention layers in the main trunk — the count of KV-cache
+    /// slots the model actually uses (SSM layers carry no KV). Excludes the MTP
+    /// slot.
+    pub fn n_attention_layers(&self) -> u32 {
+        (0..self.n_main)
+            .filter(|&i| self.is_attention_layer(i))
+            .count() as u32
+    }
+
+    /// Compact KV-cache slot for layer `i`: the number of attention layers
+    /// before it. For an attention layer this is its dense index in
+    /// `[0, n_attention_layers)`; for the MTP layer (`i == n_main`) it returns
+    /// `n_attention_layers` (its dedicated trailing slot). Mirrors how the SSM
+    /// state is addressed by a compact `ssm_layer_idx`.
+    pub fn attn_cache_idx(&self, i: u32) -> u32 {
+        (0..i).filter(|&j| self.is_attention_layer(j)).count() as u32
+    }
+
     /// Total dimensionality of all attention heads on the K side
     /// (`head_dim_k * n_head_kv`).
     pub fn n_embd_k_gqa(&self) -> u32 {
@@ -261,16 +279,18 @@ impl Model for Qwen35MoeModel {
     }
 
     fn cache_dims(&self) -> CacheDims {
-        // Only attention blocks need a KV cache, but the engine indexes the
-        // cache by layer (one slot per `n_layer`). For Phase 1 we expose the
-        // attention block dims uniformly and accept the unused-SSM-layer
-        // waste; a later optimization can compact to attention-only slots.
+        // Only full-attention blocks carry a KV cache (SSM layers don't), so
+        // allocate exactly `n_attention_layers` slots and address them by a
+        // compact `attn_cache_idx` (the SSM state is addressed the same way).
+        // This avoids wasting ~75% of the KV cache on a hybrid trunk where most
+        // layers are SSM.
         //
         // When the MTP draft head is loaded it needs its own (ephemeral,
-        // per-step) KV slot at index `n_main`, so allocate one extra layer.
+        // per-step) KV slot — `attn_cache_idx(n_main) == n_attention_layers` —
+        // so allocate one extra slot for it.
         let mtp_slots = if self.weights.mtp.is_some() { 1 } else { 0 };
         CacheDims {
-            n_layer: self.params.n_main + mtp_slots,
+            n_layer: self.params.n_attention_layers() + mtp_slots,
             head_dim: self.params.head_dim_k,
             n_head_kv: self.params.n_head_kv,
             n_head: self.params.n_head,
@@ -1796,6 +1816,11 @@ fn attention_block(
     hidden_v: u64,
     cache_direct: bool,
 ) -> Result<(), Box<dyn Error>> {
+    // Compact KV-cache slot: attention layers are packed densely (SSM layers
+    // carry no KV); the MTP layer (layer_idx == n_main) maps to the trailing
+    // slot. `layer_idx` stays the absolute index for tap/diagnostic labels.
+    let kv_idx = p.attn_cache_idx(layer_idx) as usize;
+
     // 1. attn_norm
     let x_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
     rms_norm::record(ctx, residual, att.attn_norm, x_norm, p.rms_eps)?;
@@ -1843,7 +1868,7 @@ fn attention_block(
         rope_params,
         p.rms_eps,
     )?;
-    let k_cache_layer = cache.k_layers[layer_idx as usize];
+    let k_cache_layer = cache.k_layers[kv_idx];
     let cache_max_seq_len = cache.config.max_seq_len;
     let k_cache_fused = k_cache_layer.dtype == GgmlType::F16;
     if k_cache_fused {
@@ -1888,7 +1913,7 @@ fn attention_block(
     // `v_cache_write_f16` so the descriptor binding doesn't bake the
     // position offset (required for the persistent-decode-cmdbuf
     // replay path).
-    let v_cache_layer = cache.v_layers[layer_idx as usize];
+    let v_cache_layer = cache.v_layers[kv_idx];
     if v_cache_layer.dtype == GgmlType::F16 {
         cache_io::record_v_cache_write_f16_nofence(ctx, v_view, v_cache_layer, position_offset)?;
         // ONE barrier covering (q_roped, K cache slot, V cache slot)
@@ -1910,14 +1935,11 @@ fn attention_block(
     // (materialize path) we still slice to `total_len` — those callers
     // don't use replay.
     let (k_src, v_src) = if cache_direct {
-        (
-            cache.k_layers[layer_idx as usize],
-            cache.v_layers[layer_idx as usize],
-        )
+        (cache.k_layers[kv_idx], cache.v_layers[kv_idx])
     } else {
         (
-            cache_io::record_read(ctx, cache.k_layers[layer_idx as usize], total_len)?,
-            cache_io::record_read(ctx, cache.v_layers[layer_idx as usize], total_len)?,
+            cache_io::record_read(ctx, cache.k_layers[kv_idx], total_len)?,
+            cache_io::record_read(ctx, cache.v_layers[kv_idx], total_len)?,
         )
     };
 
@@ -1928,7 +1950,7 @@ fn attention_block(
     //     `DecodeDyn::kv_len` via the `kv_actual` arg here, which feeds
     //     `pick_k_num` and the dyn write.
     let kv_for_perm = if cache_direct {
-        cache.k_layers[layer_idx as usize].dims[2]
+        cache.k_layers[kv_idx].dims[2]
     } else {
         kv_len_u
     };
@@ -3006,6 +3028,7 @@ fn attention_block_batch(
     fa_dyn_range: crate::inference::buffer::BufferRange,
 ) -> Result<(), Box<dyn Error>> {
     let elem = 4u64;
+    let kv_idx = p.attn_cache_idx(layer_idx); // compact attention-only KV slot
     let x_norm = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
     rms_norm::record(ctx, residual, att.attn_norm, x_norm, p.rms_eps)?;
 
@@ -3064,19 +3087,19 @@ fn attention_block_batch(
         cache_io::record_write(
             ctx,
             k_col,
-            batch.slot_k_view(slots[s], layer_idx),
+            batch.slot_k_view(slots[s], kv_idx),
             positions[s],
         )?;
         cache_io::record_write(
             ctx,
             v_col,
-            batch.slot_v_view(slots[s], layer_idx),
+            batch.slot_v_view(slots[s], kv_idx),
             positions[s],
         )?;
     }
 
     // TurboQuant: forward-WHT the query when this layer's K is turbo.
-    let q_for_attn = if is_turbo(batch.k_dtype(layer_idx)) {
+    let q_for_attn = if is_turbo(batch.k_dtype(kv_idx)) {
         let qw = ctx.alloc_tensor([head_dim_k, n_head, b, 1], GgmlType::F32)?;
         turbo_wht::record(ctx, q_roped, qw, WhtDir::Forward)?;
         qw
@@ -3087,8 +3110,8 @@ fn attention_block_batch(
     // Batched attention. The K/V views bind every slab; the flash reads each
     // sequence's slab via `DecodeDyn::slot` (= slots[s]).
     let q_attn = batched_q_attn_view(q_for_attn, head_dim_k, n_head, b, hidden_v);
-    let k_attn = batch.batched_k_attn_view(layer_idx);
-    let v_attn = batch.batched_v_attn_view(layer_idx);
+    let k_attn = batch.batched_k_attn_view(kv_idx);
+    let v_attn = batch.batched_v_attn_view(kv_idx);
     let attn_out_raw = ctx.alloc_tensor([hidden_v, b, 1, 1], GgmlType::F32)?;
     flash_attn::record_batched(
         ctx,
@@ -3103,7 +3126,7 @@ fn attention_block_batch(
         /*query_lens=*/ None,
     )?;
     // TurboQuant: inverse-WHT the output (in V's rotated basis) when V is turbo.
-    let attn_out = if is_turbo(batch.v_dtype(layer_idx)) {
+    let attn_out = if is_turbo(batch.v_dtype(kv_idx)) {
         let ao = ctx.alloc_tensor([hidden_v, b, 1, 1], GgmlType::F32)?;
         turbo_wht::record(ctx, attn_out_raw, ao, WhtDir::Inverse)?;
         ao
@@ -3166,6 +3189,7 @@ fn attention_block_unified(
     fa_dyn_range: crate::inference::buffer::BufferRange,
 ) -> Result<(), Box<dyn Error>> {
     let elem = 4u64;
+    let kv_idx = p.attn_cache_idx(layer_idx); // compact attention-only KV slot
     let b = seq_lens.len();
     let x_norm = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
     rms_norm::record(ctx, residual, att.attn_norm, x_norm, p.rms_eps)?;
@@ -3231,13 +3255,13 @@ fn attention_block_unified(
         let base = kv_lens[s] - seq_lens[s];
         let k_chunk = chunk(k_roped, q_starts[s], l, head_dim_k, n_head_kv, k_tok_stride);
         let v_chunk = chunk(v_view, q_starts[s], l, head_dim_v, n_head_kv, v_tok_stride);
-        cache_io::record_write(ctx, k_chunk, batch.slot_k_view(slots[s], layer_idx), base)?;
-        cache_io::record_write(ctx, v_chunk, batch.slot_v_view(slots[s], layer_idx), base)?;
+        cache_io::record_write(ctx, k_chunk, batch.slot_k_view(slots[s], kv_idx), base)?;
+        cache_io::record_write(ctx, v_chunk, batch.slot_v_view(slots[s], kv_idx), base)?;
     }
 
     // TurboQuant: forward-WHT the query when this layer's K is turbo (K/V stored
     // WHT-rotated; the per-slot write above rotated K via copy_to_quant_turbo).
-    let q_for_attn = if is_turbo(batch.k_dtype(layer_idx)) {
+    let q_for_attn = if is_turbo(batch.k_dtype(kv_idx)) {
         let qw = ctx.alloc_tensor([head_dim_k, n_head, n_total, 1], GgmlType::F32)?;
         turbo_wht::record(ctx, q_roped, qw, WhtDir::Forward)?;
         qw
@@ -3263,8 +3287,8 @@ fn attention_block_unified(
         ],
         ..q_for_attn
     };
-    let k_attn = batch.batched_k_attn_view(layer_idx);
-    let v_attn = batch.batched_v_attn_view(layer_idx);
+    let k_attn = batch.batched_k_attn_view(kv_idx);
+    let v_attn = batch.batched_v_attn_view(kv_idx);
     let attn_out_raw = ctx.alloc_tensor([hidden_v, n_total, 1, 1], GgmlType::F32)?;
     flash_attn::record_batched(
         ctx,
@@ -3279,7 +3303,7 @@ fn attention_block_unified(
         Some(seq_lens),
     )?;
     // TurboQuant: inverse-WHT the output (in V's rotated basis) when V is turbo.
-    let attn_out = if is_turbo(batch.v_dtype(layer_idx)) {
+    let attn_out = if is_turbo(batch.v_dtype(kv_idx)) {
         let ao = ctx.alloc_tensor([hidden_v, n_total, 1, 1], GgmlType::F32)?;
         turbo_wht::record(ctx, attn_out_raw, ao, WhtDir::Inverse)?;
         ao
