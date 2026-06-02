@@ -72,6 +72,21 @@ fn vision_fa_kv_walk() -> u32 {
         .unwrap_or(3_000)
 }
 
+/// cm1's single-pass KV ceiling. cm1 tolerates a far longer per-workgroup walk
+/// than the scalar path (its coopmat QK^T/PV are ~5× faster per key, so the
+/// dispatch stays under the watchdog), and single-pass is faster than split-K at
+/// every measured size (no combine pass, no large partials buffer). Default high
+/// so all default-cap images (n_pos ≤ 16104) run single-pass; KV beyond this
+/// still split-Ks for safety. `SEEKER_FA_VISION_WALK` overrides (e.g. to force a
+/// split for validation against the single-pass path).
+fn cm1_fa_kv_walk() -> u32 {
+    std::env::var("SEEKER_FA_VISION_WALK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(16_384)
+}
+
 /// Same heuristic as `pick_k_num`, clamped to `FA_MAX_K_NUM`. Used by
 /// the Engine to decide whether a cached decode cmdbuf can be replayed
 /// for the current `kv` — the wg count is baked into the cmdbuf via
@@ -1110,13 +1125,18 @@ fn record_cm1(
     let nb22 = v.element_stride[2] as u32;
     let nb23 = v.element_stride[3] as u32;
 
-    // ── cm1 split-K. Each workgroup walks only its KV sub-range so no single
-    // dispatch walks the whole cache (the per-dispatch watchdog cap the vision
-    // tower's full-res n_pos=16104 single pass would trip). Short KV → single
-    // pass (k_num=1, one block range covering all blocks).
+    // ── cm1 split-K. UNLIKE the scalar path (which faults past ~3k keys/wg, so
+    // splits at `vision_fa_kv_walk`=3000), cm1's coopmat throughput keeps the
+    // per-workgroup walk well under the RADV watchdog: single-pass is clean AND
+    // fastest (no combine pass) up to the full-res default cap (n_pos=16104,
+    // measured 7.95 s vs 8.27 s split). So cm1 single-passes up to a high ceiling
+    // and only split-Ks pathologically large KV beyond it. (More splits are also
+    // a memory risk here: the partials buffer is k_num·(hd+2)·n·heads — ~1 GB at
+    // k_num≈11, n_pos=16104.) Override the ceiling with `SEEKER_FA_VISION_WALK`.
+    let cm1_walk = cm1_fa_kv_walk();
     let num_blocks = kv.div_ceil(CM1_BC as u32).max(1);
-    let (k_num, blocks_per_split) = if kv > vision_fa_kv_walk() {
-        let kf = kv.div_ceil(vision_fa_kv_walk()).clamp(2, num_blocks);
+    let (k_num, blocks_per_split) = if kv > cm1_walk {
+        let kf = kv.div_ceil(cm1_walk).clamp(2, num_blocks);
         (kf, num_blocks.div_ceil(kf))
     } else {
         (1u32, num_blocks)
