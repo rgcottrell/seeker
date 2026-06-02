@@ -1924,12 +1924,13 @@ fn vision_block_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
 /// (llama.cpp) anchor.
 ///
 /// Oracle note: the project GPU matmul stages F32 activations to **F16** in the
-/// cooperative-matrix prefill path (`mul_mm_cm.slang`, taken when
-/// `n_pos >= 32 && n_pos % 16 == 0`), so across 27 residual blocks the exact-f32
-/// CPU reference drifts by a benign amount — the SCALE-ROBUST per-token cosine
-/// is the gate, not max-abs. A grid whose `n_pos` is NOT a multiple of 16
-/// instead takes the per-column `mul_mat_vec` path (`FLOAT_TYPE=float`, f32
-/// accumulate), where the CPU is a tight oracle (~1e-3). Either way an indexing
+/// cooperative-matrix prefill path (`mul_mm_cm.slang`, now taken for any
+/// `n_pos >= 32` — its `ALLOW_PARTIAL_N` store handles a non-16-aligned last
+/// tile), so across 27 residual blocks the exact-f32 CPU reference drifts by a
+/// benign amount — the SCALE-ROBUST per-token cosine is the gate, not max-abs.
+/// Only a grid with `n_pos < 32` falls through to the per-column `mul_mat_vec`
+/// path (`FLOAT_TYPE=float`, f32 accumulate), where the CPU is a tight oracle
+/// (~1e-3). Either way an indexing
 /// bug (rope positions, 2x2 interleave, head layout) yields cosine far below 1.
 ///
 /// Env knobs:
@@ -2017,7 +2018,11 @@ fn vision_encode_smoke(engine: &mut Engine) -> Result<(), Box<dyn Error>> {
     let grid_w = img.grid_w;
     let grid_h = img.grid_h;
     let n_pos = (grid_w * grid_h) as usize;
-    let coop_path = n_pos >= 32 && n_pos.is_multiple_of(16);
+    // The coop-matrix kernel now serves any `n_pos >= 32` — its `ALLOW_PARTIAL_N`
+    // path stages a non-16-aligned last tile through groupshared (M, the output
+    // feature dim, is always 16-aligned in the tower). Only `n_pos < 32` falls
+    // through to the per-column `mul_mat_vec` (f32-accumulate) oracle.
+    let coop_path = n_pos >= 32;
     println!(
         "VISION image: resized={}x{} grid={grid_w}x{grid_h} n_patches={n_pos} \
          n_tokens={} matmul_path={}",

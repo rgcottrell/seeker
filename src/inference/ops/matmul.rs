@@ -265,14 +265,18 @@ fn record_inner(
     //   - device.coop_matrix (the KHR extension is enabled and the device
     //     reports CoopMat support)
     //   - mmcm_variant for this A dtype is wired
-    //   - n >= 32 AND n % 16 == 0 — the CoopMat store writes a full 16-col
-    //     fragment per warp; partial-N tiles would overrun the output. M
-    //     in the Llama path is always a multiple of 32 (hidden=2048,
+    //   - n >= 32 — N need NOT be a multiple of 16: a non-16-aligned last
+    //     tile is served by the kernel's `ALLOW_PARTIAL_N` store (staged
+    //     through groupshared, in-bounds columns only; see the dispatch
+    //     below). M in the Llama path is always a multiple of 32 (hidden=2048,
     //     n_ff=8192, vocab=128256, n_kv*head_dim=512), so we don't gate on
-    //     M alignment yet.
+    //     M alignment beyond the 16-multiple requirement just below.
     //
     // Verified ~3× prefill win on Llama-1B Q4_K_M and ~1.4× on
-    // qwen35moe Q4_K_XL @ N=320; default-on. `SEEKER_MM_CM=0` opts out.
+    // qwen35moe Q4_K_XL @ N=320; default-on. The partial-N path also lets the
+    // qwen3-vl vision tower (n_pos e.g. 16104) use coopmat instead of the
+    // per-column matvec fallback — 13–26% faster encode on small/medium images,
+    // ~neutral at full-res (attention-bound). `SEEKER_MM_CM=0` opts out.
     // M (output rows) must also be a multiple of 16: the CoopMat store writes
     // full 16×16 fragments, so a non-16-aligned M would mishandle / overrun the
     // partial output fragment — observed as NONDETERMINISTIC output (and likely
@@ -283,12 +287,17 @@ fn record_inner(
     let mm_cm_enabled = !*crate::runtime_flags::MM_CM_DISABLED;
     if ctx.device.coop_matrix
         && n >= 32
-        && n.is_multiple_of(16)
         && a.dims[1].is_multiple_of(16)
         && mm_cm_enabled
         && let Some(variant) = mmcm_variant(a.dtype)
     {
-        return record_mul_mm_cm(ctx, &variant, a, b, d, fence);
+        // N need not be a multiple of 16: when it isn't, the kernel's
+        // `ALLOW_PARTIAL_N` path stages the straddling last tile through
+        // groupshared and writes only in-bounds columns (the vision tower's
+        // n_pos, e.g. 16104, is not 16-aligned). The aligned path (N % 16 == 0,
+        // text decoder) is byte-identical and skips that staging.
+        let partial_n = !n.is_multiple_of(16);
+        return record_mul_mm_cm(ctx, &variant, partial_n, a, b, d, fence);
     }
 
     if a.dtype == GgmlType::F16 && n > 1 {
@@ -431,6 +440,10 @@ fn record_mul_mm(
 fn record_mul_mm_cm(
     ctx: &mut DispatchContext,
     variant: &MmCmVariant,
+    // When the N (or M) dimension isn't a multiple of the 32-wide tile, select
+    // the kernel's `ALLOW_PARTIAL_N` specialization (groupshared-staged,
+    // in-bounds-only store). `false` → the aligned full-fragment store.
+    partial_n: bool,
     a: TensorView,
     b: TensorView,
     d: TensorView,
@@ -481,8 +494,13 @@ fn record_mul_mm_cm(
         push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
     }
 
-    let key = PipelineKey::dense(variant.name, 3, MUL_MM_CM_PARAMS_BYTES, Vec::new())
-        .with_subgroup_size(32);
+    let key = PipelineKey::dense(
+        variant.name,
+        3,
+        MUL_MM_CM_PARAMS_BYTES,
+        vec![partial_n as u32],
+    )
+    .with_subgroup_size(32);
     let pipeline = *ctx.pipelines.get(ctx.device, key, variant.spv)?;
     let workgroups = [m.div_ceil(BM), n.div_ceil(BN), 1];
     super::bind_and_dispatch(

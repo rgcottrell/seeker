@@ -84,6 +84,15 @@ static const uint BN = 32;
 static const uint WORKGROUP_SIZE = 128;
 static const uint SUBGROUP_SIZE  = 32;
 
+// When 1, the output store tolerates a PARTIAL last tile (N — or M — not a
+// multiple of the 32-wide workgroup tile): each 16×16 CoopMat fragment is
+// staged into `store_buf` and only the in-bounds elements are written to
+// global, so a straddling tile can't overrun `data_d`. When 0 (default — the
+// aligned path the text decoder uses) the direct full-fragment store runs,
+// byte-identical to before and touching no `store_buf`. Lets the coopmat matmul
+// serve N % 16 ≠ 0 (e.g. the vision tower's n_pos=16104).
+[SpecializationConstant] const uint ALLOW_PARTIAL_N = 0;
+
 // 2×2 warp layout over the 32×32 output. Each subgroup owns a 16×16 fragment.
 static const uint WM = BM / 2;
 static const uint WN = BN / 2;
@@ -119,6 +128,10 @@ static const uint BS_STRIDE = BK + 4;
 
 groupshared float16_t buf_a[BM * AS_STRIDE];
 groupshared float16_t buf_b[BN * BS_STRIDE];
+
+// Output staging for the partial-tile store (ALLOW_PARTIAL_N path only; unused
+// — and DCE'd — when ALLOW_PARTIAL_N == 0). One BM×BN f32 tile, local coords.
+groupshared float store_buf[BM * BN];
 
 // Per-DATA_A_X: write a BM × BK tile of dequantized f16 into buf_a starting at
 // (row0, k0) in the global A coordinate system. WORKGROUP_SIZE threads cooperate.
@@ -951,7 +964,25 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
     // Matches llama.cpp's mul_mm.comp ColumnMajor store (line 404).
     const uint sub_row = row0 + warp_r * WM;
     const uint sub_col = col0 + warp_c * WN;
-    if (sub_row < p.M && sub_col < p.N) {
+    if (ALLOW_PARTIAL_N != 0 && (col0 + BN > p.N || row0 + BM > p.M)) {
+        // Partial output tile: a full 16×16 CoopMat store would overrun data_d.
+        // Stage every warp's fragment into store_buf (row-major, local coords),
+        // then copy only the in-bounds (m<M, n<N) elements out. The branch is
+        // workgroup-uniform (row0/col0), so all warps reach the barrier.
+        sums.Store<CoopMatMatrixLayout::RowMajor>(store_buf,
+                                                  warp_r * WM * BN + warp_c * WN,
+                                                  BN);
+        GroupMemoryBarrierWithGroupSync();
+        for (uint i = tid; i < BM * BN; i += WORKGROUP_SIZE) {
+            const uint lr = i / BN;
+            const uint lc = i % BN;
+            const uint gm = row0 + lr;
+            const uint gn = col0 + lc;
+            if (gm < p.M && gn < p.N) {
+                data_d[d_base + gn * p.stride_d + gm] = D_TYPE(store_buf[lr * BN + lc]);
+            }
+        }
+    } else if (sub_row < p.M && sub_col < p.N) {
         sums.Store<CoopMatMatrixLayout::ColumnMajor>(data_d,
                                                      d_base + sub_col * p.stride_d + sub_row,
                                                      p.stride_d);
