@@ -9,6 +9,7 @@ use tower_http::trace::TraceLayer;
 
 use super::handlers::{anthropic, llama, openai, ops};
 use super::state::AppState;
+use super::static_assets;
 
 /// Build the router with all stub endpoints wired in.
 ///
@@ -56,7 +57,12 @@ pub fn build_router(cors: bool, state: AppState) -> Router {
         .route("/tokenize", post(llama::tokenize))
         .route("/detokenize", post(llama::detokenize))
         .route("/embedding", post(llama::embedding))
-        .route("/apply-template", post(llama::apply_template));
+        .route("/apply-template", post(llama::apply_template))
+        // Static-asset fallback: fires only when NO route above matched the
+        // request path (a matched path with a wrong method still gets the
+        // route's own 405). Placed before the layers so TraceLayer/CorsLayer
+        // wrap it identically to the routes.
+        .fallback(static_assets::handler);
 
     if cors {
         app = app.layer(CorsLayer::permissive());
@@ -81,6 +87,19 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         app.oneshot(req).await.unwrap().status()
+    }
+
+    /// Like [`status`] but returns the full response so headers/body can be
+    /// asserted.
+    async fn response(method: &str, uri: &str, body: &str) -> axum::http::Response<Body> {
+        let app = build_router(false, AppState::default());
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
     }
 
     #[tokio::test]
@@ -120,5 +139,49 @@ mod tests {
                 "{uri} should 501"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn root_serves_index_html() {
+        // The embedded `public/index.html` is reachable at `/` (root → index)
+        // and at its explicit path.
+        for uri in ["/", "/index.html"] {
+            let resp = response("GET", uri, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(ct.starts_with("text/html"), "{uri} content-type = {ct}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(!bytes.is_empty(), "{uri} body should be non-empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_path_404() {
+        // No route and no embedded asset → the static fallback 404s. Both a GET
+        // (asset miss) and a non-GET (method guard) hit the bare 404.
+        assert_eq!(
+            status("GET", "/definitely/not/a/real/path", "").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status("POST", "/definitely/not/a/real/path", "{}").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn defined_route_wrong_method_405_not_fallback() {
+        // `/health` is GET-only; a POST must 405 from the route, never fall
+        // through to the static 404.
+        assert_eq!(
+            status("POST", "/health", "{}").await,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
     }
 }

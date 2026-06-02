@@ -15,6 +15,7 @@ pub mod handlers;
 pub mod inference;
 pub mod router;
 pub mod state;
+pub mod static_assets;
 pub mod stream;
 pub mod types;
 
