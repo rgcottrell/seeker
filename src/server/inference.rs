@@ -43,7 +43,16 @@ pub struct WorkerConfig {
     /// Number of independent KV-cache slots (llama.cpp `--parallel`). Each slot
     /// is a full `ctx_size` cache, so total KV(+SSM) memory is `n_slots ×`
     /// per-slot. `1` = single-cache behavior. Allocated eagerly at setup.
+    /// `0` = **auto**: size from the device memory budget (see `parallel_max` /
+    /// `mem_fraction`), so concurrent subagents get >1 warm slot by default.
     pub n_slots: u32,
+    /// Upper bound for the `n_slots == 0` auto path (the per-slot full-context
+    /// slab is large, so cap the count for the handful-of-subagents target).
+    pub parallel_max: u32,
+    /// Fraction of DEVICE_LOCAL memory the auto path may budget for KV slots
+    /// (after weights + scratch). Leaves headroom for the OS / transient image
+    /// scratch on the unified-memory APU. Ignored when `n_slots >= 1`.
+    pub mem_fraction: f32,
 }
 
 /// Per-request generation parameters. The CLI sampling flags form the base
@@ -169,10 +178,11 @@ pub struct InferenceHandle {
 
 impl InferenceHandle {
     /// Spawn the dedicated worker thread. Returns the handle plus a readiness
-    /// channel: the worker runs the full model-load sequence and sends
-    /// `Ok(())` (or `Err(msg)`) *before* entering its job loop, so the caller
-    /// can fail fast on a bad model / missing GPU exactly like `seeker chat`.
-    pub fn spawn(cfg: WorkerConfig) -> (InferenceHandle, oneshot::Receiver<Result<(), String>>) {
+    /// channel: the worker runs the full model-load sequence and sends the
+    /// *resolved* slot count `Ok(n_slots)` (or `Err(msg)`) *before* entering its
+    /// job loop, so the caller can fail fast on a bad model / missing GPU and
+    /// learn the auto-sized `n_slots` for `/slots` + `/props`.
+    pub fn spawn(cfg: WorkerConfig) -> (InferenceHandle, oneshot::Receiver<Result<u32, String>>) {
         let (jobs_tx, jobs_rx) = mpsc::channel::<GenJob>(16);
         let (ready_tx, ready_rx) = oneshot::channel();
         std::thread::Builder::new()
@@ -391,6 +401,9 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     let mut engine = Engine::new(cfg.n_ubatch, cfg.n_batch)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened for serve");
     let weights = engine.upload_weights(&gguf)?;
+    // Capture the uploaded weight bytes before the handle moves into the model;
+    // the auto-slot budget subtracts it from the device memory.
+    let weights_bytes = weights.total_bytes;
     let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
 
     // Scratch is sized per-ubatch/ctx and shared across slots (one forward runs
@@ -410,7 +423,19 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         max_seq_len: cfg.ctx_size,
         n_head: dims.n_head,
     };
-    let n_slots = cfg.n_slots.max(1);
+    let ssm_dims = model.ssm_state_dims();
+    // Resolve the slot count: an explicit `--parallel N` is honored verbatim
+    // (fail-fast below if N×ctx doesn't fit); `0` auto-sizes from the device
+    // memory budget (capped at `parallel_max`).
+    let n_slots = resolve_n_slots(
+        &engine.device,
+        &dims,
+        cache_config,
+        ssm_dims.as_ref(),
+        weights_bytes,
+        scratch_bytes,
+        cfg,
+    );
     // One BatchKvCache with N slabs: idle slabs keep their conversation's
     // prefix (reuse); the active subset batches in one forward. Allocated
     // eagerly (fail-fast if N×ctx doesn't fit).
@@ -422,7 +447,7 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         n_slots,
         cache_config,
     )?;
-    if let Some(ssm) = model.ssm_state_dims() {
+    if let Some(ssm) = &ssm_dims {
         batch.allocate_ssm_state(
             &engine.device,
             ssm.n_ssm_layers,
@@ -434,6 +459,7 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     let mib = 1u64 << 20;
     tracing::info!(
         slots = n_slots,
+        auto = (cfg.n_slots == 0),
         ctx = cfg.ctx_size,
         total_mib = batch.total_bytes() / mib,
         "batched kv cache allocated",
@@ -490,6 +516,96 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     })
 }
 
+/// Resolve the KV-slot count. An explicit `cfg.n_slots >= 1` is returned as-is
+/// (the eager `BatchKvCache::new` fail-fasts if it doesn't fit). `0` auto-sizes:
+/// fit as many full-context slots as `mem_fraction` of DEVICE_LOCAL memory
+/// allows after weights + scratch, clamped to `[1, parallel_max]`. Rounds down
+/// and fail-soft to 1 — on unified DDR5 (DEVICE_LOCAL == system RAM) an
+/// over-commit would OOM the box, not just a discrete GPU.
+fn resolve_n_slots(
+    device: &crate::inference::device::Device,
+    dims: &crate::models::CacheDims,
+    cache_config: KvCacheConfig,
+    ssm_dims: Option<&crate::models::SsmStateDims>,
+    weights_bytes: u64,
+    scratch_bytes: u64,
+    cfg: &WorkerConfig,
+) -> u32 {
+    if cfg.n_slots >= 1 {
+        return cfg.n_slots;
+    }
+    let parallel_max = cfg.parallel_max.max(1);
+    // Per-slot bytes via a throwaway 1-slot cache: exact (no estimator that
+    // could drift from the allocator), and dropped before the real N-slot
+    // allocation so it adds no memory peak.
+    let per_slot = match probe_per_slot_bytes(device, dims, cache_config, ssm_dims) {
+        Ok(b) if b > 0 => b,
+        _ => {
+            tracing::warn!("auto --parallel: could not size a KV slot; falling back to 1");
+            return 1;
+        }
+    };
+    let heap = device_local_bytes(device);
+    let frac = cfg.mem_fraction.clamp(0.1, 1.0) as f64;
+    let budget = (heap as f64 * frac) as u64;
+    let avail = budget.saturating_sub(weights_bytes.saturating_add(scratch_bytes));
+    let n = ((avail / per_slot) as u32).clamp(1, parallel_max);
+    if n < parallel_max {
+        tracing::warn!(
+            resolved = n,
+            parallel_max,
+            per_slot_mib = per_slot / (1 << 20),
+            heap_mib = heap / (1 << 20),
+            weights_mib = weights_bytes / (1 << 20),
+            "auto --parallel: memory-bound below parallel-max; lower --ctx-size or KV quant for more slots"
+        );
+    } else {
+        tracing::info!(resolved = n, "auto --parallel resolved");
+    }
+    n
+}
+
+/// Size of one full-context KV(+SSM) slot, measured by allocating and
+/// immediately dropping a 1-slot cache. Exact, and the alloc is freed before
+/// the real N-slot allocation so it adds no peak.
+fn probe_per_slot_bytes(
+    device: &crate::inference::device::Device,
+    dims: &crate::models::CacheDims,
+    cache_config: KvCacheConfig,
+    ssm_dims: Option<&crate::models::SsmStateDims>,
+) -> Result<u64, Box<dyn Error>> {
+    let mut probe = BatchKvCache::new(
+        device,
+        dims.n_layer,
+        dims.head_dim,
+        dims.n_head_kv,
+        1,
+        cache_config,
+    )?;
+    if let Some(ssm) = ssm_dims {
+        probe.allocate_ssm_state(
+            device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
+    }
+    Ok(probe.total_bytes())
+}
+
+/// Total bytes across DEVICE_LOCAL memory heaps (≈ system RAM on the unified APU).
+fn device_local_bytes(device: &crate::inference::device::Device) -> u64 {
+    let mp = &device.mem_props;
+    let mut total = 0u64;
+    for i in 0..mp.memory_heap_count as usize {
+        let heap = mp.memory_heaps[i];
+        if heap.flags.contains(ash::vk::MemoryHeapFlags::DEVICE_LOCAL) {
+            total = total.saturating_add(heap.size);
+        }
+    }
+    total
+}
+
 /// Build the vision tower from an mmproj GGUF (upload weights, build encoder +
 /// host-side patch-embed copies). Mirrors `seeker chat`'s lazy `/image` build.
 fn build_vision(engine: &Engine, mmproj_path: &Path) -> Result<VisionCtx, Box<dyn Error>> {
@@ -522,7 +638,7 @@ fn build_vision(engine: &Engine, mmproj_path: &Path) -> Result<VisionCtx, Box<dy
 fn worker_main(
     cfg: WorkerConfig,
     mut jobs: mpsc::Receiver<GenJob>,
-    ready: oneshot::Sender<Result<(), String>>,
+    ready: oneshot::Sender<Result<u32, String>>,
 ) {
     let mut worker = match setup(&cfg) {
         Ok(w) => w,
@@ -531,7 +647,8 @@ fn worker_main(
             return;
         }
     };
-    if ready.send(Ok(())).is_err() {
+    // Report the resolved slot count (auto-sizing may differ from the request).
+    if ready.send(Ok(worker.slots.len() as u32)).is_err() {
         // `serve::run` gave up waiting (process exiting). Nothing to serve.
         return;
     }

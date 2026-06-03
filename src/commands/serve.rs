@@ -81,11 +81,24 @@ pub struct ServeArgs {
 
     /// Number of independent KV-cache slots (llama.cpp's `--parallel`). Each
     /// slot is a full `--ctx-size` cache, so total KV(+SSM) memory is N× the
-    /// per-slot size (printed at startup). `1` = a single cache. Raise it so
-    /// interleaved sessions — e.g. concurrent subagents — each keep their cache
-    /// warm and reuse it instead of re-prefilling on every switch. (short: -np)
-    #[arg(long = "parallel", default_value_t = 1)]
+    /// per-slot size (printed at startup). Concurrent subagents each keep their
+    /// cache warm and reuse it instead of re-prefilling on every switch.
+    /// `0` (the default) = **auto**: fit as many slots as memory allows, capped
+    /// at `--parallel-max`. `1` = a single cache. (short: -np)
+    #[arg(long = "parallel", default_value_t = 0)]
     parallel: u32,
+
+    /// Upper bound for `--parallel 0` (auto). The per-slot full-context slab is
+    /// large, so the auto path caps the count for the handful-of-subagents
+    /// target; raise it (and/or lower `--ctx-size`) for more concurrency.
+    #[arg(long = "parallel-max", default_value_t = 8)]
+    parallel_max: u32,
+
+    /// Fraction of device memory the `--parallel 0` auto path may budget for KV
+    /// slots, after weights + scratch. Leaves headroom for the OS / transient
+    /// image scratch on the unified-memory APU.
+    #[arg(long = "mem-fraction", default_value_t = 0.9)]
+    mem_fraction: f32,
 
     /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1
     /// (quant + turbo* require the per-block BatchKvCache path).
@@ -240,8 +253,9 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
     };
     tracing::info!(
         ctx_size,
-        n_slots = args.parallel.max(1),
-        "context window per slot"
+        parallel = args.parallel,
+        parallel_max = args.parallel_max,
+        "context window per slot (parallel 0 = auto-size from memory)"
     );
 
     // Resolve the mmproj vision sidecar (unless --no-mmproj). The worker builds
@@ -264,7 +278,6 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
     // If the config didn't parse, don't hand the worker a path it can't use.
     let mmproj_path = vision_config.as_ref().and(mmproj_path);
 
-    let n_slots = args.parallel.max(1);
     let (handle, ready) = InferenceHandle::spawn(WorkerConfig {
         model_path: path.clone(),
         mmproj_path,
@@ -273,13 +286,17 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         ctx_size,
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
-        n_slots,
+        n_slots: args.parallel, // 0 = auto-size in the worker
+        parallel_max: args.parallel_max,
+        mem_fraction: args.mem_fraction,
     });
-    match ready.await {
-        Ok(Ok(())) => {}
+    // The worker reports the *resolved* slot count (auto-sizing may differ from
+    // the request) so `/slots` + `/props` report the real number.
+    let n_slots = match ready.await {
+        Ok(Ok(n)) => n,
         Ok(Err(e)) => return Err(format!("failed to load model: {e}").into()),
         Err(_) => return Err("inference worker exited during startup".into()),
-    }
+    };
 
     let model_id = path
         .file_stem()

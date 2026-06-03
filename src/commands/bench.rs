@@ -435,7 +435,9 @@ async fn bench_concurrent(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         ctx_size,
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
-        n_slots: max_b,
+        n_slots: max_b, // explicit (bench pins the slot count per sweep)
+        parallel_max: max_b,
+        mem_fraction: 0.9,
     };
     let plan = BenchPlan {
         batches,
