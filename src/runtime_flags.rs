@@ -93,6 +93,14 @@ pub static SSM_BATCH_DISABLED: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(false)
 });
 
+/// `SEEKER_PROF_STEP=1` — print a per-step `PROF step:` line for the unified
+/// forward, splitting CPU command-recording time from GPU compute (fence wait).
+/// Gates the persistent batched-decode cmdbuf work: replay only pays off if
+/// recording is a meaningful fraction of a (bandwidth-bound) decode step.
+/// Always available; cached (one atomic load per step).
+pub static PROF_STEP: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("SEEKER_PROF_STEP").is_ok_and(|v| v == "1"));
+
 // ─── Debug flags (gpu_debug) ─────────────────────────────────────────
 
 /// Define a presence-based debug flag behind `gpu_debug`. With the

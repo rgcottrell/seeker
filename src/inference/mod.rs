@@ -520,6 +520,10 @@ impl Engine {
         // Varlen graph shape differs from the single-sequence decode cmdbuf.
         self.decode_cache = None;
 
+        // Per-step CPU-record vs GPU-compute split (gates the persistent
+        // batched-decode cmdbuf — replay only helps if recording is a real
+        // fraction of the step). One cheap `Instant::now` per step.
+        let t_rec0 = std::time::Instant::now();
         self.scratch.reset();
         self.descriptors.reset(&self.device)?;
         let decode_dyn_range = {
@@ -588,8 +592,10 @@ impl Engine {
             profile::BlockClass::Epilogue,
         );
 
-        unsafe {
+        let (t_record, t_gpu) = unsafe {
             self.device.device.end_command_buffer(self.command_buffer)?;
+            let t_record = t_rec0.elapsed();
+            let t_gpu0 = std::time::Instant::now();
             self.device.device.reset_fences(&[self.fence])?;
             let submit = vk::SubmitInfo::default()
                 .command_buffers(std::slice::from_ref(&self.command_buffer));
@@ -599,6 +605,19 @@ impl Engine {
             self.device
                 .device
                 .wait_for_fences(&[self.fence], true, u64::MAX)?;
+            (t_record, t_gpu0.elapsed())
+        };
+        if *crate::runtime_flags::PROF_STEP {
+            let (r, g) = (
+                t_record.as_secs_f64() * 1000.0,
+                t_gpu.as_secs_f64() * 1000.0,
+            );
+            eprintln!(
+                "PROF step: b={} n_tok={} record={r:.2}ms gpu={g:.2}ms record_frac={:.0}%",
+                b,
+                tokens.len(),
+                100.0 * r / (r + g).max(1e-9),
+            );
         }
         #[cfg(feature = "profile_gpu")]
         self.profile.readback_and_print(&self.device);
