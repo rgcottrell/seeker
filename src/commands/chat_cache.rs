@@ -40,10 +40,6 @@ pub fn save(
     let position = cache.position;
     let k_stride = k0.byte_stride[2]; // bytes per token position, all heads
     let v_stride = v0.byte_stride[2];
-    let host = cache
-        .region
-        .host_ptr
-        .ok_or("prompt-cache: KV region not host-visible")?;
     let msg_json = serde_json::to_vec(messages)?;
     let (has_ssm, ssm_size) = match &cache.ssm_region {
         Some(r) => (1u8, r.size),
@@ -78,10 +74,14 @@ pub fn save(
     // Payload: per-layer K then V live bytes, then the SSM region.
     let k_live = position as usize * k_stride as usize;
     let v_live = position as usize * v_stride as usize;
-    for (k, v) in cache.k_layers.iter().zip(&cache.v_layers) {
-        // SAFETY: region is one HOST_VISIBLE|HOST_COHERENT allocation; each
-        // view's byte_offset + live span lies within it, and the GPU's writes
-        // are coherent (the last forward's fence was already awaited).
+    for (il, (k, v)) in cache.k_layers.iter().zip(&cache.v_layers).enumerate() {
+        // SAFETY: layer `il`'s K/V live in one HOST_VISIBLE|HOST_COHERENT buffer
+        // mapped at `host`; each view's byte_offset + live span lies within it
+        // (K at 0, V after it), and the GPU's writes are coherent (the last
+        // forward's fence was already awaited).
+        let host = cache
+            .layer_host_ptr(il)
+            .ok_or("prompt-cache: KV region not host-visible")?;
         f.write_all(unsafe { live_slice(host, k.byte_offset, k_live) })?;
         f.write_all(unsafe { live_slice(host, v.byte_offset, v_live) })?;
     }
@@ -164,15 +164,15 @@ pub fn load(
     }
     let messages: Vec<ChatMessage> = serde_json::from_slice(r.bytes()?)?;
 
-    // Copy the payload back into the live cache buffers.
-    let host = cache
-        .region
-        .host_ptr
-        .ok_or("prompt-cache: KV region not host-visible")?;
+    // Copy the payload back into the live per-layer cache buffers.
     let k_live = position as usize * k_stride as usize;
     let v_live = position as usize * v_stride as usize;
-    for (k, v) in cache.k_layers.iter().zip(&cache.v_layers) {
-        // SAFETY: spans validated above to lie within each view's allocation.
+    for (il, (k, v)) in cache.k_layers.iter().zip(&cache.v_layers).enumerate() {
+        // SAFETY: layer `il`'s buffer is mapped at `host`; spans validated above
+        // to lie within each view's allocation.
+        let host = cache
+            .layer_host_ptr(il)
+            .ok_or("prompt-cache: KV region not host-visible")?;
         let kb = r.take(k_live)?;
         unsafe {
             std::ptr::copy_nonoverlapping(kb.as_ptr(), host.add(k.byte_offset as usize), k_live)

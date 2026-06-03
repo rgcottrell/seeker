@@ -451,7 +451,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         max_seq_len,
         k_dtype = ?args.cache_type_k,
         v_dtype = ?args.cache_type_v,
-        bytes = cache.region.size,
+        bytes = cache.kv_bytes(),
         "kv cache allocated",
     );
 

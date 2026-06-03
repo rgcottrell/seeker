@@ -86,7 +86,13 @@ pub fn parse_dtype(s: &str) -> Result<GgmlType, String> {
 
 pub struct KvCache {
     pub config: KvCacheConfig,
-    pub region: Region,
+    /// One buffer per layer, each holding that layer's K then V. Splitting per
+    /// layer keeps every allocation under the device's `maxBufferSize` /
+    /// `maxMemoryAllocationSize` (~4 GiB on RADV): a full model-max context
+    /// (e.g. 256K) needs several GiB of KV total, which overflows a single
+    /// buffer. Empty for a borrowed slot view — the owning `BatchKvCache` frees
+    /// the buffers, and the per-layer views below carry the real handles.
+    regions: Vec<Region>,
     pub k_layers: Vec<TensorView>,
     pub v_layers: Vec<TensorView>,
     /// Number of token positions already written into the cache.
@@ -125,9 +131,9 @@ pub struct KvCache {
     pub ssm_max_snapshots: u32,
     pub ssm_conv_kernel: u32,
     pub ssm_conv_channels: u32,
-    /// Refcounted device owner so `Drop` can free `region` + the SSM
-    /// regions, keeping the logical device alive until it does — regardless
-    /// of whether the owning engine drops first.
+    /// Refcounted device owner so `Drop` can free the per-layer `regions` +
+    /// the SSM regions, keeping the logical device alive until it does —
+    /// regardless of whether the owning engine drops first.
     device: Arc<DeviceShared>,
 }
 
@@ -169,42 +175,40 @@ impl KvCache {
             .iter()
             .map(|&d| align_up(tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, d), align))
             .collect();
-        let total: u64 = k_aligned.iter().chain(v_aligned.iter()).sum();
 
-        let region = Region::new(
-            device,
-            total.max(1),
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-
+        // One buffer per layer (K at offset 0, V at `k_aligned[il]`), so no
+        // single allocation trips the device's ~4 GiB maxBufferSize /
+        // maxMemoryAllocationSize even when a model-max context makes the KV
+        // total several GiB.
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let mut regions = Vec::with_capacity(n_layer as usize);
         let mut k_layers = Vec::with_capacity(n_layer as usize);
         let mut v_layers = Vec::with_capacity(n_layer as usize);
-        let mut cursor = 0u64;
         for il in 0..n_layer as usize {
+            let region = Region::new(device, (k_aligned[il] + v_aligned[il]).max(1), usage, mem)?;
             k_layers.push(make_view(
                 region.buffer,
-                cursor,
+                0,
                 head_dim_u,
                 max_seq_len,
                 n_head_kv_u,
                 k_dtypes[il],
             ));
-            cursor += k_aligned[il];
             v_layers.push(make_view(
                 region.buffer,
-                cursor,
+                k_aligned[il],
                 head_dim_u,
                 max_seq_len,
                 n_head_kv_u,
                 v_dtypes[il],
             ));
-            cursor += v_aligned[il];
+            regions.push(region);
         }
 
         Ok(Self {
             config,
-            region,
+            regions,
             k_layers,
             v_layers,
             position: 0,
@@ -383,6 +387,21 @@ impl KvCache {
     pub fn truncate(&mut self, new_pos: u32) {
         self.position = new_pos.min(self.position);
     }
+
+    /// Total device bytes backing the attention K/V (sum over the per-layer
+    /// buffers). Excludes the SSM/recurrent regions. `0` for a borrowed slot.
+    pub fn kv_bytes(&self) -> u64 {
+        self.regions.iter().map(|r| r.size).sum()
+    }
+
+    /// Host pointer mapping layer `il`'s K/V buffer, for prompt-cache
+    /// (de)serialization. The layer's `k_layers[il]` / `v_layers[il]` views
+    /// carry byte offsets relative to this base (K at 0, V after it). `None`
+    /// when the cache isn't host-visible or `il` is out of range (e.g. a
+    /// borrowed slot, which owns no regions).
+    pub fn layer_host_ptr(&self, il: usize) -> Option<*mut u8> {
+        self.regions.get(il).and_then(|r| r.host_ptr)
+    }
 }
 
 impl KvCache {
@@ -395,9 +414,6 @@ impl KvCache {
     #[allow(clippy::too_many_arguments)]
     fn borrowed_slot(
         config: KvCacheConfig,
-        buffer: vk::Buffer,
-        host_ptr: Option<*mut u8>,
-        buffer_size: u64,
         alignment: u64,
         k_layers: Vec<TensorView>,
         v_layers: Vec<TensorView>,
@@ -416,7 +432,9 @@ impl KvCache {
             ssm_region.map(|(buf, hp, size)| Region::borrowed(buf, hp, size, alignment));
         Self {
             config,
-            region: Region::borrowed(buffer, host_ptr, buffer_size, alignment),
+            // Borrowed slot: the per-layer views carry the BatchKvCache's real
+            // buffer handles, so this owns no regions (Drop frees nothing).
+            regions: Vec::new(),
             k_layers,
             v_layers,
             position,
@@ -440,11 +458,14 @@ impl KvCache {
 
 impl Drop for KvCache {
     fn drop(&mut self) {
-        // Free the KV region + any SSM/snapshot regions. The Arc keeps the
-        // logical device alive through this; forwards are synchronous (each
-        // fence-waits), so the GPU is idle by teardown.
+        // Free the per-layer KV regions + any SSM/snapshot regions. The Arc
+        // keeps the logical device alive through this; forwards are synchronous
+        // (each fence-waits), so the GPU is idle by teardown. Empty for a
+        // borrowed slot view (frees nothing).
         let dev = self.device.raw();
-        self.region.destroy(dev);
+        for r in &mut self.regions {
+            r.destroy(dev);
+        }
         if let Some(mut r) = self.ssm_region.take() {
             r.destroy(dev);
         }
@@ -671,14 +692,14 @@ pub struct BatchKvCache {
     pub n_layer: u32,
     head_dim: u32,
     n_head_kv: u32,
-    region: Region,
-    buffer: vk::Buffer,
-    host_ptr: Option<*mut u8>,
-    buffer_size: u64,
+    /// One buffer per layer-side (each holds all `n_slots` slabs for that
+    /// layer's K, resp. V). Splitting per layer-side keeps every allocation
+    /// under the device's ~4 GiB maxBufferSize even at model-max ctx × parallel,
+    /// while still placing all slots of a layer-side contiguously so
+    /// `batched_attn_view` can stride over slots within one bound buffer.
+    k_regions: Vec<Region>,
+    v_regions: Vec<Region>,
     alignment: u64,
-    /// Byte offset of each layer's K slab-0 / V slab-0.
-    k_base: Vec<u64>,
-    v_base: Vec<u64>,
     /// Per-layer slot slab stride in bytes (padded to `alignment`, and — for
     /// block-quant turbo layers — to a multiple of the block byte size so the
     /// flash-attn block addressing `elem/QUANT_K` lands on slot boundaries).
@@ -756,30 +777,40 @@ impl BatchKvCache {
         let k_slab_stride: Vec<u64> = k_dtypes.iter().map(|&d| slab_stride(d)).collect();
         let v_slab_stride: Vec<u64> = v_dtypes.iter().map(|&d| slab_stride(d)).collect();
 
-        let mut k_base = Vec::with_capacity(n_layer as usize);
-        let mut v_base = Vec::with_capacity(n_layer as usize);
-        let mut cursor = 0u64;
+        // One buffer per layer-side, each holding that side's `n_slots` slabs
+        // contiguously (slab `slot` at `slot * slab_stride`). Per-layer-side so
+        // no single allocation exceeds maxBufferSize even at model-max ctx ×
+        // parallel; contiguous slots so `batched_attn_view` strides over slots
+        // within the one bound buffer.
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let mut k_regions = Vec::with_capacity(n_layer as usize);
+        let mut v_regions = Vec::with_capacity(n_layer as usize);
         for il in 0..n_layer as usize {
-            let kb = align_up(cursor, align);
-            cursor = kb + k_slab_stride[il] * n_slots as u64;
-            let vb = align_up(cursor, align);
-            cursor = vb + v_slab_stride[il] * n_slots as u64;
-            k_base.push(kb);
-            v_base.push(vb);
+            let kr = Region::new(
+                device,
+                (k_slab_stride[il] * n_slots as u64).max(1),
+                usage,
+                mem,
+            )?;
+            let vr = Region::new(
+                device,
+                (v_slab_stride[il] * n_slots as u64).max(1),
+                usage,
+                mem,
+            )?;
+            // Zero so no slot reads stale K/V on its first forward (mirrors
+            // KvCache's implicit zero-on-fresh-alloc reliance).
+            if let Some(p) = kr.host_ptr {
+                unsafe { std::ptr::write_bytes(p, 0, kr.size as usize) };
+            }
+            if let Some(p) = vr.host_ptr {
+                unsafe { std::ptr::write_bytes(p, 0, vr.size as usize) };
+            }
+            k_regions.push(kr);
+            v_regions.push(vr);
         }
-        let total = cursor.max(1);
-
-        let region = Region::new(
-            device,
-            total,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        // Zero the whole buffer so no slot ever reads stale K/V on its first
-        // forward (mirrors KvCache's implicit zero-on-fresh-alloc reliance).
-        if let Some(p) = region.host_ptr {
-            unsafe { std::ptr::write_bytes(p, 0, total as usize) };
-        }
+        let alignment = k_regions.first().map_or(align, |r| r.alignment);
 
         Ok(Self {
             config,
@@ -787,13 +818,9 @@ impl BatchKvCache {
             n_layer,
             head_dim,
             n_head_kv,
-            buffer: region.buffer,
-            host_ptr: region.host_ptr,
-            buffer_size: region.size,
-            alignment: region.alignment,
-            region,
-            k_base,
-            v_base,
+            k_regions,
+            v_regions,
+            alignment,
             k_slab_stride,
             v_slab_stride,
             k_dtypes,
@@ -913,7 +940,13 @@ impl BatchKvCache {
 
     /// Total device memory (K/V slabs + SSM state) backing all slots, in bytes.
     pub fn total_bytes(&self) -> u64 {
-        self.region.size + self.ssm_region.as_ref().map_or(0, |r| r.size)
+        let kv: u64 = self
+            .k_regions
+            .iter()
+            .chain(&self.v_regions)
+            .map(|r| r.size)
+            .sum();
+        kv + self.ssm_region.as_ref().map_or(0, |r| r.size)
     }
 
     /// Zero just slot `slot`'s recurrent SSM state (all layers), leaving every
@@ -962,8 +995,8 @@ impl BatchKvCache {
 
     pub fn slot_k_view(&self, slot: u32, layer: u32) -> TensorView {
         make_view(
-            self.buffer,
-            self.k_base[layer as usize] + slot as u64 * self.k_slab_stride[layer as usize],
+            self.k_regions[layer as usize].buffer,
+            slot as u64 * self.k_slab_stride[layer as usize],
             self.head_dim as u64,
             self.config.max_seq_len as u64,
             self.n_head_kv as u64,
@@ -973,8 +1006,8 @@ impl BatchKvCache {
 
     pub fn slot_v_view(&self, slot: u32, layer: u32) -> TensorView {
         make_view(
-            self.buffer,
-            self.v_base[layer as usize] + slot as u64 * self.v_slab_stride[layer as usize],
+            self.v_regions[layer as usize].buffer,
+            slot as u64 * self.v_slab_stride[layer as usize],
             self.head_dim as u64,
             self.config.max_seq_len as u64,
             self.n_head_kv as u64,
@@ -990,8 +1023,8 @@ impl BatchKvCache {
     /// own `kv_len`, so the unused tail past each slot's position is never read.
     pub fn batched_k_attn_view(&self, layer: u32) -> TensorView {
         batched_attn_view(
-            self.buffer,
-            self.k_base[layer as usize],
+            self.k_regions[layer as usize].buffer,
+            0,
             self.k_slab_stride[layer as usize],
             self.head_dim as u64,
             self.config.max_seq_len as u64,
@@ -1003,8 +1036,8 @@ impl BatchKvCache {
 
     pub fn batched_v_attn_view(&self, layer: u32) -> TensorView {
         batched_attn_view(
-            self.buffer,
-            self.v_base[layer as usize],
+            self.v_regions[layer as usize].buffer,
+            0,
             self.v_slab_stride[layer as usize],
             self.head_dim as u64,
             self.config.max_seq_len as u64,
@@ -1044,9 +1077,6 @@ impl BatchKvCache {
         };
         let mut sc = KvCache::borrowed_slot(
             self.config,
-            self.buffer,
-            self.host_ptr,
-            self.buffer_size,
             self.alignment,
             k_layers,
             v_layers,
@@ -1067,7 +1097,9 @@ impl BatchKvCache {
 impl Drop for BatchKvCache {
     fn drop(&mut self) {
         let dev = self.device.raw();
-        self.region.destroy(dev);
+        for r in self.k_regions.iter_mut().chain(self.v_regions.iter_mut()) {
+            r.destroy(dev);
+        }
         if let Some(mut r) = self.ssm_region.take() {
             r.destroy(dev);
         }

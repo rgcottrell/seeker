@@ -144,12 +144,17 @@ pub struct ChatArgs {
     #[arg(long = "prompt-cache-ro", requires = "prompt_cache")]
     prompt_cache_ro: bool,
 
-    /// Max tokens per assistant reply.
-    #[arg(long, default_value_t = 512)]
+    /// Max tokens per assistant reply. llama.cpp's `n_predict` defaults to -1
+    /// (unbounded — stops only at an EOG token or when the context fills). We
+    /// keep a finite cap (it also reserves reply headroom for `--context-shift`
+    /// budgeting) but set it generously so coherent replies aren't cut off.
+    #[arg(long, default_value_t = 2048)]
     max_tokens: u32,
 
-    /// KV-cache budget for the whole conversation, in tokens.
-    #[arg(long = "ctx-size", default_value_t = 4096)]
+    /// KV-cache budget for the whole conversation, in tokens. `0` (the default)
+    /// uses the model's full trained context length — llama.cpp's `-c 0`
+    /// convention; pass a smaller value to cap KV memory.
+    #[arg(long = "ctx-size", default_value_t = 0)]
     ctx_size: u32,
 
     /// When the context fills, drop the oldest conversation turns and continue
@@ -301,7 +306,7 @@ pub(crate) fn parse_logit_bias(s: &str) -> Result<(u32, f32), String> {
 }
 
 impl ChatArgs {
-    fn sampler_config(&self) -> SamplerConfig {
+    fn sampler_config(&self, ctx_size: u32) -> SamplerConfig {
         SamplerConfig::from_cli(
             self.temperature,
             self.top_k,
@@ -311,7 +316,7 @@ impl ChatArgs {
             self.frequency_penalty,
             self.repeat_penalty,
             self.penalty_last_n,
-            self.ctx_size,
+            ctx_size,
             self.seed,
             self.logit_bias.clone(),
         )
@@ -335,6 +340,15 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let weights = engine.upload_weights(&gguf)?;
     let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
 
+    // `--ctx-size 0` (the default) means "use the model's full trained context"
+    // (llama.cpp's `-c 0`); fall back to 4096 if the model omits the metadata.
+    let ctx_size = if args.ctx_size == 0 {
+        gguf.trained_ctx_len().unwrap_or(4096)
+    } else {
+        args.ctx_size
+    };
+    tracing::info!(ctx_size, "context window");
+
     // The mmproj vision sidecar (if resolved and not `--no-mmproj`). The vision
     // tower is built lazily on the first `/image` (see `ChatSession::attach_image`)
     // so a text-only session never uploads the projector.
@@ -350,7 +364,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     // single-pass).
     let scratch_bytes = model.scratch_bytes_estimate(
         args.ubatch_size,
-        args.ctx_size,
+        ctx_size,
         args.cache_type_k,
         args.cache_type_v,
     );
@@ -360,7 +374,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
         v_dtype: args.cache_type_v,
-        max_seq_len: args.ctx_size,
+        max_seq_len: ctx_size,
         n_head: dims.n_head,
     };
     let mut cache =
@@ -380,7 +394,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let sampler = Sampler::new(args.sampler_config());
+    let sampler = Sampler::new(args.sampler_config(ctx_size));
 
     // Stop on any end-of-generation token (EOS / EOT / EOM / well-known turn
     // terminators), matching llama.cpp's `llama_token_is_eog`. A chat-tuned
@@ -1448,15 +1462,15 @@ fn format_arch_line(g: &GgufFile) -> String {
     parts.join(", ")
 }
 
-fn format_ctx_line(g: &GgufFile) -> String {
-    let arch = g.architecture().unwrap_or("(unknown)");
-    match read_metadata_u64(g, &format!("{arch}.context_length")) {
-        Some(n) => format!("{n} tokens"),
-        None => "(unknown)".to_string(),
+fn format_ctx_line(g: &GgufFile, ctx_size: u32) -> String {
+    // Show the effective window; note the model's trained max when capped below it.
+    match g.trained_ctx_len() {
+        Some(max) if max > ctx_size => format!("{ctx_size} tokens (model max {max})"),
+        _ => format!("{ctx_size} tokens"),
     }
 }
 
-fn print_banner(gguf: &GgufFile, path: &Path) {
+fn print_banner(gguf: &GgufFile, path: &Path, ctx_size: u32) {
     let model_file = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -1468,7 +1482,7 @@ fn print_banner(gguf: &GgufFile, path: &Path) {
     println!("device  : {}", device_name());
     println!("model   : {model_file}");
     println!("arch    : {}", format_arch_line(gguf));
-    println!("ctx     : {}", format_ctx_line(gguf));
+    println!("ctx     : {}", format_ctx_line(gguf, ctx_size));
     println!();
     println!("available commands:");
     println!("  /exit or Ctrl+C     stop or exit");
@@ -1512,7 +1526,7 @@ fn run_interactive(
         tracing::debug!(path = %p.display(), error = %e, "history load");
     }
 
-    print_banner(gguf, path);
+    print_banner(gguf, path, session.cache.config.max_seq_len);
 
     loop {
         match editor.readline("> ") {

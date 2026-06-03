@@ -168,8 +168,8 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         dims.head_dim,
         dims.n_head_kv,
         max_seq_len,
-        cache.region.size,
-        cache.region.size as f64 / (1024.0 * 1024.0),
+        cache.kv_bytes(),
+        cache.kv_bytes() as f64 / (1024.0 * 1024.0),
     );
     // Hybrid models (qwen35moe etc.) need persistent SSM/GDN recurrent state
     // carried across forwards — including across chunked-prefill ubatches and

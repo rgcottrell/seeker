@@ -74,6 +74,27 @@ impl GgufFile {
         }
     }
 
+    /// The context length the model was trained with, from the
+    /// `{arch}.context_length` metadata key (e.g. `qwen35moe.context_length`).
+    /// `None` when the key is absent or non-integer. Callers resolve a
+    /// `--ctx-size` of `0` to this, mirroring llama.cpp's `n_ctx == 0 ->
+    /// n_ctx_train`.
+    pub fn trained_ctx_len(&self) -> Option<u32> {
+        let arch = self.architecture()?;
+        let n = match self.get(&format!("{arch}.context_length"))? {
+            MetadataValue::U8(n) => *n as u64,
+            MetadataValue::U16(n) => *n as u64,
+            MetadataValue::U32(n) => *n as u64,
+            MetadataValue::U64(n) => *n,
+            MetadataValue::I8(n) if *n >= 0 => *n as u64,
+            MetadataValue::I16(n) if *n >= 0 => *n as u64,
+            MetadataValue::I32(n) if *n >= 0 => *n as u64,
+            MetadataValue::I64(n) if *n >= 0 => *n as u64,
+            _ => return None,
+        };
+        u32::try_from(n).ok()
+    }
+
     pub fn tensors(&self) -> &[TensorInfo] {
         &self.tensors
     }

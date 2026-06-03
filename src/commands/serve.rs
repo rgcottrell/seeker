@@ -61,8 +61,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 512)]
     max_tokens: u32,
 
-    /// KV-cache budget per request, in tokens.
-    #[arg(long = "ctx-size", default_value_t = 4096)]
+    /// KV-cache budget per slot, in tokens. `0` (the default) uses the model's
+    /// full trained context length — llama.cpp's `-c 0` convention. Each of the
+    /// `--parallel` slots is a full `--ctx-size` cache, so lower it to cap total
+    /// KV memory.
+    #[arg(long = "ctx-size", default_value_t = 0)]
     ctx_size: u32,
 
     /// Logical batch size (max tokens per submit). Validation-only in this
@@ -179,7 +182,7 @@ fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
 }
 
 impl ServeArgs {
-    fn sampler_config(&self) -> SamplerConfig {
+    fn sampler_config(&self, ctx_size: u32) -> SamplerConfig {
         SamplerConfig::from_cli(
             self.temperature,
             self.top_k,
@@ -189,7 +192,7 @@ impl ServeArgs {
             self.frequency_penalty,
             self.repeat_penalty,
             self.penalty_last_n,
-            self.ctx_size,
+            ctx_size,
             self.seed,
             self.logit_bias.clone(),
         )
@@ -227,6 +230,20 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         "loaded tokenizer for serve",
     );
 
+    // `--ctx-size 0` (the default) means "use the model's full trained context"
+    // (llama.cpp's `-c 0`); fall back to 4096 if the model omits the metadata.
+    // Each of the `--parallel` slots gets a full `ctx_size` cache.
+    let ctx_size = if args.ctx_size == 0 {
+        gguf.trained_ctx_len().unwrap_or(4096)
+    } else {
+        args.ctx_size
+    };
+    tracing::info!(
+        ctx_size,
+        n_slots = args.parallel.max(1),
+        "context window per slot"
+    );
+
     // Resolve the mmproj vision sidecar (unless --no-mmproj). The worker builds
     // the encoder from `mmproj_path`; the handler CPU-preprocesses with
     // `vision_config`. A sidecar that fails to parse degrades to text-only.
@@ -253,7 +270,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         mmproj_path,
         n_ubatch: args.ubatch_size,
         n_batch: args.batch_size,
-        ctx_size: args.ctx_size,
+        ctx_size,
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
         n_slots,
@@ -274,11 +291,11 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         tokenizer: Arc::new(bundle),
         inference: handle,
         template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
-        default_sampler: args.sampler_config(),
+        default_sampler: args.sampler_config(ctx_size),
         default_max_tokens: args.max_tokens,
         default_ignore_eos: args.ignore_eos,
         default_system_prompt: resolve_system_prompt(args)?,
-        ctx_size: args.ctx_size,
+        ctx_size,
         n_slots,
         model_id,
         model_path: path.display().to_string(),
