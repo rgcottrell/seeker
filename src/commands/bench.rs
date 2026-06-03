@@ -104,6 +104,35 @@ pub struct BenchArgs {
     /// 0 = unbounded (single pass). (short: -ub)
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: u32,
+
+    // ─── Concurrent-throughput mode ─────────────────────────────────────
+    /// Run the concurrent-throughput benchmark (drives the real `seeker serve`
+    /// scheduler with B sequences) instead of the single-sequence bench. This
+    /// is the measure gate for the continuous-batching throughput work.
+    #[arg(long)]
+    concurrent: bool,
+
+    /// Batch sizes (concurrent sequences) to sweep, comma-separated.
+    #[arg(long, default_value = "1,2,4,8")]
+    batches: String,
+
+    /// Per-sequence prompt length (tokens) for the concurrent bench.
+    #[arg(long = "prompt-len", default_value_t = 512)]
+    prompt_len: u32,
+
+    /// Per-sequence timed-decode tokens for the concurrent bench.
+    #[arg(long = "gen-len", default_value_t = 128)]
+    gen_len: u32,
+
+    /// Shared leading-prefix length (tokens) for the concurrent bench's shared
+    /// workload; 0 skips the shared workload.
+    #[arg(long = "shared-len", default_value_t = 0)]
+    shared_len: u32,
+
+    /// Concurrent bench: assert seq-0's greedy token stream is byte-identical
+    /// across batch sizes (the determinism gate every phase must keep green).
+    #[arg(long)]
+    check: bool,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -117,6 +146,9 @@ fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
 const DEFAULT_PROMPT: &str = "The history of computing hardware covers the developments from early simple devices to aid calculation to modern day computers. The first aids to computation were purely mechanical devices which required the operator to set up the initial values of an elementary arithmetic operation, then manipulate the device to obtain the result. Later, computers represented numbers in a continuous form, for instance distance along a scale, rotation of a shaft, or a voltage. Numbers could also be represented in the form of digits, automatically manipulated by a mechanism. Although this approach generally required more complex mechanisms, it greatly increased the precision of results. The development of transistor technology and then the integrated circuit chip led to a series of breakthroughs, starting with transistor computers and then integrated circuit computers, causing digital computers to largely replace analog computers. Metal-oxide-semiconductor large-scale integration then enabled semiconductor memory and the microprocessor, leading to another key breakthrough, the miniaturized personal computer, in the 1970s. The cost of computers gradually became so low that personal computers by the 1990s, and then mobile computers in the 2000s, became ubiquitous. The earliest known tool for use in computation is the abacus, developed in the period between 2700 to 2300 BCE in Sumer. The Sumerian abacus consisted of a table of successive columns which delimited the successive orders of magnitude of their sexagesimal number system. Its original style of usage was by lines drawn in sand with pebbles. Abaci of a more modern design are still used as calculation tools today, such as the Chinese abacus.";
 
 pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
+    if args.concurrent {
+        return bench_concurrent(args).await;
+    }
     let path = resolve_model_path(&args).await?;
     let gguf = GgufFile::open(&path)?;
     let bundle = build_tokenizer(&gguf)?;
@@ -368,6 +400,57 @@ fn greedy_argmax(logits: &[f32]) -> u32 {
         }
     }
     best_i
+}
+
+/// Concurrent-throughput benchmark: build a `WorkerConfig`, then drive the real
+/// serve scheduler with B synthetic sequences on a dedicated worker thread (see
+/// [`crate::server::inference::run_concurrent_bench`]). A fixed small context
+/// (`prompt_len + warmup + gen_len + slack`) keeps the decode-focused runs cheap
+/// and comparable across phases.
+async fn bench_concurrent(args: BenchArgs) -> Result<(), Box<dyn Error>> {
+    use crate::server::inference::{BenchPlan, WorkerConfig, run_concurrent_bench};
+
+    let path = resolve_model_path(&args).await?;
+    let batches: Vec<u32> = args
+        .batches
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u32>().ok())
+        .filter(|&b| b > 0)
+        .collect();
+    if batches.is_empty() {
+        return Err("--batches parsed to an empty list (expected e.g. \"1,2,4,8\")".into());
+    }
+    let max_b = *batches.iter().max().expect("non-empty");
+    let ctx_size = args
+        .prompt_len
+        .saturating_add(args.warmup)
+        .saturating_add(args.gen_len)
+        .saturating_add(64);
+
+    let cfg = WorkerConfig {
+        model_path: path,
+        mmproj_path: None,
+        n_ubatch: args.ubatch_size,
+        n_batch: args.batch_size,
+        ctx_size,
+        cache_type_k: args.cache_type_k,
+        cache_type_v: args.cache_type_v,
+        n_slots: max_b,
+    };
+    let plan = BenchPlan {
+        batches,
+        prompt_len: args.prompt_len,
+        gen_len: args.gen_len,
+        shared_len: args.shared_len,
+        warmup: args.warmup,
+        prompt: args.prompt.clone(),
+        check: args.check,
+    };
+
+    match tokio::task::spawn_blocking(move || run_concurrent_bench(cfg, plan)).await {
+        Ok(r) => r.map_err(|e| e.into()),
+        Err(e) => Err(format!("bench worker thread join failed: {e}").into()),
+    }
 }
 
 async fn resolve_model_path(args: &BenchArgs) -> Result<PathBuf, Box<dyn Error>> {

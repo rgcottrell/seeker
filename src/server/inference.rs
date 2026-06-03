@@ -1400,6 +1400,360 @@ fn scan_stop(pending: &str, stops: &[String]) -> StopScan {
     StopScan::Emit(pending.len() - hold)
 }
 
+// ─── Concurrent-throughput benchmark (the measure-first gate) ───────────────
+//
+// Drives the REAL scheduler (`admit_unified` + `schedule_step` +
+// `evict_finished`) with B synthetic sequences, so each later phase's win shows
+// up in the exact serve path it changes — no HTTP/template/SSE noise, fully
+// deterministic (greedy, fixed seed, `ignore_eos`). Runs on a dedicated 64 MiB
+// OS thread (not tokio) so the worker's `blocking_send` is valid, mirroring
+// [`InferenceHandle::spawn`]. One `Worker` is built at `max(batches)` slots and
+// reused across the sweep; slots are reset between runs for clean prefills.
+
+/// Synthetic workload shape for the concurrent bench.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BenchWorkload {
+    /// Each sequence's prompt diverges in its leading tokens (short `lcp`) —
+    /// forces B independent full prefills (the no-shared-prompt subagent case).
+    Distinct,
+    /// All sequences share `shared_len` leading tokens then diverge — the
+    /// subagent system-prompt case (re-prefilled per slab today; Phase 2 target).
+    Shared,
+}
+
+impl BenchWorkload {
+    fn name(self) -> &'static str {
+        match self {
+            BenchWorkload::Distinct => "distinct",
+            BenchWorkload::Shared => "shared",
+        }
+    }
+}
+
+/// Parameters for [`run_concurrent_bench`]. All `Send` (moved into the thread).
+pub struct BenchPlan {
+    pub batches: Vec<u32>,
+    pub prompt_len: u32,
+    pub gen_len: u32,
+    pub shared_len: u32,
+    pub warmup: u32,
+    pub prompt: String,
+    pub check: bool,
+}
+
+/// One result row (a single `(B, workload)` run).
+struct BenchRow {
+    prefill_tps: f64,
+    decode_tps: f64,
+    per_seq_tps: f64,
+    ms_per_step: f64,
+    ttft_p50: f64,
+    ttft_p95: f64,
+    /// seq-0's generated token ids (for the `--check` byte-identical gate).
+    gen0: Vec<u32>,
+}
+
+/// Entry point for `seeker bench --concurrent`. Spawns the worker on a 64 MiB OS
+/// thread (model load is stack-heavy; `blocking_send` needs a non-tokio thread)
+/// and blocks until the sweep finishes, returning any error as a `String`.
+pub fn run_concurrent_bench(cfg: WorkerConfig, plan: BenchPlan) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("seeker-bench".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || bench_thread(cfg, plan))
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "bench thread panicked".to_string())?
+}
+
+fn bench_thread(mut cfg: WorkerConfig, plan: BenchPlan) -> Result<(), String> {
+    let max_b = plan.batches.iter().copied().max().unwrap_or(1).max(1);
+    cfg.n_slots = max_b;
+    let mut worker = setup(&cfg).map_err(|e| e.to_string())?;
+    if !worker.unified {
+        return Err(
+            "bench --concurrent requires a model with the unified forward (e.g. qwen35moe)".into(),
+        );
+    }
+    let base = bench_encode_base(&worker, &plan.prompt)?;
+    let ctx = worker.batch.config.max_seq_len;
+    eprintln!(
+        "# concurrent bench: prompt_len={} gen_len={} shared_len={} warmup={} ctx={} ubatch={} \
+         vocab_base_tokens={}",
+        plan.prompt_len,
+        plan.gen_len,
+        plan.shared_len,
+        plan.warmup,
+        ctx,
+        cfg.n_ubatch,
+        base.len(),
+    );
+
+    let mut workloads = vec![BenchWorkload::Distinct];
+    if plan.shared_len > 0 {
+        workloads.push(BenchWorkload::Shared);
+    }
+    for workload in workloads {
+        println!(
+            "\nworkload={} prompt_len={} gen_len={} shared_len={}",
+            workload.name(),
+            plan.prompt_len,
+            plan.gen_len,
+            plan.shared_len,
+        );
+        println!(
+            "  B    prefill_tps   decode_tps  per_seq_tps   ms/step  TTFT_p50_ms  TTFT_p95_ms  speedup"
+        );
+        let mut base_decode_tps = 0.0f64;
+        let mut check0: Option<Vec<u32>> = None;
+        for (bi, &b) in plan.batches.iter().enumerate() {
+            worker.bench_reset_slots();
+            let row = drive_workload(&mut worker, &base, b, workload, &plan)?;
+            if bi == 0 {
+                base_decode_tps = row.decode_tps;
+            }
+            if plan.check {
+                match &check0 {
+                    Some(prev) => {
+                        let n = prev.len().min(row.gen0.len());
+                        if prev[..n] != row.gen0[..n] {
+                            return Err(format!(
+                                "byte-identical check FAILED: workload={} seq-0 tokens differ at B={b}",
+                                workload.name()
+                            ));
+                        }
+                    }
+                    None => check0 = Some(row.gen0.clone()),
+                }
+            }
+            let speedup = row.decode_tps / base_decode_tps.max(1e-9);
+            println!(
+                "  {b:<3}  {:>11.1}  {:>11.1}  {:>11.1}  {:>8.2}  {:>11.2}  {:>11.2}  {:>6.2}x",
+                row.prefill_tps,
+                row.decode_tps,
+                row.per_seq_tps,
+                row.ms_per_step,
+                row.ttft_p50,
+                row.ttft_p95,
+                speedup,
+            );
+        }
+    }
+    if plan.check {
+        println!("\nbyte-identical check: PASS (seq-0 greedy stream stable across B)");
+    }
+    Ok(())
+}
+
+/// Tokenize the bench passage into a base token vector (tiled/perturbed per
+/// sequence by [`bench_synth_prompt`]).
+fn bench_encode_base(worker: &Worker, prompt: &str) -> Result<Vec<u32>, String> {
+    let enc = worker
+        .model
+        .tokenizer()
+        .tokenizer
+        .encode(prompt, false)
+        .map_err(|e| format!("tokenize base prompt: {e}"))?;
+    let ids = enc.get_ids().to_vec();
+    if ids.is_empty() {
+        return Err("bench base prompt tokenized to zero tokens".into());
+    }
+    Ok(ids)
+}
+
+/// Build sequence `seq`'s prompt of `prompt_len` tokens by tiling `base`, then
+/// perturbing per the workload so `lcp` across sequences is what we intend.
+fn bench_synth_prompt(
+    base: &[u32],
+    prompt_len: usize,
+    seq: usize,
+    workload: BenchWorkload,
+    shared_len: usize,
+) -> Vec<u32> {
+    let mut v: Vec<u32> = (0..prompt_len).map(|i| base[i % base.len()]).collect();
+    match workload {
+        // Perturb the leading tokens so any two sequences diverge early → short
+        // lcp → B independent full prefills (no accidental cross-slab reuse).
+        BenchWorkload::Distinct => {
+            for i in 0..prompt_len.min(4) {
+                v[i] = base[(i + seq * 7 + 1) % base.len()];
+            }
+        }
+        // Keep the first `shared_len` identical across sequences (the shared
+        // system prompt), diverge in the suffix per sequence.
+        BenchWorkload::Shared => {
+            let start = shared_len.min(prompt_len);
+            for (i, slot) in v.iter_mut().enumerate().skip(start) {
+                *slot = base[(i + seq * 13 + 1) % base.len()];
+            }
+        }
+    }
+    v
+}
+
+/// Greedy sampler config — deterministic, sampling-behavior-free (matches the
+/// single-seq `seeker bench`).
+fn bench_greedy_cfg() -> SamplerConfig {
+    SamplerConfig {
+        temperature: 0.0,
+        top_k: 0,
+        top_p: 1.0,
+        min_p: 0.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        repeat_penalty: 1.0,
+        penalty_last_n: 0,
+        seed: 0,
+        logit_bias: Vec::new(),
+    }
+}
+
+/// Drain every reply channel without blocking; stamp each sequence's first-token
+/// time (TTFT) the first time its `Started` event appears.
+fn bench_drain(
+    rxs: &mut [mpsc::Receiver<GenEvent>],
+    started_at: &mut [Option<f64>],
+    t_submit: std::time::Instant,
+) {
+    for (s, rx) in rxs.iter_mut().enumerate() {
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, GenEvent::Started { .. }) && started_at[s].is_none() {
+                started_at[s] = Some(t_submit.elapsed().as_secs_f64());
+            }
+        }
+    }
+}
+
+/// Discard any queued reply events (keeps the bounded reply channels from
+/// back-pressuring the worker during the decode window).
+fn bench_drain_discard(rxs: &mut [mpsc::Receiver<GenEvent>]) {
+    for rx in rxs.iter_mut() {
+        while rx.try_recv().is_ok() {}
+    }
+}
+
+fn bench_percentile(sorted_ms: &[f64], q: f64) -> f64 {
+    if sorted_ms.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted_ms.len() as f64 - 1.0) * q).round() as usize;
+    sorted_ms[idx.min(sorted_ms.len() - 1)]
+}
+
+/// Run one `(B, workload)` measurement against an already-reset worker.
+fn drive_workload(
+    worker: &mut Worker,
+    base: &[u32],
+    b: u32,
+    workload: BenchWorkload,
+    plan: &BenchPlan,
+) -> Result<BenchRow, String> {
+    let b = b as usize;
+    let prompt_len = plan.prompt_len.max(1) as usize;
+    let gen_len = plan.gen_len.max(1) as usize;
+    let warmup = plan.warmup as usize;
+    let shared_len = plan.shared_len as usize;
+    // High max_tokens (+ ignore_eos) so no sequence terminates inside the timed
+    // window — the driver controls the step count exactly.
+    let max_tokens = (warmup + gen_len + 32) as u32;
+
+    let mut rxs: Vec<mpsc::Receiver<GenEvent>> = Vec::with_capacity(b);
+    for s in 0..b {
+        let tokens = bench_synth_prompt(base, prompt_len, s, workload, shared_len);
+        let (tx, rx) = mpsc::channel::<GenEvent>(gen_len + warmup + 64);
+        rxs.push(rx);
+        worker.admit_unified(GenJob {
+            tokens,
+            config: GenConfig {
+                sampler: bench_greedy_cfg(),
+                max_tokens,
+                stop: Vec::new(),
+                ignore_eos: true,
+                id_slot: None,
+            },
+            image: None,
+            reply: tx,
+        });
+    }
+
+    // ── Prefill window: step until every sequence has emitted Started. ──
+    let mut started_at: Vec<Option<f64>> = vec![None; b];
+    let t_submit = std::time::Instant::now();
+    let mut guard = 0usize;
+    while started_at.iter().any(|x| x.is_none()) {
+        worker.schedule_step();
+        worker.evict_finished();
+        bench_drain(&mut rxs, &mut started_at, t_submit);
+        guard += 1;
+        if guard > 1_000_000 {
+            return Err("bench prefill window did not converge".into());
+        }
+    }
+    let prefill_secs = t_submit.elapsed().as_secs_f64();
+
+    // ── Warm-up decode (untimed). ──
+    for _ in 0..warmup {
+        worker.schedule_step();
+        worker.evict_finished();
+        bench_drain_discard(&mut rxs);
+    }
+
+    // ── Timed decode window. ──
+    let t_dec = std::time::Instant::now();
+    for _ in 0..gen_len {
+        worker.schedule_step();
+        worker.evict_finished();
+        bench_drain_discard(&mut rxs);
+    }
+    let decode_secs = t_dec.elapsed().as_secs_f64();
+
+    // Sequences never terminated (high max_tokens), so `active` is still in
+    // admit order — active[0] is seq-0.
+    let gen0 = worker
+        .active
+        .first()
+        .map(|s| s.generated.clone())
+        .unwrap_or_default();
+
+    let prefill_tps = (b * prompt_len) as f64 / prefill_secs.max(1e-9);
+    let decode_tps = (b * gen_len) as f64 / decode_secs.max(1e-9);
+    let per_seq_tps = gen_len as f64 / decode_secs.max(1e-9);
+    let ms_per_step = decode_secs * 1000.0 / gen_len as f64;
+    let mut ttfts: Vec<f64> = started_at
+        .iter()
+        .map(|x| x.unwrap_or(0.0) * 1000.0)
+        .collect();
+    ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok(BenchRow {
+        prefill_tps,
+        decode_tps,
+        per_seq_tps,
+        ms_per_step,
+        ttft_p50: bench_percentile(&ttfts, 0.50),
+        ttft_p95: bench_percentile(&ttfts, 0.95),
+        gen0,
+    })
+}
+
+impl Worker {
+    /// Clear every slot's cached prefix + recurrent state for a fresh, comparable
+    /// bench run (no cross-run prefix reuse, no stale SSM state). Bench-only.
+    fn bench_reset_slots(&mut self) {
+        self.active.clear();
+        self.clock = 0;
+        self.engine.decode_cache = None;
+        for i in 0..self.slots.len() {
+            self.slots[i].prior_tokens.clear();
+            self.slots[i].last_used = 0;
+            self.slots[i].active = false;
+            self.batch.reset_slot(i as u32);
+            self.batch.positions[i] = 0;
+            self.batch.rope_lag[i] = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
