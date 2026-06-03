@@ -19,10 +19,10 @@ build:
     podman build -t {{image}}:{{tag}} -f Containerfile {{justfile_directory()}}
 
 # Run the server with full AMD GPU passthrough; the port is published 1:1 on the host.
-#   just run                                   # no model (only /health + /apply-template)
-#   just run qwen3.gguf                         # --model /models/qwen3.gguf
-#   just run qwen3.gguf --ctx-size 8192 --parallel 4
-run model="" *extra="":
+#   just serve                                  # no model (only /health + /apply-template)
+#   just serve qwen3.gguf                        # --model /models/qwen3.gguf
+#   just serve qwen3.gguf --ctx-size 8192 --parallel 4
+serve model="" *extra="":
     podman run --rm -it \
         --device /dev/dri \
         --group-add keep-groups \
