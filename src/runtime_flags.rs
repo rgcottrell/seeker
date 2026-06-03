@@ -81,6 +81,18 @@ pub static FA_SPLIT_DISABLED: LazyLock<bool> =
 /// Read per decode forward; cache to avoid a per-token getenv + parse.
 pub static FA_SPLIT_KNUM: LazyLock<Option<u32>> = LazyLock::new(|| env_u32("SEEKER_FA_SPLIT_KNUM"));
 
+/// `SEEKER_SSM_BATCH=0` — force the per-sequence SSM loop in the unified
+/// forward. Default-on: a pure-decode batched step routes the SSM block through
+/// `ssm_block_batch` so the in/out projections read their weights once for all
+/// B sequences (matvec → one matmul) instead of re-reading per sequence. The
+/// batched path is byte-identical to the per-sequence loop at the serve scale
+/// (B ≤ 8, below the CoopMat N≥32 gate); this flag is the revert / diff lever.
+pub static SSM_BATCH_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SEEKER_SSM_BATCH")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+});
+
 // ─── Debug flags (gpu_debug) ─────────────────────────────────────────
 
 /// Define a presence-based debug flag behind `gpu_debug`. With the

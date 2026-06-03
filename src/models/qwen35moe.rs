@@ -1672,47 +1672,76 @@ impl Qwen35MoeModel {
                     let ssm_layer_idx = (0..layer_idx)
                         .filter(|&i| !p.is_attention_layer(i as u32))
                         .count() as u32;
-                    // Per-sequence GDN/conv recurrence (sequential): each runs
-                    // its L_s-token scan over its slab's state, writing its own
-                    // disjoint residual columns. Each ssm_block uses FRESH
-                    // scratch (no mid-layer restore — matching single-seq
-                    // forward_impl) so its GPU work is never raced by a later
-                    // op reusing the same scratch offsets. The layer-top
-                    // scratch_restore reclaims it all next layer. Total scratch
-                    // ≈ a single-seq forward over N_total tokens (within the
-                    // n_ubatch reservation). Disjoint residual slices + fresh
-                    // scratch ⇒ no inter-sequence barrier needed.
-                    for s in 0..b {
-                        let l = seq_lens[s];
-                        let off = q_starts[s] * hidden * elem;
-                        let residual_slice = TensorView {
-                            byte_offset: residual.byte_offset + off,
-                            byte_size: l as u64 * hidden * elem,
-                            dims: [hidden, l as u64, 1, 1],
-                            byte_stride: [
-                                elem,
-                                hidden * elem,
-                                hidden * elem * l as u64,
-                                hidden * elem * l as u64,
-                            ],
-                            element_stride: [1, hidden, hidden * l as u64, hidden * l as u64],
-                            ..residual
-                        };
-                        let gdn_state = Some(batch.gdn_state_slot(ssm_layer_idx, slots[s]));
-                        let conv_state = Some(batch.conv_state_slot(ssm_layer_idx, slots[s]));
-                        ssm_block(
+                    // Pure-decode steps (every sequence contributes exactly one
+                    // token) take the BATCHED SSM: the in/out projections read
+                    // their weights ONCE for all B sequences (per-seq matvec → one
+                    // matmul over [·,B]) and the GDN/conv run as a single n_seqs=B
+                    // dispatch, amortizing the SSM weight traffic (37% of decode)
+                    // across the batch. This is the exact call the legacy
+                    // batched-decode path already uses, and is byte-identical to
+                    // the per-sequence loop at the serve scale (B ≤ 8): the
+                    // projections take the per-column matvec fallback (below the
+                    // CoopMat N≥32 gate, so column math matches a B=1 matvec) and
+                    // GDN/conv index sequence as an independent workgroup axis.
+                    // `SEEKER_SSM_BATCH=0` forces the per-seq loop (revert / diff).
+                    let all_decode = seq_lens.iter().all(|&l| l == 1);
+                    if all_decode && b > 1 && !*crate::runtime_flags::SSM_BATCH_DISABLED {
+                        ssm_block_batch(
                             ctx,
                             ssm_w,
-                            residual_slice,
+                            batch,
+                            residual,
                             p,
                             hidden,
-                            l,
-                            layer_idx as u32,
-                            gdn_state,
-                            conv_state,
-                            None,
-                            None,
+                            b as u64,
+                            ssm_layer_idx,
+                            positions,
+                            slots,
                         )?;
+                    } else {
+                        // Per-sequence GDN/conv recurrence (sequential): each runs
+                        // its L_s-token scan over its slab's state, writing its own
+                        // disjoint residual columns. Each ssm_block uses FRESH
+                        // scratch (no mid-layer restore — matching single-seq
+                        // forward_impl) so its GPU work is never raced by a later
+                        // op reusing the same scratch offsets. The layer-top
+                        // scratch_restore reclaims it all next layer. Total scratch
+                        // ≈ a single-seq forward over N_total tokens (within the
+                        // n_ubatch reservation). Disjoint residual slices + fresh
+                        // scratch ⇒ no inter-sequence barrier needed. Also handles
+                        // mixed (prefill-chunk + decode) steps and B==1.
+                        for s in 0..b {
+                            let l = seq_lens[s];
+                            let off = q_starts[s] * hidden * elem;
+                            let residual_slice = TensorView {
+                                byte_offset: residual.byte_offset + off,
+                                byte_size: l as u64 * hidden * elem,
+                                dims: [hidden, l as u64, 1, 1],
+                                byte_stride: [
+                                    elem,
+                                    hidden * elem,
+                                    hidden * elem * l as u64,
+                                    hidden * elem * l as u64,
+                                ],
+                                element_stride: [1, hidden, hidden * l as u64, hidden * l as u64],
+                                ..residual
+                            };
+                            let gdn_state = Some(batch.gdn_state_slot(ssm_layer_idx, slots[s]));
+                            let conv_state = Some(batch.conv_state_slot(ssm_layer_idx, slots[s]));
+                            ssm_block(
+                                ctx,
+                                ssm_w,
+                                residual_slice,
+                                p,
+                                hidden,
+                                l,
+                                layer_idx as u32,
+                                gdn_state,
+                                conv_state,
+                                None,
+                                None,
+                            )?;
+                        }
                     }
                 }
             }
