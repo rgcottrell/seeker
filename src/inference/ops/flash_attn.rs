@@ -36,10 +36,11 @@ const FA_SPLIT_CORE_COUNT_FALLBACK: u32 = 16;
 
 /// Largest head_dim the coopmat `flash_attn_cm1` path accepts. cm1's LDS no
 /// longer scales with head_dim on the K/V side (those are read coopmat-direct
-/// from global), but the per-thread register O accumulator does, and only
-/// head_dim ≤ 128 has been validated (Llama 64, qwen3-vl tower 96). qwen35moe
-/// text decode's 256 stays on the scalar path. Conservative tested ceiling.
-const CM1_MAX_HEAD_DIM: u32 = 128;
+/// from global); only the Q tile (Br × head_dim, in LDS) and the per-thread
+/// register O accumulator scale with it. 256 covers qwen35moe (key/value_length
+/// = 256), whose deep prefill MUST use coopmat — the scalar path is too slow and
+/// trips the RADV watchdog. Validated byte-close to scalar at 64/96/128/256.
+const CM1_MAX_HEAD_DIM: u32 = 256;
 
 /// Upper bound on the split-K workgroup count for any single flash-attn
 /// dispatch. Caps `pick_k_num` and sizes the per-call partials buffer
@@ -49,6 +50,14 @@ const CM1_MAX_HEAD_DIM: u32 = 128;
 /// submits. On qwen35moe Strix Halo decode the heuristic naturally
 /// saturates at ~8 (target=80 / base_wgs=10); 16 leaves headroom.
 pub const FA_MAX_K_NUM: u32 = 16;
+
+/// Max KV keys a single split-K workgroup may walk before the RADV/Strix-Halo
+/// per-dispatch watchdog risks a device-lost (~14k empirically). `pick_k_num`
+/// floors the split count at `ceil(kv / this)` so decode (and any low-base-wgs
+/// path) stays under it at deep context. Note: `FA_MAX_K_NUM` caps the split, so
+/// the walk is only guaranteed ≤ this up to `kv ≈ FA_MAX_K_NUM · this` (~128k);
+/// beyond that the walk grows again (256k+ decode is not yet watchdog-safe).
+const FA_SPLIT_MAX_WALK: u32 = 8192;
 
 /// Max KV keys a single flash-attn workgroup may walk in the VISION
 /// full-attention path before we force a KV-split. The vision tower attends
@@ -85,6 +94,23 @@ fn cm1_fa_kv_walk() -> u32 {
         .and_then(|s| s.parse().ok())
         .filter(|&w| w > 0)
         .unwrap_or(16_384)
+}
+
+/// Max KV keys a single MASKED-PREFILL flash-attn workgroup may walk before the
+/// RADV/Strix-Halo per-dispatch watchdog kills the device. The scalar F16 text
+/// path tolerates ~14k keys (empirically: 8.7k OK, 16.9k device-lost), so we
+/// force a KV-split sized to keep each split's walk ≤ this, with margin. Unlike
+/// the decode/vision paths, multi-row text prefill saturates the GPU with
+/// `L·heads` workgroups, so the base_wgs heuristic never splits it on its own.
+/// `SEEKER_FA_PREFILL_WALK` overrides (force a split at small kv for validation,
+/// or probe the ceiling). Only read on the masked path with n>1 (chunked or
+/// standalone prefill); never on the decode hot path (n==1).
+fn prefill_fa_kv_walk() -> u32 {
+    std::env::var("SEEKER_FA_PREFILL_WALK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(8_192)
 }
 
 /// Same heuristic as `pick_k_num`, clamped to `FA_MAX_K_NUM`. Used by
@@ -337,23 +363,21 @@ pub fn record(
 
     // Cooperative-matrix flash-attention path (`flash_attn_cm1.slang`):
     // 4 subgroups, register-held O accumulator, coopmat QK^T + PV, F16 KV.
-    // Opt-in for the masked text decoder (`SEEKER_FA_CM=1`) — near-neutral there
-    // since text prefill is matmul-bound; the big win is the maskless vision path
-    // below (default-on). Single-token decode passes `mask = None` and goes to
-    // the scalar split-K path; cm1 here handles the masked prefill batches.
-    //
-    // The masked decoder cm1 path expects the legacy full `[kv_len, L]` mask
-    // layout, which only coincides with the new within-chunk `[L, L]` mask when
-    // there's no prefix (`prefix_len == 0`, the first/only ubatch); chunked
-    // prefill at a non-zero offset falls back to the scalar path.
+    // DEFAULT-ON for masked prefill (`SEEKER_FA_CM=0` opts out): the coopmat
+    // QK^T/PV are ~5× faster per key than the scalar loop, so a deep-context
+    // prefill ubatch (large kv) completes in one dispatch under the RADV
+    // per-dispatch watchdog — the scalar loop is too slow and is lost past ~14k
+    // keys. This is how llama.cpp does long-context prefill. cm1 reads the same
+    // within-chunk `[L, L]` mask + `prefix_len` (mask_kv_offset) the scalar path
+    // uses, so it serves chunked prefill at any offset (not just the first
+    // ubatch). Single-token decode passes `mask = None` → scalar split-K path.
     let cm1_head_ok =
         params.head_dim_k <= CM1_MAX_HEAD_DIM && params.head_dim_v <= CM1_MAX_HEAD_DIM;
 
     if ctx.device.coop_matrix
         && k.dtype == GgmlType::F16
         && v.dtype == GgmlType::F16
-        && *crate::runtime_flags::FA_CM
-        && prefix_len == 0
+        && !*crate::runtime_flags::FA_CM_DISABLED
         && cm1_head_ok
         && let Some(m) = mask
     {
@@ -412,16 +436,28 @@ pub fn record(
 
     // ---- split-K decode heuristic (replicates llama.cpp, clamped to FA_MAX_K_NUM) ----
     let base_wgs = n * ne2 * ne3;
-    // Vision full-attention over long KV (no mask + many query rows): a single
-    // workgroup walking all `kv` keys trips the per-dispatch watchdog past ~14k.
-    // Force a KV-split so each split walks ≤ VISION_FA_KV_WALK keys. The split-K
-    // branch below then uses a DIRECT dispatch (fresh forward each encode, no
-    // decode-replay) with partials sized at the actual (small) k_num rather than
-    // FA_MAX_K_NUM. Decode/prefill (mask present, or n == 1) is unaffected.
-    let vision_split = mask.is_none() && n > 1 && kv > vision_fa_kv_walk();
-    let (k_num, blocks_per_split) = if vision_split {
+    // A single workgroup walking all `kv` keys serially trips the RADV/Strix-Halo
+    // per-dispatch watchdog (device lost) once `kv` is large. The base_wgs split-K
+    // heuristic only fires when parallelism is scarce — which never happens for a
+    // multi-row forward (vision encode, or text PREFILL: `L·heads` already
+    // saturate the GPU), so those would walk `kv` unbounded. Force a KV-split for
+    // any n>1 forward whose per-workgroup walk would exceed the safe ceiling so
+    // each split walks ≤ that many keys; the split-K branch below then uses a
+    // DIRECT dispatch (no decode-replay) with partials sized at the actual k_num.
+    // Single-token decode (n == 1) is unaffected — it split-Ks via the heuristic
+    // and the indirect-replay path. The maskless (vision) and masked (text
+    // prefill) scalar variants have different per-key cost, hence different walk
+    // ceilings. The masked split-K result matches single-pass to fp-reduction
+    // noise (validated: rel logit diff ~5e-4, identical greedy argmax).
+    let walk = if mask.is_none() {
+        vision_fa_kv_walk()
+    } else {
+        prefill_fa_kv_walk()
+    };
+    let long_walk_split = n > 1 && kv > walk;
+    let (k_num, blocks_per_split) = if long_walk_split {
         let num_blocks = kv.div_ceil(FA_BC).max(1);
-        let kf = kv.div_ceil(vision_fa_kv_walk()).clamp(2, num_blocks);
+        let kf = kv.div_ceil(walk).clamp(2, num_blocks);
         (kf, num_blocks.div_ceil(kf))
     } else {
         pick_k_num_clamped(ctx.device.shader_core_count, base_wgs, kv)
@@ -537,11 +573,11 @@ pub fn record(
         // `indirect_wg` slot. Partials are sized once at `FA_MAX_K_NUM`
         // so the binding (offset, size) is constant across calls.
         // Decode replay sizes partials at FA_MAX_K_NUM for a stable binding; the
-        // vision direct-dispatch path has no replay, so size at the actual k_num
-        // (the combine indexes partials by runtime k_num — see
-        // flash_attn_split_k_reduce.slang). At a large vision n this keeps the
-        // partials ~200 MB (k_num·(hd+2)·n·heads) instead of FA_MAX_K_NUM×.
-        let knum_partials = if vision_split { k_num } else { FA_MAX_K_NUM };
+        // direct-dispatch path (vision encode / text prefill) has no replay, so
+        // size at the actual k_num (the combine indexes partials by runtime k_num
+        // — see flash_attn_split_k_reduce.slang). At a large n this keeps the
+        // partials bounded (k_num·(hd+2)·n·heads) instead of FA_MAX_K_NUM×.
+        let knum_partials = if long_walk_split { k_num } else { FA_MAX_K_NUM };
         let partials_floats = (params.head_dim_v as u64 + 2)
             * n as u64
             * ne2 as u64
@@ -549,7 +585,7 @@ pub fn record(
             * knum_partials as u64;
         let partials = ctx.alloc_tensor([partials_floats, 1, 1, 1], GgmlType::F32)?;
 
-        if vision_split {
+        if long_walk_split {
             // Direct dispatch — one workgroup per (query row, head, split):
             // grid [n, ne2 * k_num, ne3]. No indirect args (those exist only for
             // decode-cmdbuf replay where k_num varies between submits).
@@ -970,6 +1006,14 @@ pub fn pick_k_num(shader_core_count: u32, base_wgs: u32, kv: u32) -> (u32, u32) 
     if base_wgs < target {
         split_k = target / base_wgs.max(1);
     }
+    // Watchdog floor: force enough splits that no single workgroup walks more
+    // than `FA_SPLIT_MAX_WALK` keys, even when base parallelism alone wouldn't
+    // split (deep-context decode has base_wgs = n_head ≥ target, so the
+    // heuristic leaves split_k = 1 and one workgroup walks all `kv` keys →
+    // RADV device-lost past ~14k). A const (not the env helper) keeps the
+    // decode hot path free of getenv.
+    let walk_floor = kv.div_ceil(FA_SPLIT_MAX_WALK).max(1);
+    split_k = split_k.max(walk_floor);
     if split_k <= 1 {
         return (1, num_blocks);
     }
@@ -1277,10 +1321,11 @@ fn record_cm1(
     put_u(&mut push, &mut w, nb21);
     put_u(&mut push, &mut w, nb22);
     put_u(&mut push, &mut w, nb23);
+    let prefix_len = kv.saturating_sub(n);
     put_f(&mut push, &mut w, params.scale);
     put_f(&mut push, &mut w, 0.0);
     put_f(&mut push, &mut w, 0.0);
-    put_u(&mut push, &mut w, 0);
+    put_u(&mut push, &mut w, prefix_len); // mask_kv_offset: cols < this are visible prefix
     put_f(&mut push, &mut w, 0.0);
     put_f(&mut push, &mut w, 0.0);
     put_u(&mut push, &mut w, params.gqa_ratio);

@@ -39,6 +39,15 @@ impl Default for KvCacheConfig {
     }
 }
 
+/// A restorable snapshot of a [`KvCache`]'s mutable per-sequence state (write
+/// cursor + SSM/GDN recurrent buffer). Produced by [`KvCache::snapshot_state`]
+/// and consumed by [`KvCache::restore_state`].
+pub struct CacheState {
+    position: u32,
+    rope_position_lag: u32,
+    ssm: Vec<u8>,
+}
+
 /// Dtypes the cache is willing to store K or V in.
 pub const SUPPORTED_DTYPES: &[(GgmlType, &str)] = &[
     (GgmlType::F32, "f32"),
@@ -367,6 +376,53 @@ impl KvCache {
             // allocation time.
             unsafe {
                 std::ptr::write_bytes(host_ptr, 0, size);
+            }
+        }
+    }
+
+    /// Snapshot the mutable per-sequence state — the write cursor plus the
+    /// SSM/GDN recurrent buffer — so it can be restored later without rebuilding
+    /// it. Attention K/V need no snapshot: reads are bounded by `position`, and
+    /// the prefix `[0, restored_position)` is never touched by work that runs
+    /// past it. Intended as a measurement aid (the bench restores a depth-`d`
+    /// state between reps instead of re-prefilling `d` tokens each time); the
+    /// caller must ensure no GPU work is in flight (every `forward_*`
+    /// fence-waits, so calling right after one is safe).
+    pub fn snapshot_state(&self) -> CacheState {
+        let ssm = match self
+            .ssm_region
+            .as_ref()
+            .and_then(|r| r.host_ptr.map(|p| (p, r.size as usize)))
+        {
+            // SAFETY: host_ptr maps the whole HOST_VISIBLE|HOST_COHERENT region
+            // of `size` bytes (same mapping reset() writes).
+            Some((host_ptr, size)) => unsafe {
+                std::slice::from_raw_parts(host_ptr as *const u8, size).to_vec()
+            },
+            None => Vec::new(),
+        };
+        CacheState {
+            position: self.position,
+            rope_position_lag: self.rope_position_lag,
+            ssm,
+        }
+    }
+
+    /// Restore a [`KvCache::snapshot_state`] snapshot. Same no-GPU-work-in-flight
+    /// caveat as the snapshot.
+    pub fn restore_state(&mut self, s: &CacheState) {
+        self.position = s.position;
+        self.rope_position_lag = s.rope_position_lag;
+        if !s.ssm.is_empty()
+            && let Some((host_ptr, size)) = self
+                .ssm_region
+                .as_ref()
+                .and_then(|r| r.host_ptr.map(|p| (p, r.size as usize)))
+        {
+            let n = s.ssm.len().min(size);
+            // SAFETY: copying `n <= size` bytes into the mapped region.
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.ssm.as_ptr(), host_ptr, n);
             }
         }
     }

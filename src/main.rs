@@ -8,6 +8,7 @@ use crate::commands::chat::{self, ChatArgs};
 use crate::commands::detokenize::{self, DetokenizeArgs};
 use crate::commands::download::{self, DownloadArgs};
 use crate::commands::inspect::{self, InspectArgs};
+use crate::commands::probe::{self, ProbeArgs};
 use crate::commands::run::{self as run_cmd, RunArgs};
 use crate::commands::serve::{self, ServeArgs};
 use crate::commands::tokenize::{self, TokenizeArgs};
@@ -56,8 +57,12 @@ enum Command {
     Chat(ChatArgs),
     /// Run a single forward pass and print the predicted next token.
     Run(RunArgs),
-    /// Benchmark prefill + decode tok/s; optionally dump first-token logits.
+    /// Benchmark pp (prefill) + tg (decode) tok/s across a sweep of context
+    /// depths (llama-bench style).
     Bench(BenchArgs),
+    /// Internal diagnostics/perf harness: single-seq prefill+decode timing,
+    /// perplexity, logit dumps, and the concurrent scheduler throughput sweep.
+    Probe(ProbeArgs),
 }
 
 #[tokio::main]
@@ -79,6 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Chat(args) => chat::run(args).await,
         Command::Run(args) => run_cmd::run(args).await,
         Command::Bench(args) => bench::run(args).await,
+        Command::Probe(args) => probe::run(args).await,
     }
 }
 

@@ -1,17 +1,25 @@
-//! `seeker bench` — load a model, run a prefill + N decode steps, report
-//! prefill/decode tok/s and per-token latency stats. Used as the baseline
-//! signal for the Strix Halo optimization work; every change should leave
-//! `--dump-logits` output bit-identical (or within a stated tolerance) and
-//! show a positive tok/s delta on the bench numbers.
+//! `seeker bench` — llama.cpp `llama-bench`-style performance benchmark.
 //!
-//! No new dep — just `std::time::Instant`.
+//! Reports prompt-processing (pp / prefill) and token-generation (tg / decode)
+//! throughput as tokens/second, swept across a ladder of context depths so you
+//! can watch throughput degrade as the KV cache fills. Output is an aligned
+//! table of `mean ± stddev` tok/s over `--reps` repetitions, in the spirit of
+//! `llama-bench`.
 //!
-//! The dump-logits path uses `Engine::forward` (full logits readback) for
-//! the prefill, writes them to stderr as `LOGIT <i> <f32>` lines, then
-//! greedy-samples on CPU and continues the decode loop via
-//! `forward_sampled` as usual. The prefill therefore costs an extra
-//! `vocab_size * 4`-byte host readback when dumping, which is fine —
-//! `--dump-logits` is a correctness mode, not a timing mode.
+//! The workload uses SYNTHETIC tokens (a fixed in-vocab id), so this measures
+//! raw engine throughput only — NOT output quality. The compute graph and
+//! memory traffic are token-value-independent, so synthetic tokens give the
+//! same timing as a real prompt. For correctness/quality diagnostics
+//! (perplexity, golden logits) use `seeker probe`.
+//!
+//! Per `(test, depth)`: the KV cache is reset, `depth` tokens are prefilled
+//! UNTIMED, then either `--pp` tokens are processed (pp test, pure forward) or
+//! `--tg` tokens are generated one-at-a-time (tg test, the real decode path)
+//! under timing. Each config runs `--warmup` untimed iterations first (to prime
+//! JIT / shader compilation), then `--reps` timed iterations. The cache is
+//! fully reset and re-prefilled every iteration — the only state-reset strategy
+//! that is correct for hybrid SSM/recurrent models (e.g. qwen35moe), whose
+//! recurrent state has no per-position rewind.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -20,11 +28,18 @@ use std::time::Instant;
 use clap::Args;
 
 use crate::commands::download::{HfResolveArgs, resolve_hf};
-use crate::gguf::{GgmlType, GgufFile};
+use crate::gguf::{GgmlType, GgufFile, MetadataValue};
 use crate::inference::Engine;
-use crate::inference::kv_cache::{KvCacheConfig, parse_dtype};
+use crate::inference::kv_cache::{KvCache, KvCacheConfig, parse_dtype};
 use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::tokenizer::build_tokenizer;
+
+/// Default depth ladder (sparse): base case plus a doubling-ish climb to 64K.
+const DEFAULT_LADDER: &[u32] = &[0, 4096, 16384, 65536];
+/// The auto-ladder is capped here; deeper sweeps require an explicit `--depths`.
+const DEFAULT_MAX_DEPTH: u32 = 65536;
+/// Fixed synthetic token id fed for every pp/tg token. `0` is always in-vocab.
+const DUMMY: u32 = 0;
 
 #[derive(Args)]
 pub struct BenchArgs {
@@ -52,39 +67,38 @@ pub struct BenchArgs {
     #[arg(short = 'm', long = "model")]
     model: Option<PathBuf>,
 
-    /// Prompt text to feed through the prefill pass. Defaults to a stable
-    /// 500-ish-token English passage so successive bench runs measure the
-    /// same prefill workload.
-    #[arg(long, default_value = DEFAULT_PROMPT)]
-    prompt: String,
+    // ─── Workload ───────────────────────────────────────────────────────
+    /// Prompt-processing batch size timed at each depth (llama-bench -p).
+    #[arg(long = "pp", default_value_t = 512)]
+    pp: u32,
 
-    /// Number of decode tokens to time after the prefill.
-    #[arg(long, default_value_t = 64)]
-    decode_tokens: u32,
+    /// Tokens generated one-at-a-time and timed at each depth (llama-bench -n).
+    #[arg(long = "tg", default_value_t = 128)]
+    tg: u32,
 
-    /// Number of warm-up decode tokens to run before the timed loop.
-    /// Discards JIT/page-fault costs on the first few iterations.
-    #[arg(long, default_value_t = 4)]
+    /// Repetitions per (test, depth); reported as mean ± stddev (llama-bench -r).
+    #[arg(long = "reps", default_value_t = 5)]
+    reps: u32,
+
+    /// Untimed warmup iterations per (test, depth), before the timed reps.
+    #[arg(long = "warmup", default_value_t = 1)]
     warmup: u32,
 
-    /// Perplexity mode: instead of timing decode, teacher-force the model over
-    /// the prompt passage (each position's logits score the actual next token)
-    /// and report perplexity. Use to quantify KV-quant quality vs f16.
+    /// Comma-separated depth list, e.g. "0,4096,16384". Overrides the default
+    /// ladder (0,4K,16K,64K) AND is the opt-in for depths beyond 64K — explicit
+    /// entries are only bounded by the model's trained context.
     #[arg(long)]
-    perplexity: bool,
+    depths: Option<String>,
 
-    /// Dump first-token logits to stderr (one `LOGIT <i> <f32>` line per
-    /// value). Use for golden-output comparison across optimization steps:
-    /// capture once on `main`, re-run after each change, diff.
-    #[arg(long = "dump-logits")]
-    dump_logits: bool,
+    /// Run only the pp (prefill) tests.
+    #[arg(long = "pp-only", conflicts_with = "tg_only")]
+    pp_only: bool,
 
-    /// If set, truncate the tokenized prompt to this many tokens. Use to
-    /// force a prefill length aligned to BM/BN multiples for cooperative-
-    /// matrix testing.
-    #[arg(long = "prompt-tokens")]
-    prompt_tokens: Option<u32>,
+    /// Run only the tg (decode) tests.
+    #[arg(long = "tg-only")]
+    tg_only: bool,
 
+    // ─── KV cache / batching ────────────────────────────────────────────
     /// KV cache K dtype.
     #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
     cache_type_k: GgmlType,
@@ -93,90 +107,58 @@ pub struct BenchArgs {
     #[arg(long = "cache-type-v", default_value = "f16", value_parser = parse_dtype_arg)]
     cache_type_v: GgmlType,
 
-    // ─── Batch limits (llama.cpp parity) ────────────────────────────────
-    /// Logical batch size (max tokens per submit). Validation-only in this
-    /// single-sequence engine; `--ubatch-size` is the memory-relevant knob.
+    /// Logical batch size (max tokens per submit).
     #[arg(short = 'b', long = "batch-size", default_value_t = 2048)]
     batch_size: u32,
 
-    /// Physical micro-batch size: prefill is split into ≤ this many tokens
-    /// per GPU pass so scratch memory stays bounded on long prompts.
-    /// 0 = unbounded (single pass). (short: -ub)
+    /// Physical micro-batch size: prefill is split into ≤ this many tokens per
+    /// GPU pass so scratch memory stays bounded. 0 = unbounded. (short: -ub)
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: u32,
-
-    // ─── Concurrent-throughput mode ─────────────────────────────────────
-    /// Run the concurrent-throughput benchmark (drives the real `seeker serve`
-    /// scheduler with B sequences) instead of the single-sequence bench. This
-    /// is the measure gate for the continuous-batching throughput work.
-    #[arg(long)]
-    concurrent: bool,
-
-    /// Batch sizes (concurrent sequences) to sweep, comma-separated.
-    #[arg(long, default_value = "1,2,4,8")]
-    batches: String,
-
-    /// Per-sequence prompt length (tokens) for the concurrent bench.
-    #[arg(long = "prompt-len", default_value_t = 512)]
-    prompt_len: u32,
-
-    /// Per-sequence timed-decode tokens for the concurrent bench.
-    #[arg(long = "gen-len", default_value_t = 128)]
-    gen_len: u32,
-
-    /// Shared leading-prefix length (tokens) for the concurrent bench's shared
-    /// workload; 0 skips the shared workload.
-    #[arg(long = "shared-len", default_value_t = 0)]
-    shared_len: u32,
-
-    /// Concurrent bench: assert seq-0's greedy token stream is byte-identical
-    /// across batch sizes (the determinism gate every phase must keep green).
-    #[arg(long)]
-    check: bool,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
     parse_dtype(s)
 }
 
-/// A ~500-token English passage. Deterministic content; pick `--prompt` to
-/// substitute. Length is intentionally large so the prefill pass exercises
-/// the batched matmul (N>=32) path that step 2 of the optimization plan
-/// will target.
-const DEFAULT_PROMPT: &str = "The history of computing hardware covers the developments from early simple devices to aid calculation to modern day computers. The first aids to computation were purely mechanical devices which required the operator to set up the initial values of an elementary arithmetic operation, then manipulate the device to obtain the result. Later, computers represented numbers in a continuous form, for instance distance along a scale, rotation of a shaft, or a voltage. Numbers could also be represented in the form of digits, automatically manipulated by a mechanism. Although this approach generally required more complex mechanisms, it greatly increased the precision of results. The development of transistor technology and then the integrated circuit chip led to a series of breakthroughs, starting with transistor computers and then integrated circuit computers, causing digital computers to largely replace analog computers. Metal-oxide-semiconductor large-scale integration then enabled semiconductor memory and the microprocessor, leading to another key breakthrough, the miniaturized personal computer, in the 1970s. The cost of computers gradually became so low that personal computers by the 1990s, and then mobile computers in the 2000s, became ubiquitous. The earliest known tool for use in computation is the abacus, developed in the period between 2700 to 2300 BCE in Sumer. The Sumerian abacus consisted of a table of successive columns which delimited the successive orders of magnitude of their sexagesimal number system. Its original style of usage was by lines drawn in sand with pebbles. Abaci of a more modern design are still used as calculation tools today, such as the Chinese abacus.";
-
 pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
-    if args.concurrent {
-        return bench_concurrent(args).await;
-    }
     let path = resolve_model_path(&args).await?;
     let gguf = GgufFile::open(&path)?;
     let bundle = build_tokenizer(&gguf)?;
 
-    let add_special = bundle.add_bos_default || bundle.add_eos_default;
-    let encoding = bundle
-        .tokenizer
-        .encode(args.prompt.as_str(), add_special)
-        .map_err(|e| format!("tokenize failed: {e}"))?;
-    let mut prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
-    if let Some(cap) = args.prompt_tokens {
-        prompt_tokens.truncate(cap as usize);
+    let do_pp = !args.tg_only;
+    let do_tg = !args.pp_only;
+    let span = args.pp.max(args.tg); // headroom needed on top of each depth
+
+    let trained_ctx = gguf.trained_ctx_len();
+    let (depths, skipped) = build_depths(&args, trained_ctx, span);
+    if let Some(tc) = trained_ctx {
+        eprintln!("trained context: {tc} tokens");
+    } else {
+        eprintln!("trained context: unknown (model metadata missing context_length)");
     }
-    let prefill_tokens = prompt_tokens.len();
-    if prefill_tokens == 0 {
-        return Err("tokenized prompt is empty".into());
+    for (d, reason) in &skipped {
+        eprintln!("  skipping depth {d}: {reason}");
+    }
+    if depths.is_empty() {
+        return Err(format!(
+            "no depths fit: need {span} tokens of headroom on top of each depth \
+             within the trained context (lower --pp/--tg or pick smaller --depths)"
+        )
+        .into());
     }
 
+    // ── Engine + model ──────────────────────────────────────────────────
     let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
-    tracing::info!(device = %engine.device.name(), "vulkan device opened");
+    let backend = engine.device.name();
+    tracing::info!(device = %backend, "vulkan device opened");
     let weights = engine.upload_weights(&gguf)?;
     let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
 
-    let max_seq_len = (prefill_tokens as u32)
-        .saturating_add(args.warmup)
-        .saturating_add(args.decode_tokens);
-    // Size the scratch (compute buffer) for this model + n_ubatch before the
-    // prefill, replacing the Engine::new placeholder.
+    // Size scratch + KV for the DEEPEST config (deepest live length is
+    // max_depth + max(pp, tg)). Allocated once for the whole sweep.
+    let max_depth = *depths.iter().max().expect("non-empty");
+    let max_seq_len = max_depth.saturating_add(span).saturating_add(1);
     engine.allocate_scratch(model.scratch_bytes_estimate(
         args.ubatch_size,
         max_seq_len,
@@ -184,30 +166,26 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         args.cache_type_v,
     ))?;
     let dims = model.cache_dims();
-    let cache_config = KvCacheConfig {
-        k_dtype: args.cache_type_k,
-        v_dtype: args.cache_type_v,
-        max_seq_len,
-        n_head: dims.n_head,
-    };
-    let mut cache =
-        engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
-    eprintln!(
-        "KV cache: k={:?} v={:?} n_layer={} head_dim={} n_head_kv={} max_seq_len={} \u{2192} {} bytes ({:.1} MiB)",
-        args.cache_type_k,
-        args.cache_type_v,
+    let mut cache = engine.allocate_kv_cache(
         dims.n_layer,
         dims.head_dim,
         dims.n_head_kv,
+        KvCacheConfig {
+            k_dtype: args.cache_type_k,
+            v_dtype: args.cache_type_v,
+            max_seq_len,
+            n_head: dims.n_head,
+        },
+    )?;
+    eprintln!(
+        "KV cache: k={:?} v={:?} max_seq_len={} \u{2192} {:.1} MiB",
+        args.cache_type_k,
+        args.cache_type_v,
         max_seq_len,
-        cache.kv_bytes(),
         cache.kv_bytes() as f64 / (1024.0 * 1024.0),
     );
-    // Hybrid models (qwen35moe etc.) need persistent SSM/GDN recurrent state
-    // carried across forwards — including across chunked-prefill ubatches and
-    // decode steps. Without this the SSM state resets every forward (decode
-    // produces garbage; chunked prefill diverges from single-pass). Mirrors
-    // run.rs / chat.rs.
+    // Hybrid models (qwen35moe etc.) carry persistent SSM/GDN recurrent state
+    // across forwards; allocate it so cache.reset() has a region to zero.
     if let Some(ssm) = model.ssm_state_dims() {
         cache.allocate_ssm_state(
             &engine.device,
@@ -217,9 +195,160 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         )?;
     }
 
-    // Greedy sampler — bench is for tok/s and golden-output stability, not
-    // sampling behavior. Temperature 0, no penalties, no top-k/p/min-p.
-    let mut sampler = Sampler::new(SamplerConfig {
+    // Greedy sampler — bench measures tok/s, not sampling behavior.
+    let mut sampler = Sampler::new(greedy_config());
+    // Reusable buffer of synthetic tokens; any chunk we feed is a prefix of it.
+    let dummies = vec![DUMMY; max_seq_len as usize];
+
+    // ── Table metadata (constant across rows; repeated per row, grep-able) ──
+    let model_name = model_name(&gguf);
+    let size_str = human_size(gguf.file_size() as u64);
+    let params_str = human_params(count_params(&gguf));
+
+    eprintln!(
+        "model: {model_name} | {size_str} | {params_str} params | backend {backend}\n\
+         sweep: pp={} tg={} reps={} warmup={} depths={:?}",
+        args.pp, args.tg, args.reps, args.warmup, depths,
+    );
+
+    // ── Sweep: test-major (all pp depths, then all tg depths) ────────────
+    let mut tests: Vec<(bool, u32)> = Vec::new(); // (is_pp, n)
+    if do_pp {
+        tests.push((true, args.pp));
+    }
+    if do_tg {
+        tests.push((false, args.tg));
+    }
+
+    let mut rows: Vec<[String; 6]> = Vec::new();
+    for (is_pp, n) in tests {
+        let kind = if is_pp { "pp" } else { "tg" };
+        for &depth in &depths {
+            // Prefill to `depth` ONCE (untimed), then snapshot the recurrent
+            // state and restore it between reps — far cheaper than re-prefilling
+            // `depth` tokens every rep, and correct for hybrid SSM models (the
+            // timed window only writes attention K/V at [depth, depth+n), which
+            // the restored `position` hides; the SSM region is restored exactly).
+            cache.reset();
+            sampler.reset_recent();
+            feed_kv(&mut engine, &*model, &mut cache, &dummies, depth)?; // UNTIMED prefill
+            let snap = cache.snapshot_state();
+
+            let mut samples = Vec::with_capacity(args.reps as usize);
+            for it in 0..(args.warmup + args.reps) {
+                cache.restore_state(&snap);
+                sampler.reset_recent();
+                let t0 = Instant::now();
+                if is_pp {
+                    feed_kv(&mut engine, &*model, &mut cache, &dummies, n)?;
+                } else {
+                    for _ in 0..n {
+                        let pos = cache.position;
+                        engine.forward_sampled(
+                            &*model,
+                            &mut cache,
+                            &dummies[..1],
+                            pos,
+                            &mut sampler,
+                        )?;
+                    }
+                }
+                let secs = t0.elapsed().as_secs_f64();
+                if it >= args.warmup {
+                    samples.push(n as f64 / secs.max(1e-9));
+                }
+            }
+            let m = mean(&samples);
+            let sd = stddev(&samples);
+            rows.push([
+                model_name.clone(),
+                size_str.clone(),
+                params_str.clone(),
+                backend.clone(),
+                test_label(kind, n, depth),
+                format!("{m:.2} \u{00b1} {sd:.2}"),
+            ]);
+        }
+    }
+
+    print_table(
+        ["model", "size", "params", "backend", "test", "t/s"],
+        [false, true, true, false, false, true], // right-align numeric cols
+        &rows,
+    );
+    Ok(())
+}
+
+/// Feed `n` synthetic tokens into the cache as a pure KV forward (no logits /
+/// sampling), chunked by `n_ubatch` so scratch stays bounded on long prefills.
+/// `forward_kv_only` does not chunk internally, so we do it here (the same
+/// pattern `probe.rs` uses for chunked --dump-logits prefill).
+fn feed_kv(
+    engine: &mut Engine,
+    model: &dyn crate::models::Model,
+    cache: &mut KvCache,
+    dummies: &[u32],
+    n: u32,
+) -> Result<(), Box<dyn Error>> {
+    let total = n as usize;
+    if total == 0 {
+        return Ok(());
+    }
+    let ub = engine.n_ubatch as usize;
+    let chunk = if ub == 0 { total } else { ub };
+    let mut done = 0usize;
+    while done < total {
+        let take = chunk.min(total - done);
+        let pos = cache.position;
+        engine.forward_kv_only(model, cache, &dummies[..take], pos)?;
+        done += take;
+    }
+    Ok(())
+}
+
+/// Build the depth list, filtered + sorted + deduped, plus the list of skipped
+/// depths with a reason (for the warning printout).
+fn build_depths(
+    args: &BenchArgs,
+    trained_ctx: Option<u32>,
+    span: u32,
+) -> (Vec<u32>, Vec<(u32, String)>) {
+    let explicit = args.depths.is_some();
+    let raw: Vec<u32> = match &args.depths {
+        Some(s) => s
+            .split(',')
+            .filter_map(|x| x.trim().parse::<u32>().ok())
+            .collect(),
+        None => DEFAULT_LADDER.to_vec(),
+    };
+
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for d in raw {
+        // The 64K cap applies only to the auto-ladder; an explicit --depths
+        // list is treated as an intentional opt-in past it.
+        if !explicit && d > DEFAULT_MAX_DEPTH {
+            skipped.push((
+                d,
+                "above 64K default cap (use --depths to opt in)".to_string(),
+            ));
+            continue;
+        }
+        if let Some(tc) = trained_ctx
+            && d.saturating_add(span) > tc
+        {
+            skipped.push((d, format!("d+{span} exceeds trained context {tc}")));
+            continue;
+        }
+        kept.push(d);
+    }
+    kept.sort_unstable();
+    kept.dedup();
+    (kept, skipped)
+}
+
+fn greedy_config() -> SamplerConfig {
+    SamplerConfig {
         temperature: 0.0,
         top_k: 0,
         top_p: 1.0,
@@ -230,228 +359,112 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         penalty_last_n: 0,
         seed: 0,
         logit_bias: Vec::new(),
-    });
-
-    // ── Perplexity mode ─────────────────────────────────────────────────
-    // Teacher-force the model over the prompt passage: feed one token at a
-    // time, and the last-token logits after feeding tokens[..=i] score the
-    // actual next token tokens[i+1]. PPL = exp(mean NLL). Quantifies KV-quant
-    // quality vs an f16 baseline on the identical text.
-    if args.perplexity {
-        if prompt_tokens.len() < 2 {
-            return Err("perplexity needs >= 2 prompt tokens".into());
-        }
-        let mut total_nll = 0.0f64;
-        let mut count = 0usize;
-        let t = Instant::now();
-        for i in 0..prompt_tokens.len() - 1 {
-            let pos = cache.position;
-            let logits = engine.forward(model.weights(), |ctx| {
-                model
-                    .record_forward(ctx, &mut cache, &prompt_tokens[i..i + 1], pos, true)
-                    .map(|v| v.expect("compute_logits=true must return logits").range())
-            })?;
-            // NLL of the true next token = logsumexp(logits) - logits[target].
-            let target = prompt_tokens[i + 1] as usize;
-            let maxv = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let lse = (maxv as f64)
-                + logits
-                    .iter()
-                    .map(|&v| ((v - maxv) as f64).exp())
-                    .sum::<f64>()
-                    .ln();
-            total_nll += lse - logits[target] as f64;
-            count += 1;
-        }
-        let mean_nll = total_nll / count as f64;
-        eprintln!(
-            "perplexity: k={:?} v={:?} tokens={} mean_nll={:.5} ppl={:.5}  ({:.1}s)",
-            args.cache_type_k,
-            args.cache_type_v,
-            count,
-            mean_nll,
-            mean_nll.exp(),
-            t.elapsed().as_secs_f64(),
-        );
-        return Ok(());
     }
+}
 
-    // ── Prefill ─────────────────────────────────────────────────────────
-    //
-    // With --dump-logits we go through `engine.forward()` so we can read
-    // the last-token logits buffer back; we then greedy-sample on the CPU.
-    // Without it we go through `forward_sampled` (the path production
-    // decode uses), which keeps the sampler chain on the GPU and reads
-    // back just the chosen token id. Either way the model's `record_forward`
-    // emits identical compute work. The dumped logits are last-token-only
-    // (count == n_vocab) — the correct comparison point vs llama.cpp.
-    let position_offset = cache.position;
-    let t_prefill = Instant::now();
-    let next_id = if args.dump_logits {
-        // Mirror forward_sampled's chunking so long --dump-logits prompts stay
-        // within the scratch budget: feed every ubatch but the last as a
-        // KV-only pass, then run the final chunk through engine.forward() for
-        // the last-token logits readback.
-        let ub = engine.n_ubatch as usize;
-        if ub != 0 {
-            let mut s = 0usize;
-            while s + ub < prompt_tokens.len() {
-                let pos = cache.position;
-                engine.forward_kv_only(&*model, &mut cache, &prompt_tokens[s..s + ub], pos)?;
-                s += ub;
-            }
-        }
-        let tail_start = cache.position as usize;
-        let tail = &prompt_tokens[tail_start..];
-        let tail_pos = cache.position;
-        let logits = engine.forward(model.weights(), |ctx| {
-            model
-                .record_forward(
-                    ctx, &mut cache, tail, tail_pos, /*compute_logits=*/ true,
-                )
-                .map(|view| {
-                    view.expect("compute_logits=true must return logits")
-                        .range()
-                })
-        })?;
-        let prefill_elapsed = t_prefill.elapsed();
-        let mut stderr = std::io::stderr().lock();
-        use std::io::Write as _;
-        writeln!(stderr, "LOGITS_BEGIN count={}", logits.len())?;
-        for (i, &v) in logits.iter().enumerate() {
-            writeln!(stderr, "LOGIT {i} {v:.8e}")?;
-        }
-        writeln!(stderr, "LOGITS_END")?;
-        let next = greedy_argmax(&logits);
-        sampler.accept(next);
-        eprintln!(
-            "prefill: {prefill_tokens} tok in {:.3}s ({:.1} tok/s)",
-            prefill_elapsed.as_secs_f64(),
-            prefill_tokens as f64 / prefill_elapsed.as_secs_f64().max(1e-9),
-        );
-        next
+fn test_label(kind: &str, n: u32, depth: u32) -> String {
+    if depth == 0 {
+        format!("{kind}{n}")
     } else {
-        engine.forward_sampled(
-            &*model,
-            &mut cache,
-            &prompt_tokens,
-            position_offset,
-            &mut sampler,
-        )?
-    };
-    let prefill_secs = t_prefill.elapsed().as_secs_f64();
-
-    // ── Warm-up decode ──────────────────────────────────────────────────
-    let mut cur = next_id;
-    for _ in 0..args.warmup {
-        let position_offset = cache.position;
-        cur = engine.forward_sampled(&*model, &mut cache, &[cur], position_offset, &mut sampler)?;
+        format!("{kind}{n} @ d{depth}")
     }
-
-    // ── Timed decode ────────────────────────────────────────────────────
-    let mut per_token_ns: Vec<u128> = Vec::with_capacity(args.decode_tokens as usize);
-    for _ in 0..args.decode_tokens {
-        let position_offset = cache.position;
-        let t0 = Instant::now();
-        cur = engine.forward_sampled(&*model, &mut cache, &[cur], position_offset, &mut sampler)?;
-        per_token_ns.push(t0.elapsed().as_nanos());
-    }
-
-    let decode_secs: f64 = per_token_ns.iter().sum::<u128>() as f64 / 1e9;
-    let mean_ms = decode_secs * 1000.0 / per_token_ns.len().max(1) as f64;
-    let median_ms = {
-        let mut sorted = per_token_ns.clone();
-        sorted.sort_unstable();
-        let mid = sorted.len() / 2;
-        if sorted.is_empty() {
-            0.0
-        } else if sorted.len() % 2 == 1 {
-            sorted[mid] as f64 / 1e6
-        } else {
-            (sorted[mid - 1] + sorted[mid]) as f64 / 2.0 / 1e6
-        }
-    };
-    let min_ms = per_token_ns.iter().min().copied().unwrap_or(0) as f64 / 1e6;
-    let max_ms = per_token_ns.iter().max().copied().unwrap_or(0) as f64 / 1e6;
-
-    let prefill_tps = prefill_tokens as f64 / prefill_secs.max(1e-9);
-    let decode_tps = args.decode_tokens as f64 / decode_secs.max(1e-9);
-
-    println!(
-        "prefill: {prefill_tokens} tok in {:.3}s -> {prefill_tps:.1} tok/s",
-        prefill_secs
-    );
-    println!(
-        "decode:  {decode_n} tok in {decode_secs:.3}s -> {decode_tps:.1} tok/s  \
-         (mean {mean_ms:.2} ms, median {median_ms:.2} ms, min {min_ms:.2} ms, max {max_ms:.2} ms, warmup {warmup_n})",
-        decode_n = args.decode_tokens,
-        warmup_n = args.warmup,
-    );
-    Ok(())
 }
 
-fn greedy_argmax(logits: &[f32]) -> u32 {
-    let mut best_i = 0u32;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best_i = i as u32;
-        }
+fn mean(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        0.0
+    } else {
+        xs.iter().sum::<f64>() / xs.len() as f64
     }
-    best_i
 }
 
-/// Concurrent-throughput benchmark: build a `WorkerConfig`, then drive the real
-/// serve scheduler with B synthetic sequences on a dedicated worker thread (see
-/// [`crate::server::inference::run_concurrent_bench`]). A fixed small context
-/// (`prompt_len + warmup + gen_len + slack`) keeps the decode-focused runs cheap
-/// and comparable across phases.
-async fn bench_concurrent(args: BenchArgs) -> Result<(), Box<dyn Error>> {
-    use crate::server::inference::{BenchPlan, WorkerConfig, run_concurrent_bench};
-
-    let path = resolve_model_path(&args).await?;
-    let batches: Vec<u32> = args
-        .batches
-        .split(',')
-        .filter_map(|s| s.trim().parse::<u32>().ok())
-        .filter(|&b| b > 0)
-        .collect();
-    if batches.is_empty() {
-        return Err("--batches parsed to an empty list (expected e.g. \"1,2,4,8\")".into());
+/// Sample standard deviation (n-1), matching llama-bench's `stdev`.
+fn stddev(xs: &[f64]) -> f64 {
+    if xs.len() < 2 {
+        return 0.0;
     }
-    let max_b = *batches.iter().max().expect("non-empty");
-    let ctx_size = args
-        .prompt_len
-        .saturating_add(args.warmup)
-        .saturating_add(args.gen_len)
-        .saturating_add(64);
+    let m = mean(xs);
+    let var = xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (xs.len() - 1) as f64;
+    var.sqrt()
+}
 
-    let cfg = WorkerConfig {
-        model_path: path,
-        mmproj_path: None,
-        n_ubatch: args.ubatch_size,
-        n_batch: args.batch_size,
-        ctx_size,
-        cache_type_k: args.cache_type_k,
-        cache_type_v: args.cache_type_v,
-        n_slots: max_b, // explicit (bench pins the slot count per sweep)
-        parallel_max: max_b,
-        mem_fraction: 0.9,
-    };
-    let plan = BenchPlan {
-        batches,
-        prompt_len: args.prompt_len,
-        gen_len: args.gen_len,
-        shared_len: args.shared_len,
-        warmup: args.warmup,
-        prompt: args.prompt.clone(),
-        check: args.check,
-    };
+/// Total parameter count = Σ (product of each tensor's dims). llama.cpp counts
+/// the same way (sum of `ggml_nelements`); no metadata key is reliably present.
+fn count_params(gguf: &GgufFile) -> u64 {
+    gguf.tensors()
+        .iter()
+        .map(|t| t.dims.iter().product::<u64>())
+        .sum()
+}
 
-    match tokio::task::spawn_blocking(move || run_concurrent_bench(cfg, plan)).await {
-        Ok(r) => r.map_err(|e| e.into()),
-        Err(e) => Err(format!("bench worker thread join failed: {e}").into()),
+fn model_name(gguf: &GgufFile) -> String {
+    match gguf.get("general.name") {
+        Some(MetadataValue::String(s)) => s.clone(),
+        _ => gguf.architecture().unwrap_or("unknown").to_string(),
+    }
+}
+
+fn human_params(n: u64) -> String {
+    let nf = n as f64;
+    if nf >= 1e9 {
+        format!("{:.2} B", nf / 1e9)
+    } else if nf >= 1e6 {
+        format!("{:.2} M", nf / 1e6)
+    } else if nf >= 1e3 {
+        format!("{:.2} K", nf / 1e3)
+    } else {
+        format!("{n}")
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else {
+        format!("{:.2} MiB", b / MIB)
+    }
+}
+
+/// Print a markdown-style aligned table. `right` marks columns to right-align.
+/// Widths are computed by char count so the `±` (one char) aligns correctly.
+fn print_table(headers: [&str; 6], right: [bool; 6], rows: &[[String; 6]]) {
+    let mut w = [0usize; 6];
+    for (wi, h) in w.iter_mut().zip(headers.iter()) {
+        *wi = h.chars().count();
+    }
+    for r in rows {
+        for (wi, c) in w.iter_mut().zip(r.iter()) {
+            *wi = (*wi).max(c.chars().count());
+        }
+    }
+    let line = |cells: &[String; 6]| {
+        let mut out = String::from("|");
+        for ((cell, &width), &r) in cells.iter().zip(w.iter()).zip(right.iter()) {
+            out.push(' ');
+            out.push_str(&pad(cell, width, r));
+            out.push_str(" |");
+        }
+        out
+    };
+    let header_cells: [String; 6] = std::array::from_fn(|i| headers[i].to_string());
+    let sep_cells: [String; 6] = std::array::from_fn(|i| "-".repeat(w[i]));
+    println!("{}", line(&header_cells));
+    println!("{}", line(&sep_cells));
+    for r in rows {
+        println!("{}", line(r));
+    }
+}
+
+fn pad(s: &str, w: usize, right: bool) -> String {
+    let len = s.chars().count();
+    let fill = " ".repeat(w.saturating_sub(len));
+    if right {
+        format!("{fill}{s}")
+    } else {
+        format!("{s}{fill}")
     }
 }
 

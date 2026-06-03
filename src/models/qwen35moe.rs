@@ -428,7 +428,19 @@ impl Model for Qwen35MoeModel {
         } else {
             0
         };
-        let raw = per_layer + residual + mask + logits + staging;
+        // Flash-attn prefill split-K partials on the attention layers: a chunk
+        // attending to a long KV prefix splits the KV across `k_num` workgroups,
+        // each writing a (head_dim_v+2)·l·n_head partial slice (alloc'd from
+        // scratch per FA call, reclaimed per layer). Size for the deepest split;
+        // keep `fa_walk` in sync with `flash_attn::prefill_fa_kv_walk()`.
+        let fa_walk = 8192u64;
+        let fa_partials = if max_seq_len as u64 > fa_walk {
+            let fa_k_num = (max_seq_len as u64).div_ceil(fa_walk);
+            (p.head_dim_v as u64 + 2) * l * p.n_head as u64 * fa_k_num * 4
+        } else {
+            0
+        };
+        let raw = per_layer + residual + mask + logits + staging + fa_partials;
         raw + raw / 3 + (32 << 20) // +33% headroom + 32 MiB slack
     }
 

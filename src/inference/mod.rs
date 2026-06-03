@@ -788,11 +788,13 @@ impl Engine {
         if l == 0 {
             return Err("forward_sampled called with empty token list".into());
         }
-        // Chunked prefill: a prompt longer than `n_ubatch` is fed in
-        // sequential `≤ n_ubatch`-token passes so the per-pass scratch
-        // working set stays bounded regardless of prompt length. Only the
-        // final chunk computes logits + samples. `n_ubatch == 0` disables
-        // chunking (legacy single-pass behavior).
+        // Chunked prefill: a prompt longer than `n_ubatch` is fed in sequential
+        // `≤ n_ubatch`-token passes so the per-pass scratch working set stays
+        // bounded regardless of prompt length. Deep-context attention is kept
+        // under the RADV watchdog by the coopmat flash-attn kernel (fast enough
+        // for a full ubatch in one dispatch), not by shrinking the chunk. Only
+        // the final chunk computes logits + samples. `n_ubatch == 0` disables
+        // chunking (legacy single-pass).
         if self.n_ubatch != 0 && l > self.n_ubatch {
             return self.forward_sampled_chunked(model, cache, tokens, position_offset, sampler);
         }

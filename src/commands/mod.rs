@@ -4,6 +4,7 @@ pub mod chat_cache;
 pub mod detokenize;
 pub mod download;
 pub mod inspect;
+pub mod probe;
 pub mod run;
 pub mod serve;
 pub mod tokenize;

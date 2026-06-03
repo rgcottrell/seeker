@@ -75,7 +75,11 @@ struct FaParams {
     float scale;
     float max_bias;
     float logit_softcap;
-    uint  mask_n_head_log2;
+    // Length of the always-visible cached prefix (= position_offset). KV columns
+    // < this carry no mask entry (visible); columns >= this index the within-
+    // chunk [N × N] mask at (col - mask_kv_offset). Matches the scalar path so
+    // cm1 serves chunked prefill at any offset, not just the first ubatch.
+    uint  mask_kv_offset;
     float m0;
     float m1;
     uint gqa_ratio;
@@ -160,8 +164,11 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     float Lf[ROWS_PER_THREAD], Mf[ROWS_PER_THREAD];
     [unroll] for (uint r = 0; r < ROWS_PER_THREAD; ++r) { Lf[r] = 0.0f; Mf[r] = NEG_BIG; }
 
-    const uint m_off_base = (iq3 % p.nem3) * p.nem2 * p.nem1 * p.KV
-                          + (iq2 % p.nem2) * p.nem1 * p.KV;
+    // Mask is the within-chunk [N × N] causal triangle (column stride = p.N),
+    // NOT the full [KV × N]: prefix columns (< mask_kv_offset) are always visible
+    // and carry no mask entry. Mirrors the scalar path's `write_causal_mask`.
+    const uint m_off_base = (iq3 % p.nem3) * p.nem2 * p.nem1 * p.N
+                          + (iq2 % p.nem2) * p.nem1 * p.N;
 
     // KV block range for this split. `p.split_kv` is the blocks-per-split (host
     // sets k_num=1, split_kv=num_blocks for the single-pass case). Each split
@@ -196,16 +203,19 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         matS.Store<CoopMatMatrixLayout::RowMajor>(S_sh, sg * MatBc * S_STRIDE, S_STRIDE);
         GroupMemoryBarrierWithGroupSync();
 
-        // ── Optional causal/window mask add (seeker [KV, L] layout, F16).
+        // ── Optional causal/window mask add (within-chunk [N, N] layout, F16).
+        // Columns < mask_kv_offset are the always-visible cached prefix (no mask
+        // entry); columns >= it index the within-chunk mask at (col - offset).
         if (MASK_ENABLE != 0) {
             [unroll] for (uint ci = 0; ci < COLS_PER_THREAD; ++ci) {
                 const uint c = ci * COLS_PER_ITER + col_tid;
-                if (kv_base + c < p.KV) {
+                if (kv_base + c < p.KV && kv_base + c >= p.mask_kv_offset) {
                     [unroll] for (uint r = 0; r < ROWS_PER_THREAD; ++r) {
                         const uint row = row_tid * ROWS_PER_THREAD + r;
                         if (i_row0 + row < p.N) {
-                            const uint m_off = m_off_base + (i_row0 + row) * p.KV;
-                            S_sh[c * S_STRIDE + row] += float(data_m[m_off + kv_base + c]);
+                            const uint m_off = m_off_base + (i_row0 + row) * p.N;
+                            S_sh[c * S_STRIDE + row] +=
+                                float(data_m[m_off + (kv_base + c - p.mask_kv_offset)]);
                         }
                     }
                 }

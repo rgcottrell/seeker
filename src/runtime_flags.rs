@@ -57,11 +57,18 @@ pub static MM_CM_DISABLED: LazyLock<bool> = LazyLock::new(|| {
 /// `0` disables, `1` is a no-op, `n>=2` forces that split factor.
 pub static MM_SPLIT_K: LazyLock<Option<u32>> = LazyLock::new(|| env_u32("SEEKER_MM_SPLIT_K"));
 
-/// `SEEKER_FA_CM=1` — route masked (prefill) flash-attention through the
-/// cooperative-matrix kernel. Opt-in (near-neutral on small-head text decode).
-/// The vision tower uses cm1 by default — see `FA_CM_VISION_DISABLED`.
-pub static FA_CM: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("SEEKER_FA_CM").is_ok_and(|v| v == "1"));
+/// Masked (prefill) flash-attention coopmat gate (`SEEKER_FA_CM=0` to fall back
+/// to the scalar path). Default-on: the cm1 coopmat kernel is ~5× faster per key
+/// than the scalar loop, so a deep-context prefill ubatch (large kv) finishes in
+/// one dispatch under the RADV per-dispatch watchdog — the scalar loop is too
+/// slow and trips it (device-lost) past ~14k keys. Mirrors llama.cpp, which uses
+/// coopmat FA by default for exactly this reason. F16 KV + head_dim ≤ 128 only;
+/// other combos fall through to scalar.
+pub static FA_CM_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SEEKER_FA_CM")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+});
 
 /// Vision-tower flash-attention coopmat gate (`SEEKER_FA_CM_VISION=0` to fall
 /// back to the scalar split-K path). Default-on: the register-O coopmat cm1
