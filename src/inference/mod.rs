@@ -224,6 +224,18 @@ impl Engine {
         kv_cache::KvCache::new(&self.device, n_layer, head_dim, n_head_kv, config)
     }
 
+    /// Allocate a KV cache whose K/V dims vary per layer (gemma4's interleaved
+    /// sliding-window / global attention). `head_dims[il]` / `n_head_kvs[il]`
+    /// size layer `il`'s buffer.
+    pub fn allocate_kv_cache_per_layer(
+        &self,
+        head_dims: &[u32],
+        n_head_kvs: &[u32],
+        config: kv_cache::KvCacheConfig,
+    ) -> Result<kv_cache::KvCache, Box<dyn Error>> {
+        kv_cache::KvCache::new_per_layer(&self.device, head_dims, n_head_kvs, config)
+    }
+
     /// Run a forward pass: the closure records dispatches into the
     /// `DispatchContext` and returns the `BufferRange` containing the final
     /// logits (vocab_size F32s). The engine handles begin/end/submit/wait

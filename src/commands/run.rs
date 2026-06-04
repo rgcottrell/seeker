@@ -420,8 +420,12 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         max_seq_len,
         n_head: dims.n_head,
     };
-    let mut cache =
-        engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
+    let mut cache = match model.cache_per_layer_dims() {
+        Some((hd, nkv)) => engine.allocate_kv_cache_per_layer(&hd, &nkv, cache_config)?,
+        None => {
+            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?
+        }
+    };
     // Hybrid models (qwen35moe etc.) also need persistent SSM/GDN
     // recurrent state. Allocate it on the cache; the model reads/writes
     // it across forwards.

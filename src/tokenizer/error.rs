@@ -15,7 +15,7 @@ pub enum TokenizerError {
     WrongFieldType(&'static str),
 
     #[error(
-        "unsupported tokenizer.ggml.model: `{0}`; only `gpt2` (BPE) and `llama` (Unigram) are wired up"
+        "unsupported tokenizer.ggml.model: `{0}`; only `gpt2` (BPE), `llama` (Unigram), and `gemma4` (BPE+Metaspace) are wired up"
     )]
     UnsupportedModel(String),
 

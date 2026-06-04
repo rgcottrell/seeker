@@ -166,17 +166,18 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         args.cache_type_v,
     ))?;
     let dims = model.cache_dims();
-    let mut cache = engine.allocate_kv_cache(
-        dims.n_layer,
-        dims.head_dim,
-        dims.n_head_kv,
-        KvCacheConfig {
-            k_dtype: args.cache_type_k,
-            v_dtype: args.cache_type_v,
-            max_seq_len,
-            n_head: dims.n_head,
-        },
-    )?;
+    let cache_config = KvCacheConfig {
+        k_dtype: args.cache_type_k,
+        v_dtype: args.cache_type_v,
+        max_seq_len,
+        n_head: dims.n_head,
+    };
+    let mut cache = match model.cache_per_layer_dims() {
+        Some((hd, nkv)) => engine.allocate_kv_cache_per_layer(&hd, &nkv, cache_config)?,
+        None => {
+            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?
+        }
+    };
     eprintln!(
         "KV cache: k={:?} v={:?} max_seq_len={} \u{2192} {:.1} MiB",
         args.cache_type_k,

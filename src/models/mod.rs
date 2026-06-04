@@ -11,6 +11,7 @@ use crate::inference::kv_cache::KvCache;
 use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
 
+pub mod gemma4;
 pub mod llama;
 pub mod qwen35moe;
 
@@ -31,6 +32,15 @@ pub trait Model: Send + Sync {
     fn vocab_size(&self) -> u32;
     /// Architecture params needed to allocate a KV cache.
     fn cache_dims(&self) -> CacheDims;
+
+    /// Per-layer `(head_dims, n_head_kvs)` for architectures whose KV
+    /// dimensions vary by layer (gemma4's interleaved sliding-window / global
+    /// attention). `None` ⇒ uniform dims from [`cache_dims`]. When `Some`, both
+    /// vectors have length `cache_dims().n_layer` and callers must allocate via
+    /// [`crate::inference::Engine::allocate_kv_cache_per_layer`].
+    fn cache_per_layer_dims(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+        None
+    }
 
     /// Optional per-layer SSM state. Pure-attention models return None.
     /// Hybrid models (qwen35moe) return Some so the engine allocates a
@@ -348,6 +358,9 @@ pub fn open(
         .architecture()
         .ok_or(ModelError::MissingMetadata("general.architecture"))?;
     match arch {
+        "gemma4" => Ok(Box::new(gemma4::Gemma4Model::new(
+            gguf, weights, tokenizer,
+        )?)),
         "llama" => Ok(Box::new(llama::LlamaModel::new(gguf, weights, tokenizer)?)),
         "qwen35moe" => Ok(Box::new(qwen35moe::Qwen35MoeModel::new(
             gguf,

@@ -377,8 +377,12 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         max_seq_len: ctx_size,
         n_head: dims.n_head,
     };
-    let mut cache =
-        engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
+    let mut cache = match model.cache_per_layer_dims() {
+        Some((hd, nkv)) => engine.allocate_kv_cache_per_layer(&hd, &nkv, cache_config)?,
+        None => {
+            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?
+        }
+    };
     if let Some(ssm) = model.ssm_state_dims() {
         cache.allocate_ssm_state(
             &engine.device,
