@@ -1328,9 +1328,12 @@ impl Engine {
         }
         // The image consumed `n_tok = nx*ny` KV slots but advanced the logical
         // M-RoPE cursor by only `max(nx,ny)`; subsequent (decode) forwards read
-        // this lag to keep their positions continuous past the image.
-        let n_tok = image_nx * image_ny;
-        cache.rope_position_lag += (n_tok - image_nx.max(image_ny)) as u32;
+        // this lag to keep their positions continuous past the image. gemma4 uses
+        // sequential 1D positions (image advances the cursor 1:1), so no lag.
+        if model.image_uses_mrope() {
+            let n_tok = image_nx * image_ny;
+            cache.rope_position_lag += (n_tok - image_nx.max(image_ny)) as u32;
+        }
         Ok(token)
     }
 

@@ -21,8 +21,10 @@
 //!     is correct (no runtime +1).
 //!
 //! First cut: single-sequence [`Model::record_forward`] (run / chat / bench /
-//! probe). Sliding-window masking is NOT yet applied — correct for contexts
-//! ≤ the window (1024); longer contexts need the windowed mask (TODO).
+//! probe). Sliding-window layers apply an analytical in-shader window (the
+//! flash-attn `swa_window` slot); global layers attend the full context. Vision
+//! input is spliced into the residual after the embedding scale via
+//! [`Model::record_forward_image_chunk`] (linear positions, no M-RoPE).
 
 use std::error::Error;
 
@@ -227,7 +229,82 @@ impl Model for Gemma4Model {
         position_offset: u32,
         compute_logits: bool,
     ) -> Result<Option<TensorView>, Box<dyn Error>> {
-        use crate::inference::command::record_compute_barriers;
+        self.forward_inner(ctx, cache, tokens, position_offset, compute_logits, None)
+    }
+
+    /// gemma4 image tokens use plain sequential 1D positions (no M-RoPE), so the
+    /// engine must not apply a `rope_position_lag` after an image.
+    fn image_uses_mrope(&self) -> bool {
+        false
+    }
+
+    /// Prefill one chunk of an image-containing prompt: the `<|image>`-pad
+    /// placeholder tokens in the chunk are replaced (post-embedding) by the
+    /// vision encoder's output columns. Positions stay sequential.
+    fn record_forward_image_chunk(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        chunk_tokens: &[u32],
+        chunk_global_start: usize,
+        image_embeddings: &[f32],
+        image_global_start: usize,
+        image_nx: usize,
+        image_ny: usize,
+        _prompt_pos0: u32,
+        compute_logits: bool,
+    ) -> Result<Option<TensorView>, Box<dyn Error>> {
+        let n_embd = self.params.n_embd as usize;
+        let n_tok = image_nx * image_ny;
+        if image_embeddings.len() != n_embd * n_tok {
+            return Err(format!(
+                "gemma4 image embeddings len {} != n_embd {n_embd} * n_tok {n_tok} \
+                 (vision projection_dim must equal text embedding_length)",
+                image_embeddings.len()
+            )
+            .into());
+        }
+        let l = chunk_tokens.len();
+        // Which image columns (global [g, g+n_tok)) fall in this chunk's global
+        // range [chunk_global_start, +l)? Splice just those, at their chunk-local
+        // residual column.
+        let g = image_global_start;
+        let ov_start = chunk_global_start.max(g);
+        let ov_end = (chunk_global_start + l).min(g + n_tok);
+        let splice = if ov_start < ov_end {
+            let col0 = ov_start - g;
+            let count = ov_end - ov_start;
+            let sub = &image_embeddings[col0 * n_embd..(col0 + count) * n_embd];
+            Some((sub, ov_start - chunk_global_start))
+        } else {
+            None
+        };
+        self.forward_inner(
+            ctx,
+            cache,
+            chunk_tokens,
+            cache.position,
+            compute_logits,
+            splice,
+        )
+    }
+}
+
+impl Gemma4Model {
+    /// The shared forward body for text (`image_splice = None`) and image-chunk
+    /// (`Some((columns, local_col_start))` overwrites that run of residual
+    /// columns with the unscaled vision embeddings) prefill / decode.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_inner(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        position_offset: u32,
+        compute_logits: bool,
+        image_splice: Option<(&[f32], usize)>,
+    ) -> Result<Option<TensorView>, Box<dyn Error>> {
+        use crate::inference::command::{record_compute_barriers, record_global_barrier};
         let p = &self.params;
         let l = tokens.len() as u32;
         if l == 0 {
@@ -270,6 +347,29 @@ impl Model for Gemma4Model {
         let residual = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
         elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, l, residual)?;
         elementwise::record_scale(ctx, residual, residual, p.embd_scale, 0.0)?;
+
+        // Image splice: overwrite the `<|image>`-pad placeholder columns with the
+        // (unscaled) vision embeddings. gemma scales only text-token embeddings
+        // by √n_embd, so the overwrite replaces the just-scaled placeholder
+        // values with the raw decoder-space vision columns.
+        if let Some((sub, local_start)) = image_splice {
+            let src = ctx.alloc_scratch(sub.len() as u64 * 4)?;
+            write_f32(ctx, src, sub)?;
+            record_global_barrier(ctx.device, ctx.cmd);
+            unsafe {
+                let copy = ash::vk::BufferCopy::default()
+                    .src_offset(src.offset)
+                    .dst_offset(residual.byte_offset + (local_start as u64) * hidden * 4)
+                    .size(sub.len() as u64 * 4);
+                ctx.device.device.cmd_copy_buffer(
+                    ctx.cmd,
+                    src.buffer,
+                    residual.buffer,
+                    std::slice::from_ref(&copy),
+                );
+            }
+            record_global_barrier(ctx.device, ctx.cmd);
+        }
         let layer_checkpoint = ctx.scratch_checkpoint();
 
         // ---- per-layer loop ----
@@ -531,6 +631,22 @@ fn write_u32(
         .ok_or("scratch region not host-visible")?;
     unsafe {
         let dst = host_ptr.add(range.offset as usize) as *mut u32;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+    }
+    Ok(())
+}
+
+fn write_f32(
+    ctx: &mut DispatchContext,
+    range: crate::inference::buffer::BufferRange,
+    data: &[f32],
+) -> Result<(), Box<dyn Error>> {
+    let host_ptr = ctx
+        .scratch
+        .host_ptr
+        .ok_or("scratch region not host-visible")?;
+    unsafe {
+        let dst = host_ptr.add(range.offset as usize) as *mut f32;
         std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
     Ok(())

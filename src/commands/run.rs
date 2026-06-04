@@ -268,35 +268,55 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         let mmproj_gguf = GgufFile::open(&setup.mmproj_path)?;
         let vision_weights = engine.upload_weights(&mmproj_gguf)?;
         let vcfg = &setup.vcfg;
-        let encoder = VisionEncoder::new(
-            &vision_weights,
-            vcfg.n_embd as usize,
-            vcfg.patch_size as usize,
-            vcfg.n_head as usize,
-            vcfg.n_ff as usize,
-            vcfg.n_layer as usize,
-            vcfg.eps,
-        )?;
-        let host_weights = HostWeights::from_gguf(&mmproj_gguf)?;
-        let pimg = &setup.pimg;
-        tracing::info!(
-            proj_dim = encoder.projection_dim,
-            n_image_tokens = setup.nx * setup.ny,
-            "encoding image through vision tower",
-        );
-        let embeddings = crate::vision::encoder::encode_image_chunked(
-            &mut engine,
-            &vision_weights,
-            &encoder,
-            pimg,
-            &host_weights,
-        )?;
-        Some(ImagePrefill {
-            embeddings,
-            start: setup.start,
-            nx: setup.nx,
-            ny: setup.ny,
-        })
+        if vcfg.projector_type == crate::vision::ProjectorType::Gemma4Uv {
+            // gemma4uv "no-tower" projector — a light embed pipeline.
+            tracing::info!(
+                n_image_tokens = setup.nx * setup.ny,
+                "encoding image through gemma4uv projector",
+            );
+            let (embeddings, _n_tok, npx, npy) = crate::vision::encoder::encode_image_gemma4(
+                &mut engine,
+                &vision_weights,
+                vcfg,
+                &setup.pimg,
+            )?;
+            Some(ImagePrefill {
+                embeddings,
+                start: setup.start,
+                nx: npx,
+                ny: npy,
+            })
+        } else {
+            let encoder = VisionEncoder::new(
+                &vision_weights,
+                vcfg.n_embd as usize,
+                vcfg.patch_size as usize,
+                vcfg.n_head as usize,
+                vcfg.n_ff as usize,
+                vcfg.n_layer as usize,
+                vcfg.eps,
+            )?;
+            let host_weights = HostWeights::from_gguf(&mmproj_gguf)?;
+            let pimg = &setup.pimg;
+            tracing::info!(
+                proj_dim = encoder.projection_dim,
+                n_image_tokens = setup.nx * setup.ny,
+                "encoding image through vision tower",
+            );
+            let embeddings = crate::vision::encoder::encode_image_chunked(
+                &mut engine,
+                &vision_weights,
+                &encoder,
+                pimg,
+                &host_weights,
+            )?;
+            Some(ImagePrefill {
+                embeddings,
+                start: setup.start,
+                nx: setup.nx,
+                ny: setup.ny,
+            })
+        }
     } else {
         None
     };
@@ -4317,17 +4337,26 @@ fn assemble_image_tokens(
 /// model's tokenizer lacks them (not a vision-capable model).
 fn vision_token_ids(
     bundle: &crate::tokenizer::TokenizerBundle,
+    projector: crate::vision::ProjectorType,
 ) -> Result<(u32, u32, u32), Box<dyn Error>> {
     let tid = |s: &str| -> Result<u32, Box<dyn Error>> {
         bundle.tokenizer.token_to_id(s).ok_or_else(|| {
             format!("tokenizer has no {s} token — this model is not vision-capable").into()
         })
     };
-    Ok((
-        tid("<|vision_start|>")?,
-        tid("<|image_pad|>")?,
-        tid("<|vision_end|>")?,
-    ))
+    // (begin marker, per-patch placeholder/soft-token, end marker). The
+    // placeholder is overwritten by the vision embeddings, so only its count +
+    // the surrounding markers matter for the decoder context.
+    match projector {
+        crate::vision::ProjectorType::Gemma4Uv => {
+            Ok((tid("<|image>")?, tid("<|image|>")?, tid("<image|>")?))
+        }
+        _ => Ok((
+            tid("<|vision_start|>")?,
+            tid("<|image_pad|>")?,
+            tid("<|vision_end|>")?,
+        )),
+    }
 }
 
 /// Build the decoder input tokens for `seeker run` across the four combos of
@@ -4363,14 +4392,30 @@ fn build_run_tokens(
         )?;
         let mmproj_gguf = GgufFile::open(&mmproj_path)?;
         let vcfg = crate::vision::parse_config(&mmproj_gguf)?;
-        let pcfg = crate::vision::preprocess::PreprocessConfig::qwen3vl_default(
-            vcfg.patch_size,
-            vcfg.spatial_merge_size,
-            vcfg.image_mean,
-            vcfg.image_std,
-        );
+        let is_gemma = vcfg.projector_type == crate::vision::ProjectorType::Gemma4Uv;
+        // gemma4 folds the merge into a bigger 48-patch (align = patch·n_merge);
+        // qwen aligns to patch·spatial_merge and pools later.
+        let merge = if is_gemma {
+            vcfg.n_merge
+        } else {
+            vcfg.spatial_merge_size
+        } as usize;
+        let pcfg = if is_gemma {
+            crate::vision::preprocess::PreprocessConfig::gemma4_default(
+                vcfg.patch_size,
+                vcfg.n_merge,
+                vcfg.image_mean,
+                vcfg.image_std,
+            )
+        } else {
+            crate::vision::preprocess::PreprocessConfig::qwen3vl_default(
+                vcfg.patch_size,
+                vcfg.spatial_merge_size,
+                vcfg.image_mean,
+                vcfg.image_std,
+            )
+        };
         let pimg = crate::vision::preprocess::preprocess(img_path, &pcfg)?;
-        let merge = vcfg.spatial_merge_size as usize;
         let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
         let n_tok = pimg.n_tokens as usize;
         Some((mmproj_path, vcfg, pimg, nx, ny, n_tok))
@@ -4403,7 +4448,7 @@ fn build_run_tokens(
                 let (before, after) = rendered
                     .split_once(MEDIA_MARKER)
                     .ok_or("rendered chat prompt lost the <__media__> marker")?;
-                let (vstart, ipad, vend) = vision_token_ids(bundle)?;
+                let (vstart, ipad, vend) = vision_token_ids(bundle, vcfg.projector_type)?;
                 let before_tokens = encode(before, false)?;
                 let after_tokens = encode(after, false)?;
                 let (tokens, start) =
@@ -4426,7 +4471,7 @@ fn build_run_tokens(
         let add_special = bundle.add_bos_default || bundle.add_eos_default;
         match img {
             Some((mmproj_path, vcfg, pimg, nx, ny, n_tok)) => {
-                let (vstart, ipad, vend) = vision_token_ids(bundle)?;
+                let (vstart, ipad, vend) = vision_token_ids(bundle, vcfg.projector_type)?;
                 let prefix: Vec<u32> = bundle
                     .add_bos_default
                     .then_some(bundle.bos_id)

@@ -39,7 +39,18 @@ pub fn record_nofence(
 }
 
 /// RMSNorm with NO learned weight (`scale·x` only). Gemma4 applies this to V
-/// before caching (a weightless per-head RMSNorm). Skips the trailing barrier.
+/// before caching (a weightless per-head RMSNorm) and as the vision encoder's
+/// `embedding_pre_projection_norm`. Emits a trailing barrier.
+pub fn record_noweight(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+    eps: f32,
+) -> Result<(), Box<dyn Error>> {
+    record_noweight_inner(ctx, src, dst, eps, /*fence=*/ true)
+}
+
+/// As [`record_noweight`] but skips the trailing barrier.
 pub fn record_noweight_nofence(
     ctx: &mut DispatchContext,
     src: TensorView,

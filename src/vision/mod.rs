@@ -20,15 +20,22 @@ pub enum ProjectorType {
     Qwen3VlMerger,
     /// Qwen2.5-VL merger (`"qwen2.5vl_merger"`): window attention, no deepstack.
     Qwen25VlMerger,
+    /// Gemma 4 unified vision (`"gemma4uv"`): a "no-tower" projector — image
+    /// patches are embedded (im2col → LayerNorm → linear → +2D pos → LayerNorm
+    /// → RMSNorm → linear) and fed straight into the decoder, whose own layers
+    /// do the vision processing (any-to-any). The "token merging" is folded into
+    /// a bigger 48×48 patch (`patch_size × n_merge`), so there's no pooler.
+    Gemma4Uv,
 }
 
 impl ProjectorType {
-    /// Parse the `clip.projector_type` metadata string. Returns a clear error
-    /// for any projector type seeker doesn't (yet) support.
+    /// Parse the `clip(.vision).projector_type` metadata string. Returns a clear
+    /// error for any projector type seeker doesn't (yet) support.
     pub fn parse(s: &str) -> Result<ProjectorType, Box<dyn Error>> {
         match s {
             "qwen3vl_merger" => Ok(ProjectorType::Qwen3VlMerger),
             "qwen2.5vl_merger" => Ok(ProjectorType::Qwen25VlMerger),
+            "gemma4uv" => Ok(ProjectorType::Gemma4Uv),
             other => Err(format!("unsupported clip.projector_type: {other:?}").into()),
         }
     }
@@ -53,6 +60,13 @@ pub struct VisionConfig {
     pub n_ff: u32,
     /// Spatial merge factor (`clip.vision.spatial_merge_size`, default 2).
     pub spatial_merge_size: u32,
+    /// Pooling / patch-merge factor (`clip.vision.proj_scale_factor`, default 3
+    /// for gemma4). For `Gemma4Uv` the merge is baked into the conv patch, so
+    /// the effective patch size is `patch_size × n_merge` (16×3 = 48).
+    pub n_merge: u32,
+    /// Projector output dim (`clip.vision.projection_dim`) — the decoder n_embd
+    /// the image embeddings are projected to. Defaults to `n_embd`.
+    pub projection_dim: u32,
     /// Attention layer-norm epsilon (`clip.vision.attention.layer_norm_epsilon`).
     pub eps: f32,
     /// Per-channel image normalization mean (`clip.vision.image_mean`).
@@ -150,8 +164,11 @@ fn req_f32(gguf: &GgufFile, key: &str) -> Result<f32, Box<dyn Error>> {
 
 /// Parse a [`VisionConfig`] from an mmproj GGUF's metadata.
 pub fn parse_config(gguf: &GgufFile) -> Result<VisionConfig, Box<dyn Error>> {
-    let proj_str =
-        get_str(gguf, "clip.projector_type").ok_or("mmproj missing clip.projector_type")?;
+    // gemma4 stores it under `clip.vision.projector_type`; qwen under the bare
+    // `clip.projector_type`. Accept either.
+    let proj_str = get_str(gguf, "clip.vision.projector_type")
+        .or_else(|| get_str(gguf, "clip.projector_type"))
+        .ok_or("mmproj missing clip(.vision).projector_type")?;
     let projector_type = ProjectorType::parse(proj_str)?;
 
     // `is_deepstack_layers` is a bool array marking which blocks are deepstack;
@@ -174,6 +191,15 @@ pub fn parse_config(gguf: &GgufFile) -> Result<VisionConfig, Box<dyn Error>> {
         n_layer: req_u32(gguf, "clip.vision.block_count")?,
         n_ff: req_u32(gguf, "clip.vision.feed_forward_length")?,
         spatial_merge_size: get_u32(gguf, "clip.vision.spatial_merge_size").unwrap_or(2),
+        n_merge: get_u32(gguf, "clip.vision.proj_scale_factor").unwrap_or(
+            if projector_type == ProjectorType::Gemma4Uv {
+                3
+            } else {
+                1
+            },
+        ),
+        projection_dim: get_u32(gguf, "clip.vision.projection_dim")
+            .unwrap_or(req_u32(gguf, "clip.vision.embedding_length")?),
         eps: req_f32(gguf, "clip.vision.attention.layer_norm_epsilon")?,
         image_mean: read_f32x3(gguf, "clip.vision.image_mean", [0.0; 3]),
         image_std: read_f32x3(gguf, "clip.vision.image_std", [1.0; 3]),

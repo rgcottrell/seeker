@@ -52,8 +52,8 @@ use crate::inference::command::record_compute_barrier;
 use crate::inference::context::DispatchContext;
 use crate::inference::memory::Region;
 use crate::inference::ops::bind_and_dispatch;
-use crate::inference::ops::elementwise::{record_add, record_mul};
-use crate::inference::ops::matmul;
+use crate::inference::ops::elementwise::{record_add, record_get_rows, record_mul};
+use crate::inference::ops::{matmul, rms_norm};
 use crate::inference::pipeline::PipelineKey;
 use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::shaders;
@@ -2025,6 +2025,148 @@ fn alloc_scratch_write(
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
     }
     Ok(range)
+}
+
+/// Build the gemma4 im2col matrix `[K=patch²·3, n_patches]` in **raster** patch
+/// order (token = gy·npx + gx), flat row-major (index = `kidx + K·tok`). Element
+/// order within a column is `kw + patch·(kh + patch·ic)` to match ggml's im2col
+/// (which the `patch_embd` weight was converted for). gemma4uv feeds the pixels
+/// directly (px/255, no ×2−1 — unlike gemma4v).
+fn build_gemma_im2col(img: &PreprocessedImage, patch: usize) -> Vec<f32> {
+    let w = img.resized_w as usize;
+    let h = img.resized_h as usize;
+    let npx = w / patch;
+    let npy = h / patch;
+    let n_patches = npx * npy;
+    let k = patch * patch * N_CHANNELS;
+    let mut out = vec![0f32; k * n_patches];
+    for tok in 0..n_patches {
+        let gx = tok % npx;
+        let gy = tok / npx;
+        for ic in 0..N_CHANNELS {
+            for kh in 0..patch {
+                for kw in 0..patch {
+                    let x = gx * patch + kw;
+                    let y = gy * patch + kh;
+                    let kidx = kw + patch * (kh + patch * ic);
+                    out[kidx + k * tok] = img.pixels[ic * (w * h) + y * w + x];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// View one of the two stacked `[n_embd, pos_size]` position-embedding lookup
+/// tables inside `v.position_embd.weight [n_embd, pos_size, 2]` (idx 0 = x, 1 = y).
+fn slice_pos_table(posembd: &TensorView, n_embd: u64, pos_size: u64, idx: u64) -> TensorView {
+    let elem = posembd.byte_stride[0];
+    TensorView {
+        buffer: posembd.buffer,
+        byte_offset: posembd.byte_offset + idx * n_embd * pos_size * elem,
+        byte_size: n_embd * pos_size * elem,
+        dims: [n_embd, pos_size, 1, 1],
+        byte_stride: [
+            elem,
+            elem * n_embd,
+            elem * n_embd * pos_size,
+            elem * n_embd * pos_size,
+        ],
+        element_stride: [1, n_embd, n_embd * pos_size, n_embd * pos_size],
+        dtype: posembd.dtype,
+    }
+}
+
+fn u32_to_bytes(data: &[u32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(data.len() * 4);
+    for &x in data {
+        v.extend_from_slice(&x.to_ne_bytes());
+    }
+    v
+}
+
+/// Result of [`encode_image_gemma4`]: `(embeddings [projection_dim · n_tok]
+/// column-major, n_tok, npx, npy)`.
+pub type Gemma4Encoded = (Vec<f32>, usize, usize, usize);
+
+/// Encode an image through the gemma4 `gemma4uv` "no-tower" projector. Returns
+/// `(embeddings [projection_dim · n_tok] column-major, n_tok, npx, npy)`.
+///
+/// Pipeline (`clip_graph_gemma4uv::build`): im2col(48,stride48) →
+/// LayerNorm(patch_norm_1) → matmul(patch_embd)+patch_bias →
+/// LayerNorm(patch_norm_2) → +pos_x +pos_y (2D lookup) → LayerNorm(patch_norm_3,
+/// "pos_norm") → RMSNorm(embedding_pre_projection_norm) →
+/// matmul(input_projection). No transformer tower, no pooler. The 3 LayerNorms
+/// use eps=1e-5 (pytorch default); the final RMSNorm uses the clip eps (1e-6).
+pub fn encode_image_gemma4(
+    engine: &mut crate::inference::Engine,
+    weights: &WeightsHandle,
+    cfg: &crate::vision::VisionConfig,
+    img: &PreprocessedImage,
+) -> Result<Gemma4Encoded, Box<dyn Error>> {
+    let patch = (cfg.patch_size * cfg.n_merge) as usize; // 16·3 = 48
+    let npx = img.resized_w as usize / patch;
+    let npy = img.resized_h as usize / patch;
+    let n_patches = npx * npy;
+    let k = (patch * patch * N_CHANNELS) as u64; // 6912
+    let n_embd = cfg.n_embd as u64; // 3840
+    let proj_dim = cfg.projection_dim as u64;
+    let np = n_patches as u64;
+
+    let im2col = build_gemma_im2col(img, patch);
+    let pos_x: Vec<u32> = (0..n_patches).map(|t| (t % npx) as u32).collect();
+    let pos_y: Vec<u32> = (0..n_patches).map(|t| (t / npx) as u32).collect();
+
+    let pe = weights.view("v.patch_embd.weight")?;
+    let pe_b = weights.view("v.patch_embd.bias")?;
+    let pn1w = weights.view("v.patch_norm.1.weight")?;
+    let pn1b = weights.view("v.patch_norm.1.bias")?;
+    let pn2w = weights.view("v.patch_norm.2.weight")?;
+    let pn2b = weights.view("v.patch_norm.2.bias")?;
+    let pn3w = weights.view("v.patch_norm.3.weight")?;
+    let pn3b = weights.view("v.patch_norm.3.bias")?;
+    let posembd = weights.view("v.position_embd.weight")?;
+    let inproj = weights.view("mm.input_projection.weight")?;
+    let pos_size = posembd.dims[1];
+    let tbl_x = slice_pos_table(&posembd, n_embd, pos_size, 0);
+    let tbl_y = slice_pos_table(&posembd, n_embd, pos_size, 1);
+
+    let ln_eps = 1e-5f32; // gemma4uv embedder LayerNorms (pytorch default)
+    let rms_eps = cfg.eps; // embedding_pre_projection_norm (clip eps, 1e-6)
+
+    let out = engine.forward(weights, |ctx| {
+        let im_r = alloc_scratch_write(ctx, &f32_to_bytes(&im2col))?;
+        let im_v = dense_view(&im_r, [k, np, 1, 1]);
+        let ln1 = ctx.alloc_tensor([k, np, 1, 1], GgmlType::F32)?;
+        record_layernorm_affine(ctx, im_v, pn1w, pn1b, ln1, ln_eps)?;
+
+        let embd = ctx.alloc_tensor([n_embd, np, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, pe, ln1, embd)?;
+        record_add(ctx, embd, broadcast_col_view(&pe_b, n_embd), embd)?;
+
+        let ln2 = ctx.alloc_tensor([n_embd, np, 1, 1], GgmlType::F32)?;
+        record_layernorm_affine(ctx, embd, pn2w, pn2b, ln2, ln_eps)?;
+
+        let px_r = alloc_scratch_write(ctx, &u32_to_bytes(&pos_x))?;
+        let py_r = alloc_scratch_write(ctx, &u32_to_bytes(&pos_y))?;
+        let emx = ctx.alloc_tensor([n_embd, np, 1, 1], GgmlType::F32)?;
+        record_get_rows(ctx, tbl_x, px_r, n_patches as u32, emx)?;
+        record_add(ctx, ln2, emx, ln2)?;
+        let emy = ctx.alloc_tensor([n_embd, np, 1, 1], GgmlType::F32)?;
+        record_get_rows(ctx, tbl_y, py_r, n_patches as u32, emy)?;
+        record_add(ctx, ln2, emy, ln2)?;
+
+        let ln3 = ctx.alloc_tensor([n_embd, np, 1, 1], GgmlType::F32)?;
+        record_layernorm_affine(ctx, ln2, pn3w, pn3b, ln3, ln_eps)?;
+
+        let rms = ctx.alloc_tensor([n_embd, np, 1, 1], GgmlType::F32)?;
+        rms_norm::record_noweight(ctx, ln3, rms, rms_eps)?;
+
+        let outp = ctx.alloc_tensor([proj_dim, np, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, inproj, rms, outp)?;
+        Ok(outp.range())
+    })?;
+    Ok((out, n_patches, npx, npy))
 }
 
 /// Build a dense (contiguous) F32 [`TensorView`] over a scratch range.

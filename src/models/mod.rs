@@ -192,6 +192,15 @@ pub trait Model: Send + Sync {
         Err("record_forward_unified (varlen prefill+decode) not implemented for this model".into())
     }
 
+    /// Whether image tokens use a 2D M-RoPE cursor (qwen-VL) vs plain sequential
+    /// 1D positions (gemma4). When `true` (default), the engine advances the
+    /// M-RoPE cursor by `max(nx,ny)` after an image and tracks the
+    /// `rope_position_lag` (KV slots − cursor). gemma4 returns `false`: its image
+    /// tokens advance the cursor 1:1 like text, so there is no lag.
+    fn image_uses_mrope(&self) -> bool {
+        true
+    }
+
     /// Whether [`Self::record_forward_unified`] is implemented — lets the server
     /// scheduler use the token-budget / chunked-prefill loop (mixing prefill and
     /// decode of different requests in one forward). Models without it fall back
