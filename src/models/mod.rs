@@ -209,6 +209,18 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// A model-specific ceiling on the prefill micro-batch (in tokens), or
+    /// `None` for "no constraint". The engine clamps its configured `n_ubatch`
+    /// down to this for every prefill, so the model works at default settings.
+    ///
+    /// gemma4 (12B dense) returns `Some(128)`: its whole 48-layer forward is one
+    /// command-buffer submit, and a single-pass prefill of more than ~256 tokens
+    /// exceeds the RADV ~2s ring-watchdog and device-losts. Chunking to ≤128-token
+    /// submits keeps each under the timeout. Default `None`.
+    fn recommended_prefill_ubatch(&self) -> Option<u32> {
+        None
+    }
+
     /// Conservative upper bound (in bytes) on the transient scratch one
     /// forward pass of `≤ n_ubatch` tokens needs, used to size the engine's
     /// scratch region (llama.cpp-style worst-case compute-buffer reservation).

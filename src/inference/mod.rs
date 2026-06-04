@@ -883,14 +883,15 @@ impl Engine {
         if l == 0 {
             return Err("forward_sampled called with empty token list".into());
         }
-        // Chunked prefill: a prompt longer than `n_ubatch` is fed in sequential
-        // `≤ n_ubatch`-token passes so the per-pass scratch working set stays
-        // bounded regardless of prompt length. Deep-context attention is kept
-        // under the RADV watchdog by the coopmat flash-attn kernel (fast enough
-        // for a full ubatch in one dispatch), not by shrinking the chunk. Only
-        // the final chunk computes logits + samples. `n_ubatch == 0` disables
+        // Chunked prefill: a prompt longer than the effective ubatch is fed in
+        // sequential passes so the per-pass scratch working set stays bounded
+        // regardless of prompt length. Deep-context attention is kept under the
+        // RADV watchdog by the coopmat flash-attn kernel (fast enough for a full
+        // ubatch in one dispatch), not by shrinking the chunk. Only the final
+        // chunk computes logits + samples. An effective ubatch of 0 disables
         // chunking (legacy single-pass).
-        if self.n_ubatch != 0 && l > self.n_ubatch {
+        let ub = self.effective_ubatch(model);
+        if ub != 0 && l > ub {
             return self.forward_sampled_chunked(model, cache, tokens, position_offset, sampler);
         }
         let is_decode = l == 1;
@@ -1298,11 +1299,8 @@ impl Engine {
         }
         let prompt_pos0 = cache.position;
         let n = tokens.len();
-        let ub = if self.n_ubatch == 0 {
-            n
-        } else {
-            self.n_ubatch as usize
-        };
+        let eub = self.effective_ubatch(model);
+        let ub = if eub == 0 { n } else { eub as usize };
 
         let mut token = 0u32;
         let mut start = 0usize;
@@ -1495,8 +1493,23 @@ impl Engine {
         Ok(Some(token))
     }
 
-    /// Prefill a prompt longer than `n_ubatch` by feeding it in sequential
-    /// `≤ n_ubatch`-token chunks. Every chunk but the last is KV-only (no
+    /// The prefill micro-batch actually used, after clamping the configured
+    /// [`Self::n_ubatch`] to the model's [`recommended_prefill_ubatch`]
+    /// (crate::models::Model::recommended_prefill_ubatch) ceiling. When the
+    /// model imposes a ceiling it always wins (even over a `0` "single-pass"
+    /// config), so a watchdog-sensitive model like gemma4 chunks by default;
+    /// a smaller user `n_ubatch` is left untouched. Returns `0` only when the
+    /// config is single-pass *and* the model sets no ceiling.
+    fn effective_ubatch(&self, model: &dyn crate::models::Model) -> u32 {
+        match model.recommended_prefill_ubatch() {
+            Some(rec) if self.n_ubatch == 0 => rec,
+            Some(rec) => self.n_ubatch.min(rec),
+            None => self.n_ubatch,
+        }
+    }
+
+    /// Prefill a prompt longer than the effective ubatch by feeding it in
+    /// sequential chunks. Every chunk but the last is KV-only (no
     /// logits / sampler — see [`Engine::forward_kv_only`]); the final chunk
     /// runs the normal sampling path and returns the next token.
     ///
@@ -1521,7 +1534,7 @@ impl Engine {
             )
             .into());
         }
-        let ub = self.n_ubatch as usize;
+        let ub = self.effective_ubatch(model) as usize;
         let n = tokens.len();
         debug_assert!(ub > 0 && n > ub, "chunked path entered with n={n} ub={ub}");
         let mut start = 0usize;
