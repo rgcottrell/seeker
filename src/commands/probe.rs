@@ -449,6 +449,7 @@ async fn bench_concurrent(args: ProbeArgs) -> Result<(), Box<dyn Error>> {
         n_slots: max_b, // explicit (bench pins the slot count per sweep)
         parallel_max: max_b,
         mem_fraction: 0.9,
+        pin_prefix_tokens: None, // bench uses --prewarm, not the system-prompt pin
     };
     let plan = BenchPlan {
         batches,

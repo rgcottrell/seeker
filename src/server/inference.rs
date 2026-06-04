@@ -53,6 +53,12 @@ pub struct WorkerConfig {
     /// (after weights + scratch). Leaves headroom for the OS / transient image
     /// scratch on the unified-memory APU. Ignored when `n_slots >= 1`.
     pub mem_fraction: f32,
+    /// Pre-rendered shared leading-prefix tokens (the `--system-prompt` render)
+    /// to prefill once and PIN in the leading-prefix cache at startup, so every
+    /// request beginning with it seeds instead of re-prefilling it. `None` when
+    /// no system prompt is set or `SEEKER_PREFIX_CACHE` is off. Rendered
+    /// serve-side (the worker only ever sees tokens).
+    pub pin_prefix_tokens: Option<Vec<u32>>,
 }
 
 /// Per-request generation parameters. The CLI sampling flags form the base
@@ -822,7 +828,7 @@ fn build_vision(engine: &Engine, mmproj_path: &Path) -> Result<VisionCtx, Box<dy
 /// Worker entry point. Loads the model, signals readiness, then runs the
 /// continuous-batching scheduler until every `InferenceHandle` is dropped.
 fn worker_main(
-    cfg: WorkerConfig,
+    mut cfg: WorkerConfig,
     mut jobs: mpsc::Receiver<GenJob>,
     ready: oneshot::Sender<Result<u32, String>>,
 ) {
@@ -837,6 +843,14 @@ fn worker_main(
     if ready.send(Ok(worker.slots.len() as u32)).is_err() {
         // `serve::run` gave up waiting (process exiting). Nothing to serve.
         return;
+    }
+
+    // Pin the configured system-prompt prefix: prefill it once and keep it in
+    // the cache un-evictably, so requests beginning with it seed instead of
+    // re-prefilling it. After readiness (doesn't delay startup) and before the
+    // first job is served (single-threaded loop, so no race).
+    if let Some(tokens) = cfg.pin_prefix_tokens.take() {
+        worker.pin_prefix(tokens);
     }
 
     // Scheduler loop: admit + prefill queued jobs onto free slabs, advance the
@@ -1205,7 +1219,7 @@ impl Worker {
     /// prefix can seed from it. Requires `positions[slab] == p` (a chunk
     /// boundary, where the slab's live SSM state equals state-at-P) and a
     /// text-only slab. Best-effort; failures are logged, not fatal.
-    fn capture_checkpoint(&mut self, slab: u32, p: u32, active_idx: usize) {
+    fn capture_checkpoint(&mut self, slab: u32, p: u32, active_idx: usize, pinned: bool) {
         if self.batch.rope_lag[slab as usize] != 0 {
             return;
         }
@@ -1244,7 +1258,7 @@ impl Worker {
             tokens,
             p,
             last_used: pc.clock,
-            pinned: false,
+            pinned,
         });
         tracing::debug!(slab, p, "serve: prefix-cache capture");
     }
@@ -1557,7 +1571,7 @@ impl Worker {
                     let prev = p - nn;
                     if p / stride > prev / stride {
                         let slab = self.active[i].slab;
-                        self.capture_checkpoint(slab, p, i);
+                        self.capture_checkpoint(slab, p, i, /*pinned=*/ false);
                     }
                 }
                 continue;
@@ -2188,40 +2202,35 @@ impl Worker {
         }
     }
 
-    /// Warm the leading-prefix cache before a timed Shared run: prefill exactly
-    /// the `shared_len`-token shared prefix, capture it at its boundary, then
-    /// cold-reset the slabs (keeping the cache entry) so every timed sequence
-    /// seeds from the cache instead of re-prefilling the shared prefix. No-op
-    /// without the cache (the run then measures the unwarmed/baseline path).
-    fn bench_prewarm(&mut self, base: &[u32], shared_len: usize) {
-        // Nothing to warm without the cache enabled.
+    /// Prefill `tokens` as a standalone request and capture the prefix at its
+    /// boundary (`positions[slab] == tokens.len()`, so the slab's live SSM state
+    /// is exactly state-at-P), then cold-reset the slabs KEEPING the cache entry.
+    /// `pinned` marks the entry un-evictable (the production system-prompt pin);
+    /// the bench prewarm passes `false`. Returns whether a capture happened. No-op
+    /// (with a warning) without the cache or when `tokens.len()` is outside
+    /// `[p_min, max_cached_len]` (where `capture_checkpoint` would silently skip).
+    fn prefill_and_capture(&mut self, tokens: Vec<u32>, pinned: bool) -> bool {
         let (p_min, max_cached_len) = match self.prefix_cache.as_ref() {
             Some(pc) => (pc.p_min, pc.max_cached_len),
-            None => return,
+            None => return false,
         };
-        if shared_len == 0 || base.is_empty() {
-            return;
+        let n = tokens.len() as u32;
+        if n == 0 {
+            return false;
         }
-        // The capture is silently a no-op outside `[p_min, max_cached_len]`; warn
-        // loudly here so a misconfigured sweep doesn't report an unwarmed cache as
-        // if it were the seeding path.
-        let sl = shared_len as u32;
-        if sl < p_min || sl > max_cached_len {
+        if n < p_min || n > max_cached_len {
             tracing::warn!(
-                shared_len,
+                len = n,
                 p_min,
                 max_cached_len,
-                "bench_prewarm: --shared-len outside [p_min, max_cached_len]; cache will NOT warm \
-                 (raise --shared-len or adjust SEEKER_PREFIX_CACHE_PMIN/_MAXLEN)"
+                "prefix cache: prefix length outside [p_min, max_cached_len]; not cached \
+                 (adjust SEEKER_PREFIX_CACHE_PMIN/_MAXLEN)"
             );
-            return;
+            return false;
         }
-        // Identical to the first `shared_len` tokens of every Shared-workload
-        // sequence (which tile `base` and only diverge in the suffix).
-        let prefix: Vec<u32> = (0..shared_len).map(|i| base[i % base.len()]).collect();
         let (tx, mut rx) = mpsc::channel::<GenEvent>(64);
         self.admit_unified(GenJob {
-            tokens: prefix,
+            tokens,
             config: GenConfig {
                 sampler: bench_greedy_cfg(),
                 max_tokens: 4,
@@ -2233,11 +2242,12 @@ impl Worker {
             reply: tx,
         });
         // admit_unified only pushes to `active` on success; an empty `active`
-        // here means it rejected the request (e.g. no free slab) and sent the
-        // error to the now-dropped channel.
+        // here means it rejected the request (e.g. no free slab).
         if self.active.is_empty() {
-            tracing::warn!("bench_prewarm: prewarm request was not admitted; cache not warmed");
-            return;
+            tracing::warn!(
+                "prefix cache: prefill request not admitted (no free slab?); not cached"
+            );
+            return false;
         }
         // Drive prefill to completion (the sequence emits `Started` once caught
         // up); no eviction in between so the slab is still live to capture.
@@ -2254,27 +2264,55 @@ impl Worker {
                 break;
             }
             if self.active.is_empty() {
-                tracing::warn!(
-                    "bench_prewarm: prewarm sequence ended before prefill completed; cache not warmed"
-                );
+                tracing::warn!("prefix cache: prefill ended before completing; not cached");
                 self.bench_reset_slots(false);
-                return;
+                return false;
             }
             guard += 1;
             if guard > 100_000 {
-                tracing::warn!("bench_prewarm: prefill did not converge; cache not warmed");
+                tracing::warn!("prefix cache: prefill did not converge; not cached");
                 self.bench_reset_slots(false);
-                return;
+                return false;
             }
         }
-        // Capture the shared prefix at its boundary: `positions[slab]` now equals
-        // shared_len, so the slab's live SSM state is exactly state-at-shared_len.
-        if let Some(slab) = self.active.first().map(|s| s.slab) {
+        // Capture the prefix at its boundary (positions[slab] == tokens.len()).
+        let captured = if let Some(slab) = self.active.first().map(|s| s.slab) {
             let p = self.batch.positions[slab as usize];
-            self.capture_checkpoint(slab, p, 0);
-        }
-        // Cold-reset the slabs but KEEP the cache entry → timed burst seeds.
+            self.capture_checkpoint(slab, p, 0, pinned);
+            true
+        } else {
+            false
+        };
+        // Cold-reset the slabs but KEEP the cache entry.
         self.bench_reset_slots(false);
+        captured
+    }
+
+    /// Warm the leading-prefix cache before a timed Shared bench run: prefill the
+    /// `shared_len`-token shared prefix (which every Shared sequence starts with)
+    /// and capture it (unpinned). No-op without the cache.
+    fn bench_prewarm(&mut self, base: &[u32], shared_len: usize) {
+        if self.prefix_cache.is_none() || shared_len == 0 || base.is_empty() {
+            return;
+        }
+        // Identical to the first `shared_len` tokens of every Shared-workload
+        // sequence (which tile `base` and only diverge in the suffix).
+        let prefix: Vec<u32> = (0..shared_len).map(|i| base[i % base.len()]).collect();
+        self.prefill_and_capture(prefix, /*pinned=*/ false);
+    }
+
+    /// Pin a shared leading prefix (the rendered system prompt) at startup so
+    /// every request beginning with it seeds instead of re-prefilling it. The
+    /// production analogue of `bench_prewarm`: prefill once, capture PINNED
+    /// (never evicted). No-op without the cache.
+    fn pin_prefix(&mut self, tokens: Vec<u32>) {
+        let n = tokens.len();
+        if self.prefill_and_capture(tokens, /*pinned=*/ true) {
+            tracing::info!(
+                prefix_tokens = n,
+                "prefix cache: pinned the system-prompt prefix"
+            );
+        }
     }
 }
 

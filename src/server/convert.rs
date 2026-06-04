@@ -363,6 +363,45 @@ pub fn render_and_encode_mm(
     Ok((tokens, Some((pimg, image_start, nx, ny))))
 }
 
+/// Shared leading-prefix tokens to PIN for the leading-prefix cache: the longest
+/// common token prefix of two synthetic `[system, user_X]` renders. That's
+/// exactly the system block + user-turn opening every real `[system, user…]`
+/// request begins with — taking the LCP (rather than rendering the system alone)
+/// makes it robust to tokenization-boundary merges, since both synthetic renders
+/// go through the SAME path real requests use ([`render_and_encode`]:
+/// `apply_default_system` + template + `add_generation_prompt`). `None` if the
+/// model has no chat template or the renders share no leading tokens. A mismatch
+/// is harmless (no seed, not a correctness bug), but the LCP makes it reliable.
+pub fn compute_pin_prefix(
+    bundle: &TokenizerBundle,
+    system_prompt: &str,
+    template_kwargs: &serde_json::Map<String, Value>,
+) -> Option<Vec<u32>> {
+    let template = bundle.chat_template.as_deref()?;
+    let bos = bundle.bos_token.as_deref().unwrap_or("");
+    let eos = bundle.eos_token.as_deref().unwrap_or("");
+    let render_user = |user: &str| -> Option<Vec<u32>> {
+        let mut messages = vec![ChatMessage::user(user)];
+        apply_default_system(&mut messages, Some(system_prompt));
+        let rendered = crate::chat_template::render(
+            template,
+            &messages,
+            /* add_generation_prompt = */ true,
+            bos,
+            eos,
+            template_kwargs,
+        )
+        .ok()?;
+        encode(bundle, &rendered, false).ok()
+    };
+    // Two different user contents → diverge at the user content, so the LCP is
+    // the shared system + user-turn-open prefix.
+    let a = render_user("a")?;
+    let b = render_user("the quick brown fox jumps over")?;
+    let p = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    (p > 0).then(|| a[..p].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

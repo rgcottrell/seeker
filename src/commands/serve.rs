@@ -278,6 +278,29 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
     // If the config didn't parse, don't hand the worker a path it can't use.
     let mmproj_path = vision_config.as_ref().and(mmproj_path);
 
+    // When the leading-prefix cache is on and a system prompt is set, render the
+    // shared prefix here (handler-side tokenizer/template) and hand the worker
+    // the tokens to prefill + PIN once at startup, so requests beginning with it
+    // seed instead of re-prefilling it.
+    let pin_prefix_tokens = if *crate::runtime_flags::PREFIX_CACHE {
+        match resolve_system_prompt(args)? {
+            Some(sys) => {
+                let kwargs = args.chat_template_kwargs.clone().unwrap_or_default();
+                let t = crate::server::convert::compute_pin_prefix(&bundle, &sys, &kwargs);
+                if let Some(tk) = &t {
+                    tracing::info!(
+                        prefix_tokens = tk.len(),
+                        "prefix cache: pinning system-prompt prefix"
+                    );
+                }
+                t
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let (handle, ready) = InferenceHandle::spawn(WorkerConfig {
         model_path: path.clone(),
         mmproj_path,
@@ -289,6 +312,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         n_slots: args.parallel, // 0 = auto-size in the worker
         parallel_max: args.parallel_max,
         mem_fraction: args.mem_fraction,
+        pin_prefix_tokens,
     });
     // The worker reports the *resolved* slot count (auto-sizing may differ from
     // the request) so `/slots` + `/props` report the real number.
