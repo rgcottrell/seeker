@@ -14,7 +14,7 @@ use crate::commands::chat::parse_logit_bias;
 use crate::commands::download::{HfResolveArgs, resolve_hf};
 use crate::gguf::{GgmlType, GgufFile};
 use crate::inference::kv_cache::parse_dtype;
-use crate::inference::sample::SamplerConfig;
+use crate::inference::sample::{GgufSamplingDefaults, SamplerConfig};
 use crate::server::inference::{InferenceHandle, WorkerConfig};
 use crate::server::{AppState, AppStateInit, ServerConfig, run as server_run};
 use crate::tokenizer::build_tokenizer;
@@ -110,21 +110,25 @@ pub struct ServeArgs {
     cache_type_v: GgmlType,
 
     // ─── Sampling (per-request defaults) ────────────────────────────────
-    /// Sampling temperature. 0 → greedy argmax. (llama.cpp default: 0.8)
-    #[arg(long = "temp", alias = "temperature", default_value_t = 0.8)]
-    temperature: f32,
+    // Unset → the GGUF's `general.sampling.*` default if present, else the
+    // built-in fallback (temp 0.8, top-k 40, top-p 0.95, min-p 0.05,
+    // repeat-penalty 1.0, penalty-last-n 64). An explicit flag always wins; a
+    // per-request API field overrides the resolved server default in turn.
+    /// Sampling temperature. 0 → greedy argmax. (default: GGUF, else 0.8)
+    #[arg(long = "temp", alias = "temperature")]
+    temperature: Option<f32>,
 
-    /// Top-K filter (0 = disabled, full vocab). (llama.cpp default: 40)
-    #[arg(long = "top-k", default_value_t = 40)]
-    top_k: u32,
+    /// Top-K filter (0 = disabled, full vocab). (default: GGUF, else 40)
+    #[arg(long = "top-k")]
+    top_k: Option<u32>,
 
-    /// Top-P (nucleus) filter (1.0 = disabled).
-    #[arg(long = "top-p", default_value_t = 0.95)]
-    top_p: f32,
+    /// Top-P (nucleus) filter (1.0 = disabled). (default: GGUF, else 0.95)
+    #[arg(long = "top-p")]
+    top_p: Option<f32>,
 
-    /// Min-P filter (0.0 = disabled). (llama.cpp default: 0.05)
-    #[arg(long = "min-p", default_value_t = 0.05)]
-    min_p: f32,
+    /// Min-P filter (0.0 = disabled). (default: GGUF, else 0.05)
+    #[arg(long = "min-p")]
+    min_p: Option<f32>,
 
     /// Presence penalty (subtract from any repeated-token logit; 0.0 = off).
     #[arg(long = "presence-penalty", default_value_t = 0.0)]
@@ -135,21 +139,15 @@ pub struct ServeArgs {
     frequency_penalty: f32,
 
     /// Repetition penalty (multiply/divide repeated logits; 1.0 = off).
-    #[arg(
-        long = "repeat-penalty",
-        alias = "repetition-penalty",
-        default_value_t = 1.0
-    )]
-    repeat_penalty: f32,
+    /// (default: GGUF, else 1.0)
+    #[arg(long = "repeat-penalty", alias = "repetition-penalty")]
+    repeat_penalty: Option<f32>,
 
     /// How many trailing tokens contribute to penalties. `-1` = the whole
-    /// context (`--ctx-size`); `0` = disabled. (llama.cpp's `--repeat-last-n`.)
-    #[arg(
-        long = "penalty-last-n",
-        default_value_t = 64,
-        allow_hyphen_values = true
-    )]
-    penalty_last_n: i32,
+    /// context (`--ctx-size`); `0` = disabled. (default: GGUF, else 64;
+    /// llama.cpp's `--repeat-last-n`.)
+    #[arg(long = "penalty-last-n", allow_hyphen_values = true)]
+    penalty_last_n: Option<i32>,
 
     /// Never stop on an end-of-generation token; generate until the limit.
     /// (llama.cpp's `--ignore-eos`.)
@@ -195,16 +193,26 @@ fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
 }
 
 impl ServeArgs {
-    fn sampler_config(&self, ctx_size: u32) -> SamplerConfig {
+    /// Resolve the server's default sampler with precedence **CLI flag → GGUF
+    /// `general.sampling.*` → built-in fallback** (matching llama.cpp). A
+    /// per-request API field overrides the resolved default in turn.
+    fn sampler_config(&self, gg: &GgufSamplingDefaults, ctx_size: u32) -> SamplerConfig {
+        use crate::inference::sample as s;
         SamplerConfig::from_cli(
-            self.temperature,
-            self.top_k,
-            self.top_p,
-            self.min_p,
+            self.temperature
+                .or(gg.temperature)
+                .unwrap_or(s::DEFAULT_TEMPERATURE),
+            self.top_k.or(gg.top_k).unwrap_or(s::DEFAULT_TOP_K),
+            self.top_p.or(gg.top_p).unwrap_or(s::DEFAULT_TOP_P),
+            self.min_p.or(gg.min_p).unwrap_or(s::DEFAULT_MIN_P),
             self.presence_penalty,
             self.frequency_penalty,
-            self.repeat_penalty,
-            self.penalty_last_n,
+            self.repeat_penalty
+                .or(gg.repeat_penalty)
+                .unwrap_or(s::DEFAULT_REPEAT_PENALTY),
+            self.penalty_last_n
+                .or(gg.penalty_last_n)
+                .unwrap_or(s::DEFAULT_PENALTY_LAST_N),
             ctx_size,
             self.seed,
             self.logit_bias.clone(),
@@ -304,11 +312,18 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         .unwrap_or("model")
         .to_string();
 
+    // GGUF-embedded sampling defaults (`general.sampling.*`) seed the server's
+    // default sampler, overridden by explicit CLI flags then per-request fields.
+    let gg_sampling = GgufSamplingDefaults::from_gguf(&gguf);
+    if !gg_sampling.is_empty() {
+        tracing::info!(?gg_sampling, "using GGUF general.sampling.* defaults");
+    }
+
     Ok(AppState::new(AppStateInit {
         tokenizer: Arc::new(bundle),
         inference: handle,
         template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
-        default_sampler: args.sampler_config(ctx_size),
+        default_sampler: args.sampler_config(&gg_sampling, ctx_size),
         default_max_tokens: args.max_tokens,
         default_ignore_eos: args.ignore_eos,
         default_system_prompt: resolve_system_prompt(args)?,

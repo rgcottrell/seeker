@@ -95,6 +95,51 @@ impl GgufFile {
         u32::try_from(n).ok()
     }
 
+    /// A scalar metadata value coerced to `f32` (accepts F32/F64), or `None`
+    /// when the key is absent or non-float. Used for GGUF-embedded defaults
+    /// like `general.sampling.temp`.
+    pub fn meta_f32(&self, key: &str) -> Option<f32> {
+        match self.get(key)? {
+            MetadataValue::F32(v) => Some(*v),
+            MetadataValue::F64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    /// A scalar metadata value coerced to `u32` (accepts any non-negative
+    /// integer type), or `None` when absent / non-integer / negative.
+    pub fn meta_u32(&self, key: &str) -> Option<u32> {
+        let n = match self.get(key)? {
+            MetadataValue::U8(n) => *n as i64,
+            MetadataValue::U16(n) => *n as i64,
+            MetadataValue::U32(n) => *n as i64,
+            MetadataValue::U64(n) => i64::try_from(*n).ok()?,
+            MetadataValue::I8(n) => *n as i64,
+            MetadataValue::I16(n) => *n as i64,
+            MetadataValue::I32(n) => *n as i64,
+            MetadataValue::I64(n) => *n,
+            _ => return None,
+        };
+        u32::try_from(n).ok()
+    }
+
+    /// A scalar metadata value coerced to `i32` (accepts any integer type,
+    /// negatives allowed — e.g. `penalty_last_n = -1`), or `None` otherwise.
+    pub fn meta_i32(&self, key: &str) -> Option<i32> {
+        let n = match self.get(key)? {
+            MetadataValue::U8(n) => *n as i64,
+            MetadataValue::U16(n) => *n as i64,
+            MetadataValue::U32(n) => *n as i64,
+            MetadataValue::U64(n) => i64::try_from(*n).ok()?,
+            MetadataValue::I8(n) => *n as i64,
+            MetadataValue::I16(n) => *n as i64,
+            MetadataValue::I32(n) => *n as i64,
+            MetadataValue::I64(n) => *n,
+            _ => return None,
+        };
+        i32::try_from(n).ok()
+    }
+
     pub fn tensors(&self) -> &[TensorInfo] {
         &self.tensors
     }

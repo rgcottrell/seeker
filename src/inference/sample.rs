@@ -29,6 +29,56 @@ use super::context::DispatchContext;
 use super::decode_dyn;
 use super::weights::TensorView;
 
+/// Built-in fallback sampler defaults — llama.cpp's `common_params_sampling`
+/// values, used when neither a CLI flag nor a GGUF `general.sampling.*` key
+/// supplies a knob. The resolution precedence is **CLI flag → GGUF default →
+/// these built-ins** (see [`GgufSamplingDefaults`]).
+pub const DEFAULT_TEMPERATURE: f32 = 0.8;
+pub const DEFAULT_TOP_K: u32 = 40;
+pub const DEFAULT_TOP_P: f32 = 0.95;
+pub const DEFAULT_MIN_P: f32 = 0.05;
+pub const DEFAULT_REPEAT_PENALTY: f32 = 1.0;
+pub const DEFAULT_PENALTY_LAST_N: i32 = 64;
+
+/// Sampler defaults a model author embedded in the GGUF under `general.sampling.*`
+/// (llama.cpp reads these too — see `common/common.cpp`). Each field is `None`
+/// when the corresponding key is absent. A CLI flag overrides any of these; an
+/// absent field falls back to the `DEFAULT_*` built-ins above.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GgufSamplingDefaults {
+    pub temperature: Option<f32>,
+    pub top_k: Option<u32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub penalty_last_n: Option<i32>,
+}
+
+impl GgufSamplingDefaults {
+    /// Read the `general.sampling.*` keys from a GGUF (the set llama.cpp also
+    /// honors). Missing keys stay `None`.
+    pub fn from_gguf(gguf: &crate::gguf::GgufFile) -> Self {
+        Self {
+            temperature: gguf.meta_f32("general.sampling.temp"),
+            top_k: gguf.meta_u32("general.sampling.top_k"),
+            top_p: gguf.meta_f32("general.sampling.top_p"),
+            min_p: gguf.meta_f32("general.sampling.min_p"),
+            repeat_penalty: gguf.meta_f32("general.sampling.penalty_repeat"),
+            penalty_last_n: gguf.meta_i32("general.sampling.penalty_last_n"),
+        }
+    }
+
+    /// True when the GGUF supplied at least one sampling override (for logging).
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_k.is_none()
+            && self.top_p.is_none()
+            && self.min_p.is_none()
+            && self.repeat_penalty.is_none()
+            && self.penalty_last_n.is_none()
+    }
+}
+
 /// User-facing sampler knobs. Mirrors the relevant subset of llama.cpp's
 /// `common_params_sampling`.
 #[derive(Debug, Clone)]
@@ -62,14 +112,14 @@ impl Default for SamplerConfig {
     /// sensible across families (Llama, Qwen, Mistral, …).
     fn default() -> Self {
         Self {
-            temperature: 0.8,
-            top_k: 40,
-            top_p: 0.95,
-            min_p: 0.05,
+            temperature: DEFAULT_TEMPERATURE,
+            top_k: DEFAULT_TOP_K,
+            top_p: DEFAULT_TOP_P,
+            min_p: DEFAULT_MIN_P,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
-            repeat_penalty: 1.0,
-            penalty_last_n: 64,
+            repeat_penalty: DEFAULT_REPEAT_PENALTY,
+            penalty_last_n: DEFAULT_PENALTY_LAST_N as usize,
             seed: 0,
             logit_bias: Vec::new(),
         }
