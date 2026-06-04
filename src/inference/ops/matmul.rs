@@ -219,29 +219,66 @@ pub fn record_nofence(
     record_inner(ctx, a, b, d, /*fence=*/ false)
 }
 
-/// `d += a @ b`. Fuses the residual-add that follows out-projection
-/// matmuls in the attention and SSM blocks into the matmul kernel via
-/// the `ACCUMULATE` spec constant on `mul_mat_vec_head.slang`. The
-/// caller passes `d` as the residual buffer (read-modify-write); no
-/// separate `proj` scratch is needed. Only the matvec path supports
-/// this (N=1); panics if used for prefill.
+/// `d += a @ b`. Fuses the residual-add that follows out-projection matmuls in
+/// the attention and SSM blocks into the matmul kernel via the `ACCUMULATE` spec
+/// constant on `mul_mat_vec_head.slang` — `d` is the residual buffer
+/// (read-modify-write), so no separate `proj` scratch + elementwise add is
+/// needed. Handles any N:
+///   - N == 1 (single-seq decode): the fused matvec-accumulate.
+///   - N ≤ MAX_BATCH_COLS (B>1 decode): the fused NUM_COLS matvec-accumulate
+///     (reads the weight once across columns AND fuses the add).
+///   - otherwise (prefill large-N → coopmat, or unwired): matmul into a scratch
+///     then a separate elementwise add — identical to the prior call-site code.
+///
+/// Byte-identical across all three (the add is the same F32 `residual + sum`).
 pub fn record_accumulate(
     ctx: &mut DispatchContext,
     a: TensorView,
     b: TensorView,
     d: TensorView,
 ) -> Result<(), Box<dyn Error>> {
-    debug_assert_eq!(b.dims[1], 1, "matmul accumulate path is matvec-only (N=1)");
     debug_assert_eq!(d.dtype, GgmlType::F32);
-    let variant = mmv_variant(a.dtype).ok_or_else(|| {
-        format!(
-            "matmul accumulate: weight dtype {:?} not yet wired",
-            a.dtype
-        )
-    })?;
-    record_mul_mat_vec_with_flags(
-        ctx, &variant, a, b, d, /*fence=*/ true, /*accumulate=*/ true,
-    )
+    let n = b.dims[1];
+    let variant = mmv_variant(a.dtype);
+
+    if n == 1 {
+        let variant = variant.as_ref().ok_or_else(|| {
+            format!(
+                "matmul accumulate: weight dtype {:?} not yet wired",
+                a.dtype
+            )
+        })?;
+        return record_mul_mat_vec_with_flags(
+            ctx, variant, a, b, d, /*fence=*/ true, /*accumulate=*/ true,
+        );
+    }
+
+    // B>1 decode: fuse the residual add into the batched-column matvec. Same
+    // eligibility as the non-accumulate batched path (no tensor batch, N ≤ cap).
+    // Fire for exactly the dtypes `record_inner` sends to its batched-column
+    // path (quant + F32), so the fused result matches the fallback. F16 n>1
+    // routes to `record_mul_mm` in record_inner, and coopmat needs n≥32 (never
+    // at decode) — both land in the fallback below, byte-identical to before.
+    if let Some(variant) = variant.as_ref()
+        && a.dtype != GgmlType::F16
+        && !*crate::runtime_flags::MM_BATCH_DISABLED
+        && n <= MAX_BATCH_COLS as u64
+        && b.dims[2] <= 1
+        && b.dims[3] <= 1
+        && a.dims[2] <= 1
+        && a.dims[3] <= 1
+    {
+        return record_mul_mat_vec_cols(
+            ctx, variant, a, b, d, n as u32, /*accumulate=*/ true, /*fence=*/ true,
+        );
+    }
+
+    // Fallback: matmul into a scratch then add into `d` (prefill large-N takes
+    // the coopmat `mul_mm` path inside `record_inner`). Identical to the prior
+    // `matmul::record(..) + elementwise::record_add(..)` at the call sites.
+    let proj = ctx.alloc_tensor([a.dims[1], n, 1, 1], GgmlType::F32)?;
+    record_inner(ctx, a, b, proj, /*fence=*/ true)?;
+    super::elementwise::record_add(ctx, d, proj, d)
 }
 
 fn record_inner(
@@ -337,7 +374,9 @@ fn record_inner(
         // Gated to the no-tensor-batch case (lm_head + dense projections at B>1)
         // and N ≤ MAX_BATCH_COLS so the `temp[NUM_COLS][NUM_ROWS]` register
         // tile stays bounded; wider N falls back to the per-column loop.
-        record_mul_mat_vec_cols(ctx, &variant, a, b, d, n as u32, fence)?;
+        record_mul_mat_vec_cols(
+            ctx, &variant, a, b, d, n as u32, /*accumulate=*/ false, fence,
+        )?;
     } else {
         // Per-column fallback: dispatch one `mul_mat_vec` per output column.
         // Correct but bandwidth-suboptimal (re-reads the full weight per
@@ -683,6 +722,7 @@ const MAX_BATCH_COLS: u32 = 8;
 /// batch: `b` is `[K, num_cols, 1, 1]`, `d` is `[M, num_cols, 1, 1]`, so the
 /// `NUM_COLS` j-loop steps `b`/`d` by their column stride and the `wg.y` batch
 /// is a single slice at offset 0.
+#[allow(clippy::too_many_arguments)]
 fn record_mul_mat_vec_cols(
     ctx: &mut DispatchContext,
     variant: &MmvVariant,
@@ -690,6 +730,7 @@ fn record_mul_mat_vec_cols(
     b: TensorView,
     d: TensorView,
     num_cols: u32,
+    accumulate: bool,
     fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert!(num_cols >= 1);
@@ -767,7 +808,12 @@ fn record_mul_mat_vec_cols(
         binding_indices: variant.binding_indices.to_vec(),
         push_size: MUL_MAT_VEC_PARAMS_BYTES,
         // Spec-const order: [BLOCK_SIZE, NUM_ROWS, ACCUMULATE, NUM_COLS].
-        spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows, 0, num_cols],
+        spec_constants: vec![
+            MUL_MAT_VEC_BLOCK_SIZE,
+            num_rows,
+            accumulate as u32,
+            num_cols,
+        ],
         required_subgroup_size: Some(32),
     };
     let pipeline = *ctx.pipelines.get(ctx.device, key, variant.spv)?;

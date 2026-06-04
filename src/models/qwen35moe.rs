@@ -3370,9 +3370,9 @@ fn attention_block_unified(
     let attn_gated = ctx.alloc_tensor([hidden_v, n_total, 1, 1], GgmlType::F32)?;
     elementwise::record_sigmoid_mul_split(ctx, q_gate_flat, attn_out, attn_gated)?;
 
-    let proj = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
-    matmul::record(ctx, att.wo, attn_gated, proj)?;
-    elementwise::record_add(ctx, residual, proj, residual)?;
+    // residual += wo @ attn_gated — fused matvec-accumulate at decode (B≤cap),
+    // scratch+add fallback at prefill (N>cap → coopmat). See record_accumulate.
+    matmul::record_accumulate(ctx, att.wo, attn_gated, residual)?;
     Ok(())
 }
 
@@ -3766,10 +3766,10 @@ fn ssm_block_batch(
         b as u32,
         p.rms_eps,
     )?;
-    // B > 1 → general matmul + add (the fused matvec-accumulate is N=1 only).
-    let proj = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
-    matmul::record(ctx, ssm_w.ssm_out, gated_attn, proj)?;
-    elementwise::record_add(ctx, residual, proj, residual)?;
+    // residual += ssm_out @ gated_attn — fused matvec-accumulate at decode
+    // (B≤cap reads the weight once AND fuses the add), scratch+add fallback at
+    // prefill (N>cap → coopmat). See matmul::record_accumulate.
+    matmul::record_accumulate(ctx, ssm_w.ssm_out, gated_attn, residual)?;
     Ok(())
 }
 
