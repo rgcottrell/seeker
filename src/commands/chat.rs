@@ -40,8 +40,14 @@ const MEDIA_MARKER: &str = "<__media__>";
 /// CPU-side patch-embed/pos-embd copy the encoder needs for the pos-embd resize.
 struct VisionCtx {
     vision: crate::vision::VisionModel,
-    encoder: VisionEncoder,
-    host_weights: HostWeights,
+    /// The transformer-tower encoder — `None` for the gemma4uv "no-tower"
+    /// projector (which has no vision blocks; [`attach_image`] runs the light
+    /// [`encode_image_gemma4`](crate::vision::encoder::encode_image_gemma4)
+    /// pipeline instead).
+    encoder: Option<VisionEncoder>,
+    /// CPU-side weights for the tower encoder's pos-embd resize — `None` for
+    /// gemma4uv (its encoder needs no host-side copy).
+    host_weights: Option<HostWeights>,
 }
 
 /// An image encoded through the vision tower: `[proj_dim, n_tok]` host f32
@@ -826,10 +832,11 @@ impl ChatSession {
     /// it (`add_special_tokens=false` — the template emits any BOS it wants).
     /// Returns the rendered string (the reasoning seed reads it), the token ids,
     /// and — when an image is attached — the local index of the first
-    /// `<|image_pad|>` token (where the vision-tower embeddings splice in). The
+    /// soft-placeholder token (where the encoder embeddings splice in). The
     /// rendered string carries the `<__media__>` marker (in the image turn's
-    /// content); we split on it and replace it with
-    /// `<|vision_start|><|image_pad|>×n_tok<|vision_end|>`. Shared by `generate`
+    /// content); we split on it and replace it with the projector's image block
+    /// (`<|vision_start|><|image_pad|>×n_tok<|vision_end|>` for qwen-style towers,
+    /// `<|image><|image|>×n_tok<image|>` for gemma4uv). Shared by `generate`
     /// and `evict_to_fit`.
     #[allow(clippy::type_complexity)] // (rendered, tokens, image_start) is clearer inline than a named alias
     fn render_prompt(&self) -> Result<(String, Vec<u32>, Option<usize>), Box<dyn Error>> {
@@ -866,11 +873,22 @@ impl ChatSession {
                 format!("tokenizer has no {s} token — this model is not vision-capable").into()
             })
         };
+        // Image markers differ per projector (begin, per-token soft placeholder,
+        // end). The placeholder rows are overwritten by the vision embeddings, so
+        // only their count + the surrounding markers matter for the decoder.
+        let is_gemma4 = self.vision_ctx.as_ref().is_some_and(|vc| {
+            vc.vision.config.projector_type == crate::vision::ProjectorType::Gemma4Uv
+        });
+        let (vstart, vpad, vend) = if is_gemma4 {
+            ("<|image>", "<|image|>", "<image|>")
+        } else {
+            ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>")
+        };
         let mut tokens = encode(before)?;
-        tokens.push(tid("<|vision_start|>")?);
+        tokens.push(tid(vstart)?);
         let image_start = tokens.len();
-        tokens.resize(tokens.len() + img.n_tok, tid("<|image_pad|>")?);
-        tokens.push(tid("<|vision_end|>")?);
+        tokens.resize(tokens.len() + img.n_tok, tid(vpad)?);
+        tokens.push(tid(vend)?);
         tokens.extend(encode(after)?);
         Ok((rendered, tokens, Some(image_start)))
     }
@@ -1278,18 +1296,27 @@ impl ChatSession {
         let gguf = GgufFile::open(&path)?;
         let weights = self.engine.upload_weights(&gguf)?;
         let cfg = crate::vision::parse_config(&gguf)?;
-        // The encoder copies its tensor views out of `weights` (no borrow held),
-        // so moving `weights` into the VisionModel below keeps them valid.
-        let encoder = VisionEncoder::new(
-            &weights,
-            cfg.n_embd as usize,
-            cfg.patch_size as usize,
-            cfg.n_head as usize,
-            cfg.n_ff as usize,
-            cfg.n_layer as usize,
-            cfg.eps,
-        )?;
-        let host_weights = HostWeights::from_gguf(&gguf)?;
+        // The gemma4uv projector has no transformer tower — skip the tower
+        // encoder and its host-side weights; `attach_image` runs the light
+        // `encode_image_gemma4` pipeline for it.
+        let (encoder, host_weights) =
+            if cfg.projector_type == crate::vision::ProjectorType::Gemma4Uv {
+                (None, None)
+            } else {
+                // The encoder copies its tensor views out of `weights` (no borrow
+                // held), so moving `weights` into the VisionModel below keeps them
+                // valid.
+                let encoder = VisionEncoder::new(
+                    &weights,
+                    cfg.n_embd as usize,
+                    cfg.patch_size as usize,
+                    cfg.n_head as usize,
+                    cfg.n_ff as usize,
+                    cfg.n_layer as usize,
+                    cfg.eps,
+                )?;
+                (Some(encoder), Some(HostWeights::from_gguf(&gguf)?))
+            };
         let vision = crate::vision::VisionModel {
             config: cfg,
             weights,
@@ -1321,32 +1348,56 @@ impl ChatSession {
             .vision
             .config
             .clone();
-        let pcfg = crate::vision::preprocess::PreprocessConfig::qwen3vl_default(
-            cfg.patch_size,
-            cfg.spatial_merge_size,
-            cfg.image_mean,
-            cfg.image_std,
-        );
+        let is_gemma4 = cfg.projector_type == crate::vision::ProjectorType::Gemma4Uv;
+        let pcfg = if is_gemma4 {
+            crate::vision::preprocess::PreprocessConfig::gemma4_default(
+                cfg.patch_size,
+                cfg.n_merge,
+                cfg.image_mean,
+                cfg.image_std,
+            )
+        } else {
+            crate::vision::preprocess::PreprocessConfig::qwen3vl_default(
+                cfg.patch_size,
+                cfg.spatial_merge_size,
+                cfg.image_mean,
+                cfg.image_std,
+            )
+        };
         let pimg = crate::vision::preprocess::preprocess(path, &pcfg)?;
-        let merge = cfg.spatial_merge_size as usize;
-        let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
-        let n_tok = pimg.n_tokens as usize;
 
-        // Grow the scratch for the vision tower's working set, then encode.
+        // Grow the scratch for the encoder's working set, then encode.
         let need = vision_scratch_estimate(&pimg);
         if need > self.scratch_bytes {
             self.engine.allocate_scratch(need)?;
             self.scratch_bytes = need;
         }
         let vc = self.vision_ctx.as_ref().expect("ensure_vision built it");
-        let (encoder, host_weights, weights) = (&vc.encoder, &vc.host_weights, &vc.vision.weights);
-        let embeddings = crate::vision::encoder::encode_image_chunked(
-            &mut self.engine,
-            weights,
-            encoder,
-            &pimg,
-            host_weights,
-        )?;
+        let weights = &vc.vision.weights;
+        let (embeddings, nx, ny, n_tok) = if is_gemma4 {
+            // No-tower projector: the light gemma4uv embed pipeline returns its
+            // own merged grid (npx·npy = n_tok).
+            let (emb, _ntok, npx, npy) = crate::vision::encoder::encode_image_gemma4(
+                &mut self.engine,
+                weights,
+                &cfg,
+                &pimg,
+            )?;
+            (emb, npx, npy, npx * npy)
+        } else {
+            let merge = cfg.spatial_merge_size as usize;
+            let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
+            let encoder = vc.encoder.as_ref().expect("non-gemma4 tower encoder");
+            let host_weights = vc.host_weights.as_ref().expect("non-gemma4 host weights");
+            let embeddings = crate::vision::encoder::encode_image_chunked(
+                &mut self.engine,
+                weights,
+                encoder,
+                &pimg,
+                host_weights,
+            )?;
+            (embeddings, nx, ny, pimg.n_tokens as usize)
+        };
         self.pending_image = Some(EncodedImage {
             embeddings,
             nx,
