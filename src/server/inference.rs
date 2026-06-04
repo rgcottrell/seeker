@@ -411,6 +411,15 @@ impl PrefixCache {
             .flatten()
             .any(|e| e.p >= p && lcp(&e.tokens, tokens) >= p as usize)
     }
+
+    /// Drop every cached entry (pool buffers stay allocated). The bench uses
+    /// this to start each run with a cold cache for comparable measurements.
+    fn clear(&mut self) {
+        for e in &mut self.entries {
+            *e = None;
+        }
+        self.clock = 0;
+    }
 }
 
 /// GPU-resident state owned by the worker thread for the whole process. A
@@ -1847,6 +1856,10 @@ pub struct BenchPlan {
     pub warmup: u32,
     pub prompt: String,
     pub check: bool,
+    /// Warm the leading-prefix cache before each timed Shared run (prefill the
+    /// shared prefix once) so the timed sequences seed from it — the measure
+    /// gate for `SEEKER_PREFIX_CACHE`. No effect without the shared workload.
+    pub prewarm: bool,
 }
 
 /// One result row (a single `(B, workload)` run).
@@ -1915,7 +1928,7 @@ fn bench_thread(mut cfg: WorkerConfig, plan: BenchPlan) -> Result<(), String> {
         let mut base_decode_tps = 0.0f64;
         let mut check0: Option<Vec<u32>> = None;
         for (bi, &b) in plan.batches.iter().enumerate() {
-            worker.bench_reset_slots();
+            worker.bench_reset_slots(/*clear_cache=*/ true);
             let row = drive_workload(&mut worker, &base, b, workload, &plan)?;
             if bi == 0 {
                 base_decode_tps = row.decode_tps;
@@ -2065,6 +2078,14 @@ fn drive_workload(
     // window — the driver controls the step count exactly.
     let max_tokens = (warmup + gen_len + 32) as u32;
 
+    // Optionally warm the leading-prefix cache (prefill the shared prefix once)
+    // so the timed Shared burst seeds from it. The preceding bench_reset_slots
+    // cleared the cache; bench_prewarm repopulates exactly [0, shared_len) and
+    // leaves the slabs cold so admission takes the seed path, not pure-extension.
+    if plan.prewarm && workload == BenchWorkload::Shared {
+        worker.bench_prewarm(base, shared_len);
+    }
+
     let mut rxs: Vec<mpsc::Receiver<GenEvent>> = Vec::with_capacity(b);
     for s in 0..b {
         let tokens = bench_synth_prompt(base, prompt_len, s, workload, shared_len);
@@ -2147,7 +2168,10 @@ fn drive_workload(
 impl Worker {
     /// Clear every slot's cached prefix + recurrent state for a fresh, comparable
     /// bench run (no cross-run prefix reuse, no stale SSM state). Bench-only.
-    fn bench_reset_slots(&mut self) {
+    /// `clear_cache` also wipes the leading-prefix snapshot cache — pass `true`
+    /// between runs for comparability, `false` after a prewarm (which fills the
+    /// cache and then cold-resets the slabs so the timed burst seeds from it).
+    fn bench_reset_slots(&mut self, clear_cache: bool) {
         self.active.clear();
         self.clock = 0;
         self.engine.decode_cache = None;
@@ -2159,6 +2183,98 @@ impl Worker {
             self.batch.positions[i] = 0;
             self.batch.rope_lag[i] = 0;
         }
+        if clear_cache && let Some(pc) = self.prefix_cache.as_mut() {
+            pc.clear();
+        }
+    }
+
+    /// Warm the leading-prefix cache before a timed Shared run: prefill exactly
+    /// the `shared_len`-token shared prefix, capture it at its boundary, then
+    /// cold-reset the slabs (keeping the cache entry) so every timed sequence
+    /// seeds from the cache instead of re-prefilling the shared prefix. No-op
+    /// without the cache (the run then measures the unwarmed/baseline path).
+    fn bench_prewarm(&mut self, base: &[u32], shared_len: usize) {
+        // Nothing to warm without the cache enabled.
+        let (p_min, max_cached_len) = match self.prefix_cache.as_ref() {
+            Some(pc) => (pc.p_min, pc.max_cached_len),
+            None => return,
+        };
+        if shared_len == 0 || base.is_empty() {
+            return;
+        }
+        // The capture is silently a no-op outside `[p_min, max_cached_len]`; warn
+        // loudly here so a misconfigured sweep doesn't report an unwarmed cache as
+        // if it were the seeding path.
+        let sl = shared_len as u32;
+        if sl < p_min || sl > max_cached_len {
+            tracing::warn!(
+                shared_len,
+                p_min,
+                max_cached_len,
+                "bench_prewarm: --shared-len outside [p_min, max_cached_len]; cache will NOT warm \
+                 (raise --shared-len or adjust SEEKER_PREFIX_CACHE_PMIN/_MAXLEN)"
+            );
+            return;
+        }
+        // Identical to the first `shared_len` tokens of every Shared-workload
+        // sequence (which tile `base` and only diverge in the suffix).
+        let prefix: Vec<u32> = (0..shared_len).map(|i| base[i % base.len()]).collect();
+        let (tx, mut rx) = mpsc::channel::<GenEvent>(64);
+        self.admit_unified(GenJob {
+            tokens: prefix,
+            config: GenConfig {
+                sampler: bench_greedy_cfg(),
+                max_tokens: 4,
+                stop: Vec::new(),
+                ignore_eos: true,
+                id_slot: None,
+            },
+            image: None,
+            reply: tx,
+        });
+        // admit_unified only pushes to `active` on success; an empty `active`
+        // here means it rejected the request (e.g. no free slab) and sent the
+        // error to the now-dropped channel.
+        if self.active.is_empty() {
+            tracing::warn!("bench_prewarm: prewarm request was not admitted; cache not warmed");
+            return;
+        }
+        // Drive prefill to completion (the sequence emits `Started` once caught
+        // up); no eviction in between so the slab is still live to capture.
+        let mut guard = 0usize;
+        loop {
+            self.schedule_step();
+            let mut started = false;
+            while let Ok(ev) = rx.try_recv() {
+                if matches!(ev, GenEvent::Started { .. }) {
+                    started = true;
+                }
+            }
+            if started {
+                break;
+            }
+            if self.active.is_empty() {
+                tracing::warn!(
+                    "bench_prewarm: prewarm sequence ended before prefill completed; cache not warmed"
+                );
+                self.bench_reset_slots(false);
+                return;
+            }
+            guard += 1;
+            if guard > 100_000 {
+                tracing::warn!("bench_prewarm: prefill did not converge; cache not warmed");
+                self.bench_reset_slots(false);
+                return;
+            }
+        }
+        // Capture the shared prefix at its boundary: `positions[slab]` now equals
+        // shared_len, so the slab's live SSM state is exactly state-at-shared_len.
+        if let Some(slab) = self.active.first().map(|s| s.slab) {
+            let p = self.batch.positions[slab as usize];
+            self.capture_checkpoint(slab, p, 0);
+        }
+        // Cold-reset the slabs but KEEP the cache entry → timed burst seeds.
+        self.bench_reset_slots(false);
     }
 }
 

@@ -136,6 +136,14 @@ pub struct ProbeArgs {
     /// across batch sizes (the determinism gate every phase must keep green).
     #[arg(long)]
     check: bool,
+
+    /// Concurrent bench: warm the leading-prefix cache before each timed Shared
+    /// run (prefill the shared prefix once) so sequences seed from it — the
+    /// measure gate for `SEEKER_PREFIX_CACHE`. Pair with `SEEKER_PREFIX_CACHE=1`
+    /// and `p_min <= --shared-len < --prompt-len` (p_min default 64, via
+    /// `SEEKER_PREFIX_CACHE_PMIN`); out of that range it warns and no-ops.
+    #[arg(long)]
+    prewarm: bool,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -450,6 +458,7 @@ async fn bench_concurrent(args: ProbeArgs) -> Result<(), Box<dyn Error>> {
         warmup: args.warmup,
         prompt: args.prompt.clone(),
         check: args.check,
+        prewarm: args.prewarm,
     };
 
     match tokio::task::spawn_blocking(move || run_concurrent_bench(cfg, plan)).await {
