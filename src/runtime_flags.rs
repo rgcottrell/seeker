@@ -108,6 +108,44 @@ pub static SSM_BATCH_DISABLED: LazyLock<bool> = LazyLock::new(|| {
 pub static PROF_STEP: LazyLock<bool> =
     LazyLock::new(|| std::env::var("SEEKER_PROF_STEP").is_ok_and(|v| v == "1"));
 
+// ─── Leading-prefix cache (serve) ────────────────────────────────────
+//
+// `seeker serve` reuses a shared leading prefix (system prompt, few-shot
+// block) across divergent requests: the prefix is prefilled once and
+// seeded into later requests via a GPU→GPU copy of `KV[0,P)` +
+// `SSM-state-at-P`, so each request prefills only its unique suffix
+// instead of re-running the shared prefill. In-process only (snapshots
+// are byte-identical to a fresh prefill on the same device, but not
+// across processes/drivers, so they are never persisted). Default-off;
+// when the master gate is unset the whole feature is `None` on `Worker`.
+
+/// `SEEKER_PREFIX_CACHE=1` — master gate for the leading-prefix snapshot
+/// cache in `seeker serve`. Default-off (byte-identical to today).
+pub static PREFIX_CACHE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("SEEKER_PREFIX_CACHE").is_ok_and(|v| v == "1"));
+
+/// `SEEKER_PREFIX_CACHE_SLOTS=<n>` — number of snapshot pool entries
+/// (each costs ~65 MiB SSM + up to `MAXLEN` tokens of KV). Default 2.
+pub static PREFIX_CACHE_SLOTS: LazyLock<Option<u32>> =
+    LazyLock::new(|| env_u32("SEEKER_PREFIX_CACHE_SLOTS"));
+
+/// `SEEKER_PREFIX_CACHE_CKPT=<n>` — capture checkpoint stride in tokens.
+/// A live prefill is snapshotted at the first chunk boundary past each
+/// multiple of this (sparse, since each snapshot is ~65 MiB). Default 512.
+pub static PREFIX_CACHE_CKPT: LazyLock<Option<u32>> =
+    LazyLock::new(|| env_u32("SEEKER_PREFIX_CACHE_CKPT"));
+
+/// `SEEKER_PREFIX_CACHE_PMIN=<n>` — minimum shared-prefix length to seed
+/// or snapshot. Below this, a full re-prefill is cheaper than the flat
+/// ~65 MiB SSM copy. Default 64 (the copy is GPU-side / sub-ms).
+pub static PREFIX_CACHE_PMIN: LazyLock<Option<u32>> =
+    LazyLock::new(|| env_u32("SEEKER_PREFIX_CACHE_PMIN"));
+
+/// `SEEKER_PREFIX_CACHE_MAXLEN=<n>` — cap on tokens any pool entry holds
+/// (sizes each entry's per-layer KV buffers). Default `min(ctx, 4096)`.
+pub static PREFIX_CACHE_MAXLEN: LazyLock<Option<u32>> =
+    LazyLock::new(|| env_u32("SEEKER_PREFIX_CACHE_MAXLEN"));
+
 // ─── Debug flags (gpu_debug) ─────────────────────────────────────────
 
 /// Define a presence-based debug flag behind `gpu_debug`. With the

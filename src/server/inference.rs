@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::gguf::{GgmlType, GgufFile};
 use crate::inference::Engine;
-use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig};
+use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig, PrefixSnapshot};
 use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::tokenizer::{Tokenizer, build_tokenizer};
 use crate::vision::encoder::{HostWeights, VisionEncoder};
@@ -320,6 +320,99 @@ struct ActiveSeq {
     started: bool,
 }
 
+/// One cached leading prefix: the exact prefix token ids (length `p`, matched
+/// via [`lcp`]), an LRU stamp, and a pin flag. Its KV+SSM bytes live in the
+/// pool slot at the same index in [`PrefixCache::pool`].
+struct PrefixEntry {
+    tokens: Vec<u32>,
+    p: u32,
+    last_used: u64,
+    pinned: bool,
+}
+
+/// In-process, GPU-resident leading-prefix snapshot cache for `seeker serve`.
+/// A shared leading prefix (system prompt / few-shot block) is prefilled once
+/// and snapshotted at sparse checkpoints; a later divergent request seeds a
+/// fresh slab from the longest matching snapshot (GPU→GPU copy of `KV[0,P)` +
+/// the SSM state at P) and prefills only its unique suffix. `pool[i]` holds the
+/// bytes for `entries[i]` (parallel vecs; `entries[i] == None` ⇒ free slot).
+/// Single-threaded with the Worker and every copy is a synchronous fenced
+/// submit, so no in-flight reference counting is needed.
+struct PrefixCache {
+    pool: Vec<PrefixSnapshot>,
+    entries: Vec<Option<PrefixEntry>>,
+    /// Longest prefix (tokens) any pool slot can hold — caps the KV bytes.
+    max_cached_len: u32,
+    /// Snapshot at most once per this many prefill tokens (sparse: each is ~65 MiB).
+    ckpt_stride: u32,
+    /// Don't seed/snapshot a prefix shorter than this.
+    p_min: u32,
+    /// Monotonic LRU clock (shares nothing with the slot clock).
+    clock: u64,
+}
+
+impl PrefixCache {
+    fn new(
+        batch: &BatchKvCache,
+        device: &crate::inference::device::Device,
+        capacity: u32,
+        max_cached_len: u32,
+        ckpt_stride: u32,
+        p_min: u32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut pool = Vec::with_capacity(capacity as usize);
+        for _ in 0..capacity {
+            pool.push(batch.new_prefix_snapshot(device, max_cached_len)?);
+        }
+        let entries = (0..capacity as usize).map(|_| None).collect();
+        Ok(Self {
+            pool,
+            entries,
+            max_cached_len,
+            ckpt_stride,
+            p_min,
+            clock: 0,
+        })
+    }
+
+    /// Index of the longest cached entry whose tokens are a full leading prefix
+    /// of `new_tokens` (the most reuse, least re-prefill).
+    fn lookup(&self, new_tokens: &[u32]) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            let Some(e) = e else { continue };
+            let common = lcp(&e.tokens, new_tokens);
+            if common == e.tokens.len() && best.is_none_or(|(_, bl)| e.tokens.len() > bl) {
+                best = Some((i, e.tokens.len()));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// A pool index to capture into: a free slot, else the LRU unpinned entry.
+    /// `None` only when every slot is occupied by a pinned entry.
+    fn reserve_victim(&self) -> Option<usize> {
+        if let Some(i) = self.entries.iter().position(|e| e.is_none()) {
+            return Some(i);
+        }
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.as_ref().filter(|e| !e.pinned).map(|e| (i, e.last_used)))
+            .min_by_key(|&(_, lu)| lu)
+            .map(|(i, _)| i)
+    }
+
+    /// Whether a leading prefix of `tokens` at length ≥ `p` is already cached
+    /// (so a redundant re-snapshot can be skipped).
+    fn has_at_least(&self, tokens: &[u32], p: u32) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|e| e.p >= p && lcp(&e.tokens, tokens) >= p as usize)
+    }
+}
+
 /// GPU-resident state owned by the worker thread for the whole process. A
 /// single [`BatchKvCache`] holds N slabs; idle slabs keep their conversation's
 /// prefix (cross-request reuse), while the active subset advances together in
@@ -351,6 +444,9 @@ struct Worker {
     /// Bytes the scratch region is sized for, so an image prefill (single-pass,
     /// plus the vision tower's working set) can grow it on demand.
     scratch_bytes: u64,
+    /// Leading-prefix snapshot cache (`SEEKER_PREFIX_CACHE`). `None` when the
+    /// feature is off — every seed/capture branch then short-circuits.
+    prefix_cache: Option<PrefixCache>,
 }
 
 /// Length of the longest common prefix of two token sequences.
@@ -501,6 +597,39 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
             active: false,
         })
         .collect();
+
+    // Optional leading-prefix snapshot cache (default-off). Its pool memory was
+    // already reserved out of the auto `--parallel` budget in `resolve_n_slots`.
+    let prefix_cache = if *crate::runtime_flags::PREFIX_CACHE {
+        let cap = crate::runtime_flags::PREFIX_CACHE_SLOTS.unwrap_or(2).max(1);
+        let max_cached_len = crate::runtime_flags::PREFIX_CACHE_MAXLEN
+            .unwrap_or_else(|| cfg.ctx_size.min(4096))
+            .clamp(1, cfg.ctx_size.max(1));
+        let ckpt = crate::runtime_flags::PREFIX_CACHE_CKPT
+            .unwrap_or(512)
+            .max(1);
+        let p_min = crate::runtime_flags::PREFIX_CACHE_PMIN.unwrap_or(64).max(1);
+        match PrefixCache::new(&batch, &engine.device, cap, max_cached_len, ckpt, p_min) {
+            Ok(pc) => {
+                tracing::info!(
+                    slots = cap,
+                    max_cached_len,
+                    ckpt_stride = ckpt,
+                    p_min,
+                    pool_mib = pc.pool.iter().map(|s| s.total_bytes()).sum::<u64>() / mib,
+                    "prefix cache enabled (leading-prefix seed/snapshot)"
+                );
+                Some(pc)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "prefix cache alloc failed; serving without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(Worker {
         engine,
         model,
@@ -513,6 +642,7 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         unified,
         vision,
         scratch_bytes,
+        prefix_cache,
     })
 }
 
@@ -548,7 +678,23 @@ fn resolve_n_slots(
     let heap = device_local_bytes(device);
     let frac = cfg.mem_fraction.clamp(0.1, 1.0) as f64;
     let budget = (heap as f64 * frac) as u64;
-    let avail = budget.saturating_sub(weights_bytes.saturating_add(scratch_bytes));
+    // Reserve the leading-prefix snapshot pool out of the budget so N×ctx + pool
+    // still fits (each pool entry ≈ one sequence's SSM + `max_cached_len` of KV).
+    let pool_bytes = if *crate::runtime_flags::PREFIX_CACHE {
+        let slots = crate::runtime_flags::PREFIX_CACHE_SLOTS.unwrap_or(2).max(1) as u64;
+        let max_cached_len = crate::runtime_flags::PREFIX_CACHE_MAXLEN
+            .unwrap_or_else(|| cache_config.max_seq_len.min(4096));
+        probe_prefix_snapshot_bytes(device, dims, cache_config, ssm_dims, max_cached_len)
+            .unwrap_or(0)
+            * slots
+    } else {
+        0
+    };
+    let avail = budget.saturating_sub(
+        weights_bytes
+            .saturating_add(scratch_bytes)
+            .saturating_add(pool_bytes),
+    );
     let n = ((avail / per_slot) as u32).clamp(1, parallel_max);
     if n < parallel_max {
         tracing::warn!(
@@ -591,6 +737,37 @@ fn probe_per_slot_bytes(
         )?;
     }
     Ok(probe.total_bytes())
+}
+
+/// Bytes one prefix-cache snapshot occupies (KV mini-slabs for `max_cached_len`
+/// tokens + one sequence's SSM state), measured exactly via a throwaway 1-slot
+/// cache + snapshot that is dropped before the real allocation.
+fn probe_prefix_snapshot_bytes(
+    device: &crate::inference::device::Device,
+    dims: &crate::models::CacheDims,
+    cache_config: KvCacheConfig,
+    ssm_dims: Option<&crate::models::SsmStateDims>,
+    max_cached_len: u32,
+) -> Result<u64, Box<dyn Error>> {
+    let mut probe = BatchKvCache::new(
+        device,
+        dims.n_layer,
+        dims.head_dim,
+        dims.n_head_kv,
+        1,
+        cache_config,
+    )?;
+    if let Some(ssm) = ssm_dims {
+        probe.allocate_ssm_state(
+            device,
+            ssm.n_ssm_layers,
+            ssm.conv_state_floats,
+            ssm.gdn_state_floats,
+        )?;
+    }
+    Ok(probe
+        .new_prefix_snapshot(device, max_cached_len)?
+        .total_bytes())
 }
 
 /// Total bytes across DEVICE_LOCAL memory heaps (≈ system RAM on the unified APU).
@@ -926,6 +1103,12 @@ impl Worker {
             } else {
                 common as u32 - 1
             }
+        } else if let Some(p_seed) = self.try_seed_prefix(idx, &new_tokens, prompt_tokens) {
+            // No live-slab pure extension, but the leading-prefix cache holds a
+            // shared prefix: seed KV[0,P)+SSM-at-P GPU→GPU and prefill only the
+            // divergent suffix [p_seed, prompt). (seed_slab already overwrote the
+            // slab's SSM state, so no reset_slot is needed.)
+            p_seed
         } else {
             self.batch.reset_slot(idx as u32);
             0
@@ -960,6 +1143,101 @@ impl Worker {
             num_computed,
             started: false,
         });
+    }
+
+    /// On a cross-request leading-prefix cache hit, seed `slab` from the cached
+    /// snapshot (GPU→GPU copy of `KV[0, P)` + the SSM state at P) and return the
+    /// seeded position `p_seed`, so the caller prefills only `[p_seed, prompt)`.
+    /// `None` ⇒ miss / below `p_min` / cache disabled, so the caller does a
+    /// fresh prefill. Text-only: the seed forces `rope_lag = 0`.
+    fn try_seed_prefix(
+        &mut self,
+        slab: usize,
+        new_tokens: &[u32],
+        prompt_tokens: u32,
+    ) -> Option<u32> {
+        // Decide (immutable phase); pull out scalars so no borrow is held across
+        // the `&mut self.engine` seed call below.
+        let (pool_idx, p_seed) = {
+            let pc = self.prefix_cache.as_ref()?;
+            let ei = pc.lookup(new_tokens)?;
+            let p = pc.entries[ei].as_ref()?.p;
+            // Leave ≥1 suffix token so the first sampled logit comes from a real
+            // forward (`p ≤ prompt_tokens`, since the entry is a prefix of it).
+            let p_seed = p.min(prompt_tokens.saturating_sub(1));
+            if p_seed < pc.p_min {
+                return None;
+            }
+            (ei, p_seed)
+        };
+        // GPU→GPU seed (disjoint field borrows: &mut engine, &batch, &pool slot).
+        {
+            let snap = &self.prefix_cache.as_ref().unwrap().pool[pool_idx];
+            if let Err(e) = self
+                .engine
+                .seed_slab(&self.batch, snap, slab as u32, p_seed)
+            {
+                tracing::warn!(error = %e, "prefix-cache seed failed; full prefill");
+                return None;
+            }
+        }
+        self.batch.rope_lag[slab] = 0;
+        let pc = self.prefix_cache.as_mut().unwrap();
+        pc.clock += 1;
+        if let Some(e) = pc.entries[pool_idx].as_mut() {
+            e.last_used = pc.clock;
+        }
+        tracing::debug!(slab, p_seed, "serve: prefix-cache seed");
+        Some(p_seed)
+    }
+
+    /// Snapshot the live prefix `[0, p)` of `slab` into the cache (a sparse
+    /// checkpoint during prefill), so a later request sharing this leading
+    /// prefix can seed from it. Requires `positions[slab] == p` (a chunk
+    /// boundary, where the slab's live SSM state equals state-at-P) and a
+    /// text-only slab. Best-effort; failures are logged, not fatal.
+    fn capture_checkpoint(&mut self, slab: u32, p: u32, active_idx: usize) {
+        if self.batch.rope_lag[slab as usize] != 0 {
+            return;
+        }
+        // Decide whether + where to capture (immutable phase).
+        let pool_idx = {
+            let Some(pc) = self.prefix_cache.as_ref() else {
+                return;
+            };
+            if p < pc.p_min || p > pc.max_cached_len {
+                return;
+            }
+            let prompt = &self.active[active_idx].prompt;
+            if (p as usize) > prompt.len() {
+                return;
+            }
+            if pc.has_at_least(&prompt[..p as usize], p) {
+                return;
+            }
+            match pc.reserve_victim() {
+                Some(i) => i,
+                None => return,
+            }
+        };
+        // GPU→GPU capture (disjoint field borrows: &mut engine, &batch, &pool slot).
+        {
+            let snap = &self.prefix_cache.as_ref().unwrap().pool[pool_idx];
+            if let Err(e) = self.engine.capture_prefix(&self.batch, snap, slab, p) {
+                tracing::warn!(error = %e, "prefix-cache capture failed");
+                return;
+            }
+        }
+        let tokens = self.active[active_idx].prompt[..p as usize].to_vec();
+        let pc = self.prefix_cache.as_mut().unwrap();
+        pc.clock += 1;
+        pc.entries[pool_idx] = Some(PrefixEntry {
+            tokens,
+            p,
+            last_used: pc.clock,
+            pinned: false,
+        });
+        tracing::debug!(slab, p, "serve: prefix-cache capture");
     }
 
     /// Encode an image through the vision tower (GPU) → `[proj_dim, n_tok]` host
@@ -1260,6 +1538,19 @@ impl Worker {
             self.active[i].num_computed += nn;
             let caught_up = self.active[i].num_computed as usize == logical_len(&self.active[i]);
             if !caught_up {
+                // Still prefilling. The forward synced `batch.positions[slab]` to
+                // `num_computed`, so the slab's live SSM state is exactly
+                // state-at-P here — a valid checkpoint. Snapshot the shared
+                // leading prefix once per `ckpt_stride` tokens (each snapshot is
+                // ~65 MiB, so keep it sparse) for later requests to seed from.
+                if let Some(stride) = self.prefix_cache.as_ref().map(|pc| pc.ckpt_stride) {
+                    let p = self.active[i].num_computed;
+                    let prev = p - nn;
+                    if p / stride > prev / stride {
+                        let slab = self.active[i].slab;
+                        self.capture_checkpoint(slab, p, i);
+                    }
+                }
                 continue;
             }
             if !self.active[i].started {
@@ -1976,5 +2267,78 @@ mod tests {
         assert_eq!(choose_slot(&slots, &[1, 2, 3], Some(1)), 1);
         // Out-of-range pin falls back to auto-select (slot 0 is a pure ext).
         assert_eq!(choose_slot(&slots, &[1, 2, 3], Some(9)), 0);
+    }
+
+    // ─── PrefixCache logic (no GPU; pool is empty, only `entries` is read) ────
+
+    fn entry(tokens: &[u32], last_used: u64, pinned: bool) -> Option<PrefixEntry> {
+        Some(PrefixEntry {
+            tokens: tokens.to_vec(),
+            p: tokens.len() as u32,
+            last_used,
+            pinned,
+        })
+    }
+
+    fn pc(entries: Vec<Option<PrefixEntry>>, p_min: u32) -> PrefixCache {
+        PrefixCache {
+            pool: Vec::new(),
+            entries,
+            max_cached_len: 4096,
+            ckpt_stride: 512,
+            p_min,
+            clock: 0,
+        }
+    }
+
+    #[test]
+    fn prefix_lookup_picks_longest_leading_prefix() {
+        let c = pc(
+            vec![entry(&[1, 2], 0, false), entry(&[1, 2, 3, 4], 0, false)],
+            1,
+        );
+        // [1,2,3,4,5] extends both cached prefixes; pick the longer one (slot 1).
+        assert_eq!(c.lookup(&[1, 2, 3, 4, 5]), Some(1));
+    }
+
+    #[test]
+    fn prefix_lookup_requires_full_leading_prefix() {
+        // A cached entry that is NOT a full leading prefix of the request must
+        // not match (byte-exact, like choose_slot's pure-extension rule).
+        let c = pc(vec![entry(&[1, 2, 9], 0, false)], 1);
+        assert_eq!(c.lookup(&[1, 2, 3]), None);
+        // And an entry LONGER than the request can't be a prefix of it.
+        let c = pc(vec![entry(&[1, 2, 3], 0, false)], 1);
+        assert_eq!(c.lookup(&[1, 2]), None);
+    }
+
+    #[test]
+    fn prefix_reserve_victim_prefers_free_then_lru_unpinned() {
+        // A free (None) slot is taken first.
+        let c = pc(vec![entry(&[1], 7, false), None], 1);
+        assert_eq!(c.reserve_victim(), Some(1));
+        // No free slot: evict the least-recently-used UNPINNED entry. Slot 0 is
+        // older (1) but pinned, so slot 2 (used 3) is the victim over slot 1 (5).
+        let c = pc(
+            vec![
+                entry(&[1], 1, true),
+                entry(&[2], 5, false),
+                entry(&[3], 3, false),
+            ],
+            1,
+        );
+        assert_eq!(c.reserve_victim(), Some(2));
+        // Every slot pinned ⇒ nothing to evict.
+        let c = pc(vec![entry(&[1], 1, true), entry(&[2], 2, true)], 1);
+        assert_eq!(c.reserve_victim(), None);
+    }
+
+    #[test]
+    fn prefix_has_at_least_checks_length_and_match() {
+        let c = pc(vec![entry(&[1, 2, 3, 4], 0, false)], 1);
+        assert!(c.has_at_least(&[1, 2, 3, 4, 5], 3)); // cached p=4 covers ≥3, prefix matches
+        assert!(c.has_at_least(&[1, 2, 3, 4, 5], 4));
+        assert!(!c.has_at_least(&[1, 2, 3, 4, 5], 5)); // cached p=4 < 5
+        assert!(!c.has_at_least(&[1, 2, 9], 3)); // diverges at index 2 (lcp=2 < 3)
     }
 }

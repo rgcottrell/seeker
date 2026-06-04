@@ -13,8 +13,11 @@ use ash::vk;
 
 use crate::gguf::GgmlType;
 
+use super::buffer::BufferRange;
+use super::command::record_copy;
 use super::device::{Device, DeviceShared};
 use super::memory::Region;
+use super::ops::cache_io::per_token_bytes;
 use super::weights::TensorView;
 
 #[derive(Debug, Clone, Copy)]
@@ -735,6 +738,23 @@ fn lcm(a: u64, b: u64) -> u64 {
     a / x * b // a/gcd*b
 }
 
+/// Per-slot slab stride (bytes) for a KV layer-side of the given `dtype`.
+/// Padded to the storage-buffer `align` AND to a multiple of the quant block
+/// byte size (so block-quant turbo's `elem / QUANT_K` addressing lands on slot
+/// boundaries). Shared by [`BatchKvCache::new`] and the prefix-snapshot pool so
+/// the two can never drift apart on a future dtype change.
+pub(crate) fn slab_stride_for(
+    head_dim: u64,
+    max_seq_len: u64,
+    n_head_kv: u64,
+    align: u64,
+    dtype: GgmlType,
+) -> u64 {
+    let (_, type_size) = dtype.block_layout();
+    let bytes = tensor_bytes(head_dim, max_seq_len, n_head_kv, dtype);
+    align_up(bytes, lcm(align, type_size as u64))
+}
+
 /// A KV cache holding `n_slots` independent sequence slabs in one shared buffer
 /// per layer, so a batched decode can address all active sequences through the
 /// flash-attn batch stride (`nb13`/`nb23`). Each slab has the identical natural
@@ -825,11 +845,8 @@ impl BatchKvCache {
         // flash-attn's `elem / QUANT_K` block index lands on slot boundaries for
         // block-quant turbo). For block_size==1 the type size divides the
         // alignment, so this reduces to `align_up(bytes, align)`.
-        let slab_stride = |dtype: GgmlType| -> u64 {
-            let (_, type_size) = dtype.block_layout();
-            let bytes = tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, dtype);
-            align_up(bytes, lcm(align, type_size as u64))
-        };
+        let slab_stride =
+            |dtype: GgmlType| slab_stride_for(head_dim_u, max_seq_len, n_head_kv_u, align, dtype);
         let k_slab_stride: Vec<u64> = k_dtypes.iter().map(|&d| slab_stride(d)).collect();
         let v_slab_stride: Vec<u64> = v_dtypes.iter().map(|&d| slab_stride(d)).collect();
 
@@ -1147,6 +1164,264 @@ impl BatchKvCache {
         // copies any updated lag back into `self.rope_lag[slot]`.
         sc.rope_position_lag = self.rope_lag[slot as usize];
         sc
+    }
+
+    // ─── Leading-prefix snapshot cache (serve) ───────────────────────
+    //
+    // The shared leading prefix of a request is prefilled once, then seeded
+    // into later divergent requests by copying `KV[0, P)` + the SSM state at
+    // P into a fresh slab. Because the SSM/GDN/conv state is position-
+    // independent and `KV[0, P)` is contiguous, a GPU→GPU copy + setting the
+    // slot's position to P is byte-identical, in-process, to that slab having
+    // prefilled `[0, P)` itself (the same determinism pure-extension reuse
+    // already relies on). All copies are GPU-side `vkCmdCopyBuffer` — host
+    // reads of GPU-written SSM regions return stale bytes despite HOST_COHERENT.
+
+    /// Contiguous K byte range covering tokens `[0, p)` of `slot`'s slab for
+    /// `layer`, plus that layer's `per_token_bytes`. Position is the outermost
+    /// axis of the `[head_dim, n_head_kv, max_seq_len]` layout, so the prefix is
+    /// one flat span — a single `vkCmdCopyBuffer` seeds or captures it.
+    pub fn k_prefix_range(&self, slot: u32, layer: u32, p: u32) -> (BufferRange, u64) {
+        let il = layer as usize;
+        let (block_size, _) = self.k_dtypes[il].block_layout();
+        debug_assert_eq!(
+            (self.head_dim as u64 * self.n_head_kv as u64) % block_size as u64,
+            0,
+            "KV per-token elements must be a whole number of quant blocks for a contiguous prefix copy"
+        );
+        let ptb = per_token_bytes(
+            self.head_dim as u64,
+            self.n_head_kv as u64,
+            self.k_dtypes[il],
+        );
+        (
+            BufferRange {
+                buffer: self.k_regions[il].buffer,
+                offset: slot as u64 * self.k_slab_stride[il],
+                size: p as u64 * ptb,
+            },
+            ptb,
+        )
+    }
+
+    /// V-side companion to [`Self::k_prefix_range`].
+    pub fn v_prefix_range(&self, slot: u32, layer: u32, p: u32) -> (BufferRange, u64) {
+        let il = layer as usize;
+        let ptb = per_token_bytes(
+            self.head_dim as u64,
+            self.n_head_kv as u64,
+            self.v_dtypes[il],
+        );
+        (
+            BufferRange {
+                buffer: self.v_regions[il].buffer,
+                offset: slot as u64 * self.v_slab_stride[il],
+                size: p as u64 * ptb,
+            },
+            ptb,
+        )
+    }
+
+    /// Allocate a [`PrefixSnapshot`] sized to hold up to `max_cached_len` tokens
+    /// of this cache's KV (per-layer dtype/stride, via the shared
+    /// [`slab_stride_for`]) plus one sequence's SSM recurrent state.
+    pub fn new_prefix_snapshot(
+        &self,
+        device: &Device,
+        max_cached_len: u32,
+    ) -> Result<PrefixSnapshot, Box<dyn Error>> {
+        let maxl = max_cached_len as u64;
+        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+        let head_dim_u = self.head_dim as u64;
+        let n_head_kv_u = self.n_head_kv as u64;
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+
+        let mut k_regions = Vec::with_capacity(self.n_layer as usize);
+        let mut v_regions = Vec::with_capacity(self.n_layer as usize);
+        for il in 0..self.n_layer as usize {
+            let kb = slab_stride_for(head_dim_u, maxl, n_head_kv_u, align, self.k_dtypes[il]);
+            let vb = slab_stride_for(head_dim_u, maxl, n_head_kv_u, align, self.v_dtypes[il]);
+            k_regions.push(Region::new(device, kb.max(1), usage, mem)?);
+            v_regions.push(Region::new(device, vb.max(1), usage, mem)?);
+        }
+
+        let n_ssm = self.n_ssm_layers();
+        let conv = self.conv_slab_floats as u64 * 4;
+        let gdn = self.gdn_slab_floats as u64 * 4;
+        let mut conv_off = Vec::with_capacity(n_ssm);
+        let mut gdn_off = Vec::with_capacity(n_ssm);
+        let mut cursor = 0u64;
+        for _ in 0..n_ssm {
+            let co = align_up(cursor, align);
+            cursor = co + conv;
+            let go = align_up(cursor, align);
+            cursor = go + gdn;
+            conv_off.push(co);
+            gdn_off.push(go);
+        }
+        let ssm_region = Region::new(device, cursor.max(1), usage, mem)?;
+
+        Ok(PrefixSnapshot {
+            k_regions,
+            v_regions,
+            ssm_region,
+            conv_off,
+            gdn_off,
+            device: self.device.clone(),
+        })
+    }
+
+    /// Record KV copies between `slot`'s slab and `snap` (`capture` = slab→snap,
+    /// else snap→slab) for the prefix `[0, p)`.
+    fn record_kv(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        snap: &PrefixSnapshot,
+        slot: u32,
+        p: u32,
+        capture: bool,
+    ) {
+        for il in 0..self.n_layer {
+            let (slab_k, ptb_k) = self.k_prefix_range(slot, il, p);
+            let snap_k = BufferRange {
+                buffer: snap.k_regions[il as usize].buffer,
+                offset: 0,
+                size: p as u64 * ptb_k,
+            };
+            let (src, dst) = if capture {
+                (slab_k, snap_k)
+            } else {
+                (snap_k, slab_k)
+            };
+            record_copy(device, cmd, src, dst, src.size);
+
+            let (slab_v, ptb_v) = self.v_prefix_range(slot, il, p);
+            let snap_v = BufferRange {
+                buffer: snap.v_regions[il as usize].buffer,
+                offset: 0,
+                size: p as u64 * ptb_v,
+            };
+            let (src, dst) = if capture {
+                (slab_v, snap_v)
+            } else {
+                (snap_v, slab_v)
+            };
+            record_copy(device, cmd, src, dst, src.size);
+        }
+    }
+
+    /// Record SSM (conv + GDN, all layers) copies between `slot`'s slab and
+    /// `snap` (`capture` = slab→snap, else snap→slab).
+    fn record_ssm(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        snap: &PrefixSnapshot,
+        slot: u32,
+        capture: bool,
+    ) {
+        let conv = self.conv_slab_floats as u64 * 4;
+        let gdn = self.gdn_slab_floats as u64 * 4;
+        for layer in 0..self.n_ssm_layers() {
+            let slab_conv = self.conv_state_slot(layer as u32, slot);
+            let snap_conv = BufferRange {
+                buffer: snap.ssm_region.buffer,
+                offset: snap.conv_off[layer],
+                size: conv,
+            };
+            let (src, dst) = if capture {
+                (slab_conv, snap_conv)
+            } else {
+                (snap_conv, slab_conv)
+            };
+            record_copy(device, cmd, src, dst, conv);
+
+            let slab_gdn = self.gdn_state_slot(layer as u32, slot);
+            let snap_gdn = BufferRange {
+                buffer: snap.ssm_region.buffer,
+                offset: snap.gdn_off[layer],
+                size: gdn,
+            };
+            let (src, dst) = if capture {
+                (slab_gdn, snap_gdn)
+            } else {
+                (snap_gdn, slab_gdn)
+            };
+            record_copy(device, cmd, src, dst, gdn);
+        }
+    }
+
+    /// Record the copies seeding `dst_slot`'s slab (KV `[0, p)` + SSM state at P)
+    /// from `snap`. The caller emits the trailing global barrier before the slab
+    /// is read by a forward.
+    pub fn record_seed(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        snap: &PrefixSnapshot,
+        dst_slot: u32,
+        p: u32,
+    ) {
+        self.record_kv(device, cmd, snap, dst_slot, p, /*capture=*/ false);
+        self.record_ssm(device, cmd, snap, dst_slot, /*capture=*/ false);
+    }
+
+    /// Record the copies capturing `src_slot`'s prefix `[0, p)` (KV + SSM state
+    /// at P) into `snap`. The slab's live SSM state equals state-at-P only when
+    /// `positions[src_slot] == p` (a prefill chunk boundary), which the caller
+    /// must guarantee.
+    pub fn record_capture(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        snap: &PrefixSnapshot,
+        src_slot: u32,
+        p: u32,
+    ) {
+        self.record_kv(device, cmd, snap, src_slot, p, /*capture=*/ true);
+        self.record_ssm(device, cmd, snap, src_slot, /*capture=*/ true);
+    }
+}
+
+/// A pool buffer set holding one captured leading prefix: per-layer-side KV
+/// "mini-slabs" (sized for up to `max_cached_len` tokens) plus one sequence's
+/// SSM recurrent state (conv + GDN per SSM layer). Owns its `Region`s. Lives in
+/// `inference` (not `server`) so both [`BatchKvCache`]'s copy helpers and
+/// [`crate::inference::Engine`] can address it. Snapshots are byte-identical to
+/// a fresh prefill on the same device but NOT across processes/drivers, so they
+/// are never persisted to disk.
+pub struct PrefixSnapshot {
+    k_regions: Vec<Region>,
+    v_regions: Vec<Region>,
+    ssm_region: Region,
+    /// Per-SSM-layer byte offsets of this snapshot's single-sequence conv / GDN
+    /// state within `ssm_region`.
+    conv_off: Vec<u64>,
+    gdn_off: Vec<u64>,
+    device: Arc<DeviceShared>,
+}
+
+impl PrefixSnapshot {
+    /// Total device memory backing this snapshot (KV mini-slabs + SSM state).
+    pub fn total_bytes(&self) -> u64 {
+        self.k_regions
+            .iter()
+            .chain(&self.v_regions)
+            .map(|r| r.size)
+            .sum::<u64>()
+            + self.ssm_region.size
+    }
+}
+
+impl Drop for PrefixSnapshot {
+    fn drop(&mut self) {
+        let dev = self.device.raw();
+        for r in self.k_regions.iter_mut().chain(self.v_regions.iter_mut()) {
+            r.destroy(dev);
+        }
+        self.ssm_region.destroy(dev);
     }
 }
 

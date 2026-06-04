@@ -635,6 +635,89 @@ impl Engine {
         Ok(out)
     }
 
+    /// Seed `dst_slot`'s slab from a captured leading-prefix `snap`: a one-time
+    /// fenced transfer cmdbuf that GPU→GPU copies `KV[0, p)` + the SSM state at
+    /// P into the slab. The caller then sets `positions[dst_slot] = p` and
+    /// prefills only the divergent suffix `[p, len)`. Byte-identical, in-process,
+    /// to the slab having prefilled `[0, p)` itself (SSM state is position-
+    /// independent, `KV[0, p)` is contiguous). Invalidates the decode replay
+    /// cache (it binds specific slab buffers).
+    pub fn seed_slab(
+        &mut self,
+        batch: &kv_cache::BatchKvCache,
+        snap: &kv_cache::PrefixSnapshot,
+        dst_slot: u32,
+        p: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        unsafe {
+            self.device
+                .device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)?;
+        }
+        batch.record_seed(&self.device, self.command_buffer, snap, dst_slot, p);
+        command::record_global_barrier(&self.device, self.command_buffer);
+        unsafe {
+            self.device.device.end_command_buffer(self.command_buffer)?;
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        // The cached decode cmdbuf binds specific slab buffers; a seed changes
+        // what the next forward must read, so force a fresh recording.
+        self.decode_cache = None;
+        Ok(())
+    }
+
+    /// Capture `src_slot`'s leading prefix `[0, p)` (KV + the SSM state at P)
+    /// into `snap`. The slab's live SSM state equals state-at-P only when
+    /// `positions[src_slot] == p` (a prefill chunk boundary) — the caller must
+    /// guarantee that. A read of the slab; the active slab state is unchanged,
+    /// so the decode cache stays valid.
+    pub fn capture_prefix(
+        &mut self,
+        batch: &kv_cache::BatchKvCache,
+        snap: &kv_cache::PrefixSnapshot,
+        src_slot: u32,
+        p: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        unsafe {
+            self.device
+                .device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)?;
+        }
+        batch.record_capture(&self.device, self.command_buffer, snap, src_slot, p);
+        command::record_global_barrier(&self.device, self.command_buffer);
+        unsafe {
+            self.device.device.end_command_buffer(self.command_buffer)?;
+            self.device.device.reset_fences(&[self.fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.command_buffer));
+            self.device
+                .device
+                .queue_submit(self.device.queue, &[submit], self.fence)?;
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        Ok(())
+    }
+
     /// Debug: run [`crate::models::Model::record_forward_unified`] with the
     /// release-capable per-op dump enabled, and return `(label, hash)` for each
     /// dumped buffer (FNV-1a over the raw bytes). Run the same input twice and
