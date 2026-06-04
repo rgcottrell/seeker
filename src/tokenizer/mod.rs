@@ -206,19 +206,17 @@ fn install_specials(
 
     let mut single = String::new();
     let mut special_pairs: Vec<(String, u32)> = Vec::new();
-    if want_bos
-        && let (Some(s), Some(i)) = (bos_str.as_ref(), bos_id) {
-            single.push_str(s);
-            single.push(' ');
-            special_pairs.push((s.clone(), i));
-        }
+    if want_bos && let (Some(s), Some(i)) = (bos_str.as_ref(), bos_id) {
+        single.push_str(s);
+        single.push(' ');
+        special_pairs.push((s.clone(), i));
+    }
     single.push_str("$A");
-    if want_eos
-        && let (Some(s), Some(i)) = (eos_str.as_ref(), eos_id) {
-            single.push(' ');
-            single.push_str(s);
-            special_pairs.push((s.clone(), i));
-        }
+    if want_eos && let (Some(s), Some(i)) = (eos_str.as_ref(), eos_id) {
+        single.push(' ');
+        single.push_str(s);
+        special_pairs.push((s.clone(), i));
+    }
 
     match TemplateProcessing::builder()
         .try_single(single.as_str())

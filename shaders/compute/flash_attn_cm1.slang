@@ -80,8 +80,8 @@ struct FaParams {
     // chunk [N × N] mask at (col - mask_kv_offset). Matches the scalar path so
     // cm1 serves chunked prefill at any offset, not just the first ubatch.
     uint  mask_kv_offset;
-    float m0;
-    float m1;
+    float m0;          // ALiBi slope (unused)
+    uint swa_window;   // sliding-window span (repurposed ALiBi m1 slot); 0 = full causal
     uint gqa_ratio;
     uint split_kv;
     uint k_num;
@@ -216,6 +216,27 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                             const uint m_off = m_off_base + (i_row0 + row) * p.N;
                             S_sh[c * S_STRIDE + row] +=
                                 float(data_m[m_off + (kv_base + c - p.mask_kv_offset)]);
+                        }
+                    }
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+
+        // ── Sliding-window mask (analytical, independent of MASK_ENABLE): mask
+        // keys outside [qpos-window+1, qpos] for query abs pos qpos.
+        if (p.swa_window != 0u) {
+            [unroll] for (uint ci = 0; ci < COLS_PER_THREAD; ++ci) {
+                const uint c = ci * COLS_PER_ITER + col_tid;
+                if (kv_base + c < p.KV) {
+                    const uint kpos = kv_base + c;
+                    [unroll] for (uint r = 0; r < ROWS_PER_THREAD; ++r) {
+                        const uint row = row_tid * ROWS_PER_THREAD + r;
+                        if (i_row0 + row < p.N) {
+                            const uint qpos = p.mask_kv_offset + i_row0 + row;
+                            if (kpos > qpos || qpos - kpos >= p.swa_window) {
+                                S_sh[c * S_STRIDE + row] = NEG_BIG;
+                            }
                         }
                     }
                 }

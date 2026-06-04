@@ -590,6 +590,7 @@ impl VisionEncoder {
                 head_dim_k: hd_pad as u32,
                 head_dim_v: hd_pad as u32,
                 gqa_ratio: 1,
+                swa_window: 0,
             },
             /*kv_actual=*/ n_pos as u32,
         )?;

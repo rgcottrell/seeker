@@ -115,8 +115,14 @@ struct FaParams {
     // KV columns < mask_kv_offset are unconditionally visible. (Repurposed
     // from the unused ALiBi `mask_n_head_log2` slot — keeps push ≤ 128 B.)
     uint  mask_kv_offset;
-    float m0;
-    float m1;
+    float m0;          // ALiBi slope (unused)
+    // Sliding-window span (repurposed ALiBi m1 slot). 0 = full causal. When >0,
+    // a key at absolute position kpos is masked for a query at absolute position
+    // qpos = mask_kv_offset + query_row unless kpos <= qpos && qpos - kpos <
+    // swa_window. Applied analytically below, independent of MASK_ENABLE, so it
+    // covers prefill / chunked prefill / decode (split-K) uniformly. (Gemma4
+    // sliding layers; the non-VARLEN query-position form is used.)
+    uint swa_window;
 
     uint gqa_ratio;
     uint split_kv;
@@ -452,6 +458,12 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                 }
                 if (MASK_ENABLE != 0 && kv_base + c >= p.mask_kv_offset) {
                     s += data_m[m_off + (kv_base + c - p.mask_kv_offset)];
+                }
+                // Sliding-window attention: mask keys outside [qpos-window+1, qpos].
+                if (p.swa_window != 0u) {
+                    const uint qpos = p.mask_kv_offset + i_row;
+                    const uint kpos = kv_base + c;
+                    if (kpos > qpos || qpos - kpos >= p.swa_window) { s = -1.0e30f; }
                 }
             } else {
                 s = -1.0e30f;

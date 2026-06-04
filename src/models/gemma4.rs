@@ -293,6 +293,13 @@ impl Model for Gemma4Model {
                 head_dim_v: head_dim as u32,
                 gqa_ratio: (n_head / n_head_kv).max(1) as u32,
                 scale: 1.0, // gemma4: NO 1/sqrt(head_dim)
+                // Sliding layers attend only to the most recent `sliding_window`
+                // keys; global layers (swa[il]==false) use full causal (0).
+                swa_window: if p.swa[layer_idx] {
+                    p.sliding_window
+                } else {
+                    0
+                },
             };
 
             // input norm
