@@ -325,11 +325,24 @@ fn record_inner(
             return record_mul_mat_vec_split_k(ctx, &variant, a, b, d, split_k, fence);
         }
         record_mul_mat_vec(ctx, &variant, a, b, d, fence)?;
+    } else if !*crate::runtime_flags::MM_BATCH_DISABLED
+        && n <= MAX_BATCH_COLS as u64
+        && b.dims[2] <= 1
+        && b.dims[3] <= 1
+        && a.dims[2] <= 1
+        && a.dims[3] <= 1
+    {
+        // Batched-column dispatch: read the weight once for all N columns
+        // (NUM_COLS=N) instead of re-reading it per column. Byte-identical.
+        // Gated to the no-tensor-batch case (lm_head + dense projections at B>1)
+        // and N ≤ MAX_BATCH_COLS so the `temp[NUM_COLS][NUM_ROWS]` register
+        // tile stays bounded; wider N falls back to the per-column loop.
+        record_mul_mat_vec_cols(ctx, &variant, a, b, d, n as u32, fence)?;
     } else {
         // Per-column fallback: dispatch one `mul_mat_vec` per output column.
-        // Correct but bandwidth-suboptimal — replace with a dedicated
-        // dtype-specific `mul_mm` once those kernels are wired (or use
-        // cooperative-matrix `mul_mm_cm` when the device exposes it).
+        // Correct but bandwidth-suboptimal (re-reads the full weight per
+        // column). Reached when `SEEKER_MM_BATCH=0`, N > MAX_BATCH_COLS, or a
+        // real tensor (dim-2/3) batch — otherwise the batched path above runs.
         // Intra-group barriers are unnecessary (each column writes a
         // disjoint slice of D), so only fence after the last column.
         let last = n - 1;
@@ -656,6 +669,124 @@ fn record_mul_mat_vec_with_flags(
     Ok(())
 }
 
+/// Max output columns the batched-column matvec handles in one dispatch. The
+/// `temp[NUM_COLS][NUM_ROWS]` accumulator is register-resident, so wide N would
+/// spill; the serve decode batch is ≤ 8, and wider N falls back to per-column.
+const MAX_BATCH_COLS: u32 = 8;
+
+/// Batched-column matvec: one dispatch computes all `num_cols` output columns,
+/// dequantizing each A (weight) row ONCE and reusing it across the columns (the
+/// `NUM_COLS` spec const), so a large (> L2) weight is read once instead of
+/// re-read per column. **Byte-identical** to `num_cols` separate
+/// [`record_mul_mat_vec`] calls — each column's dot product is computed exactly
+/// as before; only the weight dequant is shared. Requires NO tensor (dim-2/3)
+/// batch: `b` is `[K, num_cols, 1, 1]`, `d` is `[M, num_cols, 1, 1]`, so the
+/// `NUM_COLS` j-loop steps `b`/`d` by their column stride and the `wg.y` batch
+/// is a single slice at offset 0.
+fn record_mul_mat_vec_cols(
+    ctx: &mut DispatchContext,
+    variant: &MmvVariant,
+    a: TensorView,
+    b: TensorView,
+    d: TensorView,
+    num_cols: u32,
+    fence: bool,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert!(num_cols >= 1);
+    debug_assert_eq!(
+        b.dims[1] as u32, num_cols,
+        "mul_mat_vec_cols: b column count must equal num_cols"
+    );
+    debug_assert!(
+        b.dims[2] <= 1 && b.dims[3] <= 1 && a.dims[2] <= 1 && a.dims[3] <= 1,
+        "mul_mat_vec_cols: tensor (dim-2/3) batch unsupported"
+    );
+
+    let ncols = a.dims[0] as u32; // K
+    let m = a.dims[1] as u32; // output rows
+    let stride_a = a.element_stride[1] as u32; // = K
+    let stride_b = b.element_stride[1] as u32; // = K (within a column)
+    let stride_d = m;
+    // The NUM_COLS j-loop steps b/d by their COLUMN stride; with no tensor
+    // batch (ne02=ne12=1) the wg.y batch resolves to a single slice at 0.
+    let batch_stride_a = a.element_stride[2] as u32; // unused (a_offset = 0)
+    let batch_stride_b = b.element_stride[1] as u32; // column step of b
+    let batch_stride_d = d.element_stride[1] as u32; // column step of d
+
+    let mut push = [0u8; MUL_MAT_VEC_PARAMS_BYTES as usize];
+    let fields = [
+        ncols,
+        stride_a,
+        stride_b,
+        stride_d,
+        batch_stride_a,
+        batch_stride_b,
+        batch_stride_d,
+        0, // fusion_flags
+        0, // base_work_group_y
+        1, // ne02
+        1, // ne12
+        1, // broadcast2
+        1, // broadcast3
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    let bindings: Vec<_> = variant
+        .binding_indices
+        .iter()
+        .map(|&slot| match slot {
+            0 | 3 | 6 => a.range(),
+            1 | 4 | 5 => b.range(),
+            2 => d.range(),
+            other => panic!("unexpected mul_mat_vec binding slot {other}"),
+        })
+        .collect();
+
+    // Base per-WG row tile (same heuristic as the single-column path), capped so
+    // the `temp[NUM_COLS][NUM_ROWS]` accumulator stays ≤ 8 — at B>1 the
+    // weight-read-once (NUM_COLS) win dominates the row-tiling (NUM_ROWS) win.
+    let base_rows: u32 = if m >= 32_768 {
+        4
+    } else {
+        match a.dtype {
+            crate::gguf::GgmlType::Q8_0 => 1,
+            _ => 2,
+        }
+    };
+    let num_rows = base_rows.min((MAX_BATCH_COLS / num_cols).max(1));
+    debug_assert!(
+        num_cols <= MAX_BATCH_COLS && num_rows * num_cols <= MAX_BATCH_COLS,
+        "mul_mat_vec_cols: register tile num_rows*num_cols={} exceeds budget {MAX_BATCH_COLS}",
+        num_rows * num_cols
+    );
+
+    let key = PipelineKey {
+        name: variant.name.to_string(),
+        binding_indices: variant.binding_indices.to_vec(),
+        push_size: MUL_MAT_VEC_PARAMS_BYTES,
+        // Spec-const order: [BLOCK_SIZE, NUM_ROWS, ACCUMULATE, NUM_COLS].
+        spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows, 0, num_cols],
+        required_subgroup_size: Some(32),
+    };
+    let pipeline = *ctx.pipelines.get(ctx.device, key, variant.spv)?;
+
+    let workgroups = [m.div_ceil(num_rows), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        variant.binding_indices,
+        &bindings,
+        &push,
+        workgroups,
+    )?;
+    if fence {
+        record_compute_barrier(ctx.device, ctx.cmd, d.range());
+    }
+    Ok(())
+}
+
 /// Heuristic: opt into split-K for the lm_head matvec specifically.
 /// `ncols` = K (hidden dim), `nrows` = M (vocab). Returns the split factor
 /// to use, or None for the single-pass path.
@@ -737,14 +868,17 @@ fn record_mul_mat_vec_split_k(
         push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
     }
 
-    // Pipeline: `mul_mat_vec_split_k.slang` Q8_0 variant. Spec-const order
-    // matches the head + the new SPLIT_K: [BLOCK_SIZE, NUM_ROWS,
-    // ACCUMULATE, SPLIT_K]. Accumulate stays 0 (partials are fresh).
+    // Pipeline: `mul_mat_vec_split_k.slang` Q8_0 variant. Spec-const order is
+    // the head's [BLOCK_SIZE, NUM_ROWS, ACCUMULATE, NUM_COLS] (ids 0-3) plus
+    // this shader's own SPLIT_K (id 4). NUM_COLS pins to 1 (split-K is the
+    // single-column lm_head path); accumulate stays 0 (partials are fresh).
+    // NOTE: NUM_COLS must appear here — it sits at id 3 in the head now, so
+    // omitting it would push SPLIT_K's value onto NUM_COLS and break split-K.
     let key = PipelineKey {
         name: "mul_mat_vec_split_k_q8_0".to_string(),
         binding_indices: variant.binding_indices.to_vec(),
         push_size: MUL_MAT_VEC_PARAMS_BYTES,
-        spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows, 0, split_k],
+        spec_constants: vec![MUL_MAT_VEC_BLOCK_SIZE, num_rows, 0, 1, split_k],
         required_subgroup_size: Some(32),
     };
     let pipeline = *ctx.pipelines.get(

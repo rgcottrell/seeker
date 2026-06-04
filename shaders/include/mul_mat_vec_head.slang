@@ -101,13 +101,21 @@ struct MulMatVecParams {
 // llama.cpp uses 4–8 depending on dtype; we use 2 — register pressure goes
 // up linearly and we don't want to overflow Apple's tighter file.
 [SpecializationConstant] const uint NUM_ROWS = 2;
-static const uint NUM_COLS = 1;
 
 // ACCUMULATE=1 turns the trailing write into `data_d[i] += sum` instead
 // of `data_d[i] = sum`. Used by the attention/SSM out-projections so the
 // residual add can collapse into the matmul (saves a separate elementwise
 // dispatch + barrier per layer).
 [SpecializationConstant] const uint ACCUMULATE = 0;
+
+// NUM_COLS = how many output columns (B-vectors) one workgroup processes
+// together, dequantizing each A row ONCE and reusing it across all NUM_COLS
+// columns. The decode default is 1 (single column); the host raises it to B
+// for a batched (B>1) matvec so the (huge, > L2) weight is read once instead
+// of re-read per column. Declared LAST so spec-ids stay [BLOCK_SIZE=0,
+// NUM_ROWS=1, ACCUMULATE=2, NUM_COLS=3] — callers that omit it keep NUM_COLS=1.
+// The per-column math is unchanged, so the batched result is byte-identical.
+[SpecializationConstant] const uint NUM_COLS = 1;
 
 // Per-DATA_A_X dequantize / dequantize4 / get_dm overloads live in dequant_funcs.slang.
 // Including here after the buffer bindings so the helpers can reference data_a /

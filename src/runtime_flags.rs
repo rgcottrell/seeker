@@ -57,6 +57,19 @@ pub static MM_CM_DISABLED: LazyLock<bool> = LazyLock::new(|| {
 /// `0` disables, `1` is a no-op, `n>=2` forces that split factor.
 pub static MM_SPLIT_K: LazyLock<Option<u32>> = LazyLock::new(|| env_u32("SEEKER_MM_SPLIT_K"));
 
+/// `SEEKER_MM_BATCH=0` — disable the batched-column quant matvec. Default-on:
+/// at B>1 decode a quantized matvec with N>1 output columns runs as a single
+/// batched dispatch (`NUM_COLS=N`) that dequantizes each weight row once and
+/// reuses it across all N columns, instead of the per-column fallback that
+/// re-reads the whole (huge, >L2) weight per column. Byte-identical; measured
+/// +15/34/38% decode at B=2/4/8 on Strix Halo (Q4_K_XL). This flag is the
+/// revert / diff lever.
+pub static MM_BATCH_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SEEKER_MM_BATCH")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+});
+
 /// Masked (prefill) flash-attention coopmat gate (`SEEKER_FA_CM=0` to fall back
 /// to the scalar path). Default-on: the cm1 coopmat kernel is ~5× faster per key
 /// than the scalar loop, so a deep-context prefill ubatch (large kv) finishes in
