@@ -21,13 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust (stable + rustfmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
+      - name: Install Rust (from rust-toolchain.toml) + cache
+        # Reads channel + components from rust-toolchain.toml (the single source of
+        # truth) — the version is never restated here. Bundles cargo/target caching,
+        # so it replaces the separate Swatinem/rust-cache step. Runs on Node 24.
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: System build deps
         # openssl-sys (via reqwest/native-tls) links system OpenSSL.

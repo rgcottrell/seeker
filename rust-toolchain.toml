@@ -1,0 +1,8 @@
+# Single source of truth for the Rust toolchain. rustup auto-honors this for every
+# cargo/rustc command in the repo (local dev, scripts/check.sh, the pre-push hook).
+# CI reads it via actions-rust-lang/setup-rust-toolchain; the container build extracts
+# the version into its base-image tag (see justfile `build`). Bump the version HERE only.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
