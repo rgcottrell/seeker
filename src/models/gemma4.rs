@@ -238,13 +238,6 @@ impl Model for Gemma4Model {
         false
     }
 
-    /// 128-token prefill ceiling: the whole 48-layer forward is one cmdbuf
-    /// submit, and a single-pass prefill > ~256 tokens trips the RADV ~2s ring
-    /// watchdog (device-lost). Chunking to ≤128 keeps each submit under it.
-    fn recommended_prefill_ubatch(&self) -> Option<u32> {
-        Some(128)
-    }
-
     /// Prefill one chunk of an image-containing prompt: the `<|image>`-pad
     /// placeholder tokens in the chunk are replaced (post-embedding) by the
     /// vision encoder's output columns. Positions stay sequential.

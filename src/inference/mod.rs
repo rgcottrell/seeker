@@ -281,6 +281,7 @@ impl Engine {
         let taps;
         let logits_range = {
             let mut ctx = DispatchContext {
+                flush: None,
                 device: &self.device,
                 weights,
                 scratch: &mut self.scratch,
@@ -431,6 +432,7 @@ impl Engine {
 
         let token_ranges: Vec<BufferRange> = {
             let mut ctx = DispatchContext {
+                flush: None,
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -562,6 +564,7 @@ impl Engine {
 
         let token_ranges: Vec<BufferRange> = {
             let mut ctx = DispatchContext {
+                flush: Self::build_flush(self.fence, model.weights()),
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -782,6 +785,7 @@ impl Engine {
 
         let records = {
             let mut ctx = DispatchContext {
+                flush: None,
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -890,7 +894,7 @@ impl Engine {
         // ubatch in one dispatch), not by shrinking the chunk. Only the final
         // chunk computes logits + samples. An effective ubatch of 0 disables
         // chunking (legacy single-pass).
-        let ub = self.effective_ubatch(model);
+        let ub = self.effective_ubatch();
         if ub != 0 && l > ub {
             return self.forward_sampled_chunked(model, cache, tokens, position_offset, sampler);
         }
@@ -1129,6 +1133,11 @@ impl Engine {
         let n_dispatches;
         let token_range = {
             let mut ctx = DispatchContext {
+                flush: if cache_recording {
+                    None
+                } else {
+                    Self::build_flush(self.fence, model.weights())
+                },
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -1299,7 +1308,7 @@ impl Engine {
         }
         let prompt_pos0 = cache.position;
         let n = tokens.len();
-        let eub = self.effective_ubatch(model);
+        let eub = self.effective_ubatch();
         let ub = if eub == 0 { n } else { eub as usize };
 
         let mut token = 0u32;
@@ -1423,6 +1432,7 @@ impl Engine {
         let taps: Vec<(String, BufferRange)>;
         let token_range = {
             let mut ctx = DispatchContext {
+                flush: Self::build_flush(self.fence, model.weights()),
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -1529,19 +1539,40 @@ impl Engine {
         Ok(Some(token))
     }
 
-    /// The prefill micro-batch actually used, after clamping the configured
-    /// [`Self::n_ubatch`] to the model's [`recommended_prefill_ubatch`]
-    /// (crate::models::Model::recommended_prefill_ubatch) ceiling. When the
-    /// model imposes a ceiling it always wins (even over a `0` "single-pass"
-    /// config), so a watchdog-sensitive model like gemma4 chunks by default;
-    /// a smaller user `n_ubatch` is left untouched. Returns `0` only when the
-    /// config is single-pass *and* the model sets no ceiling.
-    fn effective_ubatch(&self, model: &dyn crate::models::Model) -> u32 {
-        match model.recommended_prefill_ubatch() {
-            Some(rec) if self.n_ubatch == 0 => rec,
-            Some(rec) => self.n_ubatch.min(rec),
-            None => self.n_ubatch,
+    /// Build the prefill submission-splitting budget ([`context::FlushState`])
+    /// for a forward that records into a freshly-begun command buffer, or `None`
+    /// when flushing is disabled (`SEEKER_PREFILL_FLUSH=0`). Budget =
+    /// `min(100 MB, total_weight_bytes / 40)` (overridable via
+    /// `SEEKER_PREFILL_FLUSH_MB`) — a *bytes-of-weight-read* budget, which is a
+    /// time budget in the one unit ~independent of quant. Associated (no `&self`
+    /// borrow) so it can be evaluated inline in a `DispatchContext` literal
+    /// alongside `&mut self.scratch`; `fence` is `Copy`.
+    fn build_flush(
+        fence: vk::Fence,
+        weights: &weights::WeightsHandle,
+    ) -> Option<context::FlushState> {
+        if *crate::runtime_flags::PREFILL_FLUSH_DISABLED {
+            return None;
         }
+        let budget_bytes = match *crate::runtime_flags::PREFILL_FLUSH_MB {
+            Some(mb) => (mb as u64) * 1024 * 1024,
+            None => (100u64 * 1024 * 1024).min((weights.total_bytes / 40).max(1)),
+        };
+        Some(context::FlushState {
+            fence,
+            budget_bytes: budget_bytes.max(1),
+            node_budget: 100,
+            bytes_since_flush: 0,
+            nodes_since_flush: 0,
+        })
+    }
+
+    /// The prefill micro-batch: the configured [`Self::n_ubatch`] (0 =
+    /// single-pass). The GPU TDR watchdog is handled by mid-forward submission
+    /// splitting ([`build_flush`](Self::build_flush)), not by clamping the
+    /// micro-batch — token-chunking now bounds only the per-chunk scratch.
+    fn effective_ubatch(&self) -> u32 {
+        self.n_ubatch
     }
 
     /// Prefill a prompt longer than the effective ubatch by feeding it in
@@ -1570,7 +1601,7 @@ impl Engine {
             )
             .into());
         }
-        let ub = self.effective_ubatch(model) as usize;
+        let ub = self.effective_ubatch() as usize;
         let n = tokens.len();
         debug_assert!(ub > 0 && n > ub, "chunked path entered with n={n} ub={ub}");
         let mut start = 0usize;
@@ -1638,6 +1669,7 @@ impl Engine {
 
         {
             let mut ctx = DispatchContext {
+                flush: Self::build_flush(self.fence, model.weights()),
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -1748,6 +1780,7 @@ impl Engine {
 
         let ranges = {
             let mut ctx = DispatchContext {
+                flush: None,
                 device: &self.device,
                 weights,
                 scratch: &mut self.scratch,

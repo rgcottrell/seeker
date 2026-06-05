@@ -15,6 +15,24 @@ use super::memory::Region;
 use super::pipeline::PipelineCache;
 use super::weights::{TensorView, WeightsHandle};
 
+/// Prefill submission-splitting budget (llama.cpp-style). When present on a
+/// [`DispatchContext`], [`DispatchContext::maybe_flush`] ends + submits the
+/// current command buffer and starts a fresh one once the recorded weight-bytes
+/// (or dispatch count) since the last flush crosses the budget — so no single
+/// submission can exceed the GPU's TDR watchdog on a large prefill. `None` on
+/// decode-replay and other single-submit paths (see `inference::Engine`).
+pub struct FlushState {
+    /// The engine fence, reused for each intermediate flush submit.
+    pub fence: vk::Fence,
+    /// Flush once `bytes_since_flush` reaches this (bytes of weights read).
+    pub budget_bytes: u64,
+    /// Flush once `nodes_since_flush` reaches this (dispatch-count fallback for
+    /// non-matmul stretches like flash-attn).
+    pub node_budget: u32,
+    pub bytes_since_flush: u64,
+    pub nodes_since_flush: u32,
+}
+
 pub struct DispatchContext<'a> {
     pub device: &'a Device,
     pub weights: &'a WeightsHandle,
@@ -22,6 +40,9 @@ pub struct DispatchContext<'a> {
     pub pipelines: &'a mut PipelineCache,
     pub descriptors: &'a DescriptorAllocator,
     pub cmd: vk::CommandBuffer,
+    /// Prefill submission-splitting budget, or `None` to never flush mid-forward
+    /// (decode replay / record-for-replay / single-submit debug paths).
+    pub flush: Option<FlushState>,
     /// Per-forward dynamic-params slot. Reserved at the top of every
     /// forward (always the first scratch alloc, so the offset is stable
     /// across calls — required for the persistent-decode-cmdbuf
@@ -166,6 +187,59 @@ impl<'a> DispatchContext<'a> {
     /// every slot allocated since then.
     pub fn scratch_restore(&mut self, cursor: u64) {
         self.scratch.cursor = cursor;
+    }
+
+    /// Account `weight_bytes` of weight read toward the prefill flush budget.
+    /// Called by the matmul recorders (the weight `TensorView`'s `byte_size`).
+    /// No-op when `flush` is `None`.
+    pub fn account_matmul(&mut self, weight_bytes: u64) {
+        if let Some(f) = self.flush.as_mut() {
+            f.bytes_since_flush += weight_bytes;
+        }
+    }
+
+    /// Prefill submission-splitting: bump the dispatch count and, if the recorded
+    /// weight-bytes or dispatch count since the last flush has crossed the budget,
+    /// end + submit the current command buffer, wait the fence, then reset and
+    /// re-begin the same `cmd` handle so recording continues into a fresh
+    /// submission. Called after every recorded dispatch (the universal
+    /// `bind_and_dispatch` hook). No-op when `flush` is `None`.
+    ///
+    /// Correctness across the cut: the fence-wait makes every prior dispatch
+    /// *complete* before the next cmdbuf runs, so cross-cmdbuf reads see finished
+    /// values (the fence subsumes the in-cmdbuf barrier). Live state survives —
+    /// weights/KV are persistent buffers and the residual / in-flight per-layer
+    /// scratch keep their offsets (we do NOT reset scratch or move its cursor).
+    pub fn maybe_flush(&mut self) -> Result<(), Box<dyn Error>> {
+        // Decide within a scoped borrow of `self.flush`, so `self.device`/`self.cmd`
+        // are free to use for the submit afterwards.
+        let fence = {
+            let Some(f) = self.flush.as_mut() else {
+                return Ok(());
+            };
+            f.nodes_since_flush += 1;
+            if f.bytes_since_flush < f.budget_bytes && f.nodes_since_flush < f.node_budget {
+                return Ok(());
+            }
+            f.bytes_since_flush = 0;
+            f.nodes_since_flush = 0;
+            f.fence
+        };
+        let dev = &self.device.device;
+        let cmd = self.cmd;
+        let queue = self.device.queue;
+        unsafe {
+            dev.end_command_buffer(cmd)?;
+            dev.reset_fences(&[fence])?;
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            dev.queue_submit(queue, &[submit], fence)?;
+            dev.wait_for_fences(&[fence], true, u64::MAX)?;
+            dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            dev.begin_command_buffer(cmd, &begin)?;
+        }
+        Ok(())
     }
 
     /// Reserve a `bytes`-byte slot in scratch and return its `BufferRange`.

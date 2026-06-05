@@ -65,6 +65,9 @@ pub fn bind_and_dispatch(
     {
         ctx.n_dispatches += 1;
     }
+    // Prefill submission-splitting: count this dispatch and flush the cmdbuf if
+    // the byte/node budget is crossed (no-op unless `ctx.flush` is set).
+    ctx.maybe_flush()?;
     Ok(())
 }
 
@@ -99,6 +102,7 @@ pub fn bind_and_dispatch_indirect(
     {
         ctx.n_dispatches += 1;
     }
+    ctx.maybe_flush()?;
     Ok(())
 }
 

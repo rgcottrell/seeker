@@ -298,6 +298,11 @@ fn record_inner(
     debug_assert_eq!(d.dims[0], a.dims[1], "matmul output M mismatch");
     debug_assert_eq!(d.dims[1], b.dims[1], "matmul output N mismatch");
 
+    // Count the weight bytes this matmul reads toward the prefill flush budget
+    // (no-op unless this forward has flushing enabled). All dense matmul callers
+    // (record / record_nofence / record_accumulate-prefill-fallback) funnel here.
+    ctx.account_matmul(a.byte_size);
+
     let n = b.dims[1];
 
     // Cooperative-matrix prefill path (KHR_cooperative_matrix). Pulls in
