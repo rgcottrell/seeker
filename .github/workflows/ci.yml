@@ -1,7 +1,11 @@
 name: CI
 
 on:
+  # Limit `push` to main so a PR branch isn't built twice (once for the branch
+  # push, once for the pull_request event). Feature branches get CI via the
+  # pull_request run below; main still gets a post-merge run here.
   push:
+    branches: [main]
   pull_request:
 
 env:
