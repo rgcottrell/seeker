@@ -1,5 +1,6 @@
 # seeker container image — build & run the Vulkan inference server in Podman.
-# Multistage Containerfile: rust:bookworm builder -> debian:bookworm-slim + Mesa RADV.
+# Multistage Containerfile: rust:${RUST_VERSION}-bookworm builder (version from
+# rust-toolchain.toml) -> ubuntu:26.04 + Mesa RADV.
 
 image := "seeker"
 tag   := "latest"
@@ -14,9 +15,12 @@ hf_cache  := "/models/huggingface"
 qwen_repo := "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 qwen_file := "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
 
-# Build the container image.
+# Build the container image. The builder's Rust version is read from
+# rust-toolchain.toml (single source of truth) and passed in as a build-arg.
 build:
-    podman build -t {{image}}:{{tag}} -f Containerfile {{justfile_directory()}}
+    podman build \
+        --build-arg RUST_VERSION="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' {{justfile_directory()}}/rust-toolchain.toml)" \
+        -t {{image}}:{{tag}} -f Containerfile {{justfile_directory()}}
 
 # Run the server with full AMD GPU passthrough; the port is published 1:1 on the host.
 #   just serve                                  # no model (only /health + /apply-template)

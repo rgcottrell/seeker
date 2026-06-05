@@ -4,7 +4,11 @@
 # present; shaders are baked into the binary by build.rs.
 
 # ── Stage 1: build ──────────────────────────────────────────────────────────
-FROM rust:bookworm AS builder
+# Builder Rust version comes from the justfile, which extracts it from
+# rust-toolchain.toml (the single source of truth). Build via `just build` so the
+# arg is supplied; a bare `podman build` must pass --build-arg RUST_VERSION=<ver>.
+ARG RUST_VERSION
+FROM rust:${RUST_VERSION}-bookworm AS builder
 ARG SLANG_VERSION=2026.8
 
 # openssl-sys (hf-hub) links system OpenSSL; curl+jq fetch the slang release.
