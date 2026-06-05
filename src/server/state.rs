@@ -48,6 +48,10 @@ struct Inner {
     /// CPU-preprocesses image content with it; the worker holds the encoder.
     /// `None` ⇒ image requests are rejected.
     vision_config: Option<crate::vision::VisionConfig>,
+    /// Audio projector config (gemma4ua), when the mmproj carries an audio
+    /// encoder. The chat handler uses it to size the `<|audio|>` block;
+    /// `None` ⇒ audio requests are rejected.
+    audio_config: Option<crate::audio::AudioConfig>,
 }
 
 /// Everything needed to build an `AppState` with a loaded model. Built by
@@ -65,6 +69,7 @@ pub struct AppStateInit {
     pub model_id: String,
     pub model_path: String,
     pub vision_config: Option<crate::vision::VisionConfig>,
+    pub audio_config: Option<crate::audio::AudioConfig>,
 }
 
 impl AppState {
@@ -84,6 +89,7 @@ impl AppState {
                 model_id: init.model_id,
                 model_path: Some(init.model_path),
                 vision_config: init.vision_config,
+                audio_config: init.audio_config,
             }),
         }
     }
@@ -91,6 +97,11 @@ impl AppState {
     /// The vision projector config, if an mmproj was loaded (image input).
     pub fn vision_config(&self) -> Option<&crate::vision::VisionConfig> {
         self.inner.vision_config.as_ref()
+    }
+
+    /// The audio projector config, if the mmproj has an audio encoder.
+    pub fn audio_config(&self) -> Option<&crate::audio::AudioConfig> {
+        self.inner.audio_config.as_ref()
     }
 
     /// The loaded tokenizer bundle, if any (`/tokenize`, `/detokenize`,

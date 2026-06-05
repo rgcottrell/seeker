@@ -9,10 +9,10 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
 use crate::server::convert::{
-    self, openai_messages_to_chat_mm, parse_stop, prompt_value_to_tokens,
+    self, MediaParts, openai_messages_to_chat_mm, parse_stop, prompt_value_to_tokens,
 };
 use crate::server::error;
-use crate::server::inference::{GenConfig, GenOutput, ServeImage, collect};
+use crate::server::inference::{GenConfig, GenOutput, ServeAudio, ServeImage, collect};
 use crate::server::state::AppState;
 use crate::server::stream::{gen_id, openai_chat_stream, openai_completion_stream, unix_now};
 use crate::server::types::common::Usage;
@@ -31,23 +31,46 @@ pub async fn chat_completions(
     if req.n.unwrap_or(1) > 1 {
         return error::bad_request("`n` > 1 is not supported (single-sequence engine)");
     }
-    // Multimodal-aware: collect any `image_url` content (the message text keeps
-    // the `<__media__>` marker where each image sat) and render+splice the
-    // vision block. `image` is `None` for a text-only request.
-    let (messages, images) = match openai_messages_to_chat_mm(&req.messages) {
+    // Multimodal-aware: collect any `image_url` / `input_audio` content (the
+    // message text keeps the `<__media__>` marker where each item sat) and
+    // render+splice the projector block. Both are `None` for a text request.
+    let (messages, images, audios) = match openai_messages_to_chat_mm(&req.messages) {
         Ok(m) => m,
         Err(e) => return error::bad_request(e),
     };
-    let (tokens, image_parts) = match convert::render_and_encode_mm(&state, messages, &images) {
+    let (tokens, media) = match convert::render_and_encode_mm(&state, messages, &images, &audios) {
         Ok(t) => t,
         Err(e) => return error::bad_request(e),
     };
-    let image = image_parts.map(|(pimg, image_start, nx, ny)| ServeImage {
-        pimg,
-        image_start,
-        nx,
-        ny,
-    });
+    let (image, audio) = match media {
+        Some(MediaParts::Image {
+            pimg,
+            image_start,
+            nx,
+            ny,
+        }) => (
+            Some(ServeImage {
+                pimg,
+                image_start,
+                nx,
+                ny,
+            }),
+            None,
+        ),
+        Some(MediaParts::Audio {
+            samples,
+            audio_start,
+            n_tok,
+        }) => (
+            None,
+            Some(ServeAudio {
+                samples,
+                audio_start,
+                n_tok,
+            }),
+        ),
+        None => (None, None),
+    };
     let config = GenConfig {
         sampler: req.sampler_config(state.default_sampler()),
         max_tokens: req.max_tokens.unwrap_or(state.default_max_tokens()),
@@ -55,7 +78,7 @@ pub async fn chat_completions(
         ignore_eos: state.default_ignore_eos(),
         id_slot: None,
     };
-    let rx = match handle.start_mm(tokens, config, image).await {
+    let rx = match handle.start_mm(tokens, config, image, audio).await {
         Ok(rx) => rx,
         Err(e) => return error::internal(e),
     };

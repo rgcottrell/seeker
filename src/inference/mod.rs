@@ -1335,6 +1335,42 @@ impl Engine {
         Ok(token)
     }
 
+    /// Prefill an audio-containing prompt — the `gemma4ua` analog of
+    /// [`Self::forward_image_sampled`]. The `<|audio|>`-placeholder columns
+    /// (`audio_start..audio_start + n_audio_tok`) are overwritten by the audio
+    /// encoder's projected frames (see [`crate::audio::encoder`]).
+    ///
+    /// Audio tokens use plain sequential 1D positions (no M-RoPE), so we feed the
+    /// clip as a **1×N media grid** (`nx = n_audio_tok`, `ny = 1`) through the
+    /// shared, validated image-prefill path: the residual splice and chunked
+    /// submission are modality-agnostic, and the post-prefill rope-lag term
+    /// `n_tok − max(nx, ny) = n_audio_tok − n_audio_tok = 0` regardless of
+    /// `image_uses_mrope`, so no lag is ever introduced. The encoder's
+    /// `proj_dim == n_embd` requirement is enforced by the splice length check in
+    /// the model's `record_forward_image_chunk`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_audio_sampled(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        audio_embeddings: &[f32],
+        audio_start: usize,
+        n_audio_tok: usize,
+        sampler: &mut sample::Sampler,
+    ) -> Result<u32, Box<dyn Error>> {
+        self.forward_image_sampled(
+            model,
+            cache,
+            tokens,
+            audio_embeddings,
+            audio_start,
+            n_audio_tok,
+            1,
+            sampler,
+        )
+    }
+
     /// Record + submit ONE chunk of an image prefill (see
     /// [`Self::forward_image_sampled`]). `sampler.is_some()` ⇒ final chunk:
     /// record the sampler chain, read back and return the sampled token. `None`

@@ -274,17 +274,36 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
     } else {
         crate::commands::download::find_sidecar_mmproj(&path)
     };
-    let vision_config = mmproj_path.as_ref().and_then(|p| {
-        match GgufFile::open(p).map_err(|e| e.to_string()).and_then(|g| crate::vision::parse_config(&g).map_err(|e| e.to_string())) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(path = ?p, error = %e, "mmproj present but unparseable; serving text-only");
-                None
+    // Parse the vision + audio projector configs from the one mmproj GGUF. The
+    // handler uses these to assemble the image / audio blocks; the worker builds
+    // the encoders from `mmproj_path`. An audio encoder is optional (qwen mmprojs
+    // have none); a sidecar that yields neither degrades to text-only.
+    let (vision_config, audio_config) = match mmproj_path.as_ref() {
+        Some(p) => match GgufFile::open(p) {
+            Ok(g) => {
+                let vision = match crate::vision::parse_config(&g) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!(path = ?p, error = %e, "mmproj vision config unparseable");
+                        None
+                    }
+                };
+                let audio = crate::audio::parse_config(&g).ok();
+                (vision, audio)
             }
-        }
-    });
-    // If the config didn't parse, don't hand the worker a path it can't use.
-    let mmproj_path = vision_config.as_ref().and(mmproj_path);
+            Err(e) => {
+                tracing::warn!(path = ?p, error = %e, "mmproj present but unreadable; serving text-only");
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+    // If neither config parsed, don't hand the worker a path it can't use.
+    let mmproj_path = if vision_config.is_some() || audio_config.is_some() {
+        mmproj_path
+    } else {
+        None
+    };
 
     let (handle, ready) = InferenceHandle::spawn(WorkerConfig {
         model_path: path.clone(),
@@ -332,6 +351,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         model_id,
         model_path: path.display().to_string(),
         vision_config,
+        audio_config,
     }))
 }
 

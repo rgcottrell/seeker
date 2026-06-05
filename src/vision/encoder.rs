@@ -1999,7 +1999,7 @@ pub fn resize_position_embeddings_reordered(
 }
 
 /// Reinterpret a `&[f32]` as native-endian bytes.
-fn f32_to_bytes(data: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_to_bytes(data: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() * 4);
     for &v in data {
         out.extend_from_slice(&v.to_ne_bytes());
@@ -2011,7 +2011,7 @@ fn f32_to_bytes(data: &[f32]) -> Vec<u8> {
 /// [`Region`](crate::inference::memory::Region) backs decode inputs/outputs and
 /// is host-visible, so this is a direct memcpy into the mapped pointer — used
 /// to stage the host-computed im2col / pos-embd matrices into the GPU graph.
-fn alloc_scratch_write(
+pub(crate) fn alloc_scratch_write(
     ctx: &mut DispatchContext,
     bytes: &[u8],
 ) -> Result<BufferRange, Box<dyn Error>> {
@@ -2019,7 +2019,7 @@ fn alloc_scratch_write(
     let base = ctx
         .scratch
         .host_ptr
-        .ok_or("vision: scratch region is not host-visible; cannot stage inputs")?;
+        .ok_or("scratch region is not host-visible; cannot stage media inputs")?;
     unsafe {
         let dst = base.add(range.offset as usize);
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
@@ -2170,7 +2170,7 @@ pub fn encode_image_gemma4(
 }
 
 /// Build a dense (contiguous) F32 [`TensorView`] over a scratch range.
-fn dense_view(range: &BufferRange, dims: [u64; 4]) -> TensorView {
+pub(crate) fn dense_view(range: &BufferRange, dims: [u64; 4]) -> TensorView {
     let es = [
         1u64,
         dims[0],

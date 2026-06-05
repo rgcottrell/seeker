@@ -87,7 +87,7 @@ pub struct VisionModel {
 /// Read an integer metadata key, coercing across the GGUF int widths (matching
 /// the `read_metadata_u64` pattern used elsewhere). Returns `None` if absent or
 /// not an integer.
-fn get_u32(gguf: &GgufFile, key: &str) -> Option<u32> {
+pub(crate) fn get_u32(gguf: &GgufFile, key: &str) -> Option<u32> {
     let v = match gguf.get(key)? {
         MetadataValue::U8(n) => *n as u64,
         MetadataValue::U16(n) => *n as u64,
@@ -113,9 +113,21 @@ fn get_f32(gguf: &GgufFile, key: &str) -> Option<f32> {
 }
 
 /// Read a string metadata key. Returns `None` if absent or not a string.
-fn get_str<'a>(gguf: &'a GgufFile, key: &str) -> Option<&'a str> {
+pub(crate) fn get_str<'a>(gguf: &'a GgufFile, key: &str) -> Option<&'a str> {
     match gguf.get(key)? {
         MetadataValue::String(s) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Read a boolean metadata key (also accepting an integer 0/non-zero, as some
+/// GGUF writers store flags as `U8`). Returns `None` if absent.
+pub(crate) fn get_bool(gguf: &GgufFile, key: &str) -> Option<bool> {
+    match gguf.get(key)? {
+        MetadataValue::Bool(b) => Some(*b),
+        MetadataValue::U8(n) => Some(*n != 0),
+        MetadataValue::U32(n) => Some(*n != 0),
+        MetadataValue::I32(n) => Some(*n != 0),
         _ => None,
     }
 }

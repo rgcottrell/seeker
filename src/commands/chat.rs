@@ -61,6 +61,15 @@ struct EncodedImage {
     n_tok: usize,
 }
 
+/// Audio encoded through the gemma4ua projector: `[proj_dim, n_tok]` host f32
+/// (column = 40 ms frame). Spliced into the decoder residual at the `<|audio|>`
+/// rows during the audio turn's prefill, exactly like [`EncodedImage`].
+#[derive(Clone)]
+struct EncodedAudio {
+    embeddings: Vec<f32>,
+    n_tok: usize,
+}
+
 /// Set by the SIGINT watcher when the user presses Ctrl+C *during* generation
 /// (in interactive mode). The decode loop polls it between tokens and stops
 /// the current reply, returning control to the prompt instead of letting the
@@ -464,6 +473,9 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         vision_ctx: None,
         pending_image: None,
         image: None,
+        audio_cfg: None,
+        pending_audio: None,
+        audio: None,
         scratch_bytes,
     };
 
@@ -586,6 +598,13 @@ fn vision_scratch_estimate(pimg: &crate::vision::preprocess::PreprocessedImage) 
     (40_000u64 * n_pos * 4).max(64 << 20)
 }
 
+/// Generous scratch estimate for the gemma4ua audio encoder's working set
+/// (input + normed `[frame, n_tok]` + projection `[proj_dim, n_tok]` + matmul
+/// temps), sized per audio token like [`vision_scratch_estimate`].
+fn audio_scratch_estimate(n_tok: usize) -> u64 {
+    (40_000u64 * n_tok as u64 * 4).max(64 << 20)
+}
+
 /// All conversation state plus the GPU resources needed to advance it.
 /// One per REPL session; persists across turns.
 struct ChatSession {
@@ -630,6 +649,18 @@ struct ChatSession {
     /// lives in one user message). `None` for a text-only conversation. The
     /// first cut supports one image per conversation; `/clear` drops it.
     image: Option<EncodedImage>,
+    /// The gemma4ua audio config, parsed from the mmproj alongside the vision
+    /// config when the projector is loaded (`None` until then, or if the mmproj
+    /// has no audio encoder). The audio path reuses the vision tower's uploaded
+    /// mmproj [`WeightsHandle`](crate::inference::weights::WeightsHandle).
+    audio_cfg: Option<crate::audio::AudioConfig>,
+    /// Audio encoded by `/audio` but not yet attached — moved to `audio` (and the
+    /// marker prepended) when the next user turn is sent. Mirrors `pending_image`.
+    pending_audio: Option<EncodedAudio>,
+    /// The single audio clip committed to this conversation. Mutually exclusive
+    /// with `image` in the first cut (one media item per conversation); `/clear`
+    /// drops it.
+    audio: Option<EncodedAudio>,
     /// Bytes the scratch region is currently sized for, so image prefills (which
     /// run single-pass, unlike chunked text prefill) can grow it on demand
     /// without shrinking it back.
@@ -706,10 +737,10 @@ struct ChatHelper {
 /// followed by whitespace puts the line into filename-completion mode (Tab
 /// expands a partial path, like llama-cli); plain chat and other commands get
 /// no completion, so Tab stays inert mid-conversation.
-const PATH_COMMANDS: [&str; 3] = ["/read", "/glob", "/image"];
+const PATH_COMMANDS: [&str; 4] = ["/read", "/glob", "/image", "/audio"];
 
 /// True when `pos` sits in the path-argument region of a [`PATH_COMMANDS`]
-/// line — i.e. `^\s*/(read|glob|image)[ \t]…`. Gates filename completion so it
+/// line — i.e. `^\s*/(read|glob|image|audio)[ \t]…`. Gates filename completion so it
 /// only fires where a path is expected. The separator is a literal space/tab,
 /// not any whitespace: in `--multiline-input` mode the buffer can hold a `\n`
 /// right after the command, and we don't want completion firing once the
@@ -806,25 +837,34 @@ impl ChatSession {
         text: &str,
         on_text: impl FnMut(&str, Segment),
     ) -> Result<ReplyStats, Box<dyn Error>> {
-        // Attach a pending `/image` to this turn: the user content carries the
-        // media marker at its head (like llama-mtmd-cli) and the encoded image
-        // becomes the conversation's committed image. Moved, not cloned.
-        let had_pending = self.pending_image.is_some();
+        // Attach a pending `/image` or `/audio` to this turn: the user content
+        // carries the media marker at its head (like llama-mtmd-cli) and the
+        // encoded media becomes the conversation's committed item. Moved, not
+        // cloned. Image and audio are mutually exclusive in the first cut.
+        let had_image = self.pending_image.is_some();
+        let had_audio = self.pending_audio.is_some();
+        let had_pending = had_image || had_audio;
         let content = if had_pending {
             format!("{MEDIA_MARKER}{text}")
         } else {
             text.to_string()
         };
-        if had_pending {
+        if had_image {
             self.image = self.pending_image.take();
+        }
+        if had_audio {
+            self.audio = self.pending_audio.take();
         }
         self.messages.push(ChatMessage::user(content));
         let result = self.generate(on_text);
         if result.is_err() {
             self.messages.pop();
-            if had_pending {
-                // Fully undo the attach so the image can be retried next turn.
+            // Fully undo the attach so the media can be retried next turn.
+            if had_image {
                 self.pending_image = self.image.take();
+            }
+            if had_audio {
+                self.pending_audio = self.audio.take();
             }
         }
         result
@@ -881,6 +921,28 @@ impl ChatSession {
                 .get_ids()
                 .to_vec())
         };
+        // One audio clip: split on the marker and splice the gemma4ua block
+        // `<|audio><|audio|>×n_tok<audio|>` (begin / per-frame placeholder / end,
+        // matching llama.cpp mtmd). The placeholder rows are overwritten by the
+        // audio embeddings, so only their count + surrounding markers matter.
+        if let Some(audio) = &self.audio {
+            let (before, after) = rendered.split_once(MEDIA_MARKER).ok_or(
+                "conversation has audio but the rendered prompt has no <__media__> marker \
+                 (chat template dropped it?)",
+            )?;
+            let tid = |s: &str| -> Result<u32, Box<dyn Error>> {
+                bundle.tokenizer.token_to_id(s).ok_or_else(|| {
+                    format!("tokenizer has no {s} token — this model is not audio-capable").into()
+                })
+            };
+            let mut tokens = encode(before)?;
+            tokens.push(tid("<|audio>")?);
+            let audio_start = tokens.len();
+            tokens.resize(tokens.len() + audio.n_tok, tid("<|audio|>")?);
+            tokens.push(tid("<audio|>")?);
+            tokens.extend(encode(after)?);
+            return Ok((rendered, tokens, Some(audio_start)));
+        }
         let Some(img) = &self.image else {
             let tokens = encode(&rendered)?;
             return Ok((rendered, tokens, None));
@@ -933,7 +995,7 @@ impl ChatSession {
         // turns would move the image's position (and could evict the image turn
         // itself), which the single-image first cut doesn't track. The ctx-full
         // guards in `generate` still apply.
-        if !self.context_shift || self.image.is_some() {
+        if !self.context_shift || self.image.is_some() || self.audio.is_some() {
             return Ok(0);
         }
         let budget = self
@@ -988,7 +1050,15 @@ impl ChatSession {
         // When it drops anything it resets the cache + prior_tokens, so the
         // render below re-prefills the survivors from scratch (SSM-safe).
         let shifted_turns = self.evict_to_fit()?;
-        let (rendered, new_tokens, image_start) = self.render_prompt()?;
+        let (rendered, new_tokens, media_start) = self.render_prompt()?;
+        // The one committed media item (image XOR audio) and its placeholder-token
+        // count — both modalities splice via the same path, differing only in the
+        // forward call below.
+        let media_n_tok: Option<usize> = self
+            .image
+            .as_ref()
+            .map(|i| i.n_tok)
+            .or_else(|| self.audio.as_ref().map(|a| a.n_tok));
 
         // Prefix reuse: keep the cache prefix that still matches.
         let mut common0 = self
@@ -997,15 +1067,17 @@ impl ChatSession {
             .zip(new_tokens.iter())
             .take_while(|(a, b)| a == b)
             .count();
-        // If an image is attached, the prefill that (re)feeds its vision block
-        // must run through `forward_image_sampled`, which needs the WHOLE block
-        // in the delta. The identical `<|image_pad|>` ids mean prefix reuse
-        // normally stops before the block or sails past it; only an edited cache
-        // could leave the boundary strictly inside the pads — rewind to the
-        // block start there so the full image is re-prefilled, never half.
-        match (&self.image, image_start) {
-            (Some(img), Some(s)) if common0 > s && common0 < s + img.n_tok => common0 = s,
-            _ => {}
+        // If media is attached, the prefill that (re)feeds its block must run
+        // through `forward_{image,audio}_sampled`, which needs the WHOLE block in
+        // the delta. The identical placeholder ids mean prefix reuse normally
+        // stops before the block or sails past it; only an edited cache could
+        // leave the boundary strictly inside the placeholders — rewind to the
+        // block start there so the full media is re-prefilled, never half.
+        if let (Some(s), Some(n)) = (media_start, media_n_tok)
+            && common0 > s
+            && common0 < s + n
+        {
+            common0 = s;
         }
         if common0 > self.cache.position as usize {
             // Shouldn't happen — prior_tokens tracks what's in the cache.
@@ -1053,19 +1125,19 @@ impl ChatSession {
             .into());
         }
 
-        // Does this prefill delta contain the image's vision block? Only when
-        // the reuse boundary is at/before the first pad — otherwise the block is
-        // already cached (its embeddings were spliced when first prefilled) and
-        // the normal text path applies. When it is in the delta, the prefill
-        // runs single-pass through `forward_image_sampled` (no chunking), so grow
-        // the scratch to fit the whole delta first.
-        let image_in_delta =
-            matches!((&self.image, image_start), (Some(_), Some(s)) if common <= s);
-        // Local pad offset only when the block is in the delta (else `s < common`
-        // for a cached image would underflow this usize).
-        let img_start_in_delta = image_start.filter(|_| image_in_delta).map(|s| s - common);
+        // Does this prefill delta contain the media (image/audio) block? Only
+        // when the reuse boundary is at/before the first placeholder — otherwise
+        // the block is already cached (its embeddings were spliced when first
+        // prefilled) and the normal text path applies. When it is in the delta,
+        // the prefill runs through `forward_{image,audio}_sampled`, so grow the
+        // scratch to fit the whole delta first.
+        let media_in_delta = matches!(media_start, Some(s) if common <= s);
+        // Local placeholder offset only when the block is in the delta (else
+        // `s < common` for a cached media item would underflow this usize).
+        let media_start_in_delta = media_start.filter(|_| media_in_delta).map(|s| s - common);
+        // Image grid dims (None ⇒ the committed media is audio, fed as 1×N).
         let image_dims = self.image.as_ref().map(|i| (i.nx, i.ny));
-        if image_in_delta {
+        if media_in_delta {
             let need = self.model.scratch_bytes_estimate(
                 /*n_ubatch=*/ 0,
                 (common + delta.len()) as u32,
@@ -1077,10 +1149,13 @@ impl ChatSession {
                 self.scratch_bytes = need;
             }
         }
-        // Borrow the embeddings for the (single) image prefill forward below.
+        // Borrow the embeddings for the (single) media prefill forward below.
         // A slice ref (not a clone) — the [proj_dim,n_tok] buffer can be MBs.
-        let image_embeds: Option<&[f32]> = if image_in_delta {
-            self.image.as_ref().map(|i| i.embeddings.as_slice())
+        let media_embeds: Option<&[f32]> = if media_in_delta {
+            self.image
+                .as_ref()
+                .map(|i| i.embeddings.as_slice())
+                .or_else(|| self.audio.as_ref().map(|a| a.embeddings.as_slice()))
         } else {
             None
         };
@@ -1137,23 +1212,37 @@ impl ChatSession {
             let model = &self.model;
             let t0 = std::time::Instant::now();
             let position = cache.position;
-            // Forward 0 of an image turn splices the vision embeddings + uses the
-            // qwen-vl M-RoPE positions (single-pass). Every other forward — the
-            // rest of the prefill delta and all decode steps — is the normal
-            // text path; the cache's `rope_position_lag` (set during the image
-            // prefill) keeps their positions continuous past the image.
-            let token = if forwards == 0 && image_in_delta {
-                let (nx, ny) = image_dims.expect("image_in_delta ⇒ dims");
-                self.engine.forward_image_sampled(
-                    &**model,
-                    cache,
-                    &step_tokens,
-                    image_embeds.expect("image_in_delta ⇒ embeddings"),
-                    img_start_in_delta.expect("image_in_delta ⇒ start"),
-                    nx,
-                    ny,
-                    &mut self.sampler,
-                )?
+            // Forward 0 of a media turn splices the encoder embeddings over the
+            // placeholder rows. Image uses the (possibly M-RoPE) image path; audio
+            // (image_dims == None) uses the 1×N audio path. Every other forward —
+            // the rest of the prefill delta and all decode steps — is the normal
+            // text path.
+            let token = if forwards == 0 && media_in_delta {
+                let start = media_start_in_delta.expect("media_in_delta ⇒ start");
+                let embeds = media_embeds.expect("media_in_delta ⇒ embeddings");
+                if let Some((nx, ny)) = image_dims {
+                    self.engine.forward_image_sampled(
+                        &**model,
+                        cache,
+                        &step_tokens,
+                        embeds,
+                        start,
+                        nx,
+                        ny,
+                        &mut self.sampler,
+                    )?
+                } else {
+                    let n = media_n_tok.expect("media_in_delta ⇒ audio n_tok");
+                    self.engine.forward_audio_sampled(
+                        &**model,
+                        cache,
+                        &step_tokens,
+                        embeds,
+                        start,
+                        n,
+                        &mut self.sampler,
+                    )?
+                }
             } else {
                 self.engine.forward_sampled(
                     &**model,
@@ -1304,19 +1393,25 @@ impl ChatSession {
         })
     }
 
-    /// Build the vision tower from the mmproj sidecar on first `/image` and keep
-    /// it for the session. Errors if the model has no mmproj (or `--no-mmproj`).
-    fn ensure_vision(&mut self) -> Result<(), Box<dyn Error>> {
+    /// Load the mmproj sidecar on first `/image` or `/audio` and keep it for the
+    /// session. One upload serves both modalities: it builds the vision tower
+    /// ([`VisionCtx`]) and parses the gemma4ua audio config into `audio_cfg` (the
+    /// audio encoder reuses the vision tower's uploaded weights). Errors if the
+    /// model has no mmproj (or `--no-mmproj`).
+    fn ensure_mmproj(&mut self) -> Result<(), Box<dyn Error>> {
         if self.vision_ctx.is_some() {
             return Ok(());
         }
         let path = self.mmproj_path.clone().ok_or(
-            "no vision model available — this model has no mmproj sidecar \
+            "no multimodal projector available — this model has no mmproj sidecar \
              (or it was disabled with --no-mmproj)",
         )?;
-        tracing::info!(path = ?path, "loading vision tower for /image");
+        tracing::info!(path = ?path, "loading mmproj projector");
         let gguf = GgufFile::open(&path)?;
         let weights = self.engine.upload_weights(&gguf)?;
+        // Parse the audio encoder config if the mmproj carries one (gemma4 is
+        // "any-to-any": vision + audio share this single weight upload).
+        self.audio_cfg = crate::audio::parse_config(&gguf).ok();
         let cfg = crate::vision::parse_config(&gguf)?;
         // The gemma4uv projector has no transformer tower — skip the tower
         // encoder and its host-side weights; `attach_image` runs the light
@@ -1362,11 +1457,18 @@ impl ChatSession {
                     .into(),
             );
         }
-        self.ensure_vision()?;
+        if self.audio.is_some() {
+            return Err(
+                "this conversation already has audio — /clear to start over \
+                        (image and audio can't be mixed in one conversation yet)"
+                    .into(),
+            );
+        }
+        self.ensure_mmproj()?;
         let cfg = self
             .vision_ctx
             .as_ref()
-            .expect("ensure_vision built it")
+            .expect("ensure_mmproj built it")
             .vision
             .config
             .clone();
@@ -1394,7 +1496,7 @@ impl ChatSession {
             self.engine.allocate_scratch(need)?;
             self.scratch_bytes = need;
         }
-        let vc = self.vision_ctx.as_ref().expect("ensure_vision built it");
+        let vc = self.vision_ctx.as_ref().expect("ensure_mmproj built it");
         let weights = &vc.vision.weights;
         let (embeddings, nx, ny, n_tok) = if is_gemma4 {
             // No-tower projector: the light gemma4uv embed pipeline returns its
@@ -1427,6 +1529,55 @@ impl ChatSession {
             n_tok,
         });
         Ok((nx, ny, n_tok))
+    }
+
+    /// Decode `path` to 16 kHz mono, encode it through the gemma4ua audio
+    /// projector (GPU), and stage it as the pending audio for the next user turn.
+    /// Returns `n_tok` (40 ms frames) for the confirmation line. Errors if audio
+    /// or an image is already attached (one media item per conversation for now).
+    fn attach_audio(&mut self, path: &Path) -> Result<usize, Box<dyn Error>> {
+        if self.audio.is_some() {
+            return Err(
+                "this conversation already has audio — /clear to start over \
+                        (one audio clip per conversation for now)"
+                    .into(),
+            );
+        }
+        if self.image.is_some() {
+            return Err(
+                "this conversation already has an image — /clear to start over \
+                        (image and audio can't be mixed in one conversation yet)"
+                    .into(),
+            );
+        }
+        self.ensure_mmproj()?;
+        let cfg = self
+            .audio_cfg
+            .clone()
+            .ok_or("this model's mmproj has no audio encoder")?;
+
+        // Decode (CPU) to 16 kHz mono f32 before touching the GPU.
+        let samples = crate::audio::decode::decode_audio_file(path)?;
+        let n_tok = samples.len().div_ceil(cfg.frame_size as usize);
+
+        // Grow scratch for the encoder working set, then encode on the GPU. The
+        // gemma4ua encoder allocates input + normed [frame, n_tok] and the
+        // projection output [proj_dim, n_tok]; size generously like vision.
+        let need = audio_scratch_estimate(n_tok);
+        if need > self.scratch_bytes {
+            self.engine.allocate_scratch(need)?;
+            self.scratch_bytes = need;
+        }
+        let weights = &self
+            .vision_ctx
+            .as_ref()
+            .expect("ensure_mmproj built it")
+            .vision
+            .weights;
+        let (embeddings, n_tok) =
+            crate::audio::encoder::encode_audio_gemma4(&mut self.engine, weights, &cfg, &samples)?;
+        self.pending_audio = Some(EncodedAudio { embeddings, n_tok });
+        Ok(n_tok)
     }
 
     /// Set (or replace) the leading system message, then reset the cache and
@@ -1465,10 +1616,12 @@ impl ChatSession {
         self.prior_tokens.clear();
         self.cache.reset();
         self.sampler.reset_recent();
-        // Drop any attached/pending image (the built vision tower is kept — it's
-        // reusable for the next `/image`).
+        // Drop any attached/pending media (the loaded mmproj projector + parsed
+        // audio config are kept — reusable for the next `/image` or `/audio`).
         self.image = None;
         self.pending_image = None;
+        self.audio = None;
+        self.pending_audio = None;
     }
 }
 
@@ -1569,6 +1722,7 @@ fn print_banner(gguf: &GgufFile, path: &Path, ctx_size: u32) {
     println!("  /read <file>        add a text file");
     println!("  /glob <pattern>     add text files using globbing pattern");
     println!("  /image <file>       attach an image to your next message (VL models)");
+    println!("  /audio <file>       attach audio to your next message (audio models)");
     println!();
 }
 
@@ -1639,6 +1793,8 @@ fn run_interactive(
                         handle_glob(session, arg.trim());
                     } else if let Some(arg) = cmd.strip_prefix("image") {
                         handle_image(session, arg.trim());
+                    } else if let Some(arg) = cmd.strip_prefix("audio") {
+                        handle_audio(session, arg.trim());
                     } else {
                         println!("unknown command: /{cmd}");
                     }
@@ -1814,6 +1970,27 @@ fn handle_image(session: &mut ChatSession, arg: &str) {
             "(image attached: {nx}×{ny} merged grid, {n_tok} tokens — sent with your next message)"
         ),
         Err(e) => println!("/image failed: {e}"),
+    }
+}
+
+/// `/audio <file>`: decode + encode an audio clip through the gemma4ua projector
+/// and stage it for the next user message (the message then carries the
+/// `<__media__>` marker, so the audio block is spliced into that turn's prefill).
+/// Audio-capable models only (gemma4 mmproj with an audio encoder).
+fn handle_audio(session: &mut ChatSession, arg: &str) {
+    // Unquote / unescape a Tab-completed path and expand a leading `~`, as for
+    // `/image` (see `normalize_path_arg`).
+    let path = normalize_path_arg(arg);
+    if path.is_empty() {
+        println!("usage: /audio <path-to-audio-file>");
+        return;
+    }
+    match session.attach_audio(Path::new(&path)) {
+        Ok(n_tok) => println!(
+            "(audio attached: {n_tok} tokens, ~{}s — sent with your next message)",
+            n_tok / 25
+        ),
+        Err(e) => println!("/audio failed: {e}"),
     }
 }
 

@@ -13,6 +13,8 @@ use crate::commands::run::{self as run_cmd, RunArgs};
 use crate::commands::serve::{self, ServeArgs};
 use crate::commands::tokenize::{self, TokenizeArgs};
 
+#[allow(dead_code)]
+mod audio;
 mod chat_template;
 mod commands;
 #[allow(dead_code)]

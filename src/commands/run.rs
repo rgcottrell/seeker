@@ -132,9 +132,17 @@ pub struct RunArgs {
     #[arg(long = "image")]
     image: Option<PathBuf>,
 
+    /// Path to an audio clip to prepend to the prompt (requires an audio-capable
+    /// model + its mmproj sidecar — gemma4's `gemma4ua`). Decoded to 16 kHz mono,
+    /// encoded by the audio projector, and spliced into the decoder as
+    /// `<|audio><|audio|>×N<audio|>`. Mutually exclusive with `--image`. Pair with
+    /// `--chat` to match `llama-mtmd-cli`'s prompt construction.
+    #[arg(long = "audio")]
+    audio: Option<PathBuf>,
+
     /// Wrap the prompt in the model's chat template (renders a single user turn
-    /// plus an assistant generation prompt). With `--image`, the media marker
-    /// is placed at the head of the user turn, mirroring llama-mtmd-cli.
+    /// plus an assistant generation prompt). With `--image`/`--audio`, the media
+    /// marker is placed at the head of the user turn, mirroring llama-mtmd-cli.
     /// Requires the GGUF to carry tokenizer.chat_template.
     #[arg(long = "chat")]
     chat: bool,
@@ -211,7 +219,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     // Build the token sequence (raw or `--chat`, ± `--image`). With `--image`
     // this CPU-preprocesses the image now (pure, no GPU) and returns an
     // `ImageSetup` for the later GPU encode.
-    let (tokens, image_setup) = build_run_tokens(&args, &bundle, &resolved)?;
+    let (tokens, media_setup) = build_run_tokens(&args, &bundle, &resolved)?;
 
     let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
@@ -226,10 +234,10 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
 
     // Phase 1: load the mmproj vision projector alongside the model when no
-    // `--image` was given (held in a local so it stays alive; an absent sidecar
-    // / load failure degrades to text-only). With `--image`, the dedicated
-    // encode path below loads + drives the projector itself, so skip this.
-    let _vision = if args.image.is_none() {
+    // media (`--image`/`--audio`) was given (held in a local so it stays alive;
+    // an absent sidecar / load failure degrades to text-only). With media, the
+    // dedicated encode path below loads + drives the projector itself, so skip.
+    let _vision = if media_setup.is_none() {
         load_vision(&engine, &resolved, args.no_mmproj)
     } else {
         None
@@ -245,7 +253,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         .max_tokens
         .saturating_add(tokens.len() as u32)
         .max(tokens.len() as u32);
-    let decoder_scratch = if image_setup.is_some() {
+    let decoder_scratch = if media_setup.is_some() {
         model.scratch_bytes_estimate(0, max_seq_len, args.cache_type_k, args.cache_type_v)
     } else {
         model.scratch_bytes_estimate(
@@ -255,70 +263,91 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             args.cache_type_v,
         )
     };
-    let vision_scratch = image_setup
-        .as_ref()
-        .map(vision_scratch_estimate)
-        .unwrap_or(0);
-    engine.allocate_scratch(decoder_scratch.max(vision_scratch))?;
+    let media_scratch = match &media_setup {
+        Some(MediaSetup::Image(s)) => vision_scratch_estimate(s),
+        Some(MediaSetup::Audio(s)) => audio_scratch_estimate(s.n_tok),
+        None => 0,
+    };
+    engine.allocate_scratch(decoder_scratch.max(media_scratch))?;
 
-    // Encode the image through the vision tower (GPU), reading the
+    // Encode the media through its projector (GPU), reading the
     // `[proj_dim, n_tok]` embeddings back to host f32 for the decoder splice.
-    let image_prefill: Option<ImagePrefill> = if let Some(setup) = &image_setup {
-        use crate::vision::encoder::{HostWeights, VisionEncoder};
-        let mmproj_gguf = GgufFile::open(&setup.mmproj_path)?;
-        let vision_weights = engine.upload_weights(&mmproj_gguf)?;
-        let vcfg = &setup.vcfg;
-        if vcfg.projector_type == crate::vision::ProjectorType::Gemma4Uv {
-            // gemma4uv "no-tower" projector — a light embed pipeline.
-            tracing::info!(
-                n_image_tokens = setup.nx * setup.ny,
-                "encoding image through gemma4uv projector",
-            );
-            let (embeddings, _n_tok, npx, npy) = crate::vision::encoder::encode_image_gemma4(
-                &mut engine,
-                &vision_weights,
-                vcfg,
-                &setup.pimg,
-            )?;
-            Some(ImagePrefill {
-                embeddings,
-                start: setup.start,
-                nx: npx,
-                ny: npy,
-            })
-        } else {
-            let encoder = VisionEncoder::new(
-                &vision_weights,
-                vcfg.n_embd as usize,
-                vcfg.patch_size as usize,
-                vcfg.n_head as usize,
-                vcfg.n_ff as usize,
-                vcfg.n_layer as usize,
-                vcfg.eps,
-            )?;
-            let host_weights = HostWeights::from_gguf(&mmproj_gguf)?;
-            let pimg = &setup.pimg;
-            tracing::info!(
-                proj_dim = encoder.projection_dim,
-                n_image_tokens = setup.nx * setup.ny,
-                "encoding image through vision tower",
-            );
-            let embeddings = crate::vision::encoder::encode_image_chunked(
-                &mut engine,
-                &vision_weights,
-                &encoder,
-                pimg,
-                &host_weights,
-            )?;
-            Some(ImagePrefill {
-                embeddings,
-                start: setup.start,
-                nx: setup.nx,
-                ny: setup.ny,
-            })
+    let media_prefill: Option<MediaPrefill> = match &media_setup {
+        Some(MediaSetup::Image(setup)) => {
+            use crate::vision::encoder::{HostWeights, VisionEncoder};
+            let mmproj_gguf = GgufFile::open(&setup.mmproj_path)?;
+            let vision_weights = engine.upload_weights(&mmproj_gguf)?;
+            let vcfg = &setup.vcfg;
+            if vcfg.projector_type == crate::vision::ProjectorType::Gemma4Uv {
+                // gemma4uv "no-tower" projector — a light embed pipeline.
+                tracing::info!(
+                    n_image_tokens = setup.nx * setup.ny,
+                    "encoding image through gemma4uv projector",
+                );
+                let (embeddings, _n_tok, npx, npy) = crate::vision::encoder::encode_image_gemma4(
+                    &mut engine,
+                    &vision_weights,
+                    vcfg,
+                    &setup.pimg,
+                )?;
+                Some(MediaPrefill::Image(ImagePrefill {
+                    embeddings,
+                    start: setup.start,
+                    nx: npx,
+                    ny: npy,
+                }))
+            } else {
+                let encoder = VisionEncoder::new(
+                    &vision_weights,
+                    vcfg.n_embd as usize,
+                    vcfg.patch_size as usize,
+                    vcfg.n_head as usize,
+                    vcfg.n_ff as usize,
+                    vcfg.n_layer as usize,
+                    vcfg.eps,
+                )?;
+                let host_weights = HostWeights::from_gguf(&mmproj_gguf)?;
+                let pimg = &setup.pimg;
+                tracing::info!(
+                    proj_dim = encoder.projection_dim,
+                    n_image_tokens = setup.nx * setup.ny,
+                    "encoding image through vision tower",
+                );
+                let embeddings = crate::vision::encoder::encode_image_chunked(
+                    &mut engine,
+                    &vision_weights,
+                    &encoder,
+                    pimg,
+                    &host_weights,
+                )?;
+                Some(MediaPrefill::Image(ImagePrefill {
+                    embeddings,
+                    start: setup.start,
+                    nx: setup.nx,
+                    ny: setup.ny,
+                }))
+            }
         }
-    } else {
-        None
+        Some(MediaSetup::Audio(setup)) => {
+            let mmproj_gguf = GgufFile::open(&setup.mmproj_path)?;
+            let audio_weights = engine.upload_weights(&mmproj_gguf)?;
+            tracing::info!(
+                n_audio_tokens = setup.n_tok,
+                "encoding audio through gemma4ua projector",
+            );
+            let (embeddings, n_tok) = crate::audio::encoder::encode_audio_gemma4(
+                &mut engine,
+                &audio_weights,
+                &setup.acfg,
+                &setup.samples,
+            )?;
+            Some(MediaPrefill::Audio(AudioPrefill {
+                embeddings,
+                start: setup.start,
+                n_tok,
+            }))
+        }
+        None => None,
     };
 
     // Op smoke-test harnesses — model bring-up scaffolding, gated behind
@@ -493,25 +522,33 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     // model loaded an MTP head. Otherwise fall through to the unchanged
     // single-token loop (byte-for-byte identical to before).
     let spec = args.spec_draft_n_max > 0 && model.supports_mtp_spec();
-    if let Some(prefill) = image_prefill {
-        // Multimodal prefill: a single full-prompt pass that splices the vision
-        // embeddings into the residual at the `<|image_pad|>` rows and uses the
-        // qwen-vl M-RoPE decoder positions. Sample the first token, then decode
-        // the rest with the normal single-token loop — the cache's
-        // `rope_position_lag` (set by the model during this prefill) keeps the
-        // M-RoPE positions continuous past the image. (Image + spec-decode is
-        // not combined; the image path takes precedence.)
+    if let Some(prefill) = media_prefill {
+        // Multimodal prefill: a single full-prompt pass that splices the encoder
+        // embeddings into the residual at the placeholder rows. Sample the first
+        // token, then decode the rest with the normal single-token loop. (Media +
+        // spec-decode is not combined; the media path takes precedence.)
         let t0 = std::time::Instant::now();
-        let first = engine.forward_image_sampled(
-            &*model,
-            &mut cache,
-            &tokens,
-            &prefill.embeddings,
-            prefill.start,
-            prefill.nx,
-            prefill.ny,
-            &mut sampler,
-        )?;
+        let first = match &prefill {
+            MediaPrefill::Image(p) => engine.forward_image_sampled(
+                &*model,
+                &mut cache,
+                &tokens,
+                &p.embeddings,
+                p.start,
+                p.nx,
+                p.ny,
+                &mut sampler,
+            )?,
+            MediaPrefill::Audio(p) => engine.forward_audio_sampled(
+                &*model,
+                &mut cache,
+                &tokens,
+                &p.embeddings,
+                p.start,
+                p.n_tok,
+                &mut sampler,
+            )?,
+        };
         prefill_secs = t0.elapsed().as_secs_f64();
         generated.push(first);
         let mut step_tokens = vec![first];
@@ -4359,6 +4396,78 @@ fn vision_token_ids(
     }
 }
 
+/// CPU-decoded audio + its placement, mirroring [`ImageSetup`]. `samples` is
+/// 16 kHz mono f32 (the GPU encode below reads it back as `[proj_dim, n_tok]`).
+struct AudioSetup {
+    mmproj_path: PathBuf,
+    acfg: crate::audio::AudioConfig,
+    samples: Vec<f32>,
+    /// Local index of the first `<|audio|>` placeholder token in the sequence.
+    start: usize,
+    /// Number of 40 ms audio frames (placeholder tokens).
+    n_tok: usize,
+}
+
+/// The encoded audio ready to splice, mirroring [`ImagePrefill`].
+struct AudioPrefill {
+    embeddings: Vec<f32>,
+    start: usize,
+    n_tok: usize,
+}
+
+/// The one media item (image XOR audio) prepended to a `seeker run` prompt.
+enum MediaSetup {
+    Image(ImageSetup),
+    Audio(AudioSetup),
+}
+
+/// The corresponding GPU-encoded embeddings ready for the prefill splice.
+enum MediaPrefill {
+    Image(ImagePrefill),
+    Audio(AudioPrefill),
+}
+
+/// Scratch estimate for the gemma4ua audio encode (per token, like
+/// [`vision_scratch_estimate`]).
+fn audio_scratch_estimate(n_tok: usize) -> u64 {
+    (40_000u64 * n_tok as u64 * 4).max(64 << 20)
+}
+
+/// Splice an audio block between `prefix` and `suffix`:
+/// `prefix… <|audio> <|audio|>×n_tok <audio|> …suffix`. Returns the tokens and
+/// the local index of the first `<|audio|>` placeholder (where the encoder
+/// embeddings splice in).
+fn assemble_audio_tokens(
+    prefix: &[u32],
+    audio_start: u32,
+    audio_pad: u32,
+    audio_end: u32,
+    n_tok: usize,
+    suffix: &[u32],
+) -> (Vec<u32>, usize) {
+    let mut tokens = Vec::with_capacity(prefix.len() + 2 + n_tok + suffix.len());
+    tokens.extend_from_slice(prefix);
+    tokens.push(audio_start);
+    let start = tokens.len();
+    tokens.resize(tokens.len() + n_tok, audio_pad);
+    tokens.push(audio_end);
+    tokens.extend_from_slice(suffix);
+    (tokens, start)
+}
+
+/// Resolve the gemma4ua audio special-token ids `(<|audio>, <|audio|>,
+/// <audio|>)`. Errors clearly if the tokenizer lacks them (not audio-capable).
+fn audio_token_ids(
+    bundle: &crate::tokenizer::TokenizerBundle,
+) -> Result<(u32, u32, u32), Box<dyn Error>> {
+    let tid = |s: &str| -> Result<u32, Box<dyn Error>> {
+        bundle.tokenizer.token_to_id(s).ok_or_else(|| {
+            format!("tokenizer has no {s} token — this model is not audio-capable").into()
+        })
+    };
+    Ok((tid("<|audio>")?, tid("<|audio|>")?, tid("<audio|>")?))
+}
+
 /// Build the decoder input tokens for `seeker run` across the four combos of
 /// {raw, `--chat`} × {text, `--image`}, returning the tokens and (when an image
 /// is present) the [`ImageSetup`] for the later GPU encode.
@@ -4373,7 +4482,7 @@ fn build_run_tokens(
     args: &RunArgs,
     bundle: &crate::tokenizer::TokenizerBundle,
     resolved: &download::Resolved,
-) -> Result<(Vec<u32>, Option<ImageSetup>), Box<dyn Error>> {
+) -> Result<(Vec<u32>, Option<MediaSetup>), Box<dyn Error>> {
     let encode = |text: &str, add_special: bool| -> Result<Vec<u32>, Box<dyn Error>> {
         Ok(bundle
             .tokenizer
@@ -4381,6 +4490,26 @@ fn build_run_tokens(
             .map_err(|e| format!("tokenize failed: {e}"))?
             .get_ids()
             .to_vec())
+    };
+
+    if args.image.is_some() && args.audio.is_some() {
+        return Err("--image and --audio are mutually exclusive (one media item per run)".into());
+    }
+
+    // Decode the audio first (CPU) — its token count is needed before the
+    // sequence can be assembled.
+    let aud = if let Some(audio_path) = &args.audio {
+        let mmproj_path = resolved.mmproj.clone().ok_or(
+            "--audio requires the model's mmproj sidecar, but none was found \
+             (expected a *mmproj*.gguf next to the model)",
+        )?;
+        let mmproj_gguf = GgufFile::open(&mmproj_path)?;
+        let acfg = crate::audio::parse_config(&mmproj_gguf)?;
+        let samples = crate::audio::decode::decode_audio_file(audio_path)?;
+        let n_tok = samples.len().div_ceil(acfg.frame_size as usize);
+        Some((mmproj_path, acfg, samples, n_tok))
+    } else {
+        None
     };
 
     // Preprocess the image first (CPU) — its token count is needed before the
@@ -4428,7 +4557,7 @@ fn build_run_tokens(
             .chat_template
             .as_deref()
             .ok_or("--chat: the model's GGUF has no tokenizer.chat_template")?;
-        let content = if img.is_some() {
+        let content = if img.is_some() || aud.is_some() {
             format!("{MEDIA_MARKER}{}", args.prompt) // marker first, like llama-mtmd-cli
         } else {
             args.prompt.clone()
@@ -4443,69 +4572,112 @@ fn build_run_tokens(
             bundle.eos_token.as_deref().unwrap_or(""),
             &kwargs,
         )?;
-        match img {
-            Some((mmproj_path, vcfg, pimg, nx, ny, n_tok)) => {
-                let (before, after) = rendered
-                    .split_once(MEDIA_MARKER)
-                    .ok_or("rendered chat prompt lost the <__media__> marker")?;
-                let (vstart, ipad, vend) = vision_token_ids(bundle, vcfg.projector_type)?;
-                let before_tokens = encode(before, false)?;
-                let after_tokens = encode(after, false)?;
-                let (tokens, start) =
-                    assemble_image_tokens(&before_tokens, vstart, ipad, vend, n_tok, &after_tokens);
-                (
-                    tokens,
-                    Some(ImageSetup {
-                        mmproj_path,
-                        vcfg,
-                        pimg,
-                        nx,
-                        ny,
-                        start,
-                    }),
-                )
-            }
-            None => (encode(&rendered, false)?, None),
+        if let Some((mmproj_path, vcfg, pimg, nx, ny, n_tok)) = img {
+            let (before, after) = rendered
+                .split_once(MEDIA_MARKER)
+                .ok_or("rendered chat prompt lost the <__media__> marker")?;
+            let (vstart, ipad, vend) = vision_token_ids(bundle, vcfg.projector_type)?;
+            let before_tokens = encode(before, false)?;
+            let after_tokens = encode(after, false)?;
+            let (tokens, start) =
+                assemble_image_tokens(&before_tokens, vstart, ipad, vend, n_tok, &after_tokens);
+            (
+                tokens,
+                Some(MediaSetup::Image(ImageSetup {
+                    mmproj_path,
+                    vcfg,
+                    pimg,
+                    nx,
+                    ny,
+                    start,
+                })),
+            )
+        } else if let Some((mmproj_path, acfg, samples, n_tok)) = aud {
+            let (before, after) = rendered
+                .split_once(MEDIA_MARKER)
+                .ok_or("rendered chat prompt lost the <__media__> marker")?;
+            let (astart, apad, aend) = audio_token_ids(bundle)?;
+            let before_tokens = encode(before, false)?;
+            let after_tokens = encode(after, false)?;
+            let (tokens, start) =
+                assemble_audio_tokens(&before_tokens, astart, apad, aend, n_tok, &after_tokens);
+            (
+                tokens,
+                Some(MediaSetup::Audio(AudioSetup {
+                    mmproj_path,
+                    acfg,
+                    samples,
+                    start,
+                    n_tok,
+                })),
+            )
+        } else {
+            (encode(&rendered, false)?, None)
         }
     } else {
         let add_special = bundle.add_bos_default || bundle.add_eos_default;
-        match img {
-            Some((mmproj_path, vcfg, pimg, nx, ny, n_tok)) => {
-                let (vstart, ipad, vend) = vision_token_ids(bundle, vcfg.projector_type)?;
-                let prefix: Vec<u32> = bundle
-                    .add_bos_default
-                    .then_some(bundle.bos_id)
-                    .flatten()
-                    .into_iter()
-                    .collect();
-                let suffix = encode(&args.prompt, false)?;
-                let (tokens, start) =
-                    assemble_image_tokens(&prefix, vstart, ipad, vend, n_tok, &suffix);
-                (
-                    tokens,
-                    Some(ImageSetup {
-                        mmproj_path,
-                        vcfg,
-                        pimg,
-                        nx,
-                        ny,
-                        start,
-                    }),
-                )
-            }
-            None => (encode(&args.prompt, add_special)?, None),
+        let bos_prefix = || -> Vec<u32> {
+            bundle
+                .add_bos_default
+                .then_some(bundle.bos_id)
+                .flatten()
+                .into_iter()
+                .collect()
+        };
+        if let Some((mmproj_path, vcfg, pimg, nx, ny, n_tok)) = img {
+            let (vstart, ipad, vend) = vision_token_ids(bundle, vcfg.projector_type)?;
+            let prefix = bos_prefix();
+            let suffix = encode(&args.prompt, false)?;
+            let (tokens, start) =
+                assemble_image_tokens(&prefix, vstart, ipad, vend, n_tok, &suffix);
+            (
+                tokens,
+                Some(MediaSetup::Image(ImageSetup {
+                    mmproj_path,
+                    vcfg,
+                    pimg,
+                    nx,
+                    ny,
+                    start,
+                })),
+            )
+        } else if let Some((mmproj_path, acfg, samples, n_tok)) = aud {
+            let (astart, apad, aend) = audio_token_ids(bundle)?;
+            let prefix = bos_prefix();
+            let suffix = encode(&args.prompt, false)?;
+            let (tokens, start) =
+                assemble_audio_tokens(&prefix, astart, apad, aend, n_tok, &suffix);
+            (
+                tokens,
+                Some(MediaSetup::Audio(AudioSetup {
+                    mmproj_path,
+                    acfg,
+                    samples,
+                    start,
+                    n_tok,
+                })),
+            )
+        } else {
+            (encode(&args.prompt, add_special)?, None)
         }
     };
 
-    if let Some(s) = &setup {
-        tracing::info!(
+    match &setup {
+        Some(MediaSetup::Image(s)) => tracing::info!(
             image = ?args.image, chat = args.chat,
             resized = format!("{}x{}", s.pimg.resized_w, s.pimg.resized_h),
             grid = format!("{}x{}", s.pimg.grid_w, s.pimg.grid_h),
             merged = format!("{}x{}", s.nx, s.ny),
             n_image_tokens = s.nx * s.ny, image_start = s.start, seq_len = tokens.len(),
             "image prompt assembled",
-        );
+        ),
+        Some(MediaSetup::Audio(s)) => tracing::info!(
+            audio = ?args.audio, chat = args.chat,
+            samples = s.samples.len(), n_audio_tokens = s.n_tok,
+            audio_start = s.start, seq_len = tokens.len(),
+            "audio prompt assembled",
+        ),
+        None => {}
     }
     Ok((tokens, setup))
 }
