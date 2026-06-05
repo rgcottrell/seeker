@@ -14,7 +14,7 @@
 use std::error::Error;
 
 use crate::gguf::GgufFile;
-use crate::vision::{get_bool, get_str, get_u32};
+use crate::vision::{get_bool, get_str};
 
 pub mod decode;
 pub mod encoder;
@@ -45,9 +45,11 @@ impl AudioProjectorType {
 pub struct AudioConfig {
     /// The detected audio projector type.
     pub projector_type: AudioProjectorType,
-    /// Frame size in samples (`clip.audio.num_mel_bins`, 640 for gemma4ua = 40 ms
-    /// @ 16 kHz). Misnamed in the GGUF: for `gemma4ua` it's a raw-sample frame
-    /// length, not a count of mel bins.
+    /// Frame size in samples (640 for gemma4ua = 40 ms @ 16 kHz). Sourced from
+    /// the projection weight's input (K) dim — the authoritative value. NOT from
+    /// `clip.audio.num_mel_bins`: that key is 128 in the real mmproj (a vestigial
+    /// value from the conformer variant), but the `gemma4ua` projection takes raw
+    /// 640-sample frames. llama.cpp likewise hardcodes 640 and ignores the key.
     pub frame_size: u32,
     /// RMSNorm epsilon. Hardcoded to `1e-6` for `gemma4ua` to match llama.cpp's
     /// `clip.cpp` (which overrides any metadata value for this projector).
@@ -68,10 +70,18 @@ pub fn parse_config(gguf: &GgufFile) -> Result<AudioConfig, Box<dyn Error>> {
     let proj_str = get_str(gguf, "clip.audio.projector_type")
         .ok_or("mmproj missing clip.audio.projector_type")?;
     let projector_type = AudioProjectorType::parse(proj_str)?;
+    // The frame size = the projection weight's input (K) dim (640 for gemma4ua).
+    // Read it straight from the GGUF tensor shape (no GPU needed) rather than
+    // trusting `clip.audio.num_mel_bins` (128 here — vestigial, see `frame_size`).
+    let frame_size = gguf
+        .tensor("mm.a.input_projection.weight")
+        .and_then(|t| t.dims.first().copied())
+        .filter(|&k| k > 0)
+        .ok_or("mmproj missing/empty mm.a.input_projection.weight (no gemma4ua audio encoder)")?
+        as u32;
     Ok(AudioConfig {
         projector_type,
-        // 640 for gemma4ua; default defensively if the key is absent.
-        frame_size: get_u32(gguf, "clip.audio.num_mel_bins").unwrap_or(640),
+        frame_size,
         eps: 1e-6,
     })
 }
