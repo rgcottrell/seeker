@@ -36,15 +36,27 @@ jobs:
       - name: Install slangc
         # build.rs compiles the .slang compute shaders with slangc. ash loads
         # Vulkan at runtime, so building/clippy need only slangc — no GPU.
+        env:
+          # Authenticate the release-metadata lookup: unauthenticated
+          # api.github.com calls share a 60/hr per-IP limit and 403 on busy
+          # shared runners. The built-in token reads public releases fine and
+          # gets the 1000/hr authenticated limit.
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Match the arch immediately followed by .tar.gz so we skip the
           # `-debug-info` (no slangc) and `-glibc-*` variants and land on the
           # generic release. The looser `linux-x86_64.*\.tar\.gz$` would match
           # all of them and pick whichever the API returns first.
-          url=$(curl -fsSL "https://api.github.com/repos/shader-slang/slang/releases/tags/v${SLANG_VERSION}" \
+          url=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/shader-slang/slang/releases/tags/v${SLANG_VERSION}" \
             | jq -r '.assets[] | select(.name | test("linux-x86_64\\.tar\\.gz$")) | .browser_download_url')
           echo "slang asset: $url"
-          test -n "$url" && test "$url" != "null"
+          # Fail loud: a bare `test ... && test ...` is ignored by `set -e`
+          # (non-final command in an && list), so an empty URL would slip past.
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            echo "::error::could not resolve slang v${SLANG_VERSION} linux-x86_64 asset URL"
+            exit 1
+          fi
           curl -fsSL "$url" -o /tmp/slang.tar.gz
           mkdir -p "$HOME/slang"
           tar -xzf /tmp/slang.tar.gz -C "$HOME/slang"
