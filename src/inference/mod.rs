@@ -224,6 +224,18 @@ impl Engine {
         kv_cache::KvCache::new(&self.device, n_layer, head_dim, n_head_kv, config)
     }
 
+    /// Allocate a KV cache whose K/V dims vary per layer (gemma4's interleaved
+    /// sliding-window / global attention). `head_dims[il]` / `n_head_kvs[il]`
+    /// size layer `il`'s buffer.
+    pub fn allocate_kv_cache_per_layer(
+        &self,
+        head_dims: &[u32],
+        n_head_kvs: &[u32],
+        config: kv_cache::KvCacheConfig,
+    ) -> Result<kv_cache::KvCache, Box<dyn Error>> {
+        kv_cache::KvCache::new_per_layer(&self.device, head_dims, n_head_kvs, config)
+    }
+
     /// Run a forward pass: the closure records dispatches into the
     /// `DispatchContext` and returns the `BufferRange` containing the final
     /// logits (vocab_size F32s). The engine handles begin/end/submit/wait
@@ -269,6 +281,7 @@ impl Engine {
         let taps;
         let logits_range = {
             let mut ctx = DispatchContext {
+                flush: None,
                 device: &self.device,
                 weights,
                 scratch: &mut self.scratch,
@@ -419,6 +432,7 @@ impl Engine {
 
         let token_ranges: Vec<BufferRange> = {
             let mut ctx = DispatchContext {
+                flush: None,
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -550,6 +564,7 @@ impl Engine {
 
         let token_ranges: Vec<BufferRange> = {
             let mut ctx = DispatchContext {
+                flush: Self::build_flush(self.fence, model.weights()),
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -770,6 +785,7 @@ impl Engine {
 
         let records = {
             let mut ctx = DispatchContext {
+                flush: None,
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -871,14 +887,15 @@ impl Engine {
         if l == 0 {
             return Err("forward_sampled called with empty token list".into());
         }
-        // Chunked prefill: a prompt longer than `n_ubatch` is fed in sequential
-        // `≤ n_ubatch`-token passes so the per-pass scratch working set stays
-        // bounded regardless of prompt length. Deep-context attention is kept
-        // under the RADV watchdog by the coopmat flash-attn kernel (fast enough
-        // for a full ubatch in one dispatch), not by shrinking the chunk. Only
-        // the final chunk computes logits + samples. `n_ubatch == 0` disables
+        // Chunked prefill: a prompt longer than the effective ubatch is fed in
+        // sequential passes so the per-pass scratch working set stays bounded
+        // regardless of prompt length. Deep-context attention is kept under the
+        // RADV watchdog by the coopmat flash-attn kernel (fast enough for a full
+        // ubatch in one dispatch), not by shrinking the chunk. Only the final
+        // chunk computes logits + samples. An effective ubatch of 0 disables
         // chunking (legacy single-pass).
-        if self.n_ubatch != 0 && l > self.n_ubatch {
+        let ub = self.effective_ubatch();
+        if ub != 0 && l > ub {
             return self.forward_sampled_chunked(model, cache, tokens, position_offset, sampler);
         }
         let is_decode = l == 1;
@@ -1116,6 +1133,11 @@ impl Engine {
         let n_dispatches;
         let token_range = {
             let mut ctx = DispatchContext {
+                flush: if cache_recording {
+                    None
+                } else {
+                    Self::build_flush(self.fence, model.weights())
+                },
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -1286,11 +1308,8 @@ impl Engine {
         }
         let prompt_pos0 = cache.position;
         let n = tokens.len();
-        let ub = if self.n_ubatch == 0 {
-            n
-        } else {
-            self.n_ubatch as usize
-        };
+        let eub = self.effective_ubatch();
+        let ub = if eub == 0 { n } else { eub as usize };
 
         let mut token = 0u32;
         let mut start = 0usize;
@@ -1316,10 +1335,49 @@ impl Engine {
         }
         // The image consumed `n_tok = nx*ny` KV slots but advanced the logical
         // M-RoPE cursor by only `max(nx,ny)`; subsequent (decode) forwards read
-        // this lag to keep their positions continuous past the image.
-        let n_tok = image_nx * image_ny;
-        cache.rope_position_lag += (n_tok - image_nx.max(image_ny)) as u32;
+        // this lag to keep their positions continuous past the image. gemma4 uses
+        // sequential 1D positions (image advances the cursor 1:1), so no lag.
+        if model.image_uses_mrope() {
+            let n_tok = image_nx * image_ny;
+            cache.rope_position_lag += (n_tok - image_nx.max(image_ny)) as u32;
+        }
         Ok(token)
+    }
+
+    /// Prefill an audio-containing prompt — the `gemma4ua` analog of
+    /// [`Self::forward_image_sampled`]. The `<|audio|>`-placeholder columns
+    /// (`audio_start..audio_start + n_audio_tok`) are overwritten by the audio
+    /// encoder's projected frames (see [`crate::audio::encoder`]).
+    ///
+    /// Audio tokens use plain sequential 1D positions (no M-RoPE), so we feed the
+    /// clip as a **1×N media grid** (`nx = n_audio_tok`, `ny = 1`) through the
+    /// shared, validated image-prefill path: the residual splice and chunked
+    /// submission are modality-agnostic, and the post-prefill rope-lag term
+    /// `n_tok − max(nx, ny) = n_audio_tok − n_audio_tok = 0` regardless of
+    /// `image_uses_mrope`, so no lag is ever introduced. The encoder's
+    /// `proj_dim == n_embd` requirement is enforced by the splice length check in
+    /// the model's `record_forward_image_chunk`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_audio_sampled(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        audio_embeddings: &[f32],
+        audio_start: usize,
+        n_audio_tok: usize,
+        sampler: &mut sample::Sampler,
+    ) -> Result<u32, Box<dyn Error>> {
+        self.forward_image_sampled(
+            model,
+            cache,
+            tokens,
+            audio_embeddings,
+            audio_start,
+            n_audio_tok,
+            1,
+            sampler,
+        )
     }
 
     /// Record + submit ONE chunk of an image prefill (see
@@ -1374,6 +1432,7 @@ impl Engine {
         let taps: Vec<(String, BufferRange)>;
         let token_range = {
             let mut ctx = DispatchContext {
+                flush: Self::build_flush(self.fence, model.weights()),
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -1480,8 +1539,44 @@ impl Engine {
         Ok(Some(token))
     }
 
-    /// Prefill a prompt longer than `n_ubatch` by feeding it in sequential
-    /// `≤ n_ubatch`-token chunks. Every chunk but the last is KV-only (no
+    /// Build the prefill submission-splitting budget ([`context::FlushState`])
+    /// for a forward that records into a freshly-begun command buffer, or `None`
+    /// when flushing is disabled (`SEEKER_PREFILL_FLUSH=0`). Budget =
+    /// `min(100 MB, total_weight_bytes / 40)` (overridable via
+    /// `SEEKER_PREFILL_FLUSH_MB`) — a *bytes-of-weight-read* budget, which is a
+    /// time budget in the one unit ~independent of quant. Associated (no `&self`
+    /// borrow) so it can be evaluated inline in a `DispatchContext` literal
+    /// alongside `&mut self.scratch`; `fence` is `Copy`.
+    fn build_flush(
+        fence: vk::Fence,
+        weights: &weights::WeightsHandle,
+    ) -> Option<context::FlushState> {
+        if *crate::runtime_flags::PREFILL_FLUSH_DISABLED {
+            return None;
+        }
+        let budget_bytes = match *crate::runtime_flags::PREFILL_FLUSH_MB {
+            Some(mb) => (mb as u64) * 1024 * 1024,
+            None => (100u64 * 1024 * 1024).min((weights.total_bytes / 40).max(1)),
+        };
+        Some(context::FlushState {
+            fence,
+            budget_bytes: budget_bytes.max(1),
+            node_budget: 100,
+            bytes_since_flush: 0,
+            nodes_since_flush: 0,
+        })
+    }
+
+    /// The prefill micro-batch: the configured [`Self::n_ubatch`] (0 =
+    /// single-pass). The GPU TDR watchdog is handled by mid-forward submission
+    /// splitting ([`build_flush`](Self::build_flush)), not by clamping the
+    /// micro-batch — token-chunking now bounds only the per-chunk scratch.
+    fn effective_ubatch(&self) -> u32 {
+        self.n_ubatch
+    }
+
+    /// Prefill a prompt longer than the effective ubatch by feeding it in
+    /// sequential chunks. Every chunk but the last is KV-only (no
     /// logits / sampler — see [`Engine::forward_kv_only`]); the final chunk
     /// runs the normal sampling path and returns the next token.
     ///
@@ -1506,7 +1601,7 @@ impl Engine {
             )
             .into());
         }
-        let ub = self.n_ubatch as usize;
+        let ub = self.effective_ubatch() as usize;
         let n = tokens.len();
         debug_assert!(ub > 0 && n > ub, "chunked path entered with n={n} ub={ub}");
         let mut start = 0usize;
@@ -1574,6 +1669,7 @@ impl Engine {
 
         {
             let mut ctx = DispatchContext {
+                flush: Self::build_flush(self.fence, model.weights()),
                 device: &self.device,
                 weights: model.weights(),
                 scratch: &mut self.scratch,
@@ -1684,6 +1780,7 @@ impl Engine {
 
         let ranges = {
             let mut ctx = DispatchContext {
+                flush: None,
                 device: &self.device,
                 weights,
                 scratch: &mut self.scratch,

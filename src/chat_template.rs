@@ -27,6 +27,20 @@ fn unknown_method_callback(
     name: &str,
     args: &[Value],
 ) -> Result<Value, MjError> {
+    // Python dict `.get(key[, default])` on a map receiver (e.g. gemma4's chat
+    // template does `message.get('reasoning')`). minijinja maps support
+    // indexing but not the `.get` method, so shim it: return the item, or the
+    // default (or Undefined ⇒ falsy) when the key is absent.
+    if name == "get" && receiver.as_str().is_none() {
+        let key = args
+            .first()
+            .ok_or_else(|| MjError::new(ErrorKind::InvalidOperation, "get: expected key"))?;
+        let item = receiver.get_item(key).unwrap_or(Value::UNDEFINED);
+        if item.is_undefined() {
+            return Ok(args.get(1).cloned().unwrap_or(Value::UNDEFINED));
+        }
+        return Ok(item);
+    }
     let s = match receiver.as_str() {
         Some(s) => s,
         None => return Err(MjError::from(ErrorKind::UnknownMethod)),

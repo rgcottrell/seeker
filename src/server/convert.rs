@@ -70,13 +70,44 @@ pub fn decode_image_url(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("image_url base64 decode failed: {e}"))
 }
 
-/// Like [`content_to_text`] but also extracts images: each `image_url` part
-/// emits the [`MEDIA_MARKER`] into the text (where the image sits in the turn)
-/// and its decoded bytes are collected, in order. Used by the vision-capable
-/// chat path; `decode_image_url` rejects anything but base64 data URLs.
-pub fn content_to_text_and_images(content: &Value) -> Result<(String, Vec<Vec<u8>>), String> {
+/// Decode an OpenAI `input_audio` content part into raw audio file bytes. The
+/// part is `{"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}`;
+/// `data` is base64-encoded audio (wav/mp3/flac/…). A `data:<mime>;base64,<…>`
+/// data URL is also accepted. The container is sniffed at decode time, so the
+/// `format` field is advisory and not required.
+pub fn decode_input_audio(part: &Value) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let data = part
+        .get("input_audio")
+        .and_then(|o| o.get("data"))
+        .and_then(|d| d.as_str())
+        .ok_or("input_audio part missing string `input_audio.data`")?;
+    // Accept a raw base64 string (the OpenAI shape) or a data URL.
+    let b64 = match data.strip_prefix("data:") {
+        Some(rest) => {
+            let comma = rest
+                .find(',')
+                .ok_or("malformed input_audio data URL: missing comma")?;
+            &rest[comma + 1..]
+        }
+        None => data,
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| format!("input_audio base64 decode failed: {e}"))
+}
+
+/// Like [`content_to_text`] but also extracts media: each `image_url` /
+/// `input_audio` part emits the [`MEDIA_MARKER`] into the text (where the media
+/// sits in the turn) and its decoded bytes are collected, in order. Returns
+/// `(text, images, audios)`. Used by the multimodal chat path.
+#[allow(clippy::type_complexity)] // (text, images, audios) is clearer inline than an alias
+pub fn content_to_text_and_media(
+    content: &Value,
+) -> Result<(String, Vec<Vec<u8>>, Vec<Vec<u8>>), String> {
     let mut text = String::new();
     let mut images = Vec::new();
+    let mut audios = Vec::new();
     match content {
         Value::Null => {}
         Value::String(s) => text.push_str(s),
@@ -99,6 +130,10 @@ pub fn content_to_text_and_images(content: &Value) -> Result<(String, Vec<Vec<u8
                         images.push(decode_image_url(url)?);
                         text.push_str(MEDIA_MARKER);
                     }
+                    Some("input_audio") => {
+                        audios.push(decode_input_audio(part)?);
+                        text.push_str(MEDIA_MARKER);
+                    }
                     Some(other) => return Err(format!("unsupported content part type {other:?}")),
                     None => return Err("content array part missing `type`".to_string()),
                 }
@@ -106,28 +141,31 @@ pub fn content_to_text_and_images(content: &Value) -> Result<(String, Vec<Vec<u8
         }
         other => return Err(format!("unsupported message content: {other}")),
     }
-    Ok((text, images))
+    Ok((text, images, audios))
 }
 
-/// OpenAI chat messages → (engine `ChatMessage`s, collected images in order).
-/// The image-bearing turn's content carries the [`MEDIA_MARKER`] where each
-/// image sat, so the chat template renders it in place. The multimodal sibling
-/// of [`openai_messages_to_chat`].
+/// OpenAI chat messages → (engine `ChatMessage`s, images, audios — in order).
+/// The media-bearing turn's content carries the [`MEDIA_MARKER`] where each item
+/// sat, so the chat template renders it in place. The multimodal sibling of
+/// [`openai_messages_to_chat`].
+#[allow(clippy::type_complexity)] // (messages, images, audios) is clearer inline than an alias
 pub fn openai_messages_to_chat_mm(
     messages: &[OpenAiMessage],
-) -> Result<(Vec<ChatMessage>, Vec<Vec<u8>>), String> {
+) -> Result<(Vec<ChatMessage>, Vec<Vec<u8>>, Vec<Vec<u8>>), String> {
     let mut out = Vec::with_capacity(messages.len());
     let mut images = Vec::new();
+    let mut audios = Vec::new();
     for m in messages {
-        let (content, imgs) = content_to_text_and_images(&m.content)?;
+        let (content, imgs, auds) = content_to_text_and_media(&m.content)?;
         images.extend(imgs);
+        audios.extend(auds);
         out.push(ChatMessage {
             role: m.role.clone(),
             content,
             reasoning_content: None,
         });
     }
-    Ok((out, images))
+    Ok((out, images, audios))
 }
 
 /// OpenAI chat messages → engine `ChatMessage`s. Roles pass through unchanged.
@@ -299,18 +337,37 @@ pub fn render_and_encode(
     encode(bundle, &rendered, false)
 }
 
-/// As [`render_and_encode`] but for a chat request that may carry images: the
-/// rendered prompt has a [`MEDIA_MARKER`] where each image sits, which we replace
-/// with the vision block (`<|vision_start|><|image_pad|>×n_tok<|vision_end|>`).
-/// Returns the token ids plus, for an image request, the preprocessed image +
-/// its placement `(image, image_start, nx, ny)` (the worker encodes + splices
-/// it). First cut: at most one image per request.
-#[allow(clippy::type_complexity)]
+/// The one media item (image XOR audio) extracted from a chat request, ready
+/// for the worker to encode + splice. The handler maps this to the worker's
+/// `ServeImage` / `ServeAudio`.
+pub enum MediaParts {
+    Image {
+        pimg: PreprocessedImage,
+        image_start: usize,
+        nx: usize,
+        ny: usize,
+    },
+    Audio {
+        /// 16 kHz mono f32 (decoded on the handler thread).
+        samples: Vec<f32>,
+        audio_start: usize,
+        n_tok: usize,
+    },
+}
+
+/// As [`render_and_encode`] but for a chat request that may carry an image or an
+/// audio clip: the rendered prompt has a [`MEDIA_MARKER`] where the media sits,
+/// which we replace with the projector's block (vision
+/// `<|vision_start|><|image_pad|>×n_tok<|vision_end|>`, or audio
+/// `<|audio><|audio|>×n_tok<audio|>`). Returns the token ids plus the
+/// [`MediaParts`] for the worker to encode + splice. First cut: at most one
+/// media item per request (image and audio are mutually exclusive).
 pub fn render_and_encode_mm(
     state: &AppState,
     mut messages: Vec<ChatMessage>,
     images: &[Vec<u8>],
-) -> Result<(Vec<u32>, Option<(PreprocessedImage, usize, usize, usize)>), String> {
+    audios: &[Vec<u8>],
+) -> Result<(Vec<u32>, Option<MediaParts>), String> {
     let template = state
         .chat_template()
         .ok_or("this model has no chat template — use the completion endpoints")?;
@@ -325,42 +382,81 @@ pub fn render_and_encode_mm(
         state.template_kwargs(),
     )
     .map_err(|e| e.to_string())?;
-    if images.is_empty() {
+    if !images.is_empty() && !audios.is_empty() {
+        return Err("a request may carry an image or audio, not both".into());
+    }
+    if images.is_empty() && audios.is_empty() {
         return Ok((encode(bundle, &rendered, false)?, None));
     }
-    if images.len() > 1 {
-        return Err("only one image per request is supported".into());
-    }
-    let vcfg = state
-        .vision_config()
-        .ok_or("this server has no vision model (mmproj); image input is unsupported")?;
-    let pcfg = PreprocessConfig::qwen3vl_default(
-        vcfg.patch_size,
-        vcfg.spatial_merge_size,
-        vcfg.image_mean,
-        vcfg.image_std,
-    );
-    let pimg = crate::vision::preprocess::preprocess_bytes(&images[0], &pcfg)
-        .map_err(|e| format!("image preprocess failed: {e}"))?;
-    let merge = vcfg.spatial_merge_size as usize;
-    let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
-    let n_tok = pimg.n_tokens as usize;
-    let (before, after) = rendered
-        .split_once(MEDIA_MARKER)
-        .ok_or("rendered chat prompt lost the <__media__> marker")?;
     let tid = |s: &str| -> Result<u32, String> {
         bundle
             .tokenizer
             .token_to_id(s)
-            .ok_or_else(|| format!("tokenizer has no {s} token — this model is not vision-capable"))
+            .ok_or_else(|| format!("tokenizer has no {s} token — this model lacks that modality"))
     };
+    let (before, after) = rendered
+        .split_once(MEDIA_MARKER)
+        .ok_or("rendered chat prompt lost the <__media__> marker")?;
+
+    if !images.is_empty() {
+        if images.len() > 1 {
+            return Err("only one image per request is supported".into());
+        }
+        let vcfg = state
+            .vision_config()
+            .ok_or("this server has no vision model (mmproj); image input is unsupported")?;
+        let pcfg = PreprocessConfig::qwen3vl_default(
+            vcfg.patch_size,
+            vcfg.spatial_merge_size,
+            vcfg.image_mean,
+            vcfg.image_std,
+        );
+        let pimg = crate::vision::preprocess::preprocess_bytes(&images[0], &pcfg)
+            .map_err(|e| format!("image preprocess failed: {e}"))?;
+        let merge = vcfg.spatial_merge_size as usize;
+        let (nx, ny) = (pimg.grid_w as usize / merge, pimg.grid_h as usize / merge);
+        let n_tok = pimg.n_tokens as usize;
+        let mut tokens = encode(bundle, before, false)?;
+        tokens.push(tid("<|vision_start|>")?);
+        let image_start = tokens.len();
+        tokens.resize(tokens.len() + n_tok, tid("<|image_pad|>")?);
+        tokens.push(tid("<|vision_end|>")?);
+        tokens.extend(encode(bundle, after, false)?);
+        return Ok((
+            tokens,
+            Some(MediaParts::Image {
+                pimg,
+                image_start,
+                nx,
+                ny,
+            }),
+        ));
+    }
+
+    // Audio.
+    if audios.len() > 1 {
+        return Err("only one audio clip per request is supported".into());
+    }
+    let acfg = state.audio_config().ok_or(
+        "this server has no audio model (mmproj audio encoder); audio input is unsupported",
+    )?;
+    let samples = crate::audio::decode::decode_audio_bytes(audios[0].clone(), None)
+        .map_err(|e| format!("audio decode failed: {e}"))?;
+    let n_tok = samples.len().div_ceil(acfg.frame_size as usize);
     let mut tokens = encode(bundle, before, false)?;
-    tokens.push(tid("<|vision_start|>")?);
-    let image_start = tokens.len();
-    tokens.resize(tokens.len() + n_tok, tid("<|image_pad|>")?);
-    tokens.push(tid("<|vision_end|>")?);
+    tokens.push(tid("<|audio>")?);
+    let audio_start = tokens.len();
+    tokens.resize(tokens.len() + n_tok, tid("<|audio|>")?);
+    tokens.push(tid("<audio|>")?);
     tokens.extend(encode(bundle, after, false)?);
-    Ok((tokens, Some((pimg, image_start, nx, ny))))
+    Ok((
+        tokens,
+        Some(MediaParts::Audio {
+            samples,
+            audio_start,
+            n_tok,
+        }),
+    ))
 }
 
 /// Shared leading-prefix tokens to PIN for the leading-prefix cache: the longest
@@ -432,19 +528,30 @@ mod tests {
     }
 
     #[test]
-    fn content_mm_interleaves_marker_and_collects_images() {
+    fn content_mm_interleaves_marker_and_collects_media() {
         let content = json!([
             {"type": "text", "text": "look: "},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
             {"type": "text", "text": " what is it?"}
         ]);
-        let (text, images) = content_to_text_and_images(&content).unwrap();
+        let (text, images, audios) = content_to_text_and_media(&content).unwrap();
         assert_eq!(text, format!("look: {MEDIA_MARKER} what is it?"));
         assert_eq!(images, vec![b"hi".to_vec()]);
-        // A bare string yields no images.
-        let (text, images) = content_to_text_and_images(&json!("plain")).unwrap();
+        assert!(audios.is_empty());
+        // A bare string yields no media.
+        let (text, images, audios) = content_to_text_and_media(&json!("plain")).unwrap();
         assert_eq!(text, "plain");
         assert!(images.is_empty());
+        assert!(audios.is_empty());
+        // An `input_audio` part emits the marker and collects the decoded bytes.
+        let content = json!([
+            {"type": "input_audio", "input_audio": {"data": "aGk=", "format": "wav"}},
+            {"type": "text", "text": " transcribe"}
+        ]);
+        let (text, images, audios) = content_to_text_and_media(&content).unwrap();
+        assert_eq!(text, format!("{MEDIA_MARKER} transcribe"));
+        assert!(images.is_empty());
+        assert_eq!(audios, vec![b"hi".to_vec()]);
     }
 
     #[test]
@@ -458,9 +565,10 @@ mod tests {
             name: None,
             tool_call_id: None,
         }];
-        let (chat, images) = openai_messages_to_chat_mm(&msgs).unwrap();
+        let (chat, images, audios) = openai_messages_to_chat_mm(&msgs).unwrap();
         assert_eq!(chat[0].content, format!("{MEDIA_MARKER}hi"));
         assert_eq!(images.len(), 1);
+        assert!(audios.is_empty());
     }
 
     #[test]

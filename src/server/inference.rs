@@ -92,6 +92,18 @@ pub struct ServeImage {
     pub ny: usize,
 }
 
+/// An audio clip attached to a chat request. The handler decodes it to 16 kHz
+/// mono on its thread (CPU) and records where the `<|audio|>` placeholders sit
+/// in `tokens`; the worker encodes it through the gemma4ua projector and splices
+/// the embeddings during that request's prefill. `samples` is `Send` (Vec<f32>).
+pub struct ServeAudio {
+    pub samples: Vec<f32>,
+    /// Local index of the first `<|audio|>` token in `GenJob::tokens`.
+    pub audio_start: usize,
+    /// Number of 40 ms audio frames (placeholder tokens).
+    pub n_tok: usize,
+}
+
 /// One unit of work for the worker. The handler has already rendered the chat
 /// template and encoded it, so only `Send` data crosses the thread boundary.
 pub struct GenJob {
@@ -100,6 +112,10 @@ pub struct GenJob {
     /// An attached image (chat requests with `image_url` content). `None` for
     /// the text path. Prefilled single-pass with the vision splice in the worker.
     pub image: Option<ServeImage>,
+    /// An attached audio clip (chat requests with `input_audio` content). `None`
+    /// otherwise. Prefilled with the gemma4ua audio splice in the worker.
+    /// Mutually exclusive with `image`.
+    pub audio: Option<ServeAudio>,
     /// Reply sink. Bounded so the worker back-pressures on a slow client; a
     /// *dropped* receiver (client disconnect) makes `blocking_send` return Err,
     /// which the decode loop treats as cancellation.
@@ -111,8 +127,15 @@ pub struct GenJob {
 /// (the encoder's tensor views hold GPU buffer handles kept valid by it).
 struct VisionCtx {
     vision: crate::vision::VisionModel,
-    encoder: VisionEncoder,
-    host_weights: HostWeights,
+    /// The transformer-tower encoder — `None` for the gemma4uv "no-tower"
+    /// projector (image input via gemma4uv isn't wired in serve yet, but the
+    /// mmproj still loads so its audio encoder can be used).
+    encoder: Option<VisionEncoder>,
+    /// CPU-side weights for the tower encoder's pos-embd resize — `None` for
+    /// gemma4uv.
+    host_weights: Option<HostWeights>,
+    /// The gemma4ua audio config, when the mmproj carries an audio encoder.
+    audio_cfg: Option<crate::audio::AudioConfig>,
 }
 
 /// Why generation stopped — maps to each API's finish/stop-reason field.
@@ -217,21 +240,24 @@ impl InferenceHandle {
         tokens: Vec<u32>,
         config: GenConfig,
     ) -> Result<mpsc::Receiver<GenEvent>, String> {
-        self.start_mm(tokens, config, None).await
+        self.start_mm(tokens, config, None, None).await
     }
 
-    /// As [`Self::start`] but with an optional attached image (multimodal chat).
+    /// As [`Self::start`] but with an optional attached image or audio clip
+    /// (multimodal chat). At most one of `image`/`audio` is `Some`.
     pub async fn start_mm(
         &self,
         tokens: Vec<u32>,
         config: GenConfig,
         image: Option<ServeImage>,
+        audio: Option<ServeAudio>,
     ) -> Result<mpsc::Receiver<GenEvent>, String> {
         let (tx, rx) = mpsc::channel(32);
         self.submit(GenJob {
             tokens,
             config,
             image,
+            audio,
             reply: tx,
         })
         .await
@@ -804,16 +830,24 @@ fn build_vision(engine: &Engine, mmproj_path: &Path) -> Result<VisionCtx, Box<dy
     let gguf = GgufFile::open(mmproj_path)?;
     let weights = engine.upload_weights(&gguf)?;
     let cfg = crate::vision::parse_config(&gguf)?;
-    let encoder = VisionEncoder::new(
-        &weights,
-        cfg.n_embd as usize,
-        cfg.patch_size as usize,
-        cfg.n_head as usize,
-        cfg.n_ff as usize,
-        cfg.n_layer as usize,
-        cfg.eps,
-    )?;
-    let host_weights = HostWeights::from_gguf(&gguf)?;
+    // gemma4uv is a "no-tower" projector with no transformer blocks; skip the
+    // tower encoder (serve image input for gemma4uv isn't wired yet) but still
+    // load the mmproj so its gemma4ua audio encoder is available.
+    let (encoder, host_weights) = if cfg.projector_type == crate::vision::ProjectorType::Gemma4Uv {
+        (None, None)
+    } else {
+        let encoder = VisionEncoder::new(
+            &weights,
+            cfg.n_embd as usize,
+            cfg.patch_size as usize,
+            cfg.n_head as usize,
+            cfg.n_ff as usize,
+            cfg.n_layer as usize,
+            cfg.eps,
+        )?;
+        (Some(encoder), Some(HostWeights::from_gguf(&gguf)?))
+    };
+    let audio_cfg = crate::audio::parse_config(&gguf).ok();
     let vision = crate::vision::VisionModel {
         config: cfg,
         weights,
@@ -822,6 +856,7 @@ fn build_vision(engine: &Engine, mmproj_path: &Path) -> Result<VisionCtx, Box<dy
         vision,
         encoder,
         host_weights,
+        audio_cfg,
     })
 }
 
@@ -862,9 +897,10 @@ fn worker_main(
         if worker.active.is_empty() {
             // Idle: block for the next job (or shutdown).
             match jobs.blocking_recv() {
-                // Image jobs prefill single-pass (the vision splice can't be
-                // chunked), regardless of the global unified flag.
+                // Media jobs prefill single-pass (the splice can't be chunked),
+                // regardless of the global unified flag.
                 Some(job) if job.image.is_some() => worker.admit_image(job),
+                Some(job) if job.audio.is_some() => worker.admit_audio(job),
                 Some(job) if unified => worker.admit_unified(job),
                 Some(job) => worker.admit(job),
                 None => return,
@@ -874,6 +910,7 @@ fn worker_main(
         while worker.free_slabs() > 0 {
             match jobs.try_recv() {
                 Ok(job) if job.image.is_some() => worker.admit_image(job),
+                Ok(job) if job.audio.is_some() => worker.admit_audio(job),
                 Ok(job) if unified => worker.admit_unified(job),
                 Ok(job) => worker.admit(job),
                 Err(_) => break, // empty or all-senders-dropped
@@ -929,7 +966,8 @@ impl Worker {
         let GenJob {
             tokens: new_tokens,
             config,
-            image: _, // text path: image jobs are routed to admit_image
+            image: _, // text path: media jobs are routed to admit_image/admit_audio
+            audio: _,
             reply,
         } = job;
         let GenConfig {
@@ -1081,6 +1119,7 @@ impl Worker {
             tokens: new_tokens,
             config,
             image: _,
+            audio: _,
             reply,
         } = job;
         let GenConfig {
@@ -1284,7 +1323,14 @@ impl Worker {
             .vision
             .as_ref()
             .expect("vision present (checked above)");
-        let (encoder, host_weights, weights) = (&vc.encoder, &vc.host_weights, &vc.vision.weights);
+        let weights = &vc.vision.weights;
+        let encoder = vc.encoder.as_ref().ok_or(
+            "this mmproj has no vision tower (gemma4uv image input is not supported in serve)",
+        )?;
+        let host_weights = vc
+            .host_weights
+            .as_ref()
+            .ok_or("vision tower host weights missing")?;
         let pimg = &image.pimg;
         crate::vision::encoder::encode_image_chunked(
             &mut self.engine,
@@ -1293,6 +1339,35 @@ impl Worker {
             pimg,
             host_weights,
         )
+    }
+
+    /// Encode an audio clip through the gemma4ua projector (GPU) → `[proj_dim,
+    /// n_tok]` host f32. Grows the scratch first. Errors if the mmproj has no
+    /// audio encoder.
+    fn encode_audio(&mut self, audio: &ServeAudio) -> Result<Vec<f32>, Box<dyn Error>> {
+        let acfg = self
+            .vision
+            .as_ref()
+            .and_then(|vc| vc.audio_cfg.clone())
+            .ok_or("no audio model loaded (mmproj has no audio encoder)")?;
+        let need = (40_000u64 * audio.n_tok as u64 * 4).max(64 << 20);
+        if need > self.scratch_bytes {
+            self.engine.allocate_scratch(need)?;
+            self.scratch_bytes = need;
+        }
+        let weights = &self
+            .vision
+            .as_ref()
+            .expect("vision present (checked above)")
+            .vision
+            .weights;
+        let (embeddings, _n_tok) = crate::audio::encoder::encode_audio_gemma4(
+            &mut self.engine,
+            weights,
+            &acfg,
+            &audio.samples,
+        )?;
+        Ok(embeddings)
     }
 
     /// Admit an image chat request: encode the image, prefill the whole prompt
@@ -1306,6 +1381,7 @@ impl Worker {
             tokens: new_tokens,
             config,
             image,
+            audio: _,
             reply,
         } = job;
         let GenConfig {
@@ -1388,6 +1464,162 @@ impl Worker {
                 image.image_start,
                 image.nx,
                 image.ny,
+                &mut sampler,
+            ) {
+                Ok(t) => {
+                    self.batch.positions[idx] = sc.position;
+                    self.batch.rope_lag[idx] = sc.rope_position_lag;
+                    t
+                }
+                Err(e) => {
+                    self.batch.reset_slot(idx as u32);
+                    self.batch.positions[idx] = 0;
+                    self.batch.rope_lag[idx] = 0;
+                    self.slots[idx].prior_tokens.clear();
+                    let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                    return;
+                }
+            }
+        };
+        self.slots[idx].active = true;
+
+        if reply
+            .blocking_send(GenEvent::Started { prompt_tokens })
+            .is_err()
+        {
+            self.slots[idx].active = false;
+            self.slots[idx].prior_tokens = new_tokens;
+            return;
+        }
+
+        let mut seq = ActiveSeq {
+            slab: idx as u32,
+            sampler,
+            prompt: new_tokens,
+            generated: Vec::new(),
+            prompt_tokens,
+            stop,
+            ignore_eos,
+            max_tokens,
+            reply,
+            stream_ids: Vec::new(),
+            stream_prefix: String::new(),
+            stream_prefix_index: 0,
+            pending: String::new(),
+            last_token: first,
+            ctx,
+            terminal: None,
+            disconnected: false,
+            num_computed: self.batch.positions[idx],
+            started: true,
+        };
+        process_token(
+            &self.model.tokenizer().tokenizer,
+            &self.eog_ids,
+            &mut seq,
+            first,
+        );
+        self.active.push(seq);
+    }
+
+    /// Admit an audio chat request — the gemma4ua analog of [`Self::admit_image`].
+    /// Encodes the clip, prefills the whole prompt with the embeddings spliced
+    /// over the `<|audio|>` rows (`forward_audio_sampled`, plain 1D positions →
+    /// no rope lag), samples the first token, and pushes it to the active set.
+    fn admit_audio(&mut self, job: GenJob) {
+        let GenJob {
+            tokens: new_tokens,
+            config,
+            image: _,
+            audio,
+            reply,
+        } = job;
+        let GenConfig {
+            sampler: cfg,
+            max_tokens,
+            stop,
+            ignore_eos,
+            id_slot,
+        } = config;
+        let Some(audio) = audio else { return }; // only routed here when Some
+        if self
+            .vision
+            .as_ref()
+            .and_then(|vc| vc.audio_cfg.as_ref())
+            .is_none()
+        {
+            let _ = reply.blocking_send(GenEvent::Error(
+                "this server has no audio model (mmproj audio encoder); audio requests are \
+                 unsupported"
+                    .into(),
+            ));
+            return;
+        }
+        let prompt_tokens = new_tokens.len() as u32;
+        if new_tokens.is_empty() {
+            let _ =
+                reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
+            return;
+        }
+        let ctx = self.batch.config.max_seq_len;
+        if prompt_tokens >= ctx {
+            let _ = reply.blocking_send(GenEvent::Error(format!(
+                "prompt is {prompt_tokens} tokens but --ctx-size is {ctx} (no room to generate) — \
+                 raise --ctx-size or shorten the prompt"
+            )));
+            return;
+        }
+        if audio.audio_start + audio.n_tok > new_tokens.len() {
+            let _ = reply.blocking_send(GenEvent::Error("audio span overruns the prompt".into()));
+            return;
+        }
+        let Some(idx) = self.select_free_slab(&new_tokens, id_slot) else {
+            let _ = reply.blocking_send(GenEvent::Error("no free cache slot available".into()));
+            return;
+        };
+        self.clock += 1;
+        self.slots[idx].last_used = self.clock;
+
+        // Encode the audio (grows scratch for the encoder), then ensure scratch
+        // fits the single-pass decoder prefill over the whole prompt.
+        let embeddings = match self.encode_audio(&audio) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        let need = self.model.scratch_bytes_estimate(
+            /*n_ubatch=*/ 0,
+            prompt_tokens,
+            self.batch.config.k_dtype,
+            self.batch.config.v_dtype,
+        );
+        if need > self.scratch_bytes {
+            if let Err(e) = self.engine.allocate_scratch(need) {
+                let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                return;
+            }
+            self.scratch_bytes = need;
+        }
+
+        // Fresh full prefill (no prefix reuse for audio).
+        self.batch.reset_slot(idx as u32);
+        self.batch.positions[idx] = 0;
+        self.batch.rope_lag[idx] = 0;
+        self.engine.decode_cache = None;
+
+        let mut sampler = Sampler::new(cfg);
+        let first = {
+            let mut sc = self.batch.slot_kvcache(idx as u32);
+            sc.position = 0;
+            match self.engine.forward_audio_sampled(
+                &*self.model,
+                &mut sc,
+                &new_tokens,
+                &embeddings,
+                audio.audio_start,
+                audio.n_tok,
                 &mut sampler,
             ) {
                 Ok(t) => {
@@ -2115,6 +2347,7 @@ fn drive_workload(
                 id_slot: None,
             },
             image: None,
+            audio: None,
             reply: tx,
         });
     }
@@ -2239,6 +2472,7 @@ impl Worker {
                 id_slot: None,
             },
             image: None,
+            audio: None,
             reply: tx,
         });
         // admit_unified only pushes to `active` on success; an empty `active`

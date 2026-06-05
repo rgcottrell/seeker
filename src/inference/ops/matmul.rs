@@ -56,6 +56,10 @@ const MMV_BINDINGS_PACKED16: &[u32] = &[0, 1, 2, 3, 4];
 /// (slots 3 and 6 — see `mul_mat_vec_head.slang`). Q4_K and Q5_K want
 /// 32-bit-wide reads of `qs[]`; Q6_K is packed16-only.
 const MMV_BINDINGS_PACKED16_AND_32: &[u32] = &[0, 1, 2, 3, 4, 6];
+/// Q5_K: like Q4_K it reads A via packed16 (3) + packed32 (6), but the B side
+/// uses the float2 alias `data_b_v2` (slot 5) rather than the float4 alias
+/// (slot 4) Q4_K uses — so its binding set is `{0,1,2,3,5,6}`, not `…,4,…`.
+const MMV_BINDINGS_Q5_K: &[u32] = &[0, 1, 2, 3, 5, 6];
 
 fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
     let v = match dtype {
@@ -124,7 +128,7 @@ fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
         GgmlType::Q5_K => MmvVariant {
             name: "mul_mat_vec_q5_k",
             spv: shaders::MUL_MAT_VEC_Q5_K_DEFAULT_SPV.as_bytes(),
-            binding_indices: MMV_BINDINGS_PACKED16_AND_32,
+            binding_indices: MMV_BINDINGS_Q5_K,
         },
         GgmlType::Q6_K => MmvVariant {
             name: "mul_mat_vec_q6_k",
@@ -293,6 +297,11 @@ fn record_inner(
     debug_assert_eq!(b.dims[0], a.dims[0], "matmul K mismatch");
     debug_assert_eq!(d.dims[0], a.dims[1], "matmul output M mismatch");
     debug_assert_eq!(d.dims[1], b.dims[1], "matmul output N mismatch");
+
+    // Count the weight bytes this matmul reads toward the prefill flush budget
+    // (no-op unless this forward has flushing enabled). All dense matmul callers
+    // (record / record_nofence / record_accumulate-prefill-fallback) funnel here.
+    ctx.account_matmul(a.byte_size);
 
     let n = b.dims[1];
 

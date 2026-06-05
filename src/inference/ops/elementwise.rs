@@ -18,7 +18,7 @@ use crate::inference::pipeline::PipelineKey;
 use crate::inference::weights::TensorView;
 use crate::shaders;
 
-use super::binary_params_bytes;
+use super::{UNARY_PARAMS_BYTES, binary_params_bytes, unary_params_bytes};
 
 const GENERIC_PARAMS_BYTES: u32 = 6 * 4;
 
@@ -486,6 +486,108 @@ pub fn record_silu(
     Ok(())
 }
 
+/// GELU (tanh approximation, = ggml `gelu`). Same generic-unary dispatch as
+/// `silu`. Gemma's GeGLU FFN runs this on the gate branch (then `× up`).
+pub fn record_gelu(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+
+    let nelements: u32 = src.dims.iter().product::<u64>() as u32;
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&nelements.to_ne_bytes());
+
+    let key = PipelineKey::dense("gelu_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::GELU_F32_SPV.as_bytes())?;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// `tanh(x)` elementwise. Same generic-unary dispatch as `silu`. Used (with
+/// [`record_scale`]) for Gemma's final-logit softcap `cap·tanh(x/cap)`.
+pub fn record_tanh(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+
+    let nelements: u32 = src.dims.iter().product::<u64>() as u32;
+    let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
+    push[0..4].copy_from_slice(&nelements.to_ne_bytes());
+
+    let key = PipelineKey::dense("tanh_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::TANH_F32_SPV.as_bytes())?;
+    let workgroups = [nelements.div_ceil(512), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// `α·x + β` over a (possibly multi-dim, contiguous) tensor via `scale.slang`.
+/// In-place safe (`src == dst`). Gemma uses it for the `× sqrt(n_embd)`
+/// embedding scale, the per-layer `× layer_output_scale`, and the final-logit
+/// softcap halves.
+pub fn record_scale(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    dst: TensorView,
+    alpha: f32,
+    beta: f32,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(src.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+
+    let push = unary_params_bytes(&src, &dst, alpha, beta);
+    let key = PipelineKey::dense("scale_f32", 2, UNARY_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::SCALE_F32_SPV.as_bytes())?;
+    let nelements: u64 = src.dims.iter().product();
+    // scale.slang: 128 threads × num_iter=4 (stepping +128) cover one 512-block,
+    // and `get_idx = y*512 + x` keys the block off the Y workgroup index. The
+    // 512-block count MUST go in Y — putting it in X spaces consecutive
+    // workgroups by 128 (= numthreads), so their +128 stepping OVERLAPS and an
+    // in-place scale compounds (×alpha^k). (Non-in-place callers tolerate the
+    // overlap since they re-write the same value, but in-place ones do not.)
+    let blocks = (nelements as u32).div_ceil(512);
+    let workgroups = [1, blocks, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1],
+        &[src.range(), dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
 /// `softplus(x) = log(1 + exp(x))`. Same generic-unary dispatch shape
 /// as `silu` / `sigmoid`. Used by the SSM block to map raw `α` projection
 /// logits to a positive value before the `ssm_a` scaling.
@@ -703,6 +805,11 @@ pub fn record_get_rows(
         (GgmlType::I32, GgmlType::I32) => {
             ("get_rows_i32", shaders::GET_ROWS_I32_SPV.as_bytes(), 512)
         }
+        (GgmlType::Q5_K, GgmlType::F32) => (
+            "get_rows_q5_k",
+            shaders::GET_ROWS_Q5_K_DEFAULT_SPV.as_bytes(),
+            256,
+        ),
         (GgmlType::Q6_K, GgmlType::F32) => (
             "get_rows_q6_k",
             shaders::GET_ROWS_Q6_K_DEFAULT_SPV.as_bytes(),

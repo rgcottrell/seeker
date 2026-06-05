@@ -90,8 +90,41 @@ impl PreprocessConfig {
         }
     }
 
+    /// Build a config for the gemma4 (`gemma4uv`) preprocessor. gemma4 shares
+    /// qwen's dyn-size + bilinear resize path, but aligns to
+    /// `patch_size · n_merge` (16·3 = 48 — the effective conv patch, since
+    /// gemma4uv folds the merge into the patch) and uses token limits
+    /// `[40, 280]` (clip.cpp `set_limit_image_tokens(40, 280)`), with
+    /// `patch_area = patch² · n_merge² = 16²·3² = 2304`. mean=[0,0,0]/std=[1,1,1]
+    /// ⇒ pixels stay `px/255`; the encoder applies the `×2−1` scale-bias. We
+    /// reuse the `spatial_merge_size` field to carry `n_merge` so `align()` /
+    /// `patch_area` are computed with the merge factor.
+    pub fn gemma4_default(
+        patch_size: u32,
+        n_merge: u32,
+        image_mean: [f32; 3],
+        image_std: [f32; 3],
+    ) -> PreprocessConfig {
+        const GEMMA4_MIN_TOKENS: u32 = 40;
+        const GEMMA4_MAX_TOKENS: u32 = 280;
+        let patch_area = patch_size * patch_size * n_merge * n_merge;
+        let max_tokens = std::env::var("SEEKER_IMG_MAX_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(GEMMA4_MAX_TOKENS);
+        PreprocessConfig {
+            patch_size,
+            spatial_merge_size: n_merge,
+            image_mean,
+            image_std,
+            min_pixels: GEMMA4_MIN_TOKENS * patch_area,
+            max_pixels: max_tokens * patch_area,
+        }
+    }
+
     /// The smart-resize alignment = `patch_size * spatial_merge_size` (=32 for
-    /// Qwen3-VL). Both output dims are multiples of this.
+    /// Qwen3-VL, 48 for gemma4 where the field carries `n_merge`). Both output
+    /// dims are multiples of this.
     #[inline]
     pub fn align(&self) -> u32 {
         self.patch_size * self.spatial_merge_size

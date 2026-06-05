@@ -3,12 +3,14 @@
 //! `tokenizer.json` — at the cost of mapping the GGUF schema onto the
 //! `tokenizers` crate's component model ourselves.
 //!
-//! Two paths today:
-//!   - `gpt2`  → `BPE` + `ByteLevel` pre-tokenizer/decoder (GPT-2 family,
+//! Three paths today:
+//!   - `gpt2`   → `BPE` + `ByteLevel` pre-tokenizer/decoder (GPT-2 family,
 //!     Mistral / Phi / Qwen / SmolLM-style models).  See [`bpe`].
-//!   - `llama` → `Unigram` + `Metaspace` pre-tokenizer/decoder
+//!   - `llama`  → `Unigram` + `Metaspace(Always)` pre-tokenizer/decoder
 //!     (SentencePiece-style; LLaMA, Llama 2, CodeLlama, Mistral v0.1, …).
 //!     See [`unigram`].
+//!   - `gemma4` → `BPE` (byte-fallback) + `Metaspace(Never, split=false)`
+//!     (SentencePiece-style BPE; Gemma 4). See [`gemma`].
 //!
 //! Anything else returns [`TokenizerError::UnsupportedModel`] so callers can render
 //! a useful message rather than panic.
@@ -16,6 +18,7 @@
 mod bpe;
 mod bundle;
 mod error;
+mod gemma;
 mod metadata;
 mod unigram;
 
@@ -50,7 +53,10 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
     let eot_id = read_optional_u32(gguf, "tokenizer.ggml.eot_token_id");
     let eom_id = read_optional_u32(gguf, "tokenizer.ggml.eom_token_id");
     let unk_id = read_optional_u32(gguf, "tokenizer.ggml.unknown_token_id");
-    let add_bos_default = read_optional_bool(gguf, "tokenizer.ggml.add_bos_token").unwrap_or(false);
+    // llama.cpp forces add_bos=true for gemma4 even when reading the flag; this
+    // GGUF already sets it, but force it for faithfulness.
+    let add_bos_default = read_optional_bool(gguf, "tokenizer.ggml.add_bos_token").unwrap_or(false)
+        || model_kind == "gemma4";
     let add_eos_default = read_optional_bool(gguf, "tokenizer.ggml.add_eos_token").unwrap_or(false);
 
     let bos_token = bos_id.and_then(|i| tokens.get(i as usize).cloned());
@@ -62,6 +68,7 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
     let mut tokenizer = match model_kind.as_str() {
         "gpt2" => bpe::build(&tokens, gguf)?,
         "llama" => unigram::build(&tokens, gguf, unk_id)?,
+        "gemma4" => gemma::build(&tokens, gguf)?,
         other => return Err(TokenizerError::UnsupportedModel(other.to_string())),
     };
 
@@ -72,6 +79,8 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
         bos_id,
         eos_id,
         unk_id,
+        add_bos_default,
+        add_eos_default,
     );
 
     Ok(TokenizerBundle {
@@ -144,6 +153,7 @@ fn collect_eog_ids(
 /// CONTROL tokens are registered `special` (so `decode(skip_special=true)`
 /// strips them from user-visible output); USER_DEFINED tokens are matched
 /// verbatim but kept in decoded output since they carry content.
+#[allow(clippy::too_many_arguments)]
 fn install_specials(
     tokenizer: &mut Tokenizer,
     tokens: &[String],
@@ -151,6 +161,8 @@ fn install_specials(
     bos_id: Option<u32>,
     eos_id: Option<u32>,
     unk_id: Option<u32>,
+    add_bos: bool,
+    add_eos: bool,
 ) {
     let bos_str = bos_id.and_then(|i| tokens.get(i as usize).cloned());
     let eos_str = eos_id.and_then(|i| tokens.get(i as usize).cloned());
@@ -180,19 +192,27 @@ fn install_specials(
         tokenizer.add_special_tokens(&specials);
     }
 
-    if bos_str.is_none() && eos_str.is_none() {
+    // The post-processor only prepends BOS / appends EOS when the GGUF's
+    // `add_bos_token` / `add_eos_token` flags are set — matching llama.cpp's
+    // `tokenizer_add_bos` / `tokenizer_add_eos`. Without this, raw-completion
+    // prompts get a spurious EOS appended (e.g. gemma4's `<end_of_turn>`),
+    // derailing generation. Chat callers encode with `add_special=false` and
+    // rely on the chat template to emit BOS, so they're unaffected either way.
+    let want_bos = add_bos && bos_str.is_some();
+    let want_eos = add_eos && eos_str.is_some();
+    if !want_bos && !want_eos {
         return;
     }
 
     let mut single = String::new();
     let mut special_pairs: Vec<(String, u32)> = Vec::new();
-    if let (Some(s), Some(i)) = (bos_str.as_ref(), bos_id) {
+    if want_bos && let (Some(s), Some(i)) = (bos_str.as_ref(), bos_id) {
         single.push_str(s);
         single.push(' ');
         special_pairs.push((s.clone(), i));
     }
     single.push_str("$A");
-    if let (Some(s), Some(i)) = (eos_str.as_ref(), eos_id) {
+    if want_eos && let (Some(s), Some(i)) = (eos_str.as_ref(), eos_id) {
         single.push(' ');
         single.push_str(s);
         special_pairs.push((s.clone(), i));
@@ -262,7 +282,16 @@ mod tests {
         // With install_specials it should collapse to the single id 4.
         let mut tk = bytelevel_bpe(&tokens);
         let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
-        install_specials(&mut tk, &owned, Some(&token_types), None, None, None);
+        install_specials(
+            &mut tk,
+            &owned,
+            Some(&token_types),
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
         assert_eq!(ids(&tk, "<|x|>"), vec![4]);
     }
 

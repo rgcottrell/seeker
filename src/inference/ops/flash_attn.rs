@@ -37,10 +37,13 @@ const FA_SPLIT_CORE_COUNT_FALLBACK: u32 = 16;
 /// Largest head_dim the coopmat `flash_attn_cm1` path accepts. cm1's LDS no
 /// longer scales with head_dim on the K/V side (those are read coopmat-direct
 /// from global); only the Q tile (Br × head_dim, in LDS) and the per-thread
-/// register O accumulator scale with it. 256 covers qwen35moe (key/value_length
-/// = 256), whose deep prefill MUST use coopmat — the scalar path is too slow and
-/// trips the RADV watchdog. Validated byte-close to scalar at 64/96/128/256.
-const CM1_MAX_HEAD_DIM: u32 = 256;
+/// register O accumulator scale with it. 512 covers gemma4's global layers
+/// (key/value_length = 512), whose moderate-context prefill MUST use coopmat —
+/// the scalar fallback trips the RADV watchdog past ~100-300 tokens. At 512 the
+/// Q tile is 16×512 f16 = 16 KB LDS (~24 KB total, well under 64 KB) and the O
+/// accumulator is Of[4][16] = 64 regs/thread. Validated byte-close to scalar at
+/// 64/96/128/256; gemma4 256 (sliding) + 512 (global) verified vs llama.cpp.
+const CM1_MAX_HEAD_DIM: u32 = 512;
 
 /// Upper bound on the split-K workgroup count for any single flash-attn
 /// dispatch. Caps `pick_k_num` and sizes the per-call partials buffer
@@ -134,6 +137,13 @@ pub struct FlashAttnParams {
     pub head_dim_v: u32,
     pub gqa_ratio: u32, // n_head / n_head_kv
     pub scale: f32,     // 1 / sqrt(head_dim)
+    /// Sliding-window attention span. `0` = no window (full causal, the
+    /// default). When `> 0`, key column `kc` is masked for query row `r` unless
+    /// `kc <= qpos && qpos - kc < swa_window`, where `qpos = mask_kv_offset + r`
+    /// (absolute query position). Applied analytically in-shader on top of any
+    /// host mask, independent of `MASK_ENABLE`, so it covers prefill, chunked
+    /// prefill, and decode (split-K) uniformly. Gemma4's sliding layers set this.
+    pub swa_window: u32,
 }
 
 /// Whether the scalar flash-attn kernel has a compiled variant that can read
@@ -508,8 +518,8 @@ pub fn record(
     put_f(&mut push, &mut w, 0.0); // max_bias
     put_f(&mut push, &mut w, 0.0); // logit_softcap
     put_u(&mut push, &mut w, prefix_len); // mask_kv_offset (was mask_n_head_log2)
-    put_f(&mut push, &mut w, 0.0); // m0
-    put_f(&mut push, &mut w, 0.0); // m1
+    put_f(&mut push, &mut w, 0.0); // m0 (ALiBi, unused)
+    put_u(&mut push, &mut w, params.swa_window); // swa_window (repurposed ALiBi m1 slot)
     put_u(&mut push, &mut w, params.gqa_ratio);
     put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
     put_u(&mut push, &mut w, k_num);
@@ -1326,8 +1336,8 @@ fn record_cm1(
     put_f(&mut push, &mut w, 0.0);
     put_f(&mut push, &mut w, 0.0);
     put_u(&mut push, &mut w, prefix_len); // mask_kv_offset: cols < this are visible prefix
-    put_f(&mut push, &mut w, 0.0);
-    put_f(&mut push, &mut w, 0.0);
+    put_f(&mut push, &mut w, 0.0); // m0 (ALiBi, unused)
+    put_u(&mut push, &mut w, params.swa_window); // swa_window (repurposed ALiBi m1 slot)
     put_u(&mut push, &mut w, params.gqa_ratio);
     put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
     put_u(&mut push, &mut w, k_num);

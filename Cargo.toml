@@ -36,6 +36,14 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Audio decode for the gemma4 `gemma4ua` audio encoder (mmproj). Like `image`,
+# default features pull every codec; trim to the common still/streaming formats.
+# Used purely for *decoding* to interleaved f32 PCM — the encoder wants 16 kHz
+# mono, so `src/audio/decode.rs` downmixes and (if the source rate differs)
+# resamples to 16 kHz with `rubato`. A 16 kHz mono clip skips the resampler and
+# matches `llama-mtmd-cli` byte-for-byte.
+symphonia = { version = "0.6.0", default-features = false, features = ["wav", "pcm", "adpcm", "mp3", "flac", "isomp4", "aac", "alac", "ogg", "vorbis"] }
+rubato = "3.0.0"
 
 [features]
 # GPU performance *measurement*. OFF by default: every

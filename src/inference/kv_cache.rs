@@ -157,39 +157,56 @@ impl KvCache {
         n_head_kv: u32,
         config: KvCacheConfig,
     ) -> Result<Self, Box<dyn Error>> {
+        let head_dims = vec![head_dim; n_layer as usize];
+        let n_head_kvs = vec![n_head_kv; n_layer as usize];
+        Self::new_per_layer(device, &head_dims, &n_head_kvs, config)
+    }
+
+    /// As [`new`] but the K/V dimensions vary per layer. Each layer `il` gets
+    /// its own buffer sized to `head_dims[il] × n_head_kvs[il] × max_seq_len`,
+    /// with the matching natural-contiguous `k_layers`/`v_layers` views, so all
+    /// the per-layer view helpers (reshape, permute, slice) work unchanged.
+    /// Needed by gemma4, whose interleaved sliding-window / global layers use
+    /// different `head_dim` (256 vs 512) and `n_head_kv` (8 vs 1).
+    pub fn new_per_layer(
+        device: &Device,
+        head_dims: &[u32],
+        n_head_kvs: &[u32],
+        config: KvCacheConfig,
+    ) -> Result<Self, Box<dyn Error>> {
+        assert_eq!(
+            head_dims.len(),
+            n_head_kvs.len(),
+            "per-layer head_dims / n_head_kvs length mismatch"
+        );
+        let n_layer = head_dims.len() as u32;
         validate_dtype(config.k_dtype, "K")?;
         validate_dtype(config.v_dtype, "V")?;
-        validate_head_dim(head_dim, config.k_dtype, "K")?;
-        validate_head_dim(head_dim, config.v_dtype, "V")?;
+        for &hd in head_dims {
+            validate_head_dim(hd, config.k_dtype, "K")?;
+            validate_head_dim(hd, config.v_dtype, "V")?;
+        }
 
         let max_seq_len = config.max_seq_len as u64;
-        let head_dim_u = head_dim as u64;
-        let n_head_kv_u = n_head_kv as u64;
 
         // Per-layer K/V dtypes (turbo auto-asymmetric + layer-adaptive may make
         // them differ across layers / sides). Non-turbo configs come back
         // uniform. Each layer's TensorView carries its own dtype, so the write,
-        // flash-attn dispatch, and WHT gating all key off it per layer.
+        // flash-attn dispatch, and WHT gating all key off it per layer. (Turbo
+        // GQA-protection keys off the first layer's n_head_kv; gemma4, the only
+        // per-layer-dims arch, is non-turbo so this is uniform anyway.)
         let (k_dtypes, v_dtypes) = resolve_layer_dtypes(
             config.k_dtype,
             config.v_dtype,
             n_layer,
             config.n_head,
-            n_head_kv,
+            *n_head_kvs.first().unwrap_or(&0),
         );
 
         let align = device.limits.min_storage_buffer_offset_alignment.max(1);
-        let k_aligned: Vec<u64> = k_dtypes
-            .iter()
-            .map(|&d| align_up(tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, d), align))
-            .collect();
-        let v_aligned: Vec<u64> = v_dtypes
-            .iter()
-            .map(|&d| align_up(tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, d), align))
-            .collect();
 
-        // One buffer per layer (K at offset 0, V at `k_aligned[il]`), so no
-        // single allocation trips the device's ~4 GiB maxBufferSize /
+        // One buffer per layer (K at offset 0, V at `k_aligned`), so no single
+        // allocation trips the device's ~4 GiB maxBufferSize /
         // maxMemoryAllocationSize even when a model-max context makes the KV
         // total several GiB.
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
@@ -198,7 +215,17 @@ impl KvCache {
         let mut k_layers = Vec::with_capacity(n_layer as usize);
         let mut v_layers = Vec::with_capacity(n_layer as usize);
         for il in 0..n_layer as usize {
-            let region = Region::new(device, (k_aligned[il] + v_aligned[il]).max(1), usage, mem)?;
+            let head_dim_u = head_dims[il] as u64;
+            let n_head_kv_u = n_head_kvs[il] as u64;
+            let k_aligned = align_up(
+                tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, k_dtypes[il]),
+                align,
+            );
+            let v_aligned = align_up(
+                tensor_bytes(head_dim_u, max_seq_len, n_head_kv_u, v_dtypes[il]),
+                align,
+            );
+            let region = Region::new(device, (k_aligned + v_aligned).max(1), usage, mem)?;
             k_layers.push(make_view(
                 region.buffer,
                 0,
@@ -209,7 +236,7 @@ impl KvCache {
             ));
             v_layers.push(make_view(
                 region.buffer,
-                k_aligned[il],
+                k_aligned,
                 head_dim_u,
                 max_seq_len,
                 n_head_kv_u,

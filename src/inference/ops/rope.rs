@@ -41,6 +41,14 @@ impl RopeParams {
     }
 }
 
+/// RoPE variant: NORM (LLaMA adjacent-pair) vs NEOX (GPT-NeoX half-rotation).
+/// Gemma uses NEOX.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RopeMode {
+    Norm,
+    Neox,
+}
+
 /// Record an in-place RoPE on a tensor reshaped to `[head_dim, n_head, L]`.
 /// `positions` is a scratch slot holding `L` `i32`s = [0, 1, …, L-1] (or
 /// whatever absolute position indices apply). Emits a trailing barrier.
@@ -51,7 +59,16 @@ pub fn record(
     dst: TensorView,
     params: RopeParams,
 ) -> Result<(), Box<dyn Error>> {
-    record_inner(ctx, src, positions, dst, params, /*fence=*/ true)
+    record_inner(
+        ctx,
+        src,
+        positions,
+        dst,
+        params,
+        RopeMode::Norm,
+        None,
+        /*fence=*/ true,
+    )
 }
 
 /// Same as [`record`] but skips the trailing barrier — for paired
@@ -63,15 +80,51 @@ pub fn record_nofence(
     dst: TensorView,
     params: RopeParams,
 ) -> Result<(), Box<dyn Error>> {
-    record_inner(ctx, src, positions, dst, params, /*fence=*/ false)
+    record_inner(
+        ctx,
+        src,
+        positions,
+        dst,
+        params,
+        RopeMode::Norm,
+        None,
+        /*fence=*/ false,
+    )
 }
 
+/// GPT-NeoX RoPE (Gemma). `freq_factors`, when `Some`, is a buffer of
+/// `n_dims/2` F32 divisors applied per frequency pair (`theta /= ff[i/2]`) —
+/// Gemma's global-attention layers use this for proportional rope (high pairs
+/// get a huge divisor ⇒ no rotation). `None` ⇒ all-ones (standard NeoX).
+pub fn record_neox_nofence(
+    ctx: &mut DispatchContext,
+    src: TensorView,
+    positions: BufferRange,
+    dst: TensorView,
+    params: RopeParams,
+    freq_factors: Option<BufferRange>,
+) -> Result<(), Box<dyn Error>> {
+    record_inner(
+        ctx,
+        src,
+        positions,
+        dst,
+        params,
+        RopeMode::Neox,
+        freq_factors,
+        /*fence=*/ false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_inner(
     ctx: &mut DispatchContext,
     src: TensorView,
     positions: BufferRange,
     dst: TensorView,
     params: RopeParams,
+    mode: RopeMode,
+    freq_factors: Option<BufferRange>,
     fence: bool,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(src.dtype, GgmlType::F32);
@@ -84,10 +137,12 @@ fn record_inner(
 
     let theta_scale = (params.freq_base).powf(-2.0 / params.n_dims as f32);
 
-    // Bind a dummy buffer for freq_factors / set_rows indices slots. Any
-    // valid storage buffer works since the shader only reads them when
-    // has_ff != 0 / set_rows_stride != 0, both of which are false here.
+    // Bind a dummy buffer for the set_rows indices slot, and for freq_factors
+    // when absent. Any valid storage buffer works since the shader only reads
+    // those slots when set_rows_stride != 0 / has_ff != 0.
     let dummy = positions;
+    let has_ff = freq_factors.is_some();
+    let ff_bind = freq_factors.unwrap_or(dummy);
 
     // Pack push constants.
     let mut push = [0u8; ROPE_PARAMS_BYTES as usize];
@@ -105,7 +160,11 @@ fn record_inner(
         *w += 4;
     }
 
-    put_u(&mut push, &mut w, 0); // rope_mode = NORM
+    let rope_mode = match mode {
+        RopeMode::Norm => 0u32,
+        RopeMode::Neox => 1u32,
+    };
+    put_u(&mut push, &mut w, rope_mode);
     put_u(&mut push, &mut w, nrows);
     put_u(&mut push, &mut w, params.n_dims);
     put_f(&mut push, &mut w, params.freq_scale);
@@ -115,7 +174,7 @@ fn record_inner(
     put_f(&mut push, &mut w, params.corr_dims[0]);
     put_f(&mut push, &mut w, params.corr_dims[1]);
     put_f(&mut push, &mut w, theta_scale);
-    put_u(&mut push, &mut w, 0); // has_ff
+    put_u(&mut push, &mut w, has_ff as u32); // has_ff
     for _ in 0..4 {
         put_i(&mut push, &mut w, 0); // sections[4]
     }
@@ -134,16 +193,18 @@ fn record_inner(
     put_u(&mut push, &mut w, 0); // a_offset
     put_u(&mut push, &mut w, 0); // d_offset
 
-    let key = PipelineKey::dense("rope_norm_f32", 5, ROPE_PARAMS_BYTES, Vec::new());
-    let pipeline = *ctx
-        .pipelines
-        .get(ctx.device, key, shaders::ROPE_NORM_F32_SPV.as_bytes())?;
+    let (name, spv) = match mode {
+        RopeMode::Norm => ("rope_norm_f32", shaders::ROPE_NORM_F32_SPV.as_bytes()),
+        RopeMode::Neox => ("rope_neox_f32", shaders::ROPE_NEOX_F32_SPV.as_bytes()),
+    };
+    let key = PipelineKey::dense(name, 5, ROPE_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx.pipelines.get(ctx.device, key, spv)?;
     let workgroups = [nrows, ne00.div_ceil(512), 1];
     super::bind_and_dispatch(
         ctx,
         &pipeline,
         &[0, 1, 2, 3, 4],
-        &[src.range(), positions, dummy, dst.range(), dummy],
+        &[src.range(), positions, ff_bind, dst.range(), dummy],
         &push,
         workgroups,
     )?;

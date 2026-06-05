@@ -201,8 +201,12 @@ pub async fn run(args: ProbeArgs) -> Result<(), Box<dyn Error>> {
         max_seq_len,
         n_head: dims.n_head,
     };
-    let mut cache =
-        engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
+    let mut cache = match model.cache_per_layer_dims() {
+        Some((hd, nkv)) => engine.allocate_kv_cache_per_layer(&hd, &nkv, cache_config)?,
+        None => {
+            engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?
+        }
+    };
     eprintln!(
         "KV cache: k={:?} v={:?} n_layer={} head_dim={} n_head_kv={} max_seq_len={} \u{2192} {} bytes ({:.1} MiB)",
         args.cache_type_k,

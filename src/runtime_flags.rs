@@ -113,6 +113,21 @@ pub static SSM_BATCH_DISABLED: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(false)
 });
 
+/// `SEEKER_PREFILL_FLUSH=0` — disable prefill submission-splitting (the
+/// llama.cpp-style mid-forward command-buffer flush that ends+submits a fresh
+/// cmdbuf every ~budget of recorded weight-bytes, so no single submit exceeds
+/// the GPU TDR watchdog on a big dense prefill). Default-on. Set to `0` to
+/// reproduce the old record-whole-forward-submit-once behavior — used for the
+/// A/B correctness check (flushing only moves cmdbuf cut points, never results).
+pub static PREFILL_FLUSH_DISABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("SEEKER_PREFILL_FLUSH").is_ok_and(|v| v == "0"));
+
+/// `SEEKER_PREFILL_FLUSH_MB=<n>` — override the per-submit weight-byte budget
+/// (default `min(100, total_weight_bytes/40)` MB). Lower it on a device/quant
+/// where the default ~100 MB slice is still too slow for the ~2 s watchdog.
+pub static PREFILL_FLUSH_MB: LazyLock<Option<u32>> =
+    LazyLock::new(|| env_u32("SEEKER_PREFILL_FLUSH_MB"));
+
 /// `SEEKER_PROF_STEP=1` — print a per-step `PROF step:` line for the unified
 /// forward, splitting CPU command-recording time from GPU compute (fence wait).
 /// Gates the persistent batched-decode cmdbuf work: replay only pays off if

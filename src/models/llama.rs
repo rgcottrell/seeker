@@ -239,6 +239,7 @@ impl Model for LlamaModel {
             head_dim_v: head_dim as u32,
             gqa_ratio,
             scale,
+            swa_window: 0,
         };
 
         // ---- per-layer loop ----
@@ -496,6 +497,7 @@ impl Model for LlamaModel {
             head_dim_v: head_dim as u32,
             gqa_ratio,
             scale,
+            swa_window: 0,
         };
 
         for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
@@ -680,6 +682,7 @@ impl Model for LlamaModel {
             head_dim_v: head_dim as u32,
             gqa_ratio,
             scale,
+            swa_window: 0,
         };
 
         for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
