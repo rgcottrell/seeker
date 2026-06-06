@@ -121,6 +121,14 @@ pub struct RunArgs {
     #[arg(long = "spec-draft-n-max", default_value_t = 0)]
     spec_draft_n_max: u32,
 
+    /// Path to a separate MTP/EAGLE draft-model GGUF for speculative decoding,
+    /// paired with the base `-m`/`--hf-file` model. gemma4 ships its draft as a
+    /// standalone `gemma4-assistant` GGUF (unsloth's `MTP/*.gguf`), unlike
+    /// qwen35moe's in-GGUF NextN head. The draft is loaded + validated against
+    /// the base model (hidden width + vocab).
+    #[arg(long = "spec-draft-model")]
+    spec_draft_model: Option<PathBuf>,
+
     /// Do not load the matching mmproj vision projector.
     #[arg(long = "no-mmproj")]
     no_mmproj: bool,
@@ -232,6 +240,35 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     );
 
     let model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
+
+    // Optional gemma4 MTP draft model (a separate `gemma4-assistant` GGUF).
+    // First cut: load + validate against the base + log. The draft forward and
+    // speculative-decode wiring land in the next step; the handle is held alive.
+    let _mtp_draft = if let Some(draft_path) = &args.spec_draft_model {
+        if model.arch() != "gemma4" {
+            return Err(format!(
+                "--spec-draft-model is only supported for a gemma4 base model (got `{}`)",
+                model.arch()
+            )
+            .into());
+        }
+        let base_n_embd = gguf
+            .get("gemma4.embedding_length")
+            .and_then(crate::models::gemma4::coerce_u32)
+            .ok_or("base gemma4 model missing `gemma4.embedding_length`")?;
+        let draft_gguf = GgufFile::open(draft_path)?;
+        let draft_weights = engine.upload_weights(&draft_gguf)?;
+        let draft = crate::models::gemma4_assistant::Gemma4AssistantDraft::load(
+            &draft_gguf,
+            draft_weights,
+            base_n_embd,
+            model.vocab_size(),
+        )?;
+        tracing::info!(summary = %draft.summary(), "loaded gemma4 MTP draft model");
+        Some(draft)
+    } else {
+        None
+    };
 
     // Phase 1: load the mmproj vision projector alongside the model when no
     // media (`--image`/`--audio`) was given (held in a local so it stays alive;

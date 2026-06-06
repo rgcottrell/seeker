@@ -788,7 +788,7 @@ fn collect_weights(
     })
 }
 
-fn read_u32_array(
+pub(crate) fn read_u32_array(
     gguf: &GgufFile,
     key: &'static str,
     n_layer: u32,
@@ -825,7 +825,7 @@ fn read_u32_array(
         .collect()
 }
 
-fn read_bool_array(
+pub(crate) fn read_bool_array(
     gguf: &GgufFile,
     key: &'static str,
     n_layer: u32,
@@ -863,7 +863,7 @@ fn read_bool_array(
 
 /// Read a single F32 (or F16) scalar weight directly from the GGUF mmap (small
 /// per-layer scalars like `layer_output_scale` that we want as host constants).
-fn read_scalar_f32(gguf: &GgufFile, name: &str) -> Option<f32> {
+pub(crate) fn read_scalar_f32(gguf: &GgufFile, name: &str) -> Option<f32> {
     let info = gguf.tensor(name)?;
     let bytes = gguf.tensor_data(name)?;
     match info.ggml_type {
@@ -891,7 +891,7 @@ fn f16_to_f32(h: u16) -> f32 {
     if sign == 1 { -val } else { val }
 }
 
-fn coerce_u32(v: &MetadataValue) -> Option<u32> {
+pub(crate) fn coerce_u32(v: &MetadataValue) -> Option<u32> {
     Some(match v {
         MetadataValue::U8(n) => *n as u32,
         MetadataValue::U16(n) => *n as u32,
@@ -905,7 +905,7 @@ fn coerce_u32(v: &MetadataValue) -> Option<u32> {
     })
 }
 
-fn coerce_f32(v: &MetadataValue) -> Option<f32> {
+pub(crate) fn coerce_f32(v: &MetadataValue) -> Option<f32> {
     Some(match v {
         MetadataValue::F32(x) => *x,
         MetadataValue::F64(x) => *x as f32,

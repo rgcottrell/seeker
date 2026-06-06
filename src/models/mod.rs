@@ -12,6 +12,7 @@ use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
 
 pub mod gemma4;
+pub mod gemma4_assistant;
 pub mod llama;
 pub mod qwen35moe;
 
