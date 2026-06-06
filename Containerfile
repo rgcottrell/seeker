@@ -11,9 +11,10 @@ ARG RUST_VERSION
 FROM rust:${RUST_VERSION}-bookworm AS builder
 ARG SLANG_VERSION=2026.8
 
-# openssl-sys (hf-hub) links system OpenSSL; curl+jq fetch the slang release.
+# openssl-sys (hf-hub) links system OpenSSL; curl+jq fetch the slang release;
+# mold is the faster linker selected by .cargo/config.toml.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libssl-dev pkg-config curl jq ca-certificates \
+        libssl-dev pkg-config curl jq ca-certificates mold \
     && rm -rf /var/lib/apt/lists/*
 
 # build.rs needs slangc. The selector matches the arch immediately before
@@ -32,7 +33,14 @@ RUN set -eux; \
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin seeker
+# Cache mounts persist cargo's registry/git + the target dir across image builds,
+# so a repeat `just build` only recompiles changed code (minutes → seconds). The
+# cache mounts don't land in the layer, so copy the binary out before the RUN ends.
+RUN --mount=type=cache,target=/build/target,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --release --bin seeker \
+    && cp target/release/seeker /usr/local/bin/seeker
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
 # Ubuntu 26.04 carries Mesa 26.0.3, whose RADV recognizes recent AMD parts
@@ -46,7 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libvulkan1 mesa-vulkan-drivers ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/seeker /usr/local/bin/seeker
+COPY --from=builder /usr/local/bin/seeker /usr/local/bin/seeker
 
 EXPOSE 11434
 ENTRYPOINT ["seeker"]
