@@ -54,7 +54,8 @@ echo "Enumerating $REPO ..."
 mapfile -t FILES < <(curl -fsSL "https://huggingface.co/api/models/$REPO" \
   | jq -r '.siblings[].rfilename
            | select(endswith(".gguf"))
-           | select(ascii_downcase | contains("mmproj") | not)' | sort)
+           | select(ascii_downcase | contains("mmproj") | not)
+           | select(contains("/") | not)' | sort)
 [[ ${#FILES[@]} -gt 0 ]] || { echo "no .gguf files found in $REPO" >&2; exit 1; }
 echo "Found ${#FILES[@]} GGUF files."
 
@@ -105,7 +106,13 @@ for f in "${FILES[@]}"; do
   timeout "$TIMEOUT" "$SEEKER" run -m "$path" --prompt "$PROMPT" \
       --max-tokens "$MAX_TOKENS" --temp 0 >"$res.out" 2>"$res.err" || rc=$?
 
-  gen=$(sed -n 's/^generated: //p' "$res.out" | head -n1)
+  # Capture the whole generated block (the text between the "generated:" and
+  # "ids:" markers), collapsed to one line. A single-line `sed 's/^generated: //'`
+  # mis-reads as empty when the first decoded token renders as a newline (common
+  # for gemma4 on a raw prompt), false-failing an otherwise-fine run.
+  gen=$(sed -n '/^generated:/,/^ids:/p' "$res.out" \
+        | sed -e '$d' -e 's/^generated:[[:space:]]*//' \
+        | tr '\n' ' ' | sed -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ //' -e 's/ *$//')
   ids=$(sed -n 's/^ids: *//p' "$res.out" | head -n1)
   nids=$(grep -oE '[0-9]+' <<<"$ids" | wc -l | tr -d ' ')
   uniq_ids=$(grep -oE '[0-9]+' <<<"$ids" | sort -u | wc -l | tr -d ' ')
