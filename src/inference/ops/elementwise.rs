@@ -805,6 +805,11 @@ pub fn record_get_rows(
         (GgmlType::I32, GgmlType::I32) => {
             ("get_rows_i32", shaders::GET_ROWS_I32_SPV.as_bytes(), 512)
         }
+        (GgmlType::Q3_K, GgmlType::F32) => (
+            "get_rows_q3_k",
+            shaders::GET_ROWS_Q3_K_DEFAULT_SPV.as_bytes(),
+            256,
+        ),
         (GgmlType::Q4_K, GgmlType::F32) => (
             "get_rows_q4_k",
             shaders::GET_ROWS_Q4_K_DEFAULT_SPV.as_bytes(),
