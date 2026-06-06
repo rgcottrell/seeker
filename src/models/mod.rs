@@ -236,6 +236,20 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Attach a *separate* MTP/EAGLE draft model from its own GGUF (gemma4's
+    /// `gemma4-assistant`), paired with this base model for speculative
+    /// decoding. `handle` is the draft GGUF's uploaded weights. After a
+    /// successful attach, [`supports_mtp_spec`](Self::supports_mtp_spec)
+    /// returns true. Models with an in-GGUF NextN head (qwen35moe) or no MTP
+    /// support return an error. Default: unsupported.
+    fn attach_mtp_draft(
+        &mut self,
+        _gguf: &GgufFile,
+        _handle: WeightsHandle,
+    ) -> Result<(), Box<dyn Error>> {
+        Err("model does not support a separate MTP draft head".into())
+    }
+
     /// Record a forward pass that also exposes the per-position hidden
     /// state (the pre-final-norm residual), used by MTP speculative
     /// decode. When `full_logits` is true the returned `logits` covers

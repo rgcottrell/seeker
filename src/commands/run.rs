@@ -239,36 +239,18 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         "weights uploaded to GPU",
     );
 
-    let model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
+    let mut model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
 
-    // Optional gemma4 MTP draft model (a separate `gemma4-assistant` GGUF).
-    // First cut: load + validate against the base + log. The draft forward and
-    // speculative-decode wiring land in the next step; the handle is held alive.
-    let _mtp_draft = if let Some(draft_path) = &args.spec_draft_model {
-        if model.arch() != "gemma4" {
-            return Err(format!(
-                "--spec-draft-model is only supported for a gemma4 base model (got `{}`)",
-                model.arch()
-            )
-            .into());
-        }
-        let base_n_embd = gguf
-            .get("gemma4.embedding_length")
-            .and_then(crate::models::gemma4::coerce_u32)
-            .ok_or("base gemma4 model missing `gemma4.embedding_length`")?;
+    // Optional separate MTP/EAGLE draft model (gemma4's `gemma4-assistant`
+    // GGUF): upload its weights and attach it to the base model. The base
+    // validates arch + dims and, once attached, reports `supports_mtp_spec()`,
+    // enabling the speculative-decode path below.
+    if let Some(draft_path) = &args.spec_draft_model {
         let draft_gguf = GgufFile::open(draft_path)?;
         let draft_weights = engine.upload_weights(&draft_gguf)?;
-        let draft = crate::models::gemma4_assistant::Gemma4AssistantDraft::load(
-            &draft_gguf,
-            draft_weights,
-            base_n_embd,
-            model.vocab_size(),
-        )?;
-        tracing::info!(summary = %draft.summary(), "loaded gemma4 MTP draft model");
-        Some(draft)
-    } else {
-        None
-    };
+        model.attach_mtp_draft(&draft_gguf, draft_weights)?;
+        tracing::info!(path = ?draft_path, "attached MTP draft model");
+    }
 
     // Phase 1: load the mmproj vision projector alongside the model when no
     // media (`--image`/`--audio`) was given (held in a local so it stays alive;
@@ -286,9 +268,19 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     // the whole prompt in one pass (the splice isn't chunk-aware yet), so size
     // it for the full prompt and take the max with the vision tower's working
     // set.
+    // Speculative decode's verify writes up to `n_max + 1` lookahead K/V per
+    // step before truncating to the accepted length, so the cache must hold
+    // `position + (n_max + 1)` at the final step — reserve that headroom or the
+    // last verify writes past the cache and hangs the GPU.
+    let spec_lookahead = if args.spec_draft_n_max > 0 && model.supports_mtp_spec() {
+        args.spec_draft_n_max + 1
+    } else {
+        0
+    };
     let max_seq_len = args
         .max_tokens
         .saturating_add(tokens.len() as u32)
+        .saturating_add(spec_lookahead)
         .max(tokens.len() as u32);
     let decoder_scratch = if media_setup.is_some() {
         model.scratch_bytes_estimate(0, max_seq_len, args.cache_type_k, args.cache_type_v)

@@ -122,6 +122,9 @@ pub struct Gemma4Model {
     pub weights: Gemma4Weights,
     pub handle: WeightsHandle,
     pub tokenizer: TokenizerBundle,
+    /// Optional gemma4-assistant MTP draft (separate GGUF), attached via
+    /// [`Model::attach_mtp_draft`] for speculative decoding.
+    pub mtp_draft: Option<super::gemma4_assistant::Gemma4AssistantDraft>,
 }
 
 impl Gemma4Model {
@@ -137,7 +140,17 @@ impl Gemma4Model {
             weights,
             handle,
             tokenizer,
+            mtp_draft: None,
         })
+    }
+
+    /// Index of the base layer whose K/V the draft's sliding-window blocks
+    /// borrow (the LAST sliding-window layer) and global blocks borrow (the
+    /// LAST global layer) — per HF Gemma4Assistant's shared-KV design.
+    fn mtp_kv_layer(&self, want_swa: bool) -> Option<usize> {
+        (0..self.params.n_layer as usize)
+            .rev()
+            .find(|&il| self.params.swa[il] == want_swa)
     }
 }
 
@@ -229,7 +242,17 @@ impl Model for Gemma4Model {
         position_offset: u32,
         compute_logits: bool,
     ) -> Result<Option<TensorView>, Box<dyn Error>> {
-        self.forward_inner(ctx, cache, tokens, position_offset, compute_logits, None)
+        Ok(self
+            .forward_inner(
+                ctx,
+                cache,
+                tokens,
+                position_offset,
+                compute_logits,
+                false,
+                None,
+            )?
+            .0)
     }
 
     /// gemma4 image tokens use plain sequential 1D positions (no M-RoPE), so the
@@ -279,14 +302,76 @@ impl Model for Gemma4Model {
         } else {
             None
         };
-        self.forward_inner(
-            ctx,
-            cache,
-            chunk_tokens,
-            cache.position,
-            compute_logits,
-            splice,
-        )
+        Ok(self
+            .forward_inner(
+                ctx,
+                cache,
+                chunk_tokens,
+                cache.position,
+                compute_logits,
+                false,
+                splice,
+            )?
+            .0)
+    }
+
+    // ─── gemma4 MTP speculative-decode hooks (gemma4-assistant draft) ───
+
+    fn supports_mtp_spec(&self) -> bool {
+        self.mtp_draft.is_some()
+    }
+
+    fn attach_mtp_draft(
+        &mut self,
+        gguf: &GgufFile,
+        handle: WeightsHandle,
+    ) -> Result<(), Box<dyn Error>> {
+        let draft = super::gemma4_assistant::Gemma4AssistantDraft::load(
+            gguf,
+            handle,
+            self.params.n_embd,
+            self.params.n_vocab,
+        )?;
+        self.mtp_draft = Some(draft);
+        Ok(())
+    }
+
+    fn record_forward_full(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        position_offset: u32,
+        full_logits: bool,
+        _checkpoint: bool, // gemma4 has no SSM state → no per-position snapshots
+    ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
+        let (logits, residual) =
+            self.forward_inner(ctx, cache, tokens, position_offset, true, full_logits, None)?;
+        Ok(crate::models::ForwardFullOut { logits, residual })
+    }
+
+    fn record_mtp_seed(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _hiddens: &[f32],
+        _tokens: &[u32],
+        _position_offset: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        // The gemma4-assistant draft has no KV cache of its own — it
+        // cross-attends to the base model's K/V — so there is nothing to seed.
+        Ok(())
+    }
+
+    fn record_mtp_draft(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        h_last: &[f32],
+        prev_token: u32,
+        rel_pos: u32,
+    ) -> Result<crate::models::MtpDraftOut, Box<dyn Error>> {
+        self.mtp_draft_step(ctx, cache, h_last, prev_token, rel_pos)
     }
 }
 
@@ -302,8 +387,9 @@ impl Gemma4Model {
         tokens: &[u32],
         position_offset: u32,
         compute_logits: bool,
+        full_logits: bool,
         image_splice: Option<(&[f32], usize)>,
-    ) -> Result<Option<TensorView>, Box<dyn Error>> {
+    ) -> Result<(Option<TensorView>, TensorView), Box<dyn Error>> {
         use crate::inference::command::{record_compute_barriers, record_global_barrier};
         let p = &self.params;
         let l = tokens.len() as u32;
@@ -525,49 +611,248 @@ impl Gemma4Model {
 
         if !compute_logits {
             cache_io::advance(cache, l);
-            return Ok(None);
+            return Ok((None, residual));
         }
 
-        // ---- final norm + lm_head (last token only) + final-logit softcap ----
+        // ---- final norm + lm_head + final-logit softcap ----
+        // `full_logits` (MTP verify) computes logits for ALL L positions
+        // (`[vocab, L]`); otherwise just the last token (`[vocab, 1]`).
         let elem_size = 4u64;
         let vocab = p.n_vocab as u64;
-        let residual_last = TensorView {
-            buffer: residual.buffer,
-            byte_offset: residual.byte_offset + (l as u64 - 1) * hidden * elem_size,
-            byte_size: hidden * elem_size,
-            dims: [hidden, 1, 1, 1],
-            byte_stride: [
-                elem_size,
-                hidden * elem_size,
-                hidden * elem_size,
-                hidden * elem_size,
-            ],
-            element_stride: [1, hidden, hidden, hidden],
-            dtype: residual.dtype,
-        };
-        let final_norm = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
-        rms_norm::record(
-            ctx,
-            residual_last,
-            self.weights.output_norm,
-            final_norm,
-            p.rms_eps,
-        )?;
-
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
-        let last_logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
-        matmul::record(ctx, lm_head, final_norm, last_logits)?;
+        let logits = if full_logits {
+            let final_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
+            rms_norm::record(
+                ctx,
+                residual,
+                self.weights.output_norm,
+                final_norm,
+                p.rms_eps,
+            )?;
+            let lg = ctx.alloc_tensor([vocab, l as u64, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, lm_head, final_norm, lg)?;
+            lg
+        } else {
+            let residual_last = TensorView {
+                buffer: residual.buffer,
+                byte_offset: residual.byte_offset + (l as u64 - 1) * hidden * elem_size,
+                byte_size: hidden * elem_size,
+                dims: [hidden, 1, 1, 1],
+                byte_stride: [
+                    elem_size,
+                    hidden * elem_size,
+                    hidden * elem_size,
+                    hidden * elem_size,
+                ],
+                element_stride: [1, hidden, hidden, hidden],
+                dtype: residual.dtype,
+            };
+            let final_norm = ctx.alloc_tensor([hidden, 1, 1, 1], GgmlType::F32)?;
+            rms_norm::record(
+                ctx,
+                residual_last,
+                self.weights.output_norm,
+                final_norm,
+                p.rms_eps,
+            )?;
+            let last_logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, lm_head, final_norm, last_logits)?;
+            last_logits
+        };
 
-        // final_logit_softcap: cap·tanh(logits/cap), in place.
+        // final_logit_softcap: cap·tanh(logits/cap), in place (any shape).
         if p.final_logit_softcap != 0.0 {
             let cap = p.final_logit_softcap;
-            elementwise::record_scale(ctx, last_logits, last_logits, 1.0 / cap, 0.0)?;
-            elementwise::record_tanh(ctx, last_logits, last_logits)?;
-            elementwise::record_scale(ctx, last_logits, last_logits, cap, 0.0)?;
+            elementwise::record_scale(ctx, logits, logits, 1.0 / cap, 0.0)?;
+            elementwise::record_tanh(ctx, logits, logits)?;
+            elementwise::record_scale(ctx, logits, logits, cap, 0.0)?;
         }
 
         cache_io::advance(cache, l);
-        Ok(Some(last_logits))
+        Ok((Some(logits), residual))
+    }
+
+    /// One gemma4-assistant MTP draft step (`L=1`): given the base model's last
+    /// pre-final-norm hidden `h_last` (`[n_embd]`) and the previous token, run
+    /// the 4-block EAGLE draft — input `pre_projection(concat(√n_embd·embed(tok),
+    /// h_last))`, blocks whose attention computes Q only and cross-attends the
+    /// BASE K/V cache (last SWA / last global layer), then `post_projection` (the
+    /// recurrence hidden) and the dense tied head (the draft's own `token_embd`).
+    /// Returns the GPU-argmax draft token + the `[n_embd]` recurrence hidden.
+    fn mtp_draft_step(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        h_last: &[f32],
+        prev_token: u32,
+        rel_pos: u32,
+    ) -> Result<crate::models::MtpDraftOut, Box<dyn Error>> {
+        use crate::inference::command::{record_compute_barrier, record_compute_barriers};
+        let p = &self.params;
+        let draft = self
+            .mtp_draft
+            .as_ref()
+            .ok_or("record_mtp_draft: no gemma4-assistant draft attached")?;
+        let dp = &draft.params;
+        let dw = &draft.weights;
+        let n_embd = p.n_embd as u64; // base hidden = draft output width (3840)
+        let d_hidden = dp.n_embd as u64; // draft hidden (1024)
+        let n_ff = dp.n_ff as u64;
+        let n_head = dp.n_head as u64;
+        let vocab = p.n_vocab as u64;
+        if h_last.len() as u64 != n_embd {
+            return Err(format!(
+                "record_mtp_draft: h_last len {} != base n_embd {n_embd}",
+                h_last.len()
+            )
+            .into());
+        }
+        // The draft cross-attends the committed base K/V over [0, kv_len).
+        let kv_len = cache.position;
+        let kv_len_u = kv_len as u64;
+        if kv_len == 0 {
+            return Err("record_mtp_draft: empty base KV cache".into());
+        }
+        let cache_direct = flash_attn::supports_pair(cache.config.k_dtype, cache.config.v_dtype);
+
+        // ── input: inp_cat = [ √n_embd·embed(prev_token) | h_last ]  (2·n_embd) ──
+        let inp_cat = ctx.alloc_tensor([2 * n_embd, 1, 1, 1], GgmlType::F32)?;
+        let half = |off_elems: u64| -> TensorView {
+            TensorView {
+                buffer: inp_cat.buffer,
+                byte_offset: inp_cat.byte_offset + off_elems * 4,
+                byte_size: n_embd * 4,
+                dims: [n_embd, 1, 1, 1],
+                byte_stride: [4, n_embd * 4, n_embd * 4, n_embd * 4],
+                element_stride: [1, n_embd, n_embd, n_embd],
+                dtype: GgmlType::F32,
+            }
+        };
+        let tok_buf = ctx.alloc_scratch(4)?;
+        write_u32(ctx, tok_buf, &[prev_token])?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, tok_buf, 1, half(0))?;
+        elementwise::record_scale(ctx, half(0), half(0), p.embd_scale, 0.0)?;
+        write_f32(ctx, half(n_embd).range(), h_last)?;
+        record_compute_barrier(ctx.device, ctx.cmd, inp_cat.range());
+
+        // inpL = pre_projection @ inp_cat → draft hidden. Stable buffer, updated
+        // in place by each block's output (L=1 → per-block temps stay tiny).
+        let inpl = ctx.alloc_tensor([d_hidden, 1, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, dw.pre_projection, inp_cat, inpl)?;
+
+        let positions_buf = ctx.alloc_scratch(4)?;
+        write_u32(ctx, positions_buf, &[rel_pos])?;
+
+        // ── 4 draft blocks: Q-only attention over the borrowed base K/V ──
+        for (il, block) in dw.blocks.iter().enumerate() {
+            let head_dim = dp.head_dim(il) as u64;
+            let q_dim = dp.q_dim(il) as u64;
+            let n_rot = head_dim as u32;
+            let rope_params = rope::RopeParams::llama_default(n_rot, dp.rope_base(il));
+            let freq_factors = if dp.swa[il] {
+                None
+            } else {
+                dw.rope_freqs.as_ref().map(|t| t.range())
+            };
+            // Borrow the base layer's K/V of the matching attention type.
+            let il_kv = self
+                .mtp_kv_layer(dp.swa[il])
+                .ok_or("gemma4 MTP: base has no layer of the draft's attention type")?;
+            let base_n_head_kv = p.n_head_kv[il_kv] as u64;
+            let fa_params = flash_attn::FlashAttnParams {
+                head_dim_k: head_dim as u32,
+                head_dim_v: head_dim as u32,
+                gqa_ratio: (n_head / base_n_head_kv).max(1) as u32,
+                scale: 1.0, // gemma4: NO 1/sqrt(head_dim)
+                swa_window: if dp.swa[il] { dp.sliding_window } else { 0 },
+            };
+
+            // input norm → Q proj → per-head Q-norm → NEOX RoPE.
+            let x_norm = ctx.alloc_tensor([d_hidden, 1, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, inpl, block.attn_norm, x_norm, dp.rms_eps)?;
+            let q = ctx.alloc_tensor([q_dim, 1, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, block.wq, x_norm, q)?;
+            let q_view = reshape_for_rope(q, head_dim, n_head, 1);
+            let q_normed = ctx.alloc_tensor(q_view.dims, GgmlType::F32)?;
+            rms_norm::record_nofence(ctx, q_view, block.attn_q_norm, q_normed, dp.rms_eps)?;
+            record_compute_barrier(ctx.device, ctx.cmd, q_normed.range());
+            let q_roped = ctx.alloc_tensor(q_view.dims, GgmlType::F32)?;
+            rope::record_neox_nofence(
+                ctx,
+                q_normed,
+                positions_buf,
+                q_roped,
+                rope_params,
+                freq_factors,
+            )?;
+            record_compute_barrier(ctx.device, ctx.cmd, q_roped.range());
+
+            // K/V read-only from the base cache (no draft KV write).
+            let (k_src, v_src) = if cache_direct {
+                (
+                    slice_cache_prefix(cache.k_layers[il_kv], kv_len_u),
+                    slice_cache_prefix(cache.v_layers[il_kv], kv_len_u),
+                )
+            } else {
+                (
+                    cache_io::record_read(ctx, cache.k_layers[il_kv], kv_len)?,
+                    cache_io::record_read(ctx, cache.v_layers[il_kv], kv_len)?,
+                )
+            };
+            let q_perm = permute_to_attn(q_roped, head_dim, 1, n_head);
+            let k_perm = permute_to_attn(k_src, head_dim, kv_len_u, base_n_head_kv);
+            let v_perm = permute_to_attn(v_src, head_dim, kv_len_u, base_n_head_kv);
+            let attn = ctx.alloc_tensor([q_dim, 1, 1, 1], GgmlType::F32)?;
+            flash_attn::record(ctx, q_perm, k_perm, v_perm, None, attn, fa_params, kv_len)?;
+
+            // O-proj → post_attn_norm → residual (attn_out = inpL + ·).
+            let proj = ctx.alloc_tensor([d_hidden, 1, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, block.wo, attn, proj)?;
+            let proj_normed = ctx.alloc_tensor([d_hidden, 1, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, proj, block.post_attn_norm, proj_normed, dp.rms_eps)?;
+            let attn_out = ctx.alloc_tensor([d_hidden, 1, 1, 1], GgmlType::F32)?;
+            elementwise::record_add(ctx, inpl, proj_normed, attn_out)?;
+
+            // FFN: ffn_norm → GeGLU(gelu-tanh) → post_ffw_norm → residual.
+            let x_norm2 = ctx.alloc_tensor([d_hidden, 1, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, attn_out, block.ffn_norm, x_norm2, dp.rms_eps)?;
+            let gate = ctx.alloc_tensor([n_ff, 1, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.ffn_gate, x_norm2, gate)?;
+            let up = ctx.alloc_tensor([n_ff, 1, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.ffn_up, x_norm2, up)?;
+            record_compute_barriers(ctx.device, ctx.cmd, &[gate.range(), up.range()]);
+            let gate_gelu = ctx.alloc_tensor([n_ff, 1, 1, 1], GgmlType::F32)?;
+            elementwise::record_gelu(ctx, gate, gate_gelu)?;
+            let ffn_hidden = ctx.alloc_tensor([n_ff, 1, 1, 1], GgmlType::F32)?;
+            elementwise::record_mul(ctx, gate_gelu, up, ffn_hidden)?;
+            let down = ctx.alloc_tensor([d_hidden, 1, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, block.ffn_down, ffn_hidden, down)?;
+            let down_normed = ctx.alloc_tensor([d_hidden, 1, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, down, block.post_ffw_norm, down_normed, dp.rms_eps)?;
+            // inpL = attn_out + down_normed (in place into the stable buffer).
+            elementwise::record_add(ctx, attn_out, down_normed, inpl)?;
+            let scale = dp.layer_output_scale[il];
+            if scale != 1.0 {
+                elementwise::record_scale(ctx, inpl, inpl, scale, 0.0)?;
+            }
+        }
+
+        // ── output_norm → recurrence (post_projection) + dense tied LM head ──
+        let h_inner = ctx.alloc_tensor([d_hidden, 1, 1, 1], GgmlType::F32)?;
+        rms_norm::record(ctx, inpl, dw.output_norm, h_inner, dp.rms_eps)?;
+        // Recurrence hidden for the next step (base hidden space, n_embd).
+        let h_post = ctx.alloc_tensor([n_embd, 1, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, dw.post_projection, h_inner, h_post)?;
+        // Dense head: the draft's own token_embd (d_hidden → vocab). Final-logit
+        // softcap is monotonic and the draft only argmaxes → omitted (invariant).
+        let logits = ctx.alloc_tensor([vocab, 1, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, dw.token_embd, h_inner, logits)?;
+        let draft_token = crate::inference::ops::sampler::record_greedy(ctx, logits)?;
+
+        Ok(crate::models::MtpDraftOut {
+            draft_token,
+            block_out: h_post,
+        })
     }
 }
 
