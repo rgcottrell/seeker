@@ -2,7 +2,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use hf_hub::api::tokio::{ApiBuilder, ApiRepo};
+use hf_hub::api::tokio::{Api, ApiBuilder, ApiRepo};
 use hf_hub::{Cache, CacheRepo, Repo, RepoType};
 use tracing::{debug, info};
 
@@ -239,6 +239,7 @@ fn list_files_offline(cache: &Cache, repo_id: &str) -> Result<Vec<String>, Box<d
 async fn fetch_or_resolve(
     cache: &Cache,
     repo_id: &str,
+    api: &Api,
     repo: &ApiRepo,
     cache_repo: &CacheRepo,
     filename: &str,
@@ -247,13 +248,94 @@ async fn fetch_or_resolve(
     if offline {
         // `CacheRepo::get` only resolves within the `refs/main` snapshot; fall
         // back to any other cached snapshot that has the file (blobs shared).
-        cache_repo
+        return cache_repo
             .get(filename)
             .or_else(|| find_cached_in_snapshots(cache, repo_id, filename))
-            .ok_or_else(|| format!("file not in offline cache: {filename}").into())
-    } else {
-        Ok(repo.get(filename).await?)
+            .ok_or_else(|| format!("file not in offline cache: {filename}").into());
     }
+
+    // Online. Fast path: the file is already symlinked under `refs/main`, so
+    // resolve it locally with no network at all.
+    if let Some(path) = cache_repo.get(filename) {
+        return Ok(path);
+    }
+
+    // `refs/main` doesn't symlink the file. This is the usual cause of a
+    // redundant redownload: another tool (or an earlier seeker run) advanced
+    // `refs/main` to a newer commit whose snapshot doesn't link this file, yet
+    // the *blob* is still on disk under the old commit. hf-hub's `download`
+    // never checks whether `blob_path(etag)` already exists, so it re-fetches a
+    // blob we already hold. HEAD the file for its etag (the content hash) and,
+    // if a matching blob is present, reuse it — re-linking the snapshot so a
+    // later run resolves locally without even the HEAD. The etag is the content
+    // hash, so a genuinely changed file misses the blob and downloads normally.
+    let url = repo.url(filename);
+    if let Ok(meta) = api.metadata(&url).await {
+        let blob = cache_repo.blob_path(meta.etag());
+        if blob.exists() {
+            info!(file = %filename, "blob already cached under another commit — skipping redownload");
+            return Ok(link_cached_blob(
+                cache_repo,
+                meta.commit_hash(),
+                filename,
+                &blob,
+            ));
+        }
+    }
+
+    // Genuinely new content (or the HEAD failed — let `download` surface the
+    // error after its own metadata fetch).
+    Ok(repo.download(filename).await?)
+}
+
+/// Re-create the `snapshots/<commit>/<filename>` symlink for a blob that is
+/// already present on disk and point `refs/main` at that commit — the same
+/// cache state hf-hub leaves after a real download, but without the transfer,
+/// so a subsequent [`CacheRepo::get`] resolves the file locally with no
+/// network. Best-effort: on any filesystem error it returns the blob path
+/// directly (seeker opens the real blob just as happily as the symlink).
+fn link_cached_blob(
+    cache_repo: &CacheRepo,
+    commit_hash: &str,
+    filename: &str,
+    blob: &Path,
+) -> PathBuf {
+    let pointer = cache_repo.pointer_path(commit_hash).join(filename);
+    if pointer.exists() {
+        // The snapshot already links the file; only `refs/main` lagged.
+        let _ = cache_repo.create_ref(commit_hash);
+        return pointer;
+    }
+    let linked = match pointer.parent() {
+        Some(parent) => {
+            std::fs::create_dir_all(parent).is_ok()
+                && std::os::unix::fs::symlink(relative_blob_target(filename, blob), &pointer)
+                    .is_ok()
+        }
+        None => false,
+    };
+    if linked {
+        let _ = cache_repo.create_ref(commit_hash);
+        pointer
+    } else {
+        blob.to_path_buf()
+    }
+}
+
+/// The relative symlink target HF stores inside a snapshot: from
+/// `snapshots/<commit>/<filename>` back to `blobs/<etag>`. Matches hf-hub's
+/// `make_relative` so the cache stays relocatable (relative links survive a
+/// move of the whole cache dir). The depth back to the repo root is `snapshots`
+/// + `<commit>` + any subdirectories embedded in `filename`.
+fn relative_blob_target(filename: &str, blob: &Path) -> PathBuf {
+    let depth = 2 + filename.matches('/').count();
+    let mut target = PathBuf::new();
+    for _ in 0..depth {
+        target.push("..");
+    }
+    target.push("blobs");
+    target.push(blob.file_name().expect("blob path has a final component"));
+    target
 }
 
 /// Inputs to the shared HF-resolution helper. Both `download` and `inspect`
@@ -332,6 +414,7 @@ pub(crate) async fn resolve_hf(
     let main = fetch_or_resolve(
         &cache,
         &repo_id,
+        &api,
         &api_repo,
         &cache_repo,
         &main_file,
@@ -346,6 +429,7 @@ pub(crate) async fn resolve_hf(
                 fetch_or_resolve(
                     &cache,
                     &repo_id,
+                    &api,
                     &api_repo,
                     &cache_repo,
                     &mmproj,
@@ -607,5 +691,70 @@ mod tests {
         let main = tmp.0.join("model.Q4_K_M.gguf");
         std::fs::write(&main, b"").unwrap();
         assert_eq!(find_sidecar_mmproj(&main), None);
+    }
+
+    #[test]
+    fn relative_blob_target_flat_and_nested() {
+        let blob = Path::new("/cache/models--org--name/blobs/deadbeef");
+        // Flat filename: snapshots/<commit>/<file> → ../../blobs/<etag>.
+        assert_eq!(
+            relative_blob_target("model.gguf", blob),
+            PathBuf::from("../../blobs/deadbeef")
+        );
+        // One subdirectory deeper adds one more `..`.
+        assert_eq!(
+            relative_blob_target("sub/model.gguf", blob),
+            PathBuf::from("../../../blobs/deadbeef")
+        );
+    }
+
+    // The redundant-redownload fix: a blob is present on disk but no snapshot
+    // links it (refs/main moved on). `link_cached_blob` must re-create the
+    // snapshot symlink + ref so the file resolves locally — no download.
+    #[test]
+    fn link_cached_blob_relinks_existing_blob() {
+        let tmp = TempDir::new("relink");
+        let cache = Cache::new(tmp.0.clone());
+        let cache_repo = cache.model("unsloth/Demo-GGUF".to_string());
+        let etag = "abc123etag";
+        let blob = cache_repo.blob_path(etag);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"GGUF-bytes").unwrap();
+
+        let commit = "commitdeadbeef";
+        let returned = link_cached_blob(&cache_repo, commit, "model.gguf", &blob);
+
+        assert!(returned.ends_with("snapshots/commitdeadbeef/model.gguf"));
+        let meta = std::fs::symlink_metadata(&returned).unwrap();
+        assert!(meta.file_type().is_symlink(), "entry should be a symlink");
+        assert_eq!(
+            std::fs::canonicalize(&returned).unwrap(),
+            std::fs::canonicalize(&blob).unwrap(),
+            "symlink must resolve to the cached blob"
+        );
+        // refs/main now points at the commit → CacheRepo::get resolves it.
+        assert_eq!(cache_repo.get("model.gguf"), Some(returned));
+    }
+
+    // If the snapshot already links the file (only refs/main lagged), reuse it
+    // and just (re)write the ref; never error or duplicate the symlink.
+    #[test]
+    fn link_cached_blob_reuses_existing_pointer() {
+        let tmp = TempDir::new("relink-existing");
+        let cache = Cache::new(tmp.0.clone());
+        let cache_repo = cache.model("unsloth/Demo-GGUF".to_string());
+        let etag = "etag2";
+        let blob = cache_repo.blob_path(etag);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"x").unwrap();
+
+        let commit = "commit2";
+        let pointer = cache_repo.pointer_path(commit).join("model.gguf");
+        std::fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../../blobs/etag2", &pointer).unwrap();
+
+        let returned = link_cached_blob(&cache_repo, commit, "model.gguf", &blob);
+        assert_eq!(returned, pointer);
+        assert_eq!(cache_repo.get("model.gguf"), Some(pointer));
     }
 }
