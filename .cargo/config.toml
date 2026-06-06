@@ -1,0 +1,9 @@
+# Use the mold linker on Linux. Linking dominates incremental rebuild time;
+# mold is much faster than the default `ld` and produces equivalent output, so
+# there is no runtime-perf or correctness impact (release stays fully optimized).
+# Requires `mold` on PATH — installed in the CI workflow and the Containerfile
+# builder. NOTE: actions-rust-lang/setup-rust-toolchain exports RUSTFLAGS, which
+# shadows this key, so CI passes the same link-arg via the action's `rustflags`
+# input instead.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

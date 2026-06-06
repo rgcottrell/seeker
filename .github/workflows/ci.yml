@@ -26,10 +26,17 @@ jobs:
         # truth) — the version is never restated here. Bundles cargo/target caching,
         # so it replaces the separate Swatinem/rust-cache step. Runs on Node 24.
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # The action exports RUSTFLAGS, which shadows .cargo/config.toml's
+          # [target] rustflags — so mold's link-arg must be added here too (kept
+          # alongside the default -D warnings). Speeds linking the --all-targets
+          # binaries; mold itself is installed in the next step.
+          rustflags: "-D warnings -C link-arg=-fuse-ld=mold"
 
       - name: System build deps
-        # openssl-sys (via reqwest/native-tls) links system OpenSSL.
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+        # openssl-sys (via reqwest/native-tls) links system OpenSSL; mold is the
+        # faster linker selected via the setup step's rustflags above.
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config mold
 
       - name: Install slangc
         # build.rs compiles the .slang compute shaders with slangc. ash loads

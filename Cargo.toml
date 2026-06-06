@@ -78,3 +78,12 @@ profile_gpu = []
 # Each debug flag accessor constant-folds to `false`/`None` when the
 # feature is off, so the surrounding branches are eliminated entirely.
 gpu_debug = []
+
+# Faster debug/test builds (release is left fully optimized). `line-tables-only`
+# keeps file:line in panics/backtraces but drops variable-level debuginfo, which
+# is the bulk of debuginfo generation + linking cost; `unpacked` keeps debuginfo
+# out of the linked artifact for a further link speedup. The test profile
+# inherits these from dev.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
