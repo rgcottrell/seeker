@@ -8,12 +8,15 @@
 //!   parallel dot-product reduction over K. Without this, decode wastes
 //!   31/32 of each workgroup's compute and runs ~20× slower than expected.
 //!
-//! Dtype dispatch (A's `dtype`): F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1,
-//! Q8_0, IQ4_NL, MXFP4 are wired through `mul_mat_vec.<variant>.spv`. For
-//! N>1 with non-F16 weights, we fall back to issuing one `mul_mat_vec`
-//! dispatch per output column — correct but not bandwidth-optimal for
-//! large prefills. K-quants (Q2_K / Q4_K / Q5_K / Q6_K) and the IQ-family
-//! quants have their own SPV variants compiled but not yet wired here.
+//! Dtype dispatch (A's `dtype`): F32, F16, BF16, the legacy quants (Q4_0,
+//! Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, MXFP4), the K-quants (Q2_K, Q3_K, Q4_K,
+//! Q5_K, Q6_K), and the IQ-family (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
+//! IQ3_XXS, IQ3_S, IQ4_XS) are all wired here, each through its own
+//! `mul_mat_vec.<variant>.spv`. For N>1 with a weight whose dtype has no
+//! coopmat (`mul_mm_cm`) variant, we fall back to issuing one `mul_mat_vec`
+//! dispatch per output column — correct but not bandwidth-optimal for large
+//! prefills (the K-quants and IQ4_XS do have coopmat; Q2_K/Q3_K and the other
+//! IQ quants take the per-column path).
 //!
 //! Push constants follow `MulMmParams` and `MulMatVecParams` respectively
 //! (see `shaders/compute/mul_mm.slang` and `shaders/include/mul_mat_vec_head.slang`).
@@ -37,13 +40,16 @@ const MUL_MAT_VEC_PARAMS_BYTES: u32 = 13 * 4;
 /// one output row via a 32-thread dot-product reduction.
 const MUL_MAT_VEC_BLOCK_SIZE: u32 = 32;
 
-/// Per-dtype dispatch info for `mul_mat_vec`. `binding_indices` tracks
-/// which slots in `mul_mat_vec_head.slang` the variant actually declares
-/// (descriptor-set layout must match the SPIR-V's binding decorations
-/// exactly, even when the path through the kernel doesn't read every
-/// alias). Slot 0 → A, 1 → B, 2 → D, 3 → A as packed16 (active when the
-/// quant defines `A_TYPE_PACKED16`), 4 → B as float4 (active when
-/// `B_TYPEV4` is defined — true for every wired variant).
+/// Per-dtype dispatch info for `mul_mat_vec`. `binding_indices` lists the
+/// descriptor slots the host binds for this variant; it must be a *superset*
+/// of the bindings the compiled SPIR-V declares (Vulkan permits a descriptor
+/// layout wider than the shader's static use — slangc `-O3` strips any alias
+/// the kernel never reads, so the surviving set is often smaller than the
+/// aliases `mul_mat_vec_head.slang` defines). Determine the minimal-correct
+/// set per shader with `spirv-dis … | grep Binding`. Slot map:
+///   0 → A,  3 → A as packed16,  6 → A as packed32
+///   1 → B,  4 → B as float4,    5 → B as float2
+///   2 → D
 struct MmvVariant {
     name: &'static str,
     spv: &'static [u8],
@@ -60,6 +66,20 @@ const MMV_BINDINGS_PACKED16_AND_32: &[u32] = &[0, 1, 2, 3, 4, 6];
 /// uses the float2 alias `data_b_v2` (slot 5) rather than the float4 alias
 /// (slot 4) Q4_K uses — so its binding set is `{0,1,2,3,5,6}`, not `…,4,…`.
 const MMV_BINDINGS_Q5_K: &[u32] = &[0, 1, 2, 3, 5, 6];
+/// Q2_K / Q3_K (`mul_mat_vec_q2_k.slang`, `…q3_k.slang`): A (0) + packed16
+/// alias (3), D (2), B via the float2 alias `data_b_v2` (5). slangc -O3 leaves
+/// the SPIR-V decorating exactly `{0,2,3,5}` (verified with spirv-dis) — the
+/// same alias set Q5_K's kernel uses, minus the over-declared slots.
+const MMV_BINDINGS_K_DMIN_V2: &[u32] = &[0, 2, 3, 5];
+/// i-quant matvec reading the block scale straight from `data_a` (no packed16
+/// alias), B as float4: IQ1_S / IQ1_M / IQ2_XS. SPIR-V decorates `{0,2,4}`.
+const MMV_BINDINGS_IQ_V4: &[u32] = &[0, 2, 4];
+/// i-quant matvec that also reads `data_a_packed16` (3) for its sign/scale
+/// field, B as float4: IQ2_XXS / IQ2_S / IQ3_XXS / IQ3_S. SPIR-V `{0,2,3,4}`.
+const MMV_BINDINGS_IQ_P16_V4: &[u32] = &[0, 2, 3, 4];
+/// IQ4_XS (generic `mul_mat_vec.slang` iq4_xs variant): B as float4 (4) plus
+/// the packed32 alias of A (6). SPIR-V decorates `{0,2,4,6}`.
+const MMV_BINDINGS_IQ4_XS: &[u32] = &[0, 2, 4, 6];
 
 fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
     let v = match dtype {
@@ -135,6 +155,62 @@ fn mmv_variant(dtype: GgmlType) -> Option<MmvVariant> {
             spv: shaders::MUL_MAT_VEC_Q6_K_DEFAULT_SPV.as_bytes(),
             binding_indices: MMV_BINDINGS_PACKED16,
         },
+        // Q2_K / Q3_K — dedicated per-dtype kernels (`mul_mat_vec_q2_k.slang`,
+        // `…q3_k.slang`), same `MulMatVecParams` layout via the shared head.
+        GgmlType::Q2_K => MmvVariant {
+            name: "mul_mat_vec_q2_k",
+            spv: shaders::MUL_MAT_VEC_Q2_K_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_K_DMIN_V2,
+        },
+        GgmlType::Q3_K => MmvVariant {
+            name: "mul_mat_vec_q3_k",
+            spv: shaders::MUL_MAT_VEC_Q3_K_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_K_DMIN_V2,
+        },
+        // IQ-family — per-dtype kernels ported from llama.cpp; codebook grids
+        // are embedded constants copied to groupshared via `init_iq_shmem()`
+        // (no extra buffer binding). Prefill (N>1) reuses these via the
+        // per-column matvec fallback in `record_inner` (no coopmat variant).
+        GgmlType::IQ1_S => MmvVariant {
+            name: "mul_mat_vec_iq1_s",
+            spv: shaders::MUL_MAT_VEC_IQ1_S_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_IQ_V4,
+        },
+        GgmlType::IQ1_M => MmvVariant {
+            name: "mul_mat_vec_iq1_m",
+            spv: shaders::MUL_MAT_VEC_IQ1_M_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_IQ_V4,
+        },
+        GgmlType::IQ2_XS => MmvVariant {
+            name: "mul_mat_vec_iq2_xs",
+            spv: shaders::MUL_MAT_VEC_IQ2_XS_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_IQ_V4,
+        },
+        GgmlType::IQ2_XXS => MmvVariant {
+            name: "mul_mat_vec_iq2_xxs",
+            spv: shaders::MUL_MAT_VEC_IQ2_XXS_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_IQ_P16_V4,
+        },
+        GgmlType::IQ2_S => MmvVariant {
+            name: "mul_mat_vec_iq2_s",
+            spv: shaders::MUL_MAT_VEC_IQ2_S_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_IQ_P16_V4,
+        },
+        GgmlType::IQ3_XXS => MmvVariant {
+            name: "mul_mat_vec_iq3_xxs",
+            spv: shaders::MUL_MAT_VEC_IQ3_XXS_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_IQ_P16_V4,
+        },
+        GgmlType::IQ3_S => MmvVariant {
+            name: "mul_mat_vec_iq3_s",
+            spv: shaders::MUL_MAT_VEC_IQ3_S_DEFAULT_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_IQ_P16_V4,
+        },
+        GgmlType::IQ4_XS => MmvVariant {
+            name: "mul_mat_vec_iq4_xs",
+            spv: shaders::MUL_MAT_VEC_IQ4_XS_SPV.as_bytes(),
+            binding_indices: MMV_BINDINGS_IQ4_XS,
+        },
         _ => return None,
     };
     Some(v)
@@ -186,6 +262,13 @@ fn mmcm_variant(dtype: GgmlType) -> Option<MmCmVariant> {
         GgmlType::MXFP4 => MmCmVariant {
             name: "mul_mm_cm_mxfp4_f32",
             spv: shaders::MUL_MM_CM_MXFP4_F32_SPV.as_bytes(),
+        },
+        // IQ4_XS has a coopmat variant (the other newly-wired quants don't —
+        // they fall through to the per-column matvec prefill path, correct but
+        // slower). Gives IQ4_XS the fast N≥32 prefill path like the K-quants.
+        GgmlType::IQ4_XS => MmCmVariant {
+            name: "mul_mm_cm_iq4_xs_f32",
+            spv: shaders::MUL_MM_CM_IQ4_XS_F32_SPV.as_bytes(),
         },
         _ => return None,
     };
