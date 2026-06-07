@@ -128,7 +128,15 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
 
     let do_pp = !args.tg_only;
     let do_tg = !args.pp_only;
-    let span = args.pp.max(args.tg); // headroom needed on top of each depth
+    // Headroom needed on top of each depth — count only the ENABLED tests so
+    // `--tg-only --pp <big>` (or `--pp-only --tg <big>`) doesn't over-reserve
+    // KV/scratch or reject depths for a mode that won't run.
+    let span = match (do_pp, do_tg) {
+        (true, true) => args.pp.max(args.tg),
+        (true, false) => args.pp,
+        (false, true) => args.tg,
+        (false, false) => unreachable!("clap: --pp-only conflicts with --tg-only"),
+    };
 
     let trained_ctx = gguf.trained_ctx_len();
     let (depths, skipped) = build_depths(&args, trained_ctx, span);
