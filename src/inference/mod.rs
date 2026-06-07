@@ -41,6 +41,13 @@ pub struct Engine {
     pub pipelines: PipelineCache,
     pub descriptors: DescriptorAllocator,
     pub scratch: Region,
+    /// Small HOST_CACHED staging buffer for result readback. The GPU-write-heavy
+    /// `scratch` is HOST_COHERENT-only (write-combined): fast for GPU writes, but
+    /// the CPU reads it uncached (~185 MB/s on this UMA APU). Copying the few
+    /// KB/MB of results into this cached buffer first (a cheap device-side copy)
+    /// makes the host read cache-speed — matters for the stochastic spec verify's
+    /// full-vocab logit readback. Grown on demand; see [`Engine::run_spec_record`].
+    pub readback: Region,
     pub command_pool: vk::CommandPool,
     pub command_buffer: vk::CommandBuffer,
     /// Secondary command buffer used to cache the decode forward graph
@@ -95,6 +102,28 @@ pub struct DecodeCache {
 /// `allocate_scratch`. Kept tiny — the real region is sized from the model.
 const SCRATCH_PLACEHOLDER_BYTES: u64 = 1 << 20;
 
+/// Initial size of the HOST_CACHED readback staging buffer (grown on demand to
+/// the largest single readback, e.g. a `[vocab, n+1]` logit block).
+const READBACK_PLACEHOLDER_BYTES: u64 = 1 << 20;
+
+/// Allocate a HOST_CACHED (fast CPU read) staging buffer for result readback,
+/// falling back to plain HOST_COHERENT (write-combined) if the device exposes no
+/// cached host-visible memory type (e.g. the CPU `llvmpipe` fallback).
+fn new_readback_region(device: &Device, bytes: u64) -> Result<Region, Box<dyn Error>> {
+    let usage = vk::BufferUsageFlags::TRANSFER_DST;
+    let cached = vk::MemoryPropertyFlags::HOST_VISIBLE
+        | vk::MemoryPropertyFlags::HOST_COHERENT
+        | vk::MemoryPropertyFlags::HOST_CACHED;
+    Region::new(device, bytes, usage, cached).or_else(|_| {
+        Region::new(
+            device,
+            bytes,
+            usage,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    })
+}
+
 /// Result of one MTP speculative-decode step ([`Engine::decode_speculative`]).
 pub struct SpecStepOut {
     /// Tokens accepted this step (`accept_len + 1`, always ≥ 1): the matched
@@ -137,6 +166,8 @@ impl Engine {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
+        let readback = new_readback_region(&device, READBACK_PLACEHOLDER_BYTES)?;
+
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(device.queue_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -161,6 +192,7 @@ impl Engine {
             pipelines,
             descriptors,
             scratch,
+            readback,
             command_pool,
             command_buffer,
             decode_command_buffer,
@@ -1744,6 +1776,19 @@ impl Engine {
     /// recording) and reserves the `DecodeDyn` slot first (offset stable),
     /// exactly like [`forward`]. The closure records dispatches and returns
     /// the ranges to read back (logits, hidden states, …).
+    /// Grow the HOST_CACHED readback staging buffer to hold at least `bytes`.
+    /// Safe to replace wholesale here: `run_spec_record` waits on its fence each
+    /// call, so no in-flight command buffer references the old region.
+    fn ensure_readback(&mut self, bytes: u64) -> Result<(), Box<dyn Error>> {
+        if self.readback.size >= bytes {
+            return Ok(());
+        }
+        let new = new_readback_region(&self.device, bytes.max(self.readback.size * 2))?;
+        let mut old = std::mem::replace(&mut self.readback, new);
+        old.destroy(&self.device.device);
+        Ok(())
+    }
+
     fn run_spec_record<F>(
         &mut self,
         weights: &WeightsHandle,
@@ -1800,6 +1845,36 @@ impl Engine {
             record(&mut ctx)?
         };
 
+        // Stage results into the HOST_CACHED readback buffer so the host read
+        // below is cache-speed, not write-combined (~185 MB/s on this UMA APU) —
+        // matters for the stochastic spec verify's full-vocab logit readback.
+        // Pack the ranges contiguously and copy each (after a compute→transfer
+        // barrier) before submitting; the host then reads the cached copy.
+        let packed: Vec<u64> = {
+            let total: u64 = ranges.iter().map(|r| r.size).sum();
+            self.ensure_readback(total.max(1))?;
+            command::record_global_barrier(&self.device, self.command_buffer);
+            let mut offs = Vec::with_capacity(ranges.len());
+            let mut dst = 0u64;
+            for r in &ranges {
+                let copy = vk::BufferCopy::default()
+                    .src_offset(r.offset)
+                    .dst_offset(dst)
+                    .size(r.size);
+                unsafe {
+                    self.device.device.cmd_copy_buffer(
+                        self.command_buffer,
+                        r.buffer,
+                        self.readback.buffer,
+                        std::slice::from_ref(&copy),
+                    );
+                }
+                offs.push(dst);
+                dst += r.size;
+            }
+            offs
+        };
+
         unsafe {
             self.device.device.end_command_buffer(self.command_buffer)?;
             self.device.device.reset_fences(&[self.fence])?;
@@ -1815,11 +1890,12 @@ impl Engine {
         #[cfg(feature = "profile_gpu")]
         self.profile.readback_and_print(&self.device);
 
-        let host_ptr = self.scratch.host_ptr.ok_or(
-            "scratch region is not host-visible — spec readback needs host-visible scratch",
-        )?;
+        let host_ptr = self
+            .readback
+            .host_ptr
+            .ok_or("readback region is not host-visible")?;
         let mut out = Vec::with_capacity(ranges.len());
-        for r in &ranges {
+        for (i, r) in ranges.iter().enumerate() {
             if r.size % 4 != 0 {
                 return Err(
                     format!("spec readback range size {} not 4-byte aligned", r.size).into(),
@@ -1827,10 +1903,10 @@ impl Engine {
             }
             let n = (r.size / 4) as usize;
             let mut buf = vec![0f32; n];
-            // SAFETY: r lies within self.scratch (the buffer the ctx wrote to)
-            // and is fully in bounds; host_ptr maps the whole scratch region.
+            // SAFETY: the result was copied to `packed[i]` in the cached readback
+            // buffer (sized by ensure_readback); offset+size are in bounds.
             unsafe {
-                let src = host_ptr.add(r.offset as usize) as *const f32;
+                let src = host_ptr.add(packed[i] as usize) as *const f32;
                 std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
             }
             out.push(buf);
@@ -2091,6 +2167,7 @@ impl Drop for Engine {
                 .destroy_command_pool(self.command_pool, None);
         }
         self.scratch.destroy(&self.device.device);
+        self.readback.destroy(&self.device.device);
         self.descriptors.destroy(&self.device);
         self.pipelines.destroy(&self.device);
     }
