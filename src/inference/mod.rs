@@ -2041,18 +2041,27 @@ impl Engine {
         } else if gpu_stochastic {
             let vocab_u = vocab as u64;
             let outs = self.run_spec_record(weights, |ctx| {
+                // One DecodeDyn slot per verify column, each holding that
+                // column's uniform draw. The fused categorical shader reads
+                // `data_dyn[0].uniform_rng`, so every column must bind its OWN
+                // slot — otherwise all N+1 sample dispatches read the last
+                // column's draw, correlating them and biasing the post-accept
+                // token (not distribution-preserving).
+                //
+                // Allocate the slots BEFORE the forward. Models that bound
+                // per-layer scratch with scratch_checkpoint/restore (qwen35moe)
+                // reclaim and REUSE the offsets above that checkpoint, and the
+                // recorded layer dispatches re-write those offsets at submit
+                // time. The uniform is host-written at record time, so a slot
+                // placed in post-forward scratch would be clobbered by a layer
+                // dispatch before the sampler reads it (garbage uniform →
+                // correct logits, wrong token → nonsense). Allocating first
+                // keeps the slots in the never-reclaimed low region, below the
+                // forward's checkpoint.
+                let dyn_arr = decode_dyn::alloc_array(ctx, (n + 1) as u32)?;
                 let o =
                     model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
                 let logits = o.logits.expect("record_forward_full computes logits");
-                // One DecodeDyn slot per verify column. The fused categorical
-                // shader reads `data_dyn[0].uniform_rng`, and the host writes
-                // that field at record time, so WITHOUT per-column slots all
-                // N+1 sample dispatches would read the LAST column's uniform —
-                // correlating the draws and biasing the post-accept token (not
-                // distribution-preserving). Allocate AFTER the forward recorded
-                // its dispatches against the original ctx.decode_dyn, so the
-                // repoint below only affects the sampler chains.
-                let dyn_arr = decode_dyn::alloc_array(ctx, (n + 1) as u32)?;
                 let mut ranges = Vec::with_capacity(n + 2);
                 for i in 0..=n {
                     ctx.decode_dyn = BufferRange {
