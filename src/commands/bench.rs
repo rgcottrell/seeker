@@ -67,6 +67,13 @@ pub struct BenchArgs {
     #[arg(short = 'm', long = "model")]
     model: Option<PathBuf>,
 
+    /// Speculative-decode draft model and max draft tokens per step
+    /// (`--spec-draft-model` / `--spec-draft-hf` / `--spec-draft-n-max`). With a
+    /// draft and `n_max > 0`, the tg test measures speculative (effective)
+    /// throughput instead of plain decode.
+    #[command(flatten)]
+    spec: crate::commands::download::SpecDraftArgs,
+
     // ─── Workload ───────────────────────────────────────────────────────
     /// Prompt-processing batch size timed at each depth (llama-bench -p).
     #[arg(long = "pp", default_value_t = 512)]
@@ -153,12 +160,43 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
     let backend = engine.device.name();
     tracing::info!(device = %backend, "vulkan device opened");
     let weights = engine.upload_weights(&gguf)?;
-    let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
+    let mut model = crate::models::open(&gguf, weights, bundle, args.spec.spec_draft_n_max > 0)?;
+
+    // Optional MTP draft model (local path or HF repo) for the spec-throughput
+    // tg test. qwen35moe self-spec needs no draft (NextN loads from the base).
+    let draft_path = crate::commands::download::resolve_spec_draft(
+        args.spec.spec_draft_model.clone(),
+        args.spec.spec_draft_hf.clone(),
+        args.hf_token.clone(),
+        args.offline,
+    )
+    .await?;
+    if let Some(draft_path) = &draft_path {
+        let draft_gguf = GgufFile::open(draft_path)?;
+        let draft_weights = engine.upload_weights(&draft_gguf)?;
+        model.attach_mtp_draft(&draft_gguf, draft_weights)?;
+        tracing::info!(path = ?draft_path, "attached MTP draft model");
+    }
+    let spec_n_max = if model.supports_mtp_spec() {
+        args.spec.spec_draft_n_max
+    } else {
+        0
+    };
 
     // Size scratch + KV for the DEEPEST config (deepest live length is
-    // max_depth + max(pp, tg)). Allocated once for the whole sweep.
+    // max_depth + max(pp, tg)). Allocated once for the whole sweep. Spec tg
+    // overshoots a block (≤ n_max) and the verify writes n_max+1 lookahead, so
+    // reserve that headroom too.
     let max_depth = *depths.iter().max().expect("non-empty");
-    let max_seq_len = max_depth.saturating_add(span).saturating_add(1);
+    let spec_headroom = if spec_n_max > 0 {
+        2 * spec_n_max + 2
+    } else {
+        0
+    };
+    let max_seq_len = max_depth
+        .saturating_add(span)
+        .saturating_add(1)
+        .saturating_add(spec_headroom);
     engine.allocate_scratch(model.scratch_bytes_estimate(
         args.ubatch_size,
         max_seq_len,
@@ -223,7 +261,13 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
 
     let mut rows: Vec<[String; 6]> = Vec::new();
     for (is_pp, n) in tests {
-        let kind = if is_pp { "pp" } else { "tg" };
+        let kind = if is_pp {
+            "pp"
+        } else if spec_n_max > 0 {
+            "ts" // tg via speculative decode (effective t/s)
+        } else {
+            "tg"
+        };
         for &depth in &depths {
             // Prefill to `depth` ONCE (untimed), then snapshot the recurrent
             // state and restore it between reps — far cheaper than re-prefilling
@@ -242,6 +286,39 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
                 let t0 = Instant::now();
                 if is_pp {
                     feed_kv(&mut engine, &*model, &mut cache, &dummies, n)?;
+                } else if spec_n_max > 0 {
+                    // Speculative tg: seed `h_last` with one hidden-exposing
+                    // forward, then generate ≥ n tokens via decode_speculative.
+                    // Reports effective t/s (n / wall-time) on synthetic content
+                    // — a throughput micro-bench of the draft+verify machinery
+                    // (acceptance on dummy tokens is not representative).
+                    let pos = cache.position;
+                    let (logits, residual) = engine.forward_full_readback(
+                        &*model,
+                        &mut cache,
+                        &dummies[..1],
+                        pos,
+                        false,
+                    )?;
+                    let mut h_last = residual;
+                    let mut last_token = sampler.sample_one(&logits);
+                    sampler.accept(last_token);
+                    let mut produced = 0usize;
+                    while produced < n as usize {
+                        let p = cache.position;
+                        let out = engine.decode_speculative(
+                            &*model,
+                            &mut cache,
+                            last_token,
+                            &h_last,
+                            p,
+                            &mut sampler,
+                            spec_n_max,
+                        )?;
+                        produced += out.emitted.len();
+                        last_token = out.last_token;
+                        h_last = out.h_last;
+                    }
                 } else {
                     for _ in 0..n {
                         let pos = cache.position;

@@ -133,6 +133,12 @@ pub struct ChatArgs {
     #[arg(short = 'm', long = "model")]
     model: Option<PathBuf>,
 
+    /// Speculative-decode draft model and max draft tokens per step
+    /// (`--spec-draft-model` / `--spec-draft-hf` / `--spec-draft-n-max`). A draft
+    /// with `n_max > 0` enables MTP speculative decoding for replies.
+    #[command(flatten)]
+    spec: crate::commands::download::SpecDraftArgs,
+
     /// Skip reading and writing the line-history file.
     #[arg(long)]
     no_history: bool,
@@ -360,7 +366,32 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let mut engine = Engine::new(args.ubatch_size, args.batch_size)?;
     tracing::info!(device = %engine.device.name(), "vulkan device opened");
     let weights = engine.upload_weights(&gguf)?;
-    let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
+    let mut model = crate::models::open(&gguf, weights, bundle, args.spec.spec_draft_n_max > 0)?;
+
+    // Optional MTP/EAGLE draft model for speculative decoding — a separate
+    // gemma4 `gemma4-assistant` GGUF (local `--spec-draft-model` or HF
+    // `--spec-draft-hf`, downloaded if absent). qwen35moe self-spec needs no
+    // draft (its NextN head loads from the base GGUF via `spec_enabled` above).
+    let draft_path = download::resolve_spec_draft(
+        args.spec.spec_draft_model.clone(),
+        args.spec.spec_draft_hf.clone(),
+        args.hf_token.clone(),
+        args.offline,
+    )
+    .await?;
+    if let Some(draft_path) = &draft_path {
+        let draft_gguf = GgufFile::open(draft_path)?;
+        let draft_weights = engine.upload_weights(&draft_gguf)?;
+        model.attach_mtp_draft(&draft_gguf, draft_weights)?;
+        tracing::info!(path = ?draft_path, "attached MTP draft model");
+    }
+    // Speculative decoding is active when a draft head is available (separate
+    // draft attached, or qwen NextN loaded) and `--spec-draft-n-max > 0`.
+    let spec_n_max = if model.supports_mtp_spec() {
+        args.spec.spec_draft_n_max
+    } else {
+        0
+    };
 
     // `--ctx-size 0` (the default) means "use the model's full trained context"
     // (llama.cpp's `-c 0`); fall back to 4096 if the model omits the metadata.
@@ -393,10 +424,14 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     engine.allocate_scratch(scratch_bytes)?;
 
     let dims = model.cache_dims();
+    // Speculative decode's verify writes up to `n_max + 1` lookahead K/V per
+    // step before truncating, so reserve that headroom on top of the context
+    // window or the final verify writes past the cache and hangs the GPU.
+    let spec_headroom = if spec_n_max > 0 { spec_n_max + 1 } else { 0 };
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
         v_dtype: args.cache_type_v,
-        max_seq_len: ctx_size,
+        max_seq_len: ctx_size + spec_headroom,
         n_head: dims.n_head,
     };
     let mut cache = match model.cache_per_layer_dims() {
@@ -466,6 +501,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         think_open_id,
         think_close_id,
         max_tokens: args.max_tokens,
+        spec_n_max,
         context_shift: args.context_shift,
         keep_turns: args.keep,
         template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
@@ -627,6 +663,10 @@ struct ChatSession {
     think_open_id: Option<u32>,
     think_close_id: Option<u32>,
     max_tokens: u32,
+    /// Max MTP draft tokens per speculative step (0 ⇒ spec-decode off). Active
+    /// only when the model has a draft head (`model.supports_mtp_spec()`); the
+    /// KV cache reserves `spec_n_max + 1` lookahead headroom when nonzero.
+    spec_n_max: u32,
     /// When true, evict the oldest turns to fit instead of stopping at the
     /// context limit (`--context-shift`).
     context_shift: bool,
@@ -1170,8 +1210,7 @@ impl ChatSession {
         // *retcons* it into the real char when the completing token
         // arrives — naive byte-length diffing slices into the middle of
         // that real char and panics.
-        let mut step_tokens = delta;
-        let prompt_tokens = step_tokens.len(); // prefill suffix fed this turn
+        let prompt_tokens = delta.len(); // prefill suffix fed this turn
         let mut prefill_secs = 0.0f64;
         let mut decode_secs = 0.0f64;
         let mut forwards = 0usize;
@@ -1190,119 +1229,232 @@ impl ChatSession {
         let mut cancelled = false;
         let mut ctx_full = false;
         GENERATION_CANCELLED.store(false, Ordering::SeqCst);
-        loop {
-            // Ctrl+C during generation (interactive mode): stop here and keep
-            // whatever was produced so far as the reply. forward_sampled waits
-            // on its fence each call, so breaking between tokens leaves the
-            // cache/position consistent — the partial turn is stored normally.
-            if GENERATION_CANCELLED.load(Ordering::SeqCst) {
-                cancelled = true;
-                break;
-            }
-            if (self.cache.position as usize + step_tokens.len() + 1) as u32
-                > self.cache.config.max_seq_len
-            {
-                // Out of context room. forwards>0 → mid-reply truncation (a
-                // clean stop, partial reply kept); forwards==0 is the
-                // can't-even-start case handled after the loop.
-                ctx_full = forwards > 0;
-                break;
-            }
-            let cache = &mut self.cache;
-            let model = &self.model;
+
+        // Speculative-decode (MTP) path: enabled for plain-text turns when a
+        // draft head is available and `--spec-draft-n-max > 0`. Prefill via the
+        // hidden-exposing forward, then draft+verify blocks. Media turns and the
+        // no-draft case fall through to the single-token loop unchanged.
+        if self.spec_n_max > 0 && !media_in_delta {
             let t0 = std::time::Instant::now();
-            let position = cache.position;
-            // Forward 0 of a media turn splices the encoder embeddings over the
-            // placeholder rows. Image uses the (possibly M-RoPE) image path; audio
-            // (image_dims == None) uses the 1×N audio path. Every other forward —
-            // the rest of the prefill delta and all decode steps — is the normal
-            // text path.
-            let token = if forwards == 0 && media_in_delta {
-                let start = media_start_in_delta.expect("media_in_delta ⇒ start");
-                let embeds = media_embeds.expect("media_in_delta ⇒ embeddings");
-                if let Some((nx, ny)) = image_dims {
-                    self.engine.forward_image_sampled(
-                        &**model,
-                        cache,
-                        &step_tokens,
-                        embeds,
-                        start,
-                        nx,
-                        ny,
-                        &mut self.sampler,
-                    )?
-                } else {
-                    let n = media_n_tok.expect("media_in_delta ⇒ audio n_tok");
-                    self.engine.forward_audio_sampled(
-                        &**model,
-                        cache,
-                        &step_tokens,
-                        embeds,
-                        start,
-                        n,
-                        &mut self.sampler,
-                    )?
+            let (logits, residual) = self.engine.forward_full_readback(
+                &*self.model,
+                &mut self.cache,
+                &delta,
+                common as u32,
+                /* full_logits = */ false,
+            )?;
+            // Seed the draft head's KV from the prompt hiddens (qwen NextN; a
+            // no-op for gemma4, whose draft cross-attends the base K/V).
+            let hsz = residual.len() / delta.len();
+            if delta.len() >= 2 {
+                self.engine.run_mtp_seed(
+                    &*self.model,
+                    &mut self.cache,
+                    &residual[0..(delta.len() - 1) * hsz],
+                    &delta[1..],
+                    common as u32,
+                )?;
+            }
+            prefill_secs = t0.elapsed().as_secs_f64();
+            let mut h_last = residual[(delta.len() - 1) * hsz..delta.len() * hsz].to_vec();
+            let first = self.sampler.sample_one(&logits);
+            self.sampler.accept(first);
+            let mut last_token = first;
+
+            // Per-emitted-token tail (EOS / push / `<think>` transition / UTF-8
+            // stream emit / max-tokens) shared by the first token and each
+            // verified+accepted token. Captures only locals, so the
+            // `decode_speculative` call (borrowing `self.engine`/`cache`/
+            // `sampler`) doesn't conflict; scoped so the &mut captures release
+            // before the epilogue reads `assistant_tokens`. Returns true = STOP.
+            {
+                let eos_ids = self.eos_ids.clone();
+                let max_tokens = self.max_tokens;
+                let think_open = self.think_open_id;
+                let think_close = self.think_close_id;
+                let n_max = self.spec_n_max;
+                let mut emit = |token: u32| -> bool {
+                    if eos_ids.contains(&token) {
+                        assistant_tokens.push(token);
+                        return true;
+                    }
+                    assistant_tokens.push(token);
+                    let was = in_think;
+                    if Some(token) == think_open {
+                        in_think = true;
+                    } else if Some(token) == think_close {
+                        in_think = false;
+                        think_close_at = Some(assistant_tokens.len() - 1);
+                    }
+                    let seg = if was || in_think {
+                        Segment::Thinking
+                    } else {
+                        Segment::Final
+                    };
+                    if let Ok(Some(piece)) = stream.step(token) {
+                        on_text(&piece, seg);
+                    }
+                    assistant_tokens.len() as u32 >= max_tokens
+                };
+
+                let t_dec = std::time::Instant::now();
+                if !emit(first) {
+                    loop {
+                        if GENERATION_CANCELLED.load(Ordering::SeqCst) {
+                            cancelled = true;
+                            break;
+                        }
+                        // Reserve the verify's `n_max + 1` lookahead within the
+                        // cache capacity (sized with that headroom).
+                        if self.cache.position + n_max + 1 > self.cache.config.max_seq_len {
+                            ctx_full = true;
+                            break;
+                        }
+                        let position = self.cache.position;
+                        let out = self.engine.decode_speculative(
+                            &*self.model,
+                            &mut self.cache,
+                            last_token,
+                            &h_last,
+                            position,
+                            &mut self.sampler,
+                            n_max,
+                        )?;
+                        let mut stop = false;
+                        for &tk in &out.emitted {
+                            if emit(tk) {
+                                stop = true;
+                                break;
+                            }
+                        }
+                        last_token = out.last_token;
+                        h_last = out.h_last;
+                        if stop {
+                            break;
+                        }
+                    }
                 }
-            } else {
-                self.engine.forward_sampled(
-                    &**model,
-                    cache,
-                    &step_tokens,
-                    position,
-                    &mut self.sampler,
-                )?
-            };
-            // Forward 0 is the prefill (N = prompt_tokens); the rest are
-            // single-token decode steps. Time them separately, like llama.cpp.
-            let dt = t0.elapsed().as_secs_f64();
-            if forwards == 0 {
-                prefill_secs = dt;
-            } else {
-                decode_secs += dt;
+                decode_secs = t_dec.elapsed().as_secs_f64();
             }
-            forwards += 1;
-            if self.eos_ids.contains(&token) {
-                // Don't emit EOS — but it IS now in the cache (the model
-                // wrote K/V for it). Track that in prior_tokens so the
-                // next render's prefix-match accounts for it.
+            // One "forward" per emitted token, for the epilogue's stats and its
+            // `forwards == 0` guard (mirrors the single-token loop's accounting).
+            forwards = assistant_tokens.len();
+        } else {
+            let mut step_tokens = delta;
+            loop {
+                // Ctrl+C during generation (interactive mode): stop here and keep
+                // whatever was produced so far as the reply. forward_sampled waits
+                // on its fence each call, so breaking between tokens leaves the
+                // cache/position consistent — the partial turn is stored normally.
+                if GENERATION_CANCELLED.load(Ordering::SeqCst) {
+                    cancelled = true;
+                    break;
+                }
+                if (self.cache.position as usize + step_tokens.len() + 1) as u32
+                    > self.cache.config.max_seq_len
+                {
+                    // Out of context room. forwards>0 → mid-reply truncation (a
+                    // clean stop, partial reply kept); forwards==0 is the
+                    // can't-even-start case handled after the loop.
+                    ctx_full = forwards > 0;
+                    break;
+                }
+                let cache = &mut self.cache;
+                let model = &self.model;
+                let t0 = std::time::Instant::now();
+                let position = cache.position;
+                // Forward 0 of a media turn splices the encoder embeddings over the
+                // placeholder rows. Image uses the (possibly M-RoPE) image path; audio
+                // (image_dims == None) uses the 1×N audio path. Every other forward —
+                // the rest of the prefill delta and all decode steps — is the normal
+                // text path.
+                let token = if forwards == 0 && media_in_delta {
+                    let start = media_start_in_delta.expect("media_in_delta ⇒ start");
+                    let embeds = media_embeds.expect("media_in_delta ⇒ embeddings");
+                    if let Some((nx, ny)) = image_dims {
+                        self.engine.forward_image_sampled(
+                            &**model,
+                            cache,
+                            &step_tokens,
+                            embeds,
+                            start,
+                            nx,
+                            ny,
+                            &mut self.sampler,
+                        )?
+                    } else {
+                        let n = media_n_tok.expect("media_in_delta ⇒ audio n_tok");
+                        self.engine.forward_audio_sampled(
+                            &**model,
+                            cache,
+                            &step_tokens,
+                            embeds,
+                            start,
+                            n,
+                            &mut self.sampler,
+                        )?
+                    }
+                } else {
+                    self.engine.forward_sampled(
+                        &**model,
+                        cache,
+                        &step_tokens,
+                        position,
+                        &mut self.sampler,
+                    )?
+                };
+                // Forward 0 is the prefill (N = prompt_tokens); the rest are
+                // single-token decode steps. Time them separately, like llama.cpp.
+                let dt = t0.elapsed().as_secs_f64();
+                if forwards == 0 {
+                    prefill_secs = dt;
+                } else {
+                    decode_secs += dt;
+                }
+                forwards += 1;
+                if self.eos_ids.contains(&token) {
+                    // Don't emit EOS — but it IS now in the cache (the model
+                    // wrote K/V for it). Track that in prior_tokens so the
+                    // next render's prefix-match accounts for it.
+                    assistant_tokens.push(token);
+                    break;
+                }
                 assistant_tokens.push(token);
-                break;
-            }
-            assistant_tokens.push(token);
 
-            // Token-level think transitions detected by id (the boundary is
-            // only reliable here, not in the decoded text). The marker tokens
-            // belong to the reasoning region, so a piece is dimmed if we were
-            // in think before this token OR still are after it — that keeps a
-            // visible `</think>` dimmed with the reasoning rather than the
-            // answer.
-            let was_in_think = in_think;
-            if Some(token) == self.think_open_id {
-                in_think = true;
-            } else if Some(token) == self.think_close_id {
-                in_think = false;
-                think_close_at = Some(assistant_tokens.len() - 1);
-            }
-            let seg = if was_in_think || in_think {
-                Segment::Thinking
-            } else {
-                Segment::Final
-            };
+                // Token-level think transitions detected by id (the boundary is
+                // only reliable here, not in the decoded text). The marker tokens
+                // belong to the reasoning region, so a piece is dimmed if we were
+                // in think before this token OR still are after it — that keeps a
+                // visible `</think>` dimmed with the reasoning rather than the
+                // answer.
+                let was_in_think = in_think;
+                if Some(token) == self.think_open_id {
+                    in_think = true;
+                } else if Some(token) == self.think_close_id {
+                    in_think = false;
+                    think_close_at = Some(assistant_tokens.len() - 1);
+                }
+                let seg = if was_in_think || in_think {
+                    Segment::Thinking
+                } else {
+                    Segment::Final
+                };
 
-            // Stream emit: `step` buffers partial UTF-8 internally and
-            // returns `Some(piece)` only once one or more complete chars
-            // are ready. Errors are rare (the tokenizer succeeds on its
-            // own outputs); on the off-chance we hit one, skip the emit
-            // — the next step's output will catch up.
-            if let Ok(Some(piece)) = stream.step(token) {
-                on_text(&piece, seg);
-            }
+                // Stream emit: `step` buffers partial UTF-8 internally and
+                // returns `Some(piece)` only once one or more complete chars
+                // are ready. Errors are rare (the tokenizer succeeds on its
+                // own outputs); on the off-chance we hit one, skip the emit
+                // — the next step's output will catch up.
+                if let Ok(Some(piece)) = stream.step(token) {
+                    on_text(&piece, seg);
+                }
 
-            if assistant_tokens.len() as u32 >= self.max_tokens {
-                break;
+                if assistant_tokens.len() as u32 >= self.max_tokens {
+                    break;
+                }
+                step_tokens = vec![token];
             }
-            step_tokens = vec![token];
-        }
+        } // end non-speculative decode branch
 
         // No forward ran: the prompt filled the context window exactly
         // (common + delta == --ctx-size), so the loop-top budget guard broke

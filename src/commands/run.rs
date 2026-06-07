@@ -114,20 +114,11 @@ pub struct RunArgs {
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: u32,
 
-    /// Max MTP draft tokens per step for speculative decoding (llama.cpp's
-    /// `--spec-draft-n-max`). 0 (default) disables it and uses the normal
-    /// non-speculative decode loop. Only the qwen35moe model with NextN
-    /// weights supports it; other models silently ignore the flag.
-    #[arg(long = "spec-draft-n-max", default_value_t = 0)]
-    spec_draft_n_max: u32,
-
-    /// Path to a separate MTP/EAGLE draft-model GGUF for speculative decoding,
-    /// paired with the base `-m`/`--hf-file` model. gemma4 ships its draft as a
-    /// standalone `gemma4-assistant` GGUF (unsloth's `MTP/*.gguf`), unlike
-    /// qwen35moe's in-GGUF NextN head. The draft is loaded + validated against
-    /// the base model (hidden width + vocab).
-    #[arg(long = "spec-draft-model")]
-    spec_draft_model: Option<PathBuf>,
+    /// Speculative-decode draft model and max draft tokens per step
+    /// (`--spec-draft-model` / `--spec-draft-hf` / `--spec-draft-n-max`).
+    /// Shared with chat/bench.
+    #[command(flatten)]
+    spec: crate::commands::download::SpecDraftArgs,
 
     /// Do not load the matching mmproj vision projector.
     #[arg(long = "no-mmproj")]
@@ -239,13 +230,21 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         "weights uploaded to GPU",
     );
 
-    let mut model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
+    let mut model = crate::models::open(&gguf, weights, bundle, args.spec.spec_draft_n_max > 0)?;
 
     // Optional separate MTP/EAGLE draft model (gemma4's `gemma4-assistant`
-    // GGUF): upload its weights and attach it to the base model. The base
-    // validates arch + dims and, once attached, reports `supports_mtp_spec()`,
-    // enabling the speculative-decode path below.
-    if let Some(draft_path) = &args.spec_draft_model {
+    // GGUF), from a local path (`--spec-draft-model`) or an HF repo
+    // (`--spec-draft-hf`, downloaded if absent): upload its weights and attach
+    // it to the base. The base validates arch + dims and, once attached,
+    // reports `supports_mtp_spec()`, enabling the speculative-decode path below.
+    let draft_path = download::resolve_spec_draft(
+        args.spec.spec_draft_model.clone(),
+        args.spec.spec_draft_hf.clone(),
+        args.hf_token.clone(),
+        args.offline,
+    )
+    .await?;
+    if let Some(draft_path) = &draft_path {
         let draft_gguf = GgufFile::open(draft_path)?;
         let draft_weights = engine.upload_weights(&draft_gguf)?;
         model.attach_mtp_draft(&draft_gguf, draft_weights)?;
@@ -272,8 +271,8 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     // step before truncating to the accepted length, so the cache must hold
     // `position + (n_max + 1)` at the final step — reserve that headroom or the
     // last verify writes past the cache and hangs the GPU.
-    let spec_lookahead = if args.spec_draft_n_max > 0 && model.supports_mtp_spec() {
-        args.spec_draft_n_max + 1
+    let spec_lookahead = if args.spec.spec_draft_n_max > 0 && model.supports_mtp_spec() {
+        args.spec.spec_draft_n_max + 1
     } else {
         0
     };
@@ -523,8 +522,8 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         // Per-position SSM checkpoint buffers for spec decode — sized for
         // L = (clamped n_draft)+1 snapshots. Lets partial acceptance roll
         // the recurrent state back without a re-run.
-        if args.spec_draft_n_max > 0 && model.supports_mtp_spec() {
-            let max_snapshots = args.spec_draft_n_max.clamp(1, 8) + 1;
+        if args.spec.spec_draft_n_max > 0 && model.supports_mtp_spec() {
+            let max_snapshots = args.spec.spec_draft_n_max.clamp(1, 8) + 1;
             cache.allocate_ssm_snapshots(&engine.device, &ssm, max_snapshots)?;
         }
     }
@@ -550,7 +549,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     // Speculative decode is active only when --spec-draft-n-max > 0 AND the
     // model loaded an MTP head. Otherwise fall through to the unchanged
     // single-token loop (byte-for-byte identical to before).
-    let spec = args.spec_draft_n_max > 0 && model.supports_mtp_spec();
+    let spec = args.spec.spec_draft_n_max > 0 && model.supports_mtp_spec();
     if let Some(prefill) = media_prefill {
         // Multimodal prefill: a single full-prompt pass that splices the encoder
         // embeddings into the residual at the placeholder rows. Sample the first
@@ -596,7 +595,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
             step_tokens = vec![next_id];
         }
     } else if spec {
-        let n_max = args.spec_draft_n_max;
+        let n_max = args.spec.spec_draft_n_max;
         // Prefill via the hidden-exposing forward; sample the first token on
         // the host (the spec path samples on host throughout).
         let t0 = std::time::Instant::now();
