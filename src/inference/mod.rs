@@ -124,6 +124,26 @@ fn new_readback_region(device: &Device, bytes: u64) -> Result<Region, Box<dyn Er
     })
 }
 
+/// Build a `TensorView` over verify column `i` of a `[vocab, n+1]` F32 logits
+/// tensor (column `i` begins at `byte_offset + i * vocab * 4`). Shared by the
+/// greedy and GPU-stochastic spec-verify paths to argmax / sample each position
+/// on the GPU and read back only the chosen token id.
+fn verify_col(
+    logits: &crate::inference::weights::TensorView,
+    i: usize,
+    vocab: u64,
+) -> crate::inference::weights::TensorView {
+    crate::inference::weights::TensorView {
+        buffer: logits.buffer,
+        byte_offset: logits.byte_offset + i as u64 * vocab * 4,
+        byte_size: vocab * 4,
+        dims: [vocab, 1, 1, 1],
+        byte_stride: [4, vocab * 4, vocab * 4, vocab * 4],
+        element_stride: [1, vocab, vocab, vocab],
+        dtype: crate::gguf::GgmlType::F32,
+    }
+}
+
 /// Result of one MTP speculative-decode step ([`Engine::decode_speculative`]).
 pub struct SpecStepOut {
     /// Tokens accepted this step (`accept_len + 1`, always ≥ 1): the matched
@@ -1976,12 +1996,20 @@ impl Engine {
         let verify_tokens: Vec<u32> = std::iter::once(last_token)
             .chain(drafts.iter().copied())
             .collect();
-        // Greedy + no penalties → argmax each verify position on the GPU and
-        // read back only N+1 token ids (4 bytes each), avoiding the ~5 MB
-        // write-combined logits readback. Lossless and identical to the
-        // non-spec greedy path. Stochastic / penalty configs take the host
-        // sample-and-compare path (reads back full logits).
-        let greedy_verify = sampler.config().is_greedy() && !sampler.config().any_penalty();
+        // Verify-path selection. Both GPU paths sample each verify position on
+        // the GPU and read back only N+1 token ids (4 bytes each), avoiding the
+        // ~MBs write-combined full-logits readback:
+        //   greedy_verify  : argmax each column (record_greedy) — lossless,
+        //                    identical to non-spec greedy.
+        //   gpu_stochastic : sample each column (record_chain, the same chain
+        //                    non-spec decode uses) — distribution-preserving.
+        // Penalty configs stay on the host sample-and-compare path: per-position
+        // penalties depend on tokens accepted earlier in this same step (the
+        // recent ring is updated between columns), so parallel per-column GPU
+        // sampling would be wrong.
+        let any_penalty = sampler.config().any_penalty();
+        let greedy_verify = sampler.config().is_greedy() && !any_penalty;
+        let gpu_stochastic = !sampler.config().is_greedy() && !any_penalty;
         let t_verify = std::time::Instant::now();
         let (emitted, residual): (Vec<u32>, Vec<f32>) = if greedy_verify {
             let vocab_u = vocab as u64;
@@ -1991,15 +2019,7 @@ impl Engine {
                 let logits = o.logits.expect("record_forward_full computes logits");
                 let mut ranges = Vec::with_capacity(n + 2);
                 for i in 0..=n {
-                    let col = crate::inference::weights::TensorView {
-                        buffer: logits.buffer,
-                        byte_offset: logits.byte_offset + i as u64 * vocab_u * 4,
-                        byte_size: vocab_u * 4,
-                        dims: [vocab_u, 1, 1, 1],
-                        byte_stride: [4, vocab_u * 4, vocab_u * 4, vocab_u * 4],
-                        element_stride: [1, vocab_u, vocab_u, vocab_u],
-                        dtype: crate::gguf::GgmlType::F32,
-                    };
+                    let col = verify_col(&logits, i, vocab_u);
                     ranges.push(crate::inference::ops::sampler::record_greedy(ctx, col)?);
                 }
                 ranges.push(o.residual.range());
@@ -2010,6 +2030,52 @@ impl Engine {
             let mut emitted = Vec::with_capacity(n + 1);
             for i in 0..=n {
                 let s = main_argmax[i];
+                sampler.accept(s);
+                emitted.push(s);
+                if i < n && s == drafts[i] {
+                    continue;
+                }
+                break;
+            }
+            (emitted, outs[n + 1].clone())
+        } else if gpu_stochastic {
+            let vocab_u = vocab as u64;
+            let outs = self.run_spec_record(weights, |ctx| {
+                let o =
+                    model.record_forward_full(ctx, cache, &verify_tokens, position, true, true)?;
+                let logits = o.logits.expect("record_forward_full computes logits");
+                // One DecodeDyn slot per verify column. The fused categorical
+                // shader reads `data_dyn[0].uniform_rng`, and the host writes
+                // that field at record time, so WITHOUT per-column slots all
+                // N+1 sample dispatches would read the LAST column's uniform —
+                // correlating the draws and biasing the post-accept token (not
+                // distribution-preserving). Allocate AFTER the forward recorded
+                // its dispatches against the original ctx.decode_dyn, so the
+                // repoint below only affects the sampler chains.
+                let dyn_arr = decode_dyn::alloc_array(ctx, (n + 1) as u32)?;
+                let mut ranges = Vec::with_capacity(n + 2);
+                for i in 0..=n {
+                    ctx.decode_dyn = BufferRange {
+                        buffer: dyn_arr.buffer,
+                        offset: dyn_arr.offset + i as u64 * decode_dyn::DecodeDyn::SIZE,
+                        size: decode_dyn::DecodeDyn::SIZE,
+                    };
+                    let col = verify_col(&logits, i, vocab_u);
+                    // Draws its own uniform (N+1 host RNG draws this step) and
+                    // samples its column on the GPU.
+                    ranges.push(sampler.record_chain(ctx, col)?);
+                }
+                ranges.push(o.residual.range());
+                Ok(ranges)
+            })?;
+            let gpu_sample: Vec<u32> = (0..=n).map(|i| outs[i][0].to_bits()).collect();
+            // Sample-and-compare on host (pure comparison, no logits): emit our
+            // GPU sample at each position, accept the draft only while it equals
+            // our sample, stop at the first mismatch. Every emitted token is a
+            // faithful target sample — same structure as the greedy path.
+            let mut emitted = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let s = gpu_sample[i];
                 sampler.accept(s);
                 emitted.push(s);
                 if i < n && s == drafts[i] {
