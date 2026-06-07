@@ -23,6 +23,37 @@ pub struct DownloadArgs {
     /// Do not auto-fetch the matching mmproj-*.gguf sidecar.
     #[arg(long = "no-mmproj")]
     no_mmproj: bool,
+    /// Also fetch a speculative-decode draft model (ORG/NAME[:QUANT], like
+    /// --hf-repo). The QUANT tag must uniquely identify the draft file
+    /// (e.g. `:MTP-Q8_0` for unsloth's in-repo gemma4 MTP draft).
+    #[arg(long = "spec-draft-hf")]
+    spec_draft_hf: Option<String>,
+}
+
+/// Speculative-decode draft-model selection, shared (via `#[command(flatten)]`)
+/// by the `run`, `chat`, and `bench` commands. A gemma4 MTP draft is a separate
+/// GGUF: supply it as a local path (`--spec-draft-model`) or an HF repo
+/// (`--spec-draft-hf`, auto-downloaded) — the two are mutually exclusive.
+#[derive(Args, Clone)]
+pub(crate) struct SpecDraftArgs {
+    /// Path to a separate MTP/EAGLE draft-model GGUF for speculative decoding,
+    /// paired with the base model (gemma4's `gemma4-assistant` draft, unlike
+    /// qwen35moe's in-GGUF NextN head). The draft is validated against the base.
+    #[arg(long = "spec-draft-model")]
+    pub spec_draft_model: Option<PathBuf>,
+
+    /// HF repo id of the draft model (ORG/NAME[:QUANT], like --hf-repo);
+    /// resolved + downloaded if not already cached. Mutually exclusive with
+    /// --spec-draft-model. The QUANT tag must uniquely identify the draft file
+    /// (e.g. `:MTP-Q8_0`).
+    #[arg(long = "spec-draft-hf", conflicts_with = "spec_draft_model")]
+    pub spec_draft_hf: Option<String>,
+
+    /// Max MTP draft tokens per step for speculative decoding (llama.cpp's
+    /// `--spec-draft-n-max`). 0 (default) disables it (normal decode). Needs a
+    /// draft model (`--spec-draft-model` / `--spec-draft-hf`) to take effect.
+    #[arg(long = "spec-draft-n-max", default_value_t = 0)]
+    pub spec_draft_n_max: u32,
 }
 
 /// Split a string into lowercase tokens on `.` and `-`. Empty tokens dropped.
@@ -448,12 +479,41 @@ pub(crate) async fn resolve_hf(
     Ok(Resolved { main, mmproj })
 }
 
+/// Resolve a speculative-decode draft model to a local GGUF path: an explicit
+/// `--spec-draft-model` path, or `--spec-draft-hf ORG/NAME[:QUANT]` resolved +
+/// downloaded via the shared HF resolver (no mmproj sidecar). Returns `None`
+/// when neither is set. clap enforces the mutual exclusion, so `hf` wins when
+/// present. `token`/`offline` come from the command's `--hf-token`/`--offline`
+/// (or their defaults: `HF_TOKEN` env / cached token, online).
+pub(crate) async fn resolve_spec_draft(
+    model: Option<PathBuf>,
+    hf: Option<String>,
+    token: Option<String>,
+    offline: bool,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    if let Some(repo) = hf {
+        let resolved = resolve_hf(
+            &HfResolveArgs {
+                repo,
+                file: None,
+                token,
+                offline,
+            },
+            /* want_mmproj = */ false,
+        )
+        .await?;
+        Ok(Some(resolved.main))
+    } else {
+        Ok(model)
+    }
+}
+
 pub async fn run(args: DownloadArgs) -> Result<(), Box<dyn Error>> {
     let resolved = resolve_hf(
         &HfResolveArgs {
             repo: args.hf_repo,
             file: args.hf_file,
-            token: args.hf_token,
+            token: args.hf_token.clone(),
             offline: args.offline,
         },
         !args.no_mmproj,
@@ -462,6 +522,12 @@ pub async fn run(args: DownloadArgs) -> Result<(), Box<dyn Error>> {
     println!("{}", resolved.main.display());
     if let Some(mmproj) = resolved.mmproj {
         println!("{}", mmproj.display());
+    }
+    // Optionally pre-fetch a speculative-decode draft model alongside the base.
+    if let Some(draft) =
+        resolve_spec_draft(None, args.spec_draft_hf, args.hf_token, args.offline).await?
+    {
+        println!("{}", draft.display());
     }
     Ok(())
 }
