@@ -232,6 +232,13 @@ pub async fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
             ssm.conv_state_floats,
             ssm.gdn_state_floats,
         )?;
+        // Per-position SSM checkpoint buffers for the speculative tg path — the
+        // verify rolls the GDN state back to the accepted length via these (see
+        // chat.rs / run.rs). Without them a hybrid model's spec output drifts.
+        if spec_n_max > 0 {
+            let max_snapshots = spec_n_max.clamp(1, 8) + 1;
+            cache.allocate_ssm_snapshots(&engine.device, &ssm, max_snapshots)?;
+        }
     }
 
     // Greedy sampler — bench measures tok/s, not sampling behavior.
