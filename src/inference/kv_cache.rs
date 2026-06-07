@@ -211,6 +211,40 @@ impl KvCache {
         // total several GiB.
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
         let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+
+        // Preflight: a KV cache larger than the GPU heap it lives in would OOM
+        // the allocation and (on RADV/amdgpu) wedge the device into a
+        // device-lost. Total the per-layer K+V bytes up front and fail with an
+        // actionable error instead. The 90% margin leaves room for weights /
+        // scratch / other allocations sharing the heap. `head_dim × max_seq_len`
+        // grows the cache, so an oversized `--ctx-size` is the usual trigger.
+        let total_kv: u64 = (0..n_layer as usize)
+            .map(|il| {
+                let hd = head_dims[il] as u64;
+                let nkv = n_head_kvs[il] as u64;
+                align_up(tensor_bytes(hd, max_seq_len, nkv, k_dtypes[il]), align)
+                    + align_up(tensor_bytes(hd, max_seq_len, nkv, v_dtypes[il]), align)
+            })
+            .sum();
+        if let Some(heap) = crate::inference::memory::heap_size_for_buffer(device, usage, mem) {
+            let budget = heap / 10 * 9;
+            if total_kv > budget {
+                const GIB: f64 = (1u64 << 30) as f64;
+                return Err(format!(
+                    "KV cache needs {:.1} GiB (max_seq_len={}, {} layers, k={:?} v={:?}) but \
+                     the GPU memory heap is only {:.1} GiB — lower --ctx-size, or use a smaller \
+                     cache dtype (e.g. --cache-type-k q8_0 --cache-type-v q8_0).",
+                    total_kv as f64 / GIB,
+                    config.max_seq_len,
+                    n_layer,
+                    config.k_dtype,
+                    config.v_dtype,
+                    heap as f64 / GIB,
+                )
+                .into());
+            }
+        }
+
         let mut regions = Vec::with_capacity(n_layer as usize);
         let mut k_layers = Vec::with_capacity(n_layer as usize);
         let mut v_layers = Vec::with_capacity(n_layer as usize);

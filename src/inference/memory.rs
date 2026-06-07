@@ -250,6 +250,30 @@ impl DeviceBuffer {
     }
 }
 
+/// Size (bytes) of the memory heap a buffer with `usage` + `required` memory
+/// flags would allocate from — the same memory-type selection [`Region::new`]
+/// makes. Used for a pre-allocation budget check (e.g. the KV cache) so an
+/// oversized request fails with an actionable error instead of OOM-ing the
+/// device (which, on some drivers, wedges it into a device-lost). Returns
+/// `None` if no memory type matches (the real allocation then fails precisely).
+pub(crate) fn heap_size_for_buffer(
+    device: &Device,
+    usage: vk::BufferUsageFlags,
+    required: vk::MemoryPropertyFlags,
+) -> Option<u64> {
+    let buf_info = vk::BufferCreateInfo::default()
+        .size(1)
+        .usage(usage | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe { device.device.create_buffer(&buf_info, None) }.ok()?;
+    let reqs = unsafe { device.device.get_buffer_memory_requirements(buffer) };
+    let mem_type = pick_memory_type(&device.mem_props, reqs.memory_type_bits, required);
+    unsafe { device.device.destroy_buffer(buffer, None) };
+    let mt = mem_type? as usize;
+    let heap_idx = device.mem_props.memory_types[mt].heap_index as usize;
+    Some(device.mem_props.memory_heaps[heap_idx].size)
+}
+
 fn pick_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
