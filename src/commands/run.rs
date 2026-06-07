@@ -121,6 +121,14 @@ pub struct RunArgs {
     #[arg(long = "spec-draft-n-max", default_value_t = 0)]
     spec_draft_n_max: u32,
 
+    /// Path to a separate MTP/EAGLE draft-model GGUF for speculative decoding,
+    /// paired with the base `-m`/`--hf-file` model. gemma4 ships its draft as a
+    /// standalone `gemma4-assistant` GGUF (unsloth's `MTP/*.gguf`), unlike
+    /// qwen35moe's in-GGUF NextN head. The draft is loaded + validated against
+    /// the base model (hidden width + vocab).
+    #[arg(long = "spec-draft-model")]
+    spec_draft_model: Option<PathBuf>,
+
     /// Do not load the matching mmproj vision projector.
     #[arg(long = "no-mmproj")]
     no_mmproj: bool,
@@ -231,7 +239,18 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         "weights uploaded to GPU",
     );
 
-    let model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
+    let mut model = crate::models::open(&gguf, weights, bundle, args.spec_draft_n_max > 0)?;
+
+    // Optional separate MTP/EAGLE draft model (gemma4's `gemma4-assistant`
+    // GGUF): upload its weights and attach it to the base model. The base
+    // validates arch + dims and, once attached, reports `supports_mtp_spec()`,
+    // enabling the speculative-decode path below.
+    if let Some(draft_path) = &args.spec_draft_model {
+        let draft_gguf = GgufFile::open(draft_path)?;
+        let draft_weights = engine.upload_weights(&draft_gguf)?;
+        model.attach_mtp_draft(&draft_gguf, draft_weights)?;
+        tracing::info!(path = ?draft_path, "attached MTP draft model");
+    }
 
     // Phase 1: load the mmproj vision projector alongside the model when no
     // media (`--image`/`--audio`) was given (held in a local so it stays alive;
@@ -249,9 +268,19 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     // the whole prompt in one pass (the splice isn't chunk-aware yet), so size
     // it for the full prompt and take the max with the vision tower's working
     // set.
+    // Speculative decode's verify writes up to `n_max + 1` lookahead K/V per
+    // step before truncating to the accepted length, so the cache must hold
+    // `position + (n_max + 1)` at the final step — reserve that headroom or the
+    // last verify writes past the cache and hangs the GPU.
+    let spec_lookahead = if args.spec_draft_n_max > 0 && model.supports_mtp_spec() {
+        args.spec_draft_n_max + 1
+    } else {
+        0
+    };
     let max_seq_len = args
         .max_tokens
         .saturating_add(tokens.len() as u32)
+        .saturating_add(spec_lookahead)
         .max(tokens.len() as u32);
     let decoder_scratch = if media_setup.is_some() {
         model.scratch_bytes_estimate(0, max_seq_len, args.cache_type_k, args.cache_type_v)

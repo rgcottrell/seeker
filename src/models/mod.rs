@@ -12,6 +12,7 @@ use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
 
 pub mod gemma4;
+pub mod gemma4_assistant;
 pub mod llama;
 pub mod qwen35moe;
 
@@ -233,6 +234,20 @@ pub trait Model: Send + Sync {
     /// load time). The engine's `decode_speculative` path requires this.
     fn supports_mtp_spec(&self) -> bool {
         false
+    }
+
+    /// Attach a *separate* MTP/EAGLE draft model from its own GGUF (gemma4's
+    /// `gemma4-assistant`), paired with this base model for speculative
+    /// decoding. `handle` is the draft GGUF's uploaded weights. After a
+    /// successful attach, [`supports_mtp_spec`](Self::supports_mtp_spec)
+    /// returns true. Models with an in-GGUF NextN head (qwen35moe) or no MTP
+    /// support return an error. Default: unsupported.
+    fn attach_mtp_draft(
+        &mut self,
+        _gguf: &GgufFile,
+        _handle: WeightsHandle,
+    ) -> Result<(), Box<dyn Error>> {
+        Err("model does not support a separate MTP draft head".into())
     }
 
     /// Record a forward pass that also exposes the per-position hidden
