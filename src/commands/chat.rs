@@ -453,6 +453,15 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
             gdn_state_floats = ssm.gdn_state_floats,
             "ssm state allocated",
         );
+        // Per-position SSM checkpoint buffers for speculative decode (qwen35moe
+        // NextN). Without these, `decode_speculative`'s verify advances the GDN
+        // recurrent state through all N+1 draft positions but never rolls it
+        // back to the accepted length (finalize is gated on these snapshots), so
+        // a hybrid model's output drifts — worse with larger --spec-draft-n-max.
+        if spec_n_max > 0 {
+            let max_snapshots = spec_n_max.clamp(1, 8) + 1;
+            cache.allocate_ssm_snapshots(&engine.device, &ssm, max_snapshots)?;
+        }
     }
 
     // GGUF-embedded sampling defaults (`general.sampling.*`) seed the sampler,
