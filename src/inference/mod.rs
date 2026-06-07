@@ -144,6 +144,19 @@ fn verify_col(
     }
 }
 
+/// Slot `i` of a contiguous `DecodeDyn` array. Each per-sequence / per-column
+/// sampler dispatch binds its own slot so its host-written `uniform_rng` isn't
+/// shared — a single slot makes every fused-categorical dispatch read
+/// `data_dyn[0].uniform_rng` from the same place, so all draws collapse onto the
+/// last one written (correlated sampling).
+fn dyn_slot(arr: BufferRange, i: usize) -> BufferRange {
+    BufferRange {
+        buffer: arr.buffer,
+        offset: arr.offset + i as u64 * decode_dyn::DecodeDyn::SIZE,
+        size: decode_dyn::DecodeDyn::SIZE,
+    }
+}
+
 /// Result of one MTP speculative-decode step ([`Engine::decode_speculative`]).
 pub struct SpecStepOut {
     /// Tokens accepted this step (`accept_len + 1`, always ≥ 1): the matched
@@ -501,6 +514,12 @@ impl Engine {
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
+            // Per-sequence DecodeDyn slots (see dyn_slot): each sampler's
+            // record_chain host-writes its uniform to its OWN slot, so concurrent
+            // sequences don't collapse onto the last one's draw. Allocated BEFORE
+            // the forward so a model that reclaims per-layer scratch (qwen35moe
+            // SSM) can't clobber the host-written uniform at submit time.
+            let sampler_dyn = decode_dyn::alloc_array(&mut ctx, b as u32)?;
             let logits = model.record_forward_batch(&mut ctx, batch, tokens, positions, slots)?;
             let vocab = logits.dims[0];
             let elem = logits.byte_stride[0];
@@ -516,6 +535,7 @@ impl Engine {
                     element_stride: [1, vocab, vocab, vocab],
                     dtype: logits.dtype,
                 };
+                ctx.decode_dyn = dyn_slot(sampler_dyn, s);
                 ranges.push(sampler.record_chain(&mut ctx, col)?);
             }
             ranges
@@ -633,6 +653,12 @@ impl Engine {
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
+            // Per-sequence DecodeDyn slots (see dyn_slot): each sampler's
+            // record_chain host-writes its uniform to its OWN slot, so concurrent
+            // sequences don't collapse onto the last one's draw. Allocated BEFORE
+            // the forward so a model that reclaims per-layer scratch (qwen35moe
+            // SSM) can't clobber the host-written uniform at submit time.
+            let sampler_dyn = decode_dyn::alloc_array(&mut ctx, b as u32)?;
             let logits = model
                 .record_forward_unified(&mut ctx, batch, tokens, positions, seq_lens, slots)?;
             let vocab = logits.dims[0];
@@ -648,6 +674,7 @@ impl Engine {
                     element_stride: [1, vocab, vocab, vocab],
                     dtype: logits.dtype,
                 };
+                ctx.decode_dyn = dyn_slot(sampler_dyn, s);
                 ranges.push(sampler.record_chain(&mut ctx, col)?);
             }
             ranges
@@ -2064,11 +2091,7 @@ impl Engine {
                 let logits = o.logits.expect("record_forward_full computes logits");
                 let mut ranges = Vec::with_capacity(n + 2);
                 for i in 0..=n {
-                    ctx.decode_dyn = BufferRange {
-                        buffer: dyn_arr.buffer,
-                        offset: dyn_arr.offset + i as u64 * decode_dyn::DecodeDyn::SIZE,
-                        size: decode_dyn::DecodeDyn::SIZE,
-                    };
+                    ctx.decode_dyn = dyn_slot(dyn_arr, i);
                     let col = verify_col(&logits, i, vocab_u);
                     // Draws its own uniform (N+1 host RNG draws this step) and
                     // samples its column on the GPU.
