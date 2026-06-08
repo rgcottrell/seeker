@@ -448,6 +448,7 @@ async fn bench_concurrent(args: ProbeArgs) -> Result<(), Box<dyn Error>> {
         n_ubatch: args.ubatch_size,
         n_batch: args.batch_size,
         ctx_size,
+        ctx_auto: false, // probe pins an explicit ctx per sweep (no auto-fit)
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
         n_slots: max_b, // explicit (bench pins the slot count per sweep)

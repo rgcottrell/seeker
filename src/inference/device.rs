@@ -97,6 +97,10 @@ pub struct Device {
     pub shader_subgroup_rotate_clustered: bool,
     pub coop_matrix: bool,
     pub coop_matrix2: bool,
+    /// `VK_EXT_memory_budget` enabled — the budget code may query live free
+    /// bytes per heap (`VkPhysicalDeviceMemoryBudgetPropertiesEXT`) instead of
+    /// the static heap size. `false` ⇒ fall back to the nominal heap capacity.
+    pub has_memory_budget: bool,
     /// Compute-unit count (AMD `activeComputeUnitCount`), used to size
     /// flash-attention split-K the way llama.cpp does. 0 when the device
     /// doesn't advertise `VK_AMD_shader_core_properties2`.
@@ -238,6 +242,7 @@ impl Device {
             coop_matrix_ext,
             coop_matrix2_ext,
             shader_core_props2_ext,
+            memory_budget_ext,
         } = pick_physical_device(&instance)?;
 
         // Pull the legacy 1.0 properties (for `limits`) and the
@@ -382,6 +387,7 @@ impl Device {
             shader_subgroup_rotate_clustered,
             coop_matrix,
             coop_matrix2,
+            has_memory_budget = memory_budget_ext,
             shader_core_count,
             min_subgroup_size,
             max_subgroup_size,
@@ -462,6 +468,9 @@ impl Device {
         if coop_matrix2 {
             device_exts.push(vk::NV_COOPERATIVE_MATRIX2_NAME.as_ptr());
         }
+        if memory_budget_ext {
+            device_exts.push(vk::EXT_MEMORY_BUDGET_NAME.as_ptr());
+        }
 
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
@@ -521,6 +530,7 @@ impl Device {
             shader_subgroup_rotate_clustered,
             coop_matrix,
             coop_matrix2,
+            has_memory_budget: memory_budget_ext,
             shader_core_count,
             min_subgroup_size,
             max_subgroup_size,
@@ -556,6 +566,7 @@ struct DevicePick {
     coop_matrix_ext: bool,
     coop_matrix2_ext: bool,
     shader_core_props2_ext: bool,
+    memory_budget_ext: bool,
 }
 
 fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error>> {
@@ -585,6 +596,10 @@ fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error
         let coop_matrix_ext = has_ext(vk::KHR_COOPERATIVE_MATRIX_NAME);
         let coop_matrix2_ext = has_ext(vk::NV_COOPERATIVE_MATRIX2_NAME);
         let shader_core_props2_ext = has_ext(vk::AMD_SHADER_CORE_PROPERTIES2_NAME);
+        // VK_EXT_memory_budget: lets the budget code read live free bytes per
+        // heap (vs the static heap size), so the memory fitter accounts for the
+        // OS / other apps sharing the unified DDR5 on an APU.
+        let memory_budget_ext = has_ext(vk::EXT_MEMORY_BUDGET_NAME);
 
         let queue_families = unsafe { instance.get_physical_device_queue_family_properties(p) };
         let qf = queue_families
@@ -600,6 +615,7 @@ fn pick_physical_device(instance: &Instance) -> Result<DevicePick, Box<dyn Error
             coop_matrix_ext,
             coop_matrix2_ext,
             shader_core_props2_ext,
+            memory_budget_ext,
         });
     }
     Err("no Vulkan 1.4 physical device with a compute queue found".into())

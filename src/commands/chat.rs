@@ -24,7 +24,10 @@ use crate::commands::download;
 use crate::commands::download::{HfResolveArgs, resolve_hf};
 use crate::gguf::{GgmlType, GgufFile, MetadataValue};
 use crate::inference::Engine;
-use crate::inference::kv_cache::{KvCacheConfig, parse_dtype};
+use crate::inference::budget;
+use crate::inference::kv_cache::{
+    KvCacheConfig, estimate_kv_bytes, estimate_kv_bytes_uniform, estimate_ssm_bytes, parse_dtype,
+};
 use crate::inference::sample::{GgufSamplingDefaults, Sampler, SamplerConfig};
 use crate::tokenizer::build_tokenizer;
 use crate::vision::encoder::{HostWeights, VisionEncoder};
@@ -393,13 +396,99 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         0
     };
 
+    // Speculative decode's verify writes up to `n_max + 1` lookahead K/V per
+    // step before truncating, so reserve that headroom on top of the context
+    // window or the final verify writes past the cache and hangs the GPU.
+    let spec_headroom = if spec_n_max > 0 { spec_n_max + 1 } else { 0 };
+
     // `--ctx-size 0` (the default) means "use the model's full trained context"
     // (llama.cpp's `-c 0`); fall back to 4096 if the model omits the metadata.
-    let ctx_size = if args.ctx_size == 0 {
+    let mut ctx_size = if args.ctx_size == 0 {
         gguf.trained_ctx_len().unwrap_or(4096)
     } else {
         args.ctx_size
     };
+    let requested_ctx = ctx_size;
+
+    // Auto-fit the context to GPU memory when it was left unset (`--ctx-size 0`
+    // → trained max): pick the largest ctx whose weights + KV + scratch fit live
+    // free memory, so a dense model with a 256K default starts instead of
+    // wedging the device. An explicit `--ctx-size` is honored verbatim (the
+    // holistic preflight in `allocate_kv_cache*` fail-fasts if it doesn't fit).
+    if args.ctx_size == 0 && budget::fit_enabled() {
+        let dims = model.cache_dims();
+        let per_layer = model.cache_per_layer_dims();
+        let align = engine
+            .device
+            .limits
+            .min_storage_buffer_offset_alignment
+            .max(1);
+        let weights_bytes = model.weights().total_bytes;
+        let ssm_bytes = model
+            .ssm_state_dims()
+            .map(|d| estimate_ssm_bytes(&d, align))
+            .unwrap_or(0);
+        // Weights are already resident; SSM state is ctx-independent — net both
+        // out of the budget up front so the search varies only KV + scratch.
+        let hb = budget::kv_heap_budget(&engine.device, 0.9);
+        let usable = hb.usable_for_new(weights_bytes).saturating_sub(ssm_bytes);
+        let cost_at = |ctx: u32| -> u64 {
+            let cfg = KvCacheConfig {
+                k_dtype: args.cache_type_k,
+                v_dtype: args.cache_type_v,
+                max_seq_len: ctx + spec_headroom,
+                n_head: dims.n_head,
+            };
+            let kv = match &per_layer {
+                Some((hd, nkv)) => estimate_kv_bytes(hd, nkv, &cfg, align),
+                None => estimate_kv_bytes_uniform(
+                    dims.n_layer,
+                    dims.head_dim,
+                    dims.n_head_kv,
+                    &cfg,
+                    align,
+                ),
+            };
+            let scratch = model.scratch_bytes_estimate(
+                args.ubatch_size,
+                ctx,
+                args.cache_type_k,
+                args.cache_type_v,
+            );
+            kv + scratch
+        };
+        match budget::fit_ctx(
+            ctx_size,
+            budget::fit_min_ctx().min(ctx_size),
+            usable,
+            cost_at,
+        ) {
+            Ok(c) => {
+                if c < ctx_size {
+                    tracing::warn!(
+                        requested = ctx_size,
+                        chosen = c,
+                        "ctx auto-reduced to fit GPU memory (--fit); pass --ctx-size to override \
+                         or SEEKER_FIT=0 to disable"
+                    );
+                }
+                ctx_size = c;
+            }
+            Err(e) => {
+                const GIB: f64 = (1u64 << 30) as f64;
+                return Err(format!(
+                    "model weights ({:.1} GiB) + min KV/scratch at ctx {} don't fit GPU memory: \
+                     need {:.1} GiB but only {:.1} GiB usable — use a smaller --cache-type-k/v or \
+                     free memory",
+                    weights_bytes as f64 / GIB,
+                    e.floor,
+                    e.need as f64 / GIB,
+                    e.usable as f64 / GIB,
+                )
+                .into());
+            }
+        }
+    }
     tracing::info!(ctx_size, "context window");
 
     // The mmproj vision sidecar (if resolved and not `--no-mmproj`). The vision
@@ -424,10 +513,6 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     engine.allocate_scratch(scratch_bytes)?;
 
     let dims = model.cache_dims();
-    // Speculative decode's verify writes up to `n_max + 1` lookahead K/V per
-    // step before truncating, so reserve that headroom on top of the context
-    // window or the final verify writes past the cache and hangs the GPU.
-    let spec_headroom = if spec_n_max > 0 { spec_n_max + 1 } else { 0 };
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
         v_dtype: args.cache_type_v,
@@ -462,6 +547,35 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
             let max_snapshots = spec_n_max.clamp(1, 8) + 1;
             cache.allocate_ssm_snapshots(&engine.device, &ssm, max_snapshots)?;
         }
+    }
+
+    // Startup memory breakdown (the `llama_memory_breakdown_print` analog):
+    // weights / KV / scratch / SSM vs the heap, plus the chosen vs requested
+    // context. Uses the *actual* allocated KV bytes (`cache.kv_bytes()`).
+    {
+        let align = engine
+            .device
+            .limits
+            .min_storage_buffer_offset_alignment
+            .max(1);
+        let ssm = model
+            .ssm_state_dims()
+            .map(|d| estimate_ssm_bytes(&d, align))
+            .unwrap_or(0);
+        let proj = budget::MemoryProjection {
+            weights: model.weights().total_bytes,
+            scratch: scratch_bytes,
+            kv: cache.kv_bytes(),
+            ssm,
+            prefix_pool: 0,
+        };
+        budget::log_breakdown(
+            &proj,
+            &budget::kv_heap_budget(&engine.device, 0.9),
+            requested_ctx,
+            ctx_size,
+            1,
+        );
     }
 
     // GGUF-embedded sampling defaults (`general.sampling.*`) seed the sampler,

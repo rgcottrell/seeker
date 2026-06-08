@@ -250,17 +250,18 @@ impl DeviceBuffer {
     }
 }
 
-/// Size (bytes) of the memory heap a buffer with `usage` + `required` memory
-/// flags would allocate from — the same memory-type selection [`Region::new`]
-/// makes. Used for a pre-allocation budget check (e.g. the KV cache) so an
+/// Heap index a buffer with `usage` + `required` memory flags would allocate
+/// from — the same memory-type → heap mapping [`Region::new`] makes. Used for a
+/// pre-allocation budget check (e.g. the KV cache): the budget code reads the
+/// heap's static size and (via `VK_EXT_memory_budget`) its live free bytes so an
 /// oversized request fails with an actionable error instead of OOM-ing the
-/// device (which, on some drivers, wedges it into a device-lost). Returns
-/// `None` if no memory type matches (the real allocation then fails precisely).
-pub(crate) fn heap_size_for_buffer(
+/// device (which, on some drivers, wedges it into a device-lost). `None` if no
+/// memory type matches (the real allocation then fails precisely).
+pub(crate) fn heap_index_for_buffer(
     device: &Device,
     usage: vk::BufferUsageFlags,
     required: vk::MemoryPropertyFlags,
-) -> Option<u64> {
+) -> Option<usize> {
     let buf_info = vk::BufferCreateInfo::default()
         .size(1)
         .usage(usage | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
@@ -270,8 +271,7 @@ pub(crate) fn heap_size_for_buffer(
     let mem_type = pick_memory_type(&device.mem_props, reqs.memory_type_bits, required);
     unsafe { device.device.destroy_buffer(buffer, None) };
     let mt = mem_type? as usize;
-    let heap_idx = device.mem_props.memory_types[mt].heap_index as usize;
-    Some(device.mem_props.memory_heaps[heap_idx].size)
+    Some(device.mem_props.memory_types[mt].heap_index as usize)
 }
 
 fn pick_memory_type(

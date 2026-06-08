@@ -351,6 +351,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         n_ubatch: args.ubatch_size,
         n_batch: args.batch_size,
         ctx_size,
+        ctx_auto: args.ctx_size == 0,
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
         n_slots: args.parallel, // 0 = auto-size in the worker
