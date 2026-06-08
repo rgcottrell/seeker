@@ -2293,10 +2293,17 @@ impl Engine {
                 "verify_unified: tokens/positions/seq_lens/slots/samplers length mismatch".into(),
             );
         }
-        debug_assert!(
-            samplers.iter().all(|s| !s.config().any_penalty()),
-            "verify_unified: penalty samplers must be gated out by the caller",
-        );
+        // Penalty samplers can't be verified per-column on the GPU (each column's
+        // penalties depend on tokens accepted earlier in THIS step). The serve
+        // scheduler gates them out (`spec_ready`), but enforce it in release too —
+        // a runtime guard fails cleanly instead of silently sampling wrong.
+        if samplers.iter().any(|s| s.config().any_penalty()) {
+            return Err(
+                "verify_unified: penalty samplers are unsupported (caller must demote to \
+                 plain batched decode)"
+                    .into(),
+            );
+        }
         // Prefix-sum column starts + the flat column→sequence map.
         let mut q_starts = Vec::with_capacity(b);
         let mut col_seq = Vec::with_capacity(n_total);

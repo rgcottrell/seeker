@@ -1754,6 +1754,19 @@ impl Qwen35MoeModel {
         if seq_lens.iter().map(|&l| l as u64).sum::<u64>() != n_total {
             return Err("forward_unified_impl: sum(seq_lens) != tokens.len()".into());
         }
+        // Verify must checkpoint EVERY sequence's SSM state into its own lane (so a
+        // per-slot partial accept rolls back); a pool shorter than `b` would panic
+        // on `snapshot_lane(s)`, and zero lanes would silently fall back to the
+        // live writeback (advancing state that the accept can't undo). Require one
+        // lane per sequence whenever this model has SSM layers. Attention-only
+        // models run no SSM block, so they need no lanes.
+        if verify && batch.n_ssm_layers() > 0 && batch.n_snapshot_lanes() < b {
+            return Err(format!(
+                "forward_unified_impl: verify needs {b} SSM snapshot lanes, found {}",
+                batch.n_snapshot_lanes()
+            )
+            .into());
+        }
         let hidden = p.n_embd as u64;
         let head_dim_k = p.head_dim_k as u64;
         let head_dim_v = p.head_dim_v as u64;
@@ -1934,8 +1947,11 @@ impl Qwen35MoeModel {
                             // scan still reads the slot's live state as its start.
                             // BufferRanges are Copy, so the immutable borrow of
                             // `batch` ends before `ssm_block` (which never touches
-                            // `batch`). Non-verify (or attention-only) → None.
-                            let checkpoint = if verify && batch.n_snapshot_lanes() > 0 {
+                            // `batch`). Reached only for SSM blocks, and the
+                            // top-of-fn guard ensures `n_snapshot_lanes() ≥ b` in
+                            // verify mode, so lane `s` is always present. Non-verify
+                            // → None (live writeback).
+                            let checkpoint = if verify {
                                 let lane = batch.snapshot_lane(s);
                                 Some((
                                     lane.gdn(ssm_layer_idx as usize),
