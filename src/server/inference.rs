@@ -588,9 +588,15 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     // the speccing sequence DEMOTES to the batched decode path, which must work.
     // Non-unified models (e.g. gemma4) have no batched decode in serve at all, so
     // enabling spec there would crash on the first concurrent request.
+    //
+    // Clamp the effective n_max to the draft's hard cap (8) ONCE here, so a single
+    // runtime value drives the snapshot-lane depth, the `spec_ready` headroom
+    // check, and the draft — `draft_tokens` re-clamps internally, but unifying it
+    // keeps the lane size (`n+1` checkpoints) and the verify width consistent even
+    // if a user passes `--spec-draft-n-max > 8`.
     let spec_n_max = if cfg.spec_draft_n_max > 0 && model.supports_mtp_spec() {
         if model.supports_unified() {
-            cfg.spec_draft_n_max
+            cfg.spec_draft_n_max.min(8)
         } else {
             tracing::warn!(
                 "speculative decode requested but this model has no unified/batched serve path \
@@ -2106,6 +2112,12 @@ impl Worker {
             return false;
         }
         let n = self.spec_n_max;
+        // The verify packs `active.len() * (n+1)` tokens into one forward; the
+        // scratch is sized for `max_batch_tokens` (= n_ubatch). Demote to plain
+        // batched decode (which chunks) if the batch would overflow it.
+        if (self.active.len() as u32).saturating_mul(n + 1) > self.max_batch_tokens {
+            return false;
+        }
         let max_phys = self.batch.config.max_seq_len;
         self.active.iter().all(|s| {
             let pos = self.batch.positions[s.slab as usize];

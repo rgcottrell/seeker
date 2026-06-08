@@ -35,10 +35,10 @@ start_server() { # $1 = n_max
 
 # completion → choices[0].text, into $1=outfile, run in background; echoes PID
 req() { # $1 outfile  $2 prompt
-  curl -s "http://127.0.0.1:$PORT/v1/completions" \
+  curl -sf "http://127.0.0.1:$PORT/v1/completions" \
     -H 'Content-Type: application/json' \
     -d "{\"prompt\":$(jq -Rs . <<<"$2"),\"max_tokens\":$NTOK,\"temperature\":0,\"stream\":false}" \
-    | jq -r '.choices[0].text' >"$1"
+    | jq -er '.choices[0].text' >"$1" || { echo "req() failed for: $2" >&2; exit 1; }
 }
 
 run_suite() { # $1 = tag (nospec|spec)

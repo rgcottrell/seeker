@@ -13,9 +13,9 @@ trap '[[ -n "$SRV" ]] && kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null' EXIT
 start() { pkill -x seeker 2>/dev/null; sleep 1
   SEEKER_SPEC_DEBUG=1 "$BIN" serve -m "$MODEL" --port "$PORT" --no-mmproj --parallel 2 --ctx-size "$CTX" --temp 0 --spec-draft-n-max "$1" >"$OUT/srv_$1.log" 2>&1 &
   SRV=$!; for _ in $(seq 1 180); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0; kill -0 "$SRV" 2>/dev/null || { echo DIED; tail -12 "$OUT/srv_$1.log"; return 1; }; sleep 1; done; echo timeout; return 1; }
-gen() { curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+gen() { curl -sf "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
   -d "{\"messages\":[{\"role\":\"user\",\"content\":$(jq -Rs . <<<"$1")}],\"max_tokens\":$NTOK,\"temperature\":0,\"stream\":false}" \
-  | jq -r '.usage.completion_tokens // 0' >"$2"; }
+  | jq -er '.usage.completion_tokens' >"$2" || { echo "gen() failed for: $1" >&2; exit 1; }; }
 measure() { local t0 t1; t0=$(date +%s.%N)
   gen "$PA" "$OUT/$1_a.tok" & local pa=$!
   gen "$PB" "$OUT/$1_b.tok" & local pb=$!

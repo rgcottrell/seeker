@@ -30,10 +30,11 @@ start() { # $1 n_max
   done; echo "timeout($1)"; return 1
 }
 chat() { # $1 outfile  $2 prompt
-  curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+  curl -sf "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
     -d "{\"messages\":[{\"role\":\"user\",\"content\":$(jq -Rs . <<<"$2")}],\"max_tokens\":$NTOK,\"temperature\":0,\"stream\":false}" \
-    >"$OUT/$1.json"
-  jq -r '.choices[0].message.content // .error // "<<NO CHOICES>>"' "$OUT/$1.json" >"$OUT/$1.txt"
+    >"$OUT/$1.json" || { echo "chat() request failed for: $2" >&2; exit 1; }
+  jq -er '.choices[0].message.content' "$OUT/$1.json" >"$OUT/$1.txt" \
+    || { echo "chat() no content (error response) for: $2" >&2; cat "$OUT/$1.json" >&2; exit 1; }
 }
 
 start 0 || exit 1; chat ns_A "$PROMPT_A"; chat ns_B "$PROMPT_B"; kill "$SRV"; wait "$SRV" 2>/dev/null; SRV=

@@ -1461,6 +1461,20 @@ impl Qwen35MoeModel {
 
         for (lane, (&slot, &accept_len)) in slots.iter().zip(accept_lens).enumerate() {
             let accept = accept_len as u64;
+            // `accept` indexes a lane snapshot slot and drives raw Vulkan copy /
+            // view offsets below; an out-of-range value would point the GDN copy
+            // past the lane buffer and underflow the conv `size - (accept+1)*elem`.
+            // It can't exceed `max_snapshots-1` by construction (accept_len ≤ the
+            // verify's n drafts < max_snapshots), but fail fast rather than record
+            // an out-of-bounds GPU access if a caller ever violates that.
+            if accept >= max_snapshots {
+                return Err(format!(
+                    "ssm_finalize_batched: accept_len {accept_len} out of range for lane {lane} \
+                     (max {})",
+                    max_snapshots.saturating_sub(1),
+                )
+                .into());
+            }
             for i in 0..n_ssm {
                 // Copy out the (Copy) ranges so the immutable borrows of `batch`
                 // end before the recording calls.
