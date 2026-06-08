@@ -1617,6 +1617,22 @@ impl Qwen35MoeModel {
         let kv_lens: Vec<u32> = (0..b)
             .map(|s| batch.positions[slots[s] as usize] + seq_lens[s])
             .collect();
+        // Sanity: a corrupted slot position would blow up the attention
+        // scratch / dispatch grid (and once wedged the GPU). Fail cleanly,
+        // naming the slot, instead of asking the driver for a huge allocation.
+        for (s, &kl) in kv_lens.iter().enumerate() {
+            if kl > batch.config.max_seq_len {
+                return Err(format!(
+                    "forward_unified: kv_len {kl} (slot {}, position {} + seq_len {}) exceeds \
+                     max_seq_len {} — corrupted position",
+                    slots[s],
+                    batch.positions[slots[s] as usize],
+                    seq_lens[s],
+                    batch.config.max_seq_len,
+                )
+                .into());
+            }
+        }
 
         // Prologue: flat token ids, M-RoPE positions ([4 axes × N_total], each
         // axis the flat per-token position — text-only), embedding → residual.

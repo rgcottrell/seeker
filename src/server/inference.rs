@@ -59,6 +59,13 @@ pub struct WorkerConfig {
     /// no system prompt is set or `SEEKER_PREFIX_CACHE` is off. Rendered
     /// serve-side (the worker only ever sees tokens).
     pub pin_prefix_tokens: Option<Vec<u32>>,
+    /// Speculative-decode draft model (local path or resolved-from-HF), or
+    /// `None`. With `spec_draft_n_max > 0` on a draft-capable model, a SINGLE
+    /// active request decodes speculatively via `decode_speculative` on its
+    /// borrowed slot; concurrent requests fall back to plain batched decode.
+    pub spec_draft_path: Option<PathBuf>,
+    /// Max MTP draft tokens per spec step (`0` = speculative decode disabled).
+    pub spec_draft_n_max: u32,
 }
 
 /// Per-request generation parameters. The CLI sampling flags form the base
@@ -350,6 +357,13 @@ struct ActiveSeq {
     /// Whether `GenEvent::Started` has been sent (deferred until the unified
     /// path finishes prefill and produces this sequence's first token).
     started: bool,
+    /// Spec path: the pre-`output_norm` hidden of this slab's last in-KV token,
+    /// carried across spec steps to seed the MTP draft head. `None` ⇒ never
+    /// seeded, or stale after a batched (non-spec) forward touched the slab.
+    h_last: Option<Vec<f32>>,
+    /// True iff `h_last` (+ the qwen draft KV) are valid for the current cache
+    /// position, so a spec step may run. Cleared by any batched forward.
+    spec_seeded: bool,
 }
 
 /// One cached leading prefix: the exact prefix token ids (length `p`, matched
@@ -488,6 +502,17 @@ struct Worker {
     /// Leading-prefix snapshot cache (`SEEKER_PREFIX_CACHE`). `None` when the
     /// feature is off — every seed/capture branch then short-circuits.
     prefix_cache: Option<PrefixCache>,
+    /// Max MTP draft tokens per spec step (`0` = disabled). When `> 0` and
+    /// exactly one request is active, the worker decodes it speculatively.
+    spec_n_max: u32,
+    /// Shared per-position SSM checkpoint buffers for the spec verify (hybrid
+    /// models only; `None` for attention-only models or when spec is off). One
+    /// set suffices — the single-stream path runs one verify at a time.
+    spec_snapshots: Option<crate::inference::kv_cache::SsmSnapshotSet>,
+    /// Logical context ceiling (`= ctx_size`). The physical slab depth is
+    /// `logical_ctx + (spec_n_max+1)` so a spec verify can write `n+1` lookahead
+    /// before truncating; LOGICAL guards use this, not `batch.config.max_seq_len`.
+    logical_ctx: u32,
 }
 
 /// Length of the longest common prefix of two token sequences.
@@ -529,6 +554,12 @@ fn choose_slot(slots: &[(&[u32], u64)], new_tokens: &[u32], id_slot: Option<usiz
         .expect("at least one slot")
 }
 
+/// Cap on the prompt length for `admit_spec`'s single-pass prefill: longer
+/// prompts fall back to chunked non-spec prefill (spec helps little when prefill
+/// dominates, and a single-pass readback over a huge prompt balloons scratch).
+/// Generous enough for typical chat prompts.
+const SPEC_PREFILL_MAX_PROMPT: usize = 8192;
+
 /// Build the engine + model + N cache slots, mirroring `seeker chat`'s load
 /// sequence. Slots are allocated eagerly (fail-fast if N×ctx doesn't fit).
 fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
@@ -541,7 +572,38 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     // Capture the uploaded weight bytes before the handle moves into the model;
     // the auto-slot budget subtracts it from the device memory.
     let weights_bytes = weights.total_bytes;
-    let model = crate::models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
+    let mut model = crate::models::open(
+        &gguf,
+        weights,
+        bundle,
+        /*spec_enabled=*/ cfg.spec_draft_n_max > 0,
+    )?;
+    // Optional separate MTP draft GGUF (gemma4-assistant); qwen35moe self-spec
+    // needs none (the NextN head loads from the base). Gate the effective n_max
+    // on the model actually supporting spec after the (optional) attach.
+    if let Some(p) = &cfg.spec_draft_path {
+        let dg = GgufFile::open(p)?;
+        let dw = engine.upload_weights(&dg)?;
+        model.attach_mtp_draft(&dg, dw)?;
+        tracing::info!(path = ?p, "attached MTP draft model for serve spec");
+    }
+    // Spec runs only on `supports_unified()` models: when a 2nd request arrives
+    // the speccing sequence DEMOTES to the batched decode path, which must work.
+    // Non-unified models (e.g. gemma4) have no batched decode in serve at all, so
+    // enabling spec there would crash on the first concurrent request.
+    let spec_n_max = if cfg.spec_draft_n_max > 0 && model.supports_mtp_spec() {
+        if model.supports_unified() {
+            cfg.spec_draft_n_max
+        } else {
+            tracing::warn!(
+                "speculative decode requested but this model has no unified/batched serve path \
+                 (concurrent demotion would fail); serving without spec"
+            );
+            0
+        }
+    } else {
+        0
+    };
 
     // Scratch is sized per-ubatch/ctx and shared across slots (one forward runs
     // at a time), so it does not scale with the slot count.
@@ -554,10 +616,14 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     engine.allocate_scratch(scratch_bytes)?;
 
     let dims = model.cache_dims();
+    // A spec verify writes `n_max+1` lookahead K/V per step before truncating to
+    // the accepted length, so each slab must physically hold `ctx_size + n_max+1`.
+    // `ctx_size` stays the LOGICAL ceiling (see `logical_ctx`).
+    let spec_lookahead = if spec_n_max > 0 { spec_n_max + 1 } else { 0 };
     let cache_config = KvCacheConfig {
         k_dtype: cfg.cache_type_k,
         v_dtype: cfg.cache_type_v,
-        max_seq_len: cfg.ctx_size,
+        max_seq_len: cfg.ctx_size + spec_lookahead,
         n_head: dims.n_head,
     };
     let ssm_dims = model.ssm_state_dims();
@@ -592,6 +658,17 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
             ssm.gdn_state_floats,
         )?;
     }
+    // Shared SSM checkpoint snapshot set for single-stream spec rollback (hybrid
+    // models only; attention-only models like gemma4 roll nothing back). One set
+    // suffices — the single-stream spec path verifies one sequence at a time.
+    let spec_snapshots = match (spec_n_max > 0, &ssm_dims) {
+        (true, Some(ssm)) => Some(crate::inference::kv_cache::SsmSnapshotSet::new(
+            &engine.device,
+            ssm,
+            spec_n_max.clamp(1, 8) + 1,
+        )?),
+        _ => None,
+    };
 
     let mib = 1u64 << 20;
     tracing::info!(
@@ -684,6 +761,9 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         vision,
         scratch_bytes,
         prefix_cache,
+        spec_n_max,
+        spec_snapshots,
+        logical_ctx: cfg.ctx_size,
     })
 }
 
@@ -901,12 +981,29 @@ fn worker_main(
                 // regardless of the global unified flag.
                 Some(job) if job.image.is_some() => worker.admit_image(job),
                 Some(job) if job.audio.is_some() => worker.admit_audio(job),
+                // Solo text request + spec enabled → single-pass spec prefill
+                // (captures h_last + seeds the draft). Long prompts fall through
+                // to chunked non-spec prefill (admit_spec is single-pass). Only
+                // from the idle branch, so concurrent (drained) requests stay
+                // batched.
+                Some(job)
+                    if worker.spec_n_max > 0 && job.tokens.len() <= SPEC_PREFILL_MAX_PROMPT =>
+                {
+                    worker.admit_spec(job)
+                }
                 Some(job) if unified => worker.admit_unified(job),
                 Some(job) => worker.admit(job),
                 None => return,
             }
         }
-        // Drain queued jobs into any free slabs without blocking the step.
+        // Drain queued jobs into any free slabs without blocking the step. With
+        // spec on, a SOLO request decodes speculatively (`spec_step`); once a 2nd
+        // request is admitted the speccer DEMOTES to the batched `forward_unified`
+        // (its slab is left committed/clean by `decode_speculative`, so it joins
+        // seamlessly; `h_last` goes unused while batched). The per-step `kv_lens`
+        // guard + scratch/readback caps make a corrupted batch a clean error
+        // rather than a wedge. (Concurrent *batched spec* — every seq drafting +
+        // verifying together — is the later phase.)
         while worker.free_slabs() > 0 {
             match jobs.try_recv() {
                 Ok(job) if job.image.is_some() => worker.admit_image(job),
@@ -917,7 +1014,9 @@ fn worker_main(
             }
         }
         if !worker.active.is_empty() {
-            if unified {
+            if worker.spec_ready() {
+                worker.spec_step();
+            } else if unified {
                 worker.schedule_step();
             } else {
                 worker.decode_step();
@@ -989,7 +1088,7 @@ impl Worker {
             let _ = reply.blocking_send(GenEvent::Error("no free cache slot available".into()));
             return;
         };
-        let ctx = self.batch.config.max_seq_len;
+        let ctx = self.logical_ctx;
         if new_tokens.len() as u32 >= ctx {
             let _ = reply.blocking_send(GenEvent::Error(format!(
                 "prompt is {} tokens but --ctx-size is {ctx} (no room to generate) — \
@@ -1097,6 +1196,8 @@ impl Worker {
             // by the legacy decode_step; kept consistent for evict bookkeeping.)
             num_computed: self.batch.positions[idx],
             started: true,
+            h_last: None,
+            spec_seeded: false,
         };
         // Stream the first (prefill) token now; it's fed back at the first
         // batched step. The rest advance in `decode_step`.
@@ -1139,7 +1240,7 @@ impl Worker {
             let _ = reply.blocking_send(GenEvent::Error("no free cache slot available".into()));
             return;
         };
-        let ctx = self.batch.config.max_seq_len;
+        let ctx = self.logical_ctx;
         if prompt_tokens >= ctx {
             let _ = reply.blocking_send(GenEvent::Error(format!(
                 "prompt is {prompt_tokens} tokens but --ctx-size is {ctx} (no room to generate) — \
@@ -1204,6 +1305,8 @@ impl Worker {
             disconnected: false,
             num_computed,
             started: false,
+            h_last: None,
+            spec_seeded: false,
         });
     }
 
@@ -1404,7 +1507,7 @@ impl Worker {
                 reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
             return;
         }
-        let ctx = self.batch.config.max_seq_len;
+        let ctx = self.logical_ctx;
         if prompt_tokens >= ctx {
             let _ = reply.blocking_send(GenEvent::Error(format!(
                 "prompt is {prompt_tokens} tokens but --ctx-size is {ctx} (no room to generate) — \
@@ -1512,6 +1615,8 @@ impl Worker {
             disconnected: false,
             num_computed: self.batch.positions[idx],
             started: true,
+            h_last: None,
+            spec_seeded: false,
         };
         process_token(
             &self.model.tokenizer().tokenizer,
@@ -1561,7 +1666,7 @@ impl Worker {
                 reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
             return;
         }
-        let ctx = self.batch.config.max_seq_len;
+        let ctx = self.logical_ctx;
         if prompt_tokens >= ctx {
             let _ = reply.blocking_send(GenEvent::Error(format!(
                 "prompt is {prompt_tokens} tokens but --ctx-size is {ctx} (no room to generate) — \
@@ -1668,6 +1773,8 @@ impl Worker {
             disconnected: false,
             num_computed: self.batch.positions[idx],
             started: true,
+            h_last: None,
+            spec_seeded: false,
         };
         process_token(
             &self.model.tokenizer().tokenizer,
@@ -1686,7 +1793,7 @@ impl Worker {
     /// After the forward, sequences that caught up to their logical end sample +
     /// stream their next token; mid-prefill chunks discard the (unused) column.
     fn schedule_step(&mut self) {
-        let ctx = self.batch.config.max_seq_len;
+        let ctx = self.logical_ctx;
         let logical_len = |s: &ActiveSeq| s.prompt.len() + s.generated.len();
 
         // Mark ctx-full sequences terminal (no room to write the next token).
@@ -1791,6 +1898,9 @@ impl Worker {
         // advanced `num_computed` (their column is unused).
         for (k, &(i, nn)) in parts.iter().enumerate() {
             self.active[i].num_computed += nn;
+            // A batched forward advanced this slab, so any spec `h_last`/draft KV
+            // is now stale — demote it out of the spec path until reseeded.
+            self.active[i].spec_seeded = false;
             let caught_up = self.active[i].num_computed as usize == logical_len(&self.active[i]);
             if !caught_up {
                 // Still prefilling. The forward synced `batch.positions[slab]` to
@@ -1830,10 +1940,239 @@ impl Worker {
         }
     }
 
+    /// Admit a request into an IDLE worker as a single-stream speculative
+    /// sequence: borrow its slot, prefill the whole prompt in one pass via
+    /// `forward_full_readback` (capturing `h_last`), seed the MTP draft head from
+    /// the prompt hiddens, sample the first token, and mark it `spec_seeded`.
+    /// Routed only from the idle admit, so the solo request gets spec; a later
+    /// concurrent request demotes it to batched decode. Mirrors `admit_image`'s
+    /// borrowed-slot single-pass prefill scaffolding (no prefix reuse).
+    fn admit_spec(&mut self, job: GenJob) {
+        let GenJob {
+            tokens: new_tokens,
+            config,
+            image: _,
+            audio: _,
+            reply,
+        } = job;
+        let GenConfig {
+            sampler: cfg,
+            max_tokens,
+            stop,
+            ignore_eos,
+            id_slot,
+        } = config;
+        let prompt_tokens = new_tokens.len() as u32;
+        if new_tokens.is_empty() {
+            let _ =
+                reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
+            return;
+        }
+        let ctx = self.logical_ctx;
+        if prompt_tokens >= ctx {
+            let _ = reply.blocking_send(GenEvent::Error(format!(
+                "prompt is {prompt_tokens} tokens but --ctx-size is {ctx} (no room to generate) — \
+                 raise --ctx-size or shorten the prompt"
+            )));
+            return;
+        }
+        let Some(idx) = self.select_free_slab(&new_tokens, id_slot) else {
+            let _ = reply.blocking_send(GenEvent::Error("no free cache slot available".into()));
+            return;
+        };
+        self.clock += 1;
+        self.slots[idx].last_used = self.clock;
+
+        // Ensure scratch fits the single-pass full-prompt readback.
+        let need = self.model.scratch_bytes_estimate(
+            /*n_ubatch=*/ 0,
+            prompt_tokens,
+            self.batch.config.k_dtype,
+            self.batch.config.v_dtype,
+        );
+        if need > self.scratch_bytes {
+            if let Err(e) = self.engine.allocate_scratch(need) {
+                let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                return;
+            }
+            self.scratch_bytes = need;
+        }
+
+        // Fresh full prefill (no prefix reuse for spec — keep it simple).
+        self.batch.reset_slot(idx as u32);
+        self.batch.positions[idx] = 0;
+        self.batch.rope_lag[idx] = 0;
+        self.engine.decode_cache = None;
+
+        let mut sampler = Sampler::new(cfg);
+        let (h_last, first) = {
+            let mut sc = self.batch.slot_kvcache(idx as u32);
+            sc.position = 0;
+            let (logits, residual) = match self.engine.forward_full_readback(
+                &*self.model,
+                &mut sc,
+                &new_tokens,
+                0,
+                /*full_logits=*/ false,
+            ) {
+                Ok(lr) => lr,
+                Err(e) => {
+                    self.batch.reset_slot(idx as u32);
+                    self.batch.positions[idx] = 0;
+                    self.batch.rope_lag[idx] = 0;
+                    self.slots[idx].prior_tokens.clear();
+                    let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+                    return;
+                }
+            };
+            let plen = new_tokens.len();
+            let hsz = residual.len() / plen;
+            // Seed the MTP draft head's KV from the prompt's main hiddens (qwen
+            // self-spec); gemma4's `run_mtp_seed` is a no-op (the draft
+            // cross-attends base K/V). Non-fatal: only affects acceptance.
+            if plen >= 2
+                && let Err(e) = self.engine.run_mtp_seed(
+                    &*self.model,
+                    &mut sc,
+                    &residual[0..(plen - 1) * hsz],
+                    &new_tokens[1..plen],
+                    0,
+                )
+            {
+                tracing::warn!(error = %e, "serve: mtp seed failed; spec acceptance may be low");
+            }
+            self.batch.positions[idx] = sc.position; // == prompt_len
+            self.batch.rope_lag[idx] = sc.rope_position_lag;
+            let h = residual[(plen - 1) * hsz..plen * hsz].to_vec();
+            let first = sampler.sample_one(&logits);
+            sampler.accept(first);
+            (h, first)
+        };
+        self.slots[idx].active = true;
+
+        if reply
+            .blocking_send(GenEvent::Started { prompt_tokens })
+            .is_err()
+        {
+            self.slots[idx].active = false;
+            self.slots[idx].prior_tokens = new_tokens;
+            return;
+        }
+
+        let mut seq = ActiveSeq {
+            slab: idx as u32,
+            sampler,
+            prompt: new_tokens,
+            generated: Vec::new(),
+            prompt_tokens,
+            stop,
+            ignore_eos,
+            max_tokens,
+            reply,
+            stream_ids: Vec::new(),
+            stream_prefix: String::new(),
+            stream_prefix_index: 0,
+            pending: String::new(),
+            last_token: first,
+            ctx,
+            terminal: None,
+            disconnected: false,
+            num_computed: self.batch.positions[idx],
+            started: true,
+            h_last: Some(h_last),
+            spec_seeded: true,
+        };
+        process_token(
+            &self.model.tokenizer().tokenizer,
+            &self.eog_ids,
+            &mut seq,
+            first,
+        );
+        self.active.push(seq);
+    }
+
+    /// True when the single-stream spec path should run this step: spec enabled,
+    /// exactly one live request, seeded (`h_last` valid), in decode phase, and
+    /// the verify's `n+1` lookahead fits the physical slab.
+    fn spec_ready(&self) -> bool {
+        if self.spec_n_max == 0 || self.active.len() != 1 {
+            return false;
+        }
+        let s = &self.active[0];
+        s.terminal.is_none()
+            && !s.disconnected
+            && s.spec_seeded
+            && s.h_last.is_some()
+            // Decode phase: every logical token but the last (`last_token`) is in KV.
+            && s.num_computed as usize == s.prompt.len() + s.generated.len() - 1
+            && self.batch.positions[s.slab as usize] + self.spec_n_max < self.batch.config.max_seq_len
+    }
+
+    /// One speculative decode step on the sole active sequence's borrowed slot:
+    /// `decode_speculative` drafts + verifies + commits (truncating K/V and
+    /// finalizing SSM, so the slab stays a valid batched-decode state), then we
+    /// stream the 1..=n+1 emitted tokens and carry `h_last`/`last_token` forward.
+    fn spec_step(&mut self) {
+        let slab = self.active[0].slab;
+        let position = self.batch.positions[slab as usize];
+        let last_token = self.active[0].last_token;
+        let h_last = self.active[0]
+            .h_last
+            .take()
+            .expect("spec_ready guarantees h_last");
+
+        let mut sc = self.batch.slot_kvcache(slab);
+        sc.position = position;
+        if let Some(set) = &self.spec_snapshots {
+            sc.attach_ssm_snapshots(set);
+        }
+        let out = match self.engine.decode_speculative(
+            &*self.model,
+            &mut sc,
+            last_token,
+            &h_last,
+            position,
+            &mut self.active[0].sampler,
+            self.spec_n_max,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(error = %e, "serve: spec_step failed");
+                let _ = self.active[0]
+                    .reply
+                    .blocking_send(GenEvent::Error(e.to_string()));
+                self.active[0].disconnected = true;
+                self.active[0].terminal = Some(StopReason::ContextFull);
+                return;
+            }
+        };
+        self.batch.positions[slab as usize] = sc.position;
+        self.batch.rope_lag[slab as usize] = sc.rope_position_lag;
+        drop(sc);
+
+        // Stream the accepted prefix + bonus token; EOS / stop / max-tokens stop
+        // mid-emit (post-stop drafts are never streamed).
+        for &tk in &out.emitted {
+            process_token(
+                &self.model.tokenizer().tokenizer,
+                &self.eog_ids,
+                &mut self.active[0],
+                tk,
+            );
+            if self.active[0].terminal.is_some() || self.active[0].disconnected {
+                break;
+            }
+        }
+        self.active[0].num_computed = self.batch.positions[slab as usize];
+        self.active[0].last_token = out.last_token;
+        self.active[0].h_last = Some(out.h_last);
+        self.active[0].spec_seeded = true;
+    }
+
     /// One batched decode step: gather the active sequences that still have
     /// context room, run a single forward, then stream + stop-check each.
     fn decode_step(&mut self) {
-        let ctx = self.batch.config.max_seq_len;
+        let ctx = self.logical_ctx;
         // Participants (ascending `active` index). Mark ctx-full ones terminal.
         let mut parts: Vec<usize> = Vec::with_capacity(self.active.len());
         for (i, seq) in self.active.iter_mut().enumerate() {
@@ -1908,6 +2247,7 @@ impl Worker {
                 token,
             );
             self.active[i].last_token = token;
+            self.active[i].spec_seeded = false; // batched touch ⇒ stale spec state
         }
     }
 
