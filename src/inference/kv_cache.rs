@@ -190,6 +190,23 @@ impl SsmSnapshotSet {
             device: device.shared(),
         })
     }
+
+    /// This lane's per-layer GDN snapshot slice (`max_snapshots ×
+    /// gdn_state_floats`). The checkpoint verify writes one state snapshot per
+    /// position here; finalize commits slot `accept_len`.
+    pub fn gdn(&self, layer: usize) -> crate::inference::buffer::BufferRange {
+        self.gdn_snaps[layer]
+    }
+
+    /// This lane's per-layer conv-input backup slice (`[(conv_kernel-1)+
+    /// max_snapshots] × conv_channels`).
+    pub fn conv(&self, layer: usize) -> crate::inference::buffer::BufferRange {
+        self.conv_backs[layer]
+    }
+
+    pub fn max_snapshots(&self) -> u32 {
+        self.max_snapshots
+    }
 }
 
 impl Drop for SsmSnapshotSet {
@@ -958,6 +975,14 @@ pub struct BatchKvCache {
     ssm_gdn_base: Vec<u64>,
     conv_slab_floats: u32,
     gdn_slab_floats: u32,
+    /// Per-lane SSM checkpoint snapshot buffers for the BATCHED spec verify: one
+    /// independent [`SsmSnapshotSet`] per concurrent verify lane (lane `s` =
+    /// batch index of the s-th verified sequence). A batched verify runs all `B`
+    /// sequences' GDN/conv scans in one forward, each writing per-position
+    /// snapshots into its own lane; finalize then rolls each slot to its accepted
+    /// position. Empty unless spec is enabled on a hybrid model. Sized to
+    /// `n_slots` lanes (the max possible `B`); each set self-drops.
+    ssm_snapshot_lanes: Vec<SsmSnapshotSet>,
     device: Arc<DeviceShared>,
 }
 
@@ -1056,8 +1081,42 @@ impl BatchKvCache {
             ssm_gdn_base: Vec::new(),
             conv_slab_floats: 0,
             gdn_slab_floats: 0,
+            ssm_snapshot_lanes: Vec::new(),
             device: device.shared(),
         })
+    }
+
+    /// Allocate the per-lane SSM checkpoint snapshot pool for batched spec verify:
+    /// `n_lanes` independent [`SsmSnapshotSet`]s (each `max_snapshots = n_draft+1`
+    /// lookahead positions × `n_ssm_layers`). No-op for attention-only models
+    /// (`dims.n_ssm_layers == 0`) or `max_snapshots == 0`. Call once at setup;
+    /// the lanes live for the cache's lifetime and are reused every step.
+    pub fn allocate_ssm_snapshot_lanes(
+        &mut self,
+        device: &Device,
+        dims: &crate::models::SsmStateDims,
+        max_snapshots: u32,
+        n_lanes: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        if max_snapshots == 0 || dims.n_ssm_layers == 0 || n_lanes == 0 {
+            return Ok(());
+        }
+        let mut lanes = Vec::with_capacity(n_lanes as usize);
+        for _ in 0..n_lanes {
+            lanes.push(SsmSnapshotSet::new(device, dims, max_snapshots)?);
+        }
+        self.ssm_snapshot_lanes = lanes;
+        Ok(())
+    }
+
+    /// Number of allocated batched-verify snapshot lanes (0 if spec off / no SSM).
+    pub fn n_snapshot_lanes(&self) -> usize {
+        self.ssm_snapshot_lanes.len()
+    }
+
+    /// Lane `lane`'s snapshot set (its per-layer GDN/conv checkpoint buffers).
+    pub fn snapshot_lane(&self, lane: usize) -> &SsmSnapshotSet {
+        &self.ssm_snapshot_lanes[lane]
     }
 
     /// Allocate per-sequence SSM recurrent state for a hybrid model. Per layer:

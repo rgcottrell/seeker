@@ -569,6 +569,16 @@ impl Model for Qwen35MoeModel {
         self.ssm_finalize_impl(ctx, cache, accept_len)
     }
 
+    fn record_ssm_finalize_batched(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        slots: &[u32],
+        accept_lens: &[u32],
+    ) -> Result<(), Box<dyn Error>> {
+        self.ssm_finalize_batched_impl(ctx, batch, slots, accept_lens)
+    }
+
     fn record_mtp_seed(
         &self,
         ctx: &mut DispatchContext,
@@ -615,7 +625,23 @@ impl Model for Qwen35MoeModel {
         seq_lens: &[u32],
         slots: &[u32],
     ) -> Result<TensorView, Box<dyn Error>> {
-        self.forward_unified_impl(ctx, batch, tokens, positions, seq_lens, slots)
+        let (logits, _residual) =
+            self.forward_unified_impl(ctx, batch, tokens, positions, seq_lens, slots, false)?;
+        Ok(logits)
+    }
+
+    fn record_forward_unified_verify(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        seq_lens: &[u32],
+        slots: &[u32],
+    ) -> Result<crate::models::UnifiedVerifyOut, Box<dyn Error>> {
+        let (logits, residual) =
+            self.forward_unified_impl(ctx, batch, tokens, positions, seq_lens, slots, true)?;
+        Ok(crate::models::UnifiedVerifyOut { logits, residual })
     }
 }
 
@@ -1403,6 +1429,139 @@ impl Qwen35MoeModel {
         Ok(())
     }
 
+    /// Batched form of [`Self::ssm_finalize_impl`] for the concurrent spec verify.
+    /// For each verified sequence `s` (batch order), commit lane `s`'s snapshots
+    /// at `accept_lens[s]` into slot `slots[s]`'s live GDN + conv state. Same
+    /// per-layer GDN copy + strided conv extract as the single-seq path, looped
+    /// over `(lane, slot, accept_len)`. All ranges are `Copy`, so the per-lane
+    /// immutable borrows of `batch` don't conflict with the per-slot ones.
+    fn ssm_finalize_batched_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        slots: &[u32],
+        accept_lens: &[u32],
+    ) -> Result<(), Box<dyn Error>> {
+        if slots.len() != accept_lens.len() {
+            return Err("ssm_finalize_batched: slots / accept_lens length mismatch".into());
+        }
+        if batch.n_snapshot_lanes() < slots.len() {
+            return Err("ssm_finalize_batched: fewer snapshot lanes than sequences".into());
+        }
+        let p = &self.params;
+        let elem = 4u64;
+        let conv_kernel = p.ssm_conv as u64;
+        let key_dim = (p.ssm_groups * p.ssm_state) as u64;
+        let value_dim = (p.ssm_dt_rank * p.ssm_state) as u64;
+        let conv_channels = 2 * key_dim + value_dim;
+        let max_snapshots = batch.snapshot_lane(0).max_snapshots() as u64;
+        let n_padded = conv_kernel - 1 + max_snapshots;
+        let state_dim_inner = conv_kernel - 1;
+        let n_ssm = batch.n_ssm_layers();
+
+        for (lane, (&slot, &accept_len)) in slots.iter().zip(accept_lens).enumerate() {
+            let accept = accept_len as u64;
+            // `accept` indexes a lane snapshot slot and drives raw Vulkan copy /
+            // view offsets below; an out-of-range value would point the GDN copy
+            // past the lane buffer and underflow the conv `size - (accept+1)*elem`.
+            // It can't exceed `max_snapshots-1` by construction (accept_len ≤ the
+            // verify's n drafts < max_snapshots), but fail fast rather than record
+            // an out-of-bounds GPU access if a caller ever violates that.
+            if accept >= max_snapshots {
+                return Err(format!(
+                    "ssm_finalize_batched: accept_len {accept_len} out of range for lane {lane} \
+                     (max {})",
+                    max_snapshots.saturating_sub(1),
+                )
+                .into());
+            }
+            for i in 0..n_ssm {
+                // Copy out the (Copy) ranges so the immutable borrows of `batch`
+                // end before the recording calls.
+                let snap_gdn = batch.snapshot_lane(lane).gdn(i);
+                let snap_conv = batch.snapshot_lane(lane).conv(i);
+                let live_gdn = batch.gdn_state_slot(i as u32, slot);
+                let live_conv = batch.conv_state_slot(i as u32, slot);
+                let state_floats = live_gdn.size / elem;
+
+                // GDN: contiguous copy of snapshot slot[accept_len] → live state.
+                unsafe {
+                    use ash::vk;
+                    let copy = vk::BufferCopy::default()
+                        .src_offset(snap_gdn.offset + accept * state_floats * elem)
+                        .dst_offset(live_gdn.offset)
+                        .size(state_floats * elem);
+                    ctx.device.device.cmd_copy_buffer(
+                        ctx.cmd,
+                        snap_gdn.buffer,
+                        live_gdn.buffer,
+                        std::slice::from_ref(&copy),
+                    );
+                    let bar = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(live_gdn.buffer)
+                        .offset(live_gdn.offset)
+                        .size(state_floats * elem);
+                    ctx.device.device.cmd_pipeline_barrier(
+                        ctx.cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        std::slice::from_ref(&bar),
+                        &[],
+                    );
+                }
+
+                // Conv: strided cast of backup rows [accept_len+1 .. +kernel-1]
+                // → live conv state (same layout as the normal writeback).
+                let src = TensorView {
+                    buffer: snap_conv.buffer,
+                    byte_offset: snap_conv.offset + (accept + 1) * elem,
+                    byte_size: snap_conv.size - (accept + 1) * elem,
+                    dims: [state_dim_inner, conv_channels, 1, 1],
+                    byte_stride: [
+                        elem,
+                        n_padded * elem,
+                        n_padded * conv_channels * elem,
+                        n_padded * conv_channels * elem,
+                    ],
+                    element_stride: [
+                        1,
+                        n_padded,
+                        n_padded * conv_channels,
+                        n_padded * conv_channels,
+                    ],
+                    dtype: GgmlType::F32,
+                };
+                let dst = TensorView {
+                    buffer: live_conv.buffer,
+                    byte_offset: live_conv.offset,
+                    byte_size: live_conv.size,
+                    dims: [state_dim_inner, conv_channels, 1, 1],
+                    byte_stride: [
+                        elem,
+                        state_dim_inner * elem,
+                        state_dim_inner * conv_channels * elem,
+                        state_dim_inner * conv_channels * elem,
+                    ],
+                    element_stride: [
+                        1,
+                        state_dim_inner,
+                        state_dim_inner * conv_channels,
+                        state_dim_inner * conv_channels,
+                    ],
+                    dtype: GgmlType::F32,
+                };
+                cast::record_cast(ctx, src, dst)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Batched **decode** forward (M2): `B = tokens.len()` sequences, one token
     /// each, in one pass. Mirrors [`Self::forward_impl`] but per-sequence:
     /// attention layers use per-slab KV + batched flash-attn; SSM layers use
@@ -1564,6 +1723,12 @@ impl Qwen35MoeModel {
     /// sequences). MoE FFN is token-parallel → reused on `N_total`. Returns each
     /// sequence's last-token logits, `[vocab, B]`.
     #[allow(clippy::too_many_arguments)]
+    /// Returns `(logits, residual)`. Normal mode: `logits = [vocab, B]` (each
+    /// sequence's LAST-token column) and per-slot `positions` are committed.
+    /// `verify` mode (spec batched verify): `logits = [vocab, N_total]` (every
+    /// position) and `positions` are NOT committed — the caller sets each slot's
+    /// accepted length. `residual` is `[n_embd, N_total]` in both.
+    #[allow(clippy::too_many_arguments)]
     fn forward_unified_impl(
         &self,
         ctx: &mut DispatchContext,
@@ -1572,7 +1737,8 @@ impl Qwen35MoeModel {
         positions: &[u32],
         seq_lens: &[u32],
         slots: &[u32],
-    ) -> Result<TensorView, Box<dyn Error>> {
+        verify: bool,
+    ) -> Result<(TensorView, TensorView), Box<dyn Error>> {
         use crate::inference::command::record_global_barrier;
         let p = &self.params;
         let b = seq_lens.len();
@@ -1587,6 +1753,19 @@ impl Qwen35MoeModel {
         }
         if seq_lens.iter().map(|&l| l as u64).sum::<u64>() != n_total {
             return Err("forward_unified_impl: sum(seq_lens) != tokens.len()".into());
+        }
+        // Verify must checkpoint EVERY sequence's SSM state into its own lane (so a
+        // per-slot partial accept rolls back); a pool shorter than `b` would panic
+        // on `snapshot_lane(s)`, and zero lanes would silently fall back to the
+        // live writeback (advancing state that the accept can't undo). Require one
+        // lane per sequence whenever this model has SSM layers. Attention-only
+        // models run no SSM block, so they need no lanes.
+        if verify && batch.n_ssm_layers() > 0 && batch.n_snapshot_lanes() < b {
+            return Err(format!(
+                "forward_unified_impl: verify needs {b} SSM snapshot lanes, found {}",
+                batch.n_snapshot_lanes()
+            )
+            .into());
         }
         let hidden = p.n_embd as u64;
         let head_dim_k = p.head_dim_k as u64;
@@ -1761,6 +1940,26 @@ impl Qwen35MoeModel {
                             };
                             let gdn_state = Some(batch.gdn_state_slot(ssm_layer_idx, slots[s]));
                             let conv_state = Some(batch.conv_state_slot(ssm_layer_idx, slots[s]));
+                            // Verify (spec): checkpoint mode — emit per-position
+                            // GDN/conv snapshots into THIS sequence's lane (lane
+                            // `s` = batch index) instead of the live writeback, so
+                            // a per-slot partial accept rolls back in finalize. The
+                            // scan still reads the slot's live state as its start.
+                            // BufferRanges are Copy, so the immutable borrow of
+                            // `batch` ends before `ssm_block` (which never touches
+                            // `batch`). Reached only for SSM blocks, and the
+                            // top-of-fn guard ensures `n_snapshot_lanes() ≥ b` in
+                            // verify mode, so lane `s` is always present. Non-verify
+                            // → None (live writeback).
+                            let checkpoint = if verify {
+                                let lane = batch.snapshot_lane(s);
+                                Some((
+                                    lane.gdn(ssm_layer_idx as usize),
+                                    lane.conv(ssm_layer_idx as usize),
+                                ))
+                            } else {
+                                None
+                            };
                             ssm_block(
                                 ctx,
                                 ssm_w,
@@ -1772,7 +1971,7 @@ impl Qwen35MoeModel {
                                 gdn_state,
                                 conv_state,
                                 None,
-                                None,
+                                checkpoint,
                             )?;
                         }
                     }
@@ -1795,42 +1994,59 @@ impl Qwen35MoeModel {
         }
         ctx.scratch_restore(layer_checkpoint);
 
-        // Epilogue: gather each sequence's last-token column → norm + lm_head.
-        let last_hidden = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
-        record_global_barrier(ctx.device, ctx.cmd);
-        unsafe {
-            use ash::vk;
-            for s in 0..b {
-                let src_col = q_starts[s] + seq_lens[s] as u64 - 1;
-                let copy = vk::BufferCopy::default()
-                    .src_offset(residual.byte_offset + src_col * hidden * elem)
-                    .dst_offset(last_hidden.byte_offset + s as u64 * hidden * elem)
-                    .size(hidden * elem);
-                ctx.device.device.cmd_copy_buffer(
-                    ctx.cmd,
-                    residual.buffer,
-                    last_hidden.buffer,
-                    std::slice::from_ref(&copy),
-                );
-            }
-        }
-        record_global_barrier(ctx.device, ctx.cmd);
-        let final_norm = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
-        rms_norm::record(
-            ctx,
-            last_hidden,
-            self.weights.output_norm,
-            final_norm,
-            p.rms_eps,
-        )?;
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
-        let logits = ctx.alloc_tensor([vocab, b as u64, 1, 1], GgmlType::F32)?;
-        matmul::record(ctx, lm_head, final_norm, logits)?;
-
-        for s in 0..b {
-            batch.positions[slots[s] as usize] = kv_lens[s];
-        }
-        Ok(logits)
+        let logits = if verify {
+            // Verify (spec batched): norm + project ALL N_total positions, so the
+            // caller can sample/compare each draft column. Positions are NOT
+            // committed — the caller truncates each slot to its accepted length.
+            let final_norm = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+            rms_norm::record(
+                ctx,
+                residual,
+                self.weights.output_norm,
+                final_norm,
+                p.rms_eps,
+            )?;
+            let logits = ctx.alloc_tensor([vocab, n_total, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, lm_head, final_norm, logits)?;
+            logits
+        } else {
+            // Normal: gather each sequence's last-token column → norm + lm_head.
+            let last_hidden = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
+            record_global_barrier(ctx.device, ctx.cmd);
+            unsafe {
+                use ash::vk;
+                for s in 0..b {
+                    let src_col = q_starts[s] + seq_lens[s] as u64 - 1;
+                    let copy = vk::BufferCopy::default()
+                        .src_offset(residual.byte_offset + src_col * hidden * elem)
+                        .dst_offset(last_hidden.byte_offset + s as u64 * hidden * elem)
+                        .size(hidden * elem);
+                    ctx.device.device.cmd_copy_buffer(
+                        ctx.cmd,
+                        residual.buffer,
+                        last_hidden.buffer,
+                        std::slice::from_ref(&copy),
+                    );
+                }
+            }
+            record_global_barrier(ctx.device, ctx.cmd);
+            let final_norm = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
+            rms_norm::record(
+                ctx,
+                last_hidden,
+                self.weights.output_norm,
+                final_norm,
+                p.rms_eps,
+            )?;
+            let logits = ctx.alloc_tensor([vocab, b as u64, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, lm_head, final_norm, logits)?;
+            for s in 0..b {
+                batch.positions[slots[s] as usize] = kv_lens[s];
+            }
+            logits
+        };
+        Ok((logits, residual))
     }
 }
 
