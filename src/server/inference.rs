@@ -996,14 +996,15 @@ fn worker_main(
                 None => return,
             }
         }
-        // Drain queued jobs into any free slabs without blocking the step.
-        // PHASE-1 SERIALIZATION: when spec is enabled, do NOT admit a 2nd request
-        // alongside an active one — single-stream spec runs `decode_speculative`
-        // on a borrowed slot, and batching a spec sequence with others (the
-        // demotion path) is deferred to the concurrent batched-verify phase. So
-        // with spec on, concurrent requests queue and are served one at a time
-        // (each speculatively). Spec disabled ⇒ normal continuous batching.
-        while worker.spec_n_max == 0 && worker.free_slabs() > 0 {
+        // Drain queued jobs into any free slabs without blocking the step. With
+        // spec on, a SOLO request decodes speculatively (`spec_step`); once a 2nd
+        // request is admitted the speccer DEMOTES to the batched `forward_unified`
+        // (its slab is left committed/clean by `decode_speculative`, so it joins
+        // seamlessly; `h_last` goes unused while batched). The per-step `kv_lens`
+        // guard + scratch/readback caps make a corrupted batch a clean error
+        // rather than a wedge. (Concurrent *batched spec* — every seq drafting +
+        // verifying together — is the later phase.)
+        while worker.free_slabs() > 0 {
             match jobs.try_recv() {
                 Ok(job) if job.image.is_some() => worker.admit_image(job),
                 Ok(job) if job.audio.is_some() => worker.admit_audio(job),
