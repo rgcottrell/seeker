@@ -6,6 +6,7 @@
 //! `crate::models::*` and use [`context::DispatchContext`] + the [`ops`]
 //! helpers to record their forward pass.
 
+pub mod budget;
 pub mod buffer;
 pub mod command;
 pub mod context;

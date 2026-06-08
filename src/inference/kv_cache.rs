@@ -331,38 +331,24 @@ impl KvCache {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
         let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-        // Preflight: a KV cache larger than the GPU heap it lives in would OOM
-        // the allocation and (on RADV/amdgpu) wedge the device into a
-        // device-lost. Total the per-layer K+V bytes up front and fail with an
-        // actionable error instead. The 90% margin leaves room for weights /
-        // scratch / other allocations sharing the heap. `head_dim × max_seq_len`
-        // grows the cache, so an oversized `--ctx-size` is the usual trigger.
-        let total_kv: u64 = (0..n_layer as usize)
-            .map(|il| {
-                let hd = head_dims[il] as u64;
-                let nkv = n_head_kvs[il] as u64;
-                align_up(tensor_bytes(hd, max_seq_len, nkv, k_dtypes[il]), align)
-                    + align_up(tensor_bytes(hd, max_seq_len, nkv, v_dtypes[il]), align)
-            })
-            .sum();
-        if let Some(heap) = crate::inference::memory::heap_size_for_buffer(device, usage, mem) {
-            let budget = heap / 10 * 9;
-            if total_kv > budget {
-                const GIB: f64 = (1u64 << 30) as f64;
-                return Err(format!(
-                    "KV cache needs {:.1} GiB (max_seq_len={}, {} layers, k={:?} v={:?}) but \
-                     the GPU memory heap is only {:.1} GiB — lower --ctx-size, or use a smaller \
-                     cache dtype (e.g. --cache-type-k q8_0 --cache-type-v q8_0).",
-                    total_kv as f64 / GIB,
-                    config.max_seq_len,
-                    n_layer,
-                    config.k_dtype,
-                    config.v_dtype,
-                    heap as f64 / GIB,
-                )
-                .into());
-            }
-        }
+        // Holistic backstop preflight: a KV cache that, together with the
+        // already-resident weights + scratch, exceeds the heap it lives in would
+        // OOM the allocation and (on RADV/amdgpu) wedge the device into a
+        // device-lost. `kv_preflight` checks the projected K+V total against the
+        // heap's *live free* bytes (which already exclude weights/scratch) and
+        // fails with an actionable error instead. `head_dim × max_seq_len` grows
+        // the cache, so an oversized `--ctx-size` is the usual trigger. The
+        // precise auto-fit (chat/serve) runs before this; this is the net.
+        let total_kv = estimate_kv_bytes(head_dims, n_head_kvs, &config, align);
+        super::budget::kv_preflight(
+            device,
+            total_kv,
+            config.max_seq_len,
+            n_layer,
+            1,
+            config.k_dtype,
+            config.v_dtype,
+        )?;
 
         let mut regions = Vec::with_capacity(n_layer as usize);
         let mut k_layers = Vec::with_capacity(n_layer as usize);
@@ -923,6 +909,90 @@ pub(crate) fn slab_stride_for(
     align_up(bytes, lcm(align, type_size as u64))
 }
 
+/// Exact device bytes [`KvCache::new_per_layer`] would allocate for these
+/// per-layer dims + dtypes at `config.max_seq_len` (per-layer `align_up` plus
+/// the TurboQuant per-layer dtype resolution). The single source of truth for
+/// the in-cache preflight, the holistic memory fitter (`inference::budget`),
+/// and the startup breakdown — they can never drift from the allocation.
+pub fn estimate_kv_bytes(
+    head_dims: &[u32],
+    n_head_kvs: &[u32],
+    config: &KvCacheConfig,
+    align: u64,
+) -> u64 {
+    debug_assert_eq!(head_dims.len(), n_head_kvs.len());
+    let n_layer = head_dims.len() as u32;
+    let max_seq_len = config.max_seq_len as u64;
+    let (k_dtypes, v_dtypes) = resolve_layer_dtypes(
+        config.k_dtype,
+        config.v_dtype,
+        n_layer,
+        config.n_head,
+        *n_head_kvs.first().unwrap_or(&0),
+    );
+    (0..head_dims.len())
+        .map(|il| {
+            let hd = head_dims[il] as u64;
+            let nkv = n_head_kvs[il] as u64;
+            align_up(tensor_bytes(hd, max_seq_len, nkv, k_dtypes[il]), align)
+                + align_up(tensor_bytes(hd, max_seq_len, nkv, v_dtypes[il]), align)
+        })
+        .sum()
+}
+
+/// As [`estimate_kv_bytes`] but for uniform per-layer dims (the common
+/// [`KvCache::new`] path).
+pub fn estimate_kv_bytes_uniform(
+    n_layer: u32,
+    head_dim: u32,
+    n_head_kv: u32,
+    config: &KvCacheConfig,
+    align: u64,
+) -> u64 {
+    let head_dims = vec![head_dim; n_layer as usize];
+    let n_head_kvs = vec![n_head_kv; n_layer as usize];
+    estimate_kv_bytes(&head_dims, &n_head_kvs, config, align)
+}
+
+/// Exact device bytes one [`BatchKvCache`] *slot* occupies (summed over layers),
+/// using the per-slot slab stride (padded to `align` AND the quant block size)
+/// — so it matches `BatchKvCache::new`. Multiply by `n_slots` for the total.
+/// Uniform dims (serve's batched cache is uniform; gemma4 per-layer serve is
+/// non-batched).
+pub fn estimate_batch_slot_bytes(
+    n_layer: u32,
+    head_dim: u32,
+    n_head_kv: u32,
+    config: &KvCacheConfig,
+    align: u64,
+) -> u64 {
+    let (k_dtypes, v_dtypes) = resolve_layer_dtypes(
+        config.k_dtype,
+        config.v_dtype,
+        n_layer,
+        config.n_head,
+        n_head_kv,
+    );
+    let hd = head_dim as u64;
+    let nkv = n_head_kv as u64;
+    let msl = config.max_seq_len as u64;
+    (0..n_layer as usize)
+        .map(|il| {
+            slab_stride_for(hd, msl, nkv, align, k_dtypes[il])
+                + slab_stride_for(hd, msl, nkv, align, v_dtypes[il])
+        })
+        .sum()
+}
+
+/// Device bytes [`KvCache::allocate_ssm_state`] would allocate for the given
+/// hybrid-model recurrent state (ctx-INDEPENDENT — a fixed addend the context
+/// fitter never scales). Mirrors that function's per-layer `align_up` layout.
+pub fn estimate_ssm_bytes(dims: &crate::models::SsmStateDims, align: u64) -> u64 {
+    let conv_aligned = align_up((dims.conv_state_floats as u64) * 4, align);
+    let gdn_aligned = align_up((dims.gdn_state_floats as u64) * 4, align);
+    (dims.n_ssm_layers as u64) * (conv_aligned + gdn_aligned)
+}
+
 /// A KV cache holding `n_slots` independent sequence slabs in one shared buffer
 /// per layer, so a batched decode can address all active sequences through the
 /// flash-attn batch stride (`nb13`/`nb23`). Each slab has the identical natural
@@ -1025,6 +1095,24 @@ impl BatchKvCache {
             |dtype: GgmlType| slab_stride_for(head_dim_u, max_seq_len, n_head_kv_u, align, dtype);
         let k_slab_stride: Vec<u64> = k_dtypes.iter().map(|&d| slab_stride(d)).collect();
         let v_slab_stride: Vec<u64> = v_dtypes.iter().map(|&d| slab_stride(d)).collect();
+
+        // Holistic backstop preflight (same as KvCache::new): the `n_slots`
+        // slabs plus the already-resident weights + scratch must fit the heap,
+        // or the allocation OOMs and wedges the device. Fail fast instead. The
+        // serve slot resolver / chat fitter run before this; this is the net for
+        // the clamp-to-1 case (a single oversized slot) and explicit configs.
+        let total_kv: u64 = (0..n_layer as usize)
+            .map(|il| (k_slab_stride[il] + v_slab_stride[il]) * n_slots as u64)
+            .sum();
+        super::budget::kv_preflight(
+            device,
+            total_kv,
+            config.max_seq_len,
+            n_layer,
+            n_slots,
+            config.k_dtype,
+            config.v_dtype,
+        )?;
 
         // One buffer per layer-side, each holding that side's `n_slots` slabs
         // contiguously (slab `slot` at `slot * slab_stride`). Per-layer-side so
@@ -1689,5 +1777,75 @@ fn batched_attn_view(
         byte_stride,
         element_stride,
         dtype,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::SsmStateDims;
+
+    fn f16_cfg(max_seq_len: u32) -> KvCacheConfig {
+        KvCacheConfig {
+            k_dtype: GgmlType::F16,
+            v_dtype: GgmlType::F16,
+            max_seq_len,
+            n_head: 0,
+        }
+    }
+
+    #[test]
+    fn estimate_kv_bytes_uniform_f16_golden() {
+        // F16 = (block 1, type_size 2). Per layer K = hd*msl*nkv*2, V same.
+        // hd=64, msl=128, nkv=2 → 64*128*2*2 = 32768 (already 256-aligned).
+        let bytes = estimate_kv_bytes_uniform(2, 64, 2, &f16_cfg(128), 256);
+        assert_eq!(bytes, 2 * (32768 + 32768));
+    }
+
+    #[test]
+    fn estimate_kv_bytes_applies_align_up() {
+        // hd=40, msl=100, nkv=1 → 40*100*2 = 8000 bytes, align_up(8000,256)=8192.
+        let bytes = estimate_kv_bytes_uniform(1, 40, 1, &f16_cfg(100), 256);
+        assert_eq!(bytes, 8192 + 8192);
+    }
+
+    #[test]
+    fn estimate_kv_bytes_per_layer_matches_uniform() {
+        // Explicit per-layer dims equal to the uniform helper for equal layers.
+        let cfg = f16_cfg(256);
+        let per_layer = estimate_kv_bytes(&[128, 128, 128], &[4, 4, 4], &cfg, 256);
+        let uniform = estimate_kv_bytes_uniform(3, 128, 4, &cfg, 256);
+        assert_eq!(per_layer, uniform);
+    }
+
+    #[test]
+    fn estimate_batch_slot_matches_kv_for_f16() {
+        // For F16, lcm(align, type_size) == align, so the per-slot slab stride
+        // equals the KvCache align_up form → one slot == single-cache total.
+        let cfg = f16_cfg(128);
+        let slot = estimate_batch_slot_bytes(2, 64, 2, &cfg, 256);
+        let kv = estimate_kv_bytes_uniform(2, 64, 2, &cfg, 256);
+        assert_eq!(slot, kv);
+    }
+
+    #[test]
+    fn estimate_kv_bytes_scales_monotonically_with_ctx() {
+        let small = estimate_kv_bytes_uniform(4, 128, 8, &f16_cfg(1024), 256);
+        let big = estimate_kv_bytes_uniform(4, 128, 8, &f16_cfg(8192), 256);
+        assert!(big > small);
+        // Linear in ctx (no per-layer rounding loss at these aligned sizes).
+        assert_eq!(big, small * 8);
+    }
+
+    #[test]
+    fn estimate_ssm_bytes_golden() {
+        let dims = SsmStateDims {
+            n_ssm_layers: 3,
+            conv_state_floats: 100, // *4 = 400 → align_up(_,256) = 512
+            gdn_state_floats: 200,  // *4 = 800 → align_up(_,256) = 1024
+            conv_channels: 0,
+            conv_kernel: 0,
+        };
+        assert_eq!(estimate_ssm_bytes(&dims, 256), 3 * (512 + 1024));
     }
 }

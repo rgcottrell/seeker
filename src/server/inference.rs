@@ -21,7 +21,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::gguf::{GgmlType, GgufFile};
 use crate::inference::Engine;
-use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig, PrefixSnapshot};
+use crate::inference::budget;
+use crate::inference::kv_cache::{
+    BatchKvCache, KvCacheConfig, PrefixSnapshot, estimate_batch_slot_bytes, estimate_ssm_bytes,
+};
 use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::tokenizer::{Tokenizer, build_tokenizer};
 use crate::vision::encoder::{HostWeights, VisionEncoder};
@@ -38,6 +41,10 @@ pub struct WorkerConfig {
     pub n_ubatch: u32,
     pub n_batch: u32,
     pub ctx_size: u32,
+    /// Whether `ctx_size` was left unset (`--ctx-size 0` → trained max) and is
+    /// therefore eligible for auto-fit reduction to fit GPU memory. An explicit
+    /// `--ctx-size N` pins it (fail-fast via the preflight if it doesn't fit).
+    pub ctx_auto: bool,
     pub cache_type_k: GgmlType,
     pub cache_type_v: GgmlType,
     /// Number of independent KV-cache slots (llama.cpp `--parallel`). Each slot
@@ -608,28 +615,96 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         0
     };
 
-    // Scratch is sized per-ubatch/ctx and shared across slots (one forward runs
-    // at a time), so it does not scale with the slot count.
-    let scratch_bytes = model.scratch_bytes_estimate(
-        cfg.n_ubatch,
-        cfg.ctx_size,
-        cfg.cache_type_k,
-        cfg.cache_type_v,
-    );
-    engine.allocate_scratch(scratch_bytes)?;
-
     let dims = model.cache_dims();
+    let ssm_dims = model.ssm_state_dims();
     // A spec verify writes `n_max+1` lookahead K/V per step before truncating to
     // the accepted length, so each slab must physically hold `ctx_size + n_max+1`.
     // `ctx_size` stays the LOGICAL ceiling (see `logical_ctx`).
     let spec_lookahead = if spec_n_max > 0 { spec_n_max + 1 } else { 0 };
+
+    // Auto-fit the per-slot context to GPU memory when `--ctx-size` was unset:
+    // pick the largest ctx whose weights + a single full-context slot's KV +
+    // scratch fit live free memory, so `resolve_n_slots` then sizes the count
+    // against a context that's known to fit at least once (instead of clamping
+    // to 1 and wedging the device on a single oversized slab). An explicit
+    // `--ctx-size` is pinned — the `BatchKvCache` preflight fail-fasts instead.
+    let mut ctx_size = cfg.ctx_size;
+    if cfg.ctx_auto && budget::fit_enabled() {
+        let align = engine
+            .device
+            .limits
+            .min_storage_buffer_offset_alignment
+            .max(1);
+        let ssm_bytes = ssm_dims
+            .as_ref()
+            .map(|d| estimate_ssm_bytes(d, align))
+            .unwrap_or(0);
+        let hb = budget::kv_heap_budget(&engine.device, cfg.mem_fraction as f64);
+        let usable = hb.usable_for_new(weights_bytes).saturating_sub(ssm_bytes);
+        let cost_at = |ctx: u32| -> u64 {
+            let cfgc = KvCacheConfig {
+                k_dtype: cfg.cache_type_k,
+                v_dtype: cfg.cache_type_v,
+                max_seq_len: ctx + spec_lookahead,
+                n_head: dims.n_head,
+            };
+            let kv = estimate_batch_slot_bytes(
+                dims.n_layer,
+                dims.head_dim,
+                dims.n_head_kv,
+                &cfgc,
+                align,
+            );
+            let scratch =
+                model.scratch_bytes_estimate(cfg.n_ubatch, ctx, cfg.cache_type_k, cfg.cache_type_v);
+            kv + scratch
+        };
+        match budget::fit_ctx(
+            ctx_size,
+            budget::fit_min_ctx().min(ctx_size),
+            usable,
+            cost_at,
+        ) {
+            Ok(c) => {
+                if c < ctx_size {
+                    tracing::warn!(
+                        requested = ctx_size,
+                        chosen = c,
+                        "serve: per-slot ctx auto-reduced to fit GPU memory (--fit); pass \
+                         --ctx-size to override or SEEKER_FIT=0 to disable"
+                    );
+                }
+                ctx_size = c;
+            }
+            Err(e) => {
+                const GIB: f64 = (1u64 << 30) as f64;
+                return Err(format!(
+                    "model weights ({:.1} GiB) + min KV/scratch at ctx {} don't fit GPU memory: \
+                     need {:.1} GiB but only {:.1} GiB usable — use a smaller --cache-type-k/v or \
+                     free memory",
+                    weights_bytes as f64 / GIB,
+                    e.floor,
+                    e.need as f64 / GIB,
+                    e.usable as f64 / GIB,
+                )
+                .into());
+            }
+        }
+    }
+
+    // Scratch is sized per-ubatch/ctx and shared across slots (one forward runs
+    // at a time), so it does not scale with the slot count. Sized for the
+    // (possibly auto-reduced) ctx.
+    let scratch_bytes =
+        model.scratch_bytes_estimate(cfg.n_ubatch, ctx_size, cfg.cache_type_k, cfg.cache_type_v);
+    engine.allocate_scratch(scratch_bytes)?;
+
     let cache_config = KvCacheConfig {
         k_dtype: cfg.cache_type_k,
         v_dtype: cfg.cache_type_v,
-        max_seq_len: cfg.ctx_size + spec_lookahead,
+        max_seq_len: ctx_size + spec_lookahead,
         n_head: dims.n_head,
     };
-    let ssm_dims = model.ssm_state_dims();
     // Resolve the slot count: an explicit `--parallel N` is honored verbatim
     // (fail-fast below if N×ctx doesn't fit); `0` auto-sizes from the device
     // memory budget (capped at `parallel_max`).
@@ -680,9 +755,25 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     tracing::info!(
         slots = n_slots,
         auto = (cfg.n_slots == 0),
-        ctx = cfg.ctx_size,
+        ctx = ctx_size,
         total_mib = batch.total_bytes() / mib,
         "batched kv cache allocated",
+    );
+    // Startup memory breakdown (the `llama_memory_breakdown_print` analog).
+    // `batch.total_bytes()` already folds in the per-slot SSM state, so report
+    // it under `kv` and leave `ssm` at 0 (avoids double-counting).
+    budget::log_breakdown(
+        &budget::MemoryProjection {
+            weights: weights_bytes,
+            scratch: scratch_bytes,
+            kv: batch.total_bytes(),
+            ssm: 0,
+            prefix_pool: 0,
+        },
+        &budget::kv_heap_budget(&engine.device, cfg.mem_fraction as f64),
+        if cfg.ctx_auto { cfg.ctx_size } else { ctx_size },
+        ctx_size,
+        n_slots,
     );
 
     let eog_ids = model.tokenizer().eog_ids.clone();
@@ -727,8 +818,8 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     let prefix_cache = if *crate::runtime_flags::PREFIX_CACHE {
         let cap = crate::runtime_flags::PREFIX_CACHE_SLOTS.unwrap_or(2).max(1);
         let max_cached_len = crate::runtime_flags::PREFIX_CACHE_MAXLEN
-            .unwrap_or_else(|| cfg.ctx_size.min(4096))
-            .clamp(1, cfg.ctx_size.max(1));
+            .unwrap_or_else(|| ctx_size.min(4096))
+            .clamp(1, ctx_size.max(1));
         let ckpt = crate::runtime_flags::PREFIX_CACHE_CKPT
             .unwrap_or(512)
             .max(1);
@@ -768,7 +859,7 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         scratch_bytes,
         prefix_cache,
         spec_n_max,
-        logical_ctx: cfg.ctx_size,
+        logical_ctx: ctx_size,
     })
 }
 

@@ -136,6 +136,33 @@ pub static PREFILL_FLUSH_MB: LazyLock<Option<u32>> =
 pub static PROF_STEP: LazyLock<bool> =
     LazyLock::new(|| std::env::var("SEEKER_PROF_STEP").is_ok_and(|v| v == "1"));
 
+// ─── Memory fit (holistic budget + auto-fit context) ─────────────────
+//
+// chat/serve project every major GPU-memory consumer (weights + KV +
+// scratch + SSM + prefix pool) against the heap the KV cache lives in and,
+// when `--ctx-size` is unset, auto-reduce the trained-max default to the
+// largest context that fits live free memory — instead of OOMing the
+// unified DDR5 heap and wedging the device (RADV device-lost). See
+// `inference::budget`. Explicit `--ctx-size` disables the auto-reduction
+// (fail-fast instead); these env knobs tune the floor/margin without a CLI
+// surface.
+
+/// `SEEKER_FIT=0` — disable the auto-fit context reduction entirely (the
+/// holistic backstop preflight still guards every allocation). Default-on.
+pub static FIT_DISABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("SEEKER_FIT").is_ok_and(|v| v == "0"));
+
+/// `SEEKER_FIT_MARGIN_MIB=<n>` — free-memory margin (MiB) the fitter leaves
+/// after every tracked consumer, covering seeker's own untracked allocations
+/// (descriptor pools, command buffers, the reused weight staging buffer,
+/// readback) plus a cushion for external pressure. Default 1024.
+pub static FIT_MARGIN_MIB: LazyLock<Option<u32>> =
+    LazyLock::new(|| env_u32("SEEKER_FIT_MARGIN_MIB"));
+
+/// `SEEKER_FIT_MIN_CTX=<n>` — floor the auto-fit context search will not go
+/// below (llama.cpp's `--fit-ctx`). Default 4096.
+pub static FIT_MIN_CTX: LazyLock<Option<u32>> = LazyLock::new(|| env_u32("SEEKER_FIT_MIN_CTX"));
+
 // ─── Leading-prefix cache (serve) ────────────────────────────────────
 //
 // `seeker serve` reuses a shared leading prefix (system prompt, few-shot
