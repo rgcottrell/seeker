@@ -569,6 +569,16 @@ impl Model for Qwen35MoeModel {
         self.ssm_finalize_impl(ctx, cache, accept_len)
     }
 
+    fn record_ssm_finalize_batched(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        slots: &[u32],
+        accept_lens: &[u32],
+    ) -> Result<(), Box<dyn Error>> {
+        self.ssm_finalize_batched_impl(ctx, batch, slots, accept_lens)
+    }
+
     fn record_mtp_seed(
         &self,
         ctx: &mut DispatchContext,
@@ -1419,6 +1429,125 @@ impl Qwen35MoeModel {
         Ok(())
     }
 
+    /// Batched form of [`Self::ssm_finalize_impl`] for the concurrent spec verify.
+    /// For each verified sequence `s` (batch order), commit lane `s`'s snapshots
+    /// at `accept_lens[s]` into slot `slots[s]`'s live GDN + conv state. Same
+    /// per-layer GDN copy + strided conv extract as the single-seq path, looped
+    /// over `(lane, slot, accept_len)`. All ranges are `Copy`, so the per-lane
+    /// immutable borrows of `batch` don't conflict with the per-slot ones.
+    fn ssm_finalize_batched_impl(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        slots: &[u32],
+        accept_lens: &[u32],
+    ) -> Result<(), Box<dyn Error>> {
+        if slots.len() != accept_lens.len() {
+            return Err("ssm_finalize_batched: slots / accept_lens length mismatch".into());
+        }
+        if batch.n_snapshot_lanes() < slots.len() {
+            return Err("ssm_finalize_batched: fewer snapshot lanes than sequences".into());
+        }
+        let p = &self.params;
+        let elem = 4u64;
+        let conv_kernel = p.ssm_conv as u64;
+        let key_dim = (p.ssm_groups * p.ssm_state) as u64;
+        let value_dim = (p.ssm_dt_rank * p.ssm_state) as u64;
+        let conv_channels = 2 * key_dim + value_dim;
+        let max_snapshots = batch.snapshot_lane(0).max_snapshots() as u64;
+        let n_padded = conv_kernel - 1 + max_snapshots;
+        let state_dim_inner = conv_kernel - 1;
+        let n_ssm = batch.n_ssm_layers();
+
+        for (lane, (&slot, &accept_len)) in slots.iter().zip(accept_lens).enumerate() {
+            let accept = accept_len as u64;
+            for i in 0..n_ssm {
+                // Copy out the (Copy) ranges so the immutable borrows of `batch`
+                // end before the recording calls.
+                let snap_gdn = batch.snapshot_lane(lane).gdn(i);
+                let snap_conv = batch.snapshot_lane(lane).conv(i);
+                let live_gdn = batch.gdn_state_slot(i as u32, slot);
+                let live_conv = batch.conv_state_slot(i as u32, slot);
+                let state_floats = live_gdn.size / elem;
+
+                // GDN: contiguous copy of snapshot slot[accept_len] → live state.
+                unsafe {
+                    use ash::vk;
+                    let copy = vk::BufferCopy::default()
+                        .src_offset(snap_gdn.offset + accept * state_floats * elem)
+                        .dst_offset(live_gdn.offset)
+                        .size(state_floats * elem);
+                    ctx.device.device.cmd_copy_buffer(
+                        ctx.cmd,
+                        snap_gdn.buffer,
+                        live_gdn.buffer,
+                        std::slice::from_ref(&copy),
+                    );
+                    let bar = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(live_gdn.buffer)
+                        .offset(live_gdn.offset)
+                        .size(state_floats * elem);
+                    ctx.device.device.cmd_pipeline_barrier(
+                        ctx.cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        std::slice::from_ref(&bar),
+                        &[],
+                    );
+                }
+
+                // Conv: strided cast of backup rows [accept_len+1 .. +kernel-1]
+                // → live conv state (same layout as the normal writeback).
+                let src = TensorView {
+                    buffer: snap_conv.buffer,
+                    byte_offset: snap_conv.offset + (accept + 1) * elem,
+                    byte_size: snap_conv.size - (accept + 1) * elem,
+                    dims: [state_dim_inner, conv_channels, 1, 1],
+                    byte_stride: [
+                        elem,
+                        n_padded * elem,
+                        n_padded * conv_channels * elem,
+                        n_padded * conv_channels * elem,
+                    ],
+                    element_stride: [
+                        1,
+                        n_padded,
+                        n_padded * conv_channels,
+                        n_padded * conv_channels,
+                    ],
+                    dtype: GgmlType::F32,
+                };
+                let dst = TensorView {
+                    buffer: live_conv.buffer,
+                    byte_offset: live_conv.offset,
+                    byte_size: live_conv.size,
+                    dims: [state_dim_inner, conv_channels, 1, 1],
+                    byte_stride: [
+                        elem,
+                        state_dim_inner * elem,
+                        state_dim_inner * conv_channels * elem,
+                        state_dim_inner * conv_channels * elem,
+                    ],
+                    element_stride: [
+                        1,
+                        state_dim_inner,
+                        state_dim_inner * conv_channels,
+                        state_dim_inner * conv_channels,
+                    ],
+                    dtype: GgmlType::F32,
+                };
+                cast::record_cast(ctx, src, dst)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Batched **decode** forward (M2): `B = tokens.len()` sequences, one token
     /// each, in one pass. Mirrors [`Self::forward_impl`] but per-sequence:
     /// attention layers use per-slab KV + batched flash-attn; SSM layers use
@@ -1784,6 +1913,23 @@ impl Qwen35MoeModel {
                             };
                             let gdn_state = Some(batch.gdn_state_slot(ssm_layer_idx, slots[s]));
                             let conv_state = Some(batch.conv_state_slot(ssm_layer_idx, slots[s]));
+                            // Verify (spec): checkpoint mode — emit per-position
+                            // GDN/conv snapshots into THIS sequence's lane (lane
+                            // `s` = batch index) instead of the live writeback, so
+                            // a per-slot partial accept rolls back in finalize. The
+                            // scan still reads the slot's live state as its start.
+                            // BufferRanges are Copy, so the immutable borrow of
+                            // `batch` ends before `ssm_block` (which never touches
+                            // `batch`). Non-verify (or attention-only) → None.
+                            let checkpoint = if verify && batch.n_snapshot_lanes() > 0 {
+                                let lane = batch.snapshot_lane(s);
+                                Some((
+                                    lane.gdn(ssm_layer_idx as usize),
+                                    lane.conv(ssm_layer_idx as usize),
+                                ))
+                            } else {
+                                None
+                            };
                             ssm_block(
                                 ctx,
                                 ssm_w,
@@ -1795,7 +1941,7 @@ impl Qwen35MoeModel {
                                 gdn_state,
                                 conv_state,
                                 None,
-                                None,
+                                checkpoint,
                             )?;
                         }
                     }

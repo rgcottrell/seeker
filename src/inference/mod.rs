@@ -173,6 +173,23 @@ pub struct SpecStepOut {
     pub last_token: u32,
 }
 
+/// Result of one BATCHED spec verify ([`Engine::verify_unified`]): the per-column
+/// GPU sample for every verified position across all `B` sequences, plus the
+/// per-position pre-`output_norm` residual (for each sequence's next-step
+/// `h_last`). The caller walks each sequence's columns `[q_starts[s], q_starts[s]
+/// + seq_lens[s])`, accepting the longest draft-matching prefix.
+pub struct VerifyUnifiedOut {
+    /// `[n_total]` — the GPU sample at each verify column (column `i` is the
+    /// next-token candidate after the token packed at flat index `i`).
+    pub sampled: Vec<u32>,
+    /// `[n_embd * n_total]`, column-major (column `i`'s hidden at `i*n_embd`) —
+    /// the pre-`output_norm` residual, sliced per accepted position for `h_last`.
+    pub residual: Vec<f32>,
+    /// `[B]` — the first flat column index of each sequence (prefix sum of
+    /// `seq_lens`).
+    pub q_starts: Vec<u64>,
+}
+
 impl Engine {
     pub fn new(n_ubatch: u32, n_batch: u32) -> Result<Self, Box<dyn Error>> {
         if n_ubatch != 0 && n_ubatch > n_batch {
@@ -1995,6 +2012,45 @@ impl Engine {
         Ok(out)
     }
 
+    /// Draft `n = n_max.clamp(1,8)` tokens with the model's MTP head, greedily
+    /// (argmax each step), feeding each draft's hidden + token into the next.
+    /// Each draft is its own tiny submit so the argmax is read on the host and
+    /// fed forward. Writes the draft head's KV into `cache`'s MTP slot at
+    /// positions `[position-1, position-1+n)`. Shared by [`Self::decode_speculative`]
+    /// (single-stream) and the batched serve spec step (which drafts each
+    /// sequence on its own borrowed slot, reusing that slot's MTP KV slab).
+    pub fn draft_tokens(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        last_token: u32,
+        h_last: &[f32],
+        position: u32,
+        n_max: u32,
+    ) -> Result<Vec<u32>, Box<dyn Error>> {
+        let weights = model.weights();
+        let n = n_max.clamp(1, 8) as usize;
+        let mut drafts: Vec<u32> = Vec::with_capacity(n);
+        let mut h: Vec<f32> = h_last.to_vec();
+        let mut tok = last_token;
+        for k in 0..n as u32 {
+            // Absolute MTP position: draft 0 is at position-1 (consuming the last
+            // committed hidden + token), so it attends over the full
+            // seeded/committed MTP KV [0, position-1).
+            let mtp_pos = (position + k).saturating_sub(1);
+            let outs = self.run_spec_record(weights, |ctx| {
+                let d = model.record_mtp_draft(ctx, cache, &h, tok, mtp_pos)?;
+                Ok(vec![d.draft_token, d.block_out.range()])
+            })?;
+            // outs[0] is the 4-byte u32 token id read back as f32 bits.
+            let draft_k = outs[0][0].to_bits();
+            drafts.push(draft_k);
+            h = outs[1].clone();
+            tok = draft_k;
+        }
+        Ok(drafts)
+    }
+
     /// Run one MTP speculative-decode step: draft `n_max` tokens with the
     /// model's NextN head, verify them with a single batched main-model
     /// forward, accept the longest prefix via lossless host sample-and-
@@ -2029,24 +2085,7 @@ impl Engine {
         //       the recurrence forward.
         let dbg = std::env::var("SEEKER_SPEC_DEBUG").is_ok();
         let t_draft = std::time::Instant::now();
-        let mut drafts: Vec<u32> = Vec::with_capacity(n);
-        let mut h: Vec<f32> = h_last.to_vec();
-        let mut tok = last_token;
-        for k in 0..n as u32 {
-            // Absolute MTP position: draft 0 is at position-1 (consuming the
-            // last committed hidden + token), so it attends over the full
-            // seeded/committed MTP KV [0, position-1).
-            let mtp_pos = (position + k).saturating_sub(1);
-            let outs = self.run_spec_record(weights, |ctx| {
-                let d = model.record_mtp_draft(ctx, cache, &h, tok, mtp_pos)?;
-                Ok(vec![d.draft_token, d.block_out.range()])
-            })?;
-            // outs[0] is the 4-byte u32 token id read back as f32 bits.
-            let draft_k = outs[0][0].to_bits();
-            drafts.push(draft_k);
-            h = outs[1].clone();
-            tok = draft_k;
-        }
+        let drafts = self.draft_tokens(model, cache, last_token, h_last, position, n_max)?;
         let draft_ms = t_draft.elapsed().as_secs_f64() * 1000.0;
 
         // ── 2. Verify: one batched main forward over [last_token, drafts…],
@@ -2215,6 +2254,120 @@ impl Engine {
             h_last: h_last_out,
             last_token: last_committed,
         })
+    }
+
+    /// Batched spec **verify**: one varlen forward over `B` sequences (sequence
+    /// `s` contributes `seq_lens[s] = n_draft_s + 1` tokens — its `last_token`
+    /// plus its drafts — packed flat into `tokens`/`positions`), in CHECKPOINT
+    /// mode so each SSM layer emits per-position recurrent-state snapshots into
+    /// sequence `s`'s lane (no live writeback; the caller finalizes the accepted
+    /// position per slot). Every verify column is sampled ON the GPU with the
+    /// owning sequence's sampler (per-column [`DecodeDyn`] slot, drawn from that
+    /// sampler's RNG — same primitive as the non-spec unified decode, so the
+    /// samples are byte-identical to non-spec for both greedy and stochastic
+    /// configs). Reads back only the `n_total` chosen token ids + the per-position
+    /// residual (staged cache-speed), never the full `[vocab, n_total]` logits.
+    ///
+    /// Penalty samplers are NOT supported here (per-column parallel sampling
+    /// can't honor a within-step recent-token ring); the caller must gate them
+    /// out (demote to plain batched decode). The forward does NOT commit
+    /// `batch.positions` — the caller truncates each slot to its accepted length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_unified(
+        &mut self,
+        model: &dyn crate::models::Model,
+        batch: &mut kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        seq_lens: &[u32],
+        slots: &[u32],
+        samplers: &mut [&mut sample::Sampler],
+    ) -> Result<VerifyUnifiedOut, Box<dyn Error>> {
+        let b = seq_lens.len();
+        let n_total = tokens.len();
+        if b == 0 || n_total == 0 {
+            return Err("verify_unified: empty batch".into());
+        }
+        if positions.len() != n_total || samplers.len() != b || slots.len() != b {
+            return Err(
+                "verify_unified: tokens/positions/seq_lens/slots/samplers length mismatch".into(),
+            );
+        }
+        debug_assert!(
+            samplers.iter().all(|s| !s.config().any_penalty()),
+            "verify_unified: penalty samplers must be gated out by the caller",
+        );
+        // Prefix-sum column starts + the flat column→sequence map.
+        let mut q_starts = Vec::with_capacity(b);
+        let mut col_seq = Vec::with_capacity(n_total);
+        let mut acc = 0u64;
+        for (s, &l) in seq_lens.iter().enumerate() {
+            q_starts.push(acc);
+            for _ in 0..l {
+                col_seq.push(s);
+            }
+            acc += l as u64;
+        }
+        if acc != n_total as u64 {
+            return Err("verify_unified: sum(seq_lens) != tokens.len()".into());
+        }
+
+        let weights = model.weights();
+        let outs = self.run_spec_record(weights, |ctx| {
+            // One DecodeDyn slot per verify COLUMN, allocated BEFORE the forward
+            // so a model that reclaims per-layer scratch (qwen35moe SSM) can't
+            // clobber the host-written per-column uniform at submit time (see the
+            // single-seq gpu_stochastic note in `decode_speculative`).
+            let col_dyn = decode_dyn::alloc_array(ctx, n_total as u32)?;
+            let v = model
+                .record_forward_unified_verify(ctx, batch, tokens, positions, seq_lens, slots)?;
+            let logits = v.logits; // [vocab, n_total]
+            let vocab = logits.dims[0];
+            let elem = logits.byte_stride[0];
+            let mut ranges = Vec::with_capacity(n_total + 1);
+            for (i, &s) in col_seq.iter().enumerate() {
+                let col = weights::TensorView {
+                    buffer: logits.buffer,
+                    byte_offset: logits.byte_offset + (i as u64) * vocab * elem,
+                    byte_size: vocab * elem,
+                    dims: [vocab, 1, 1, 1],
+                    byte_stride: [elem, vocab * elem, vocab * elem, vocab * elem],
+                    element_stride: [1, vocab, vocab, vocab],
+                    dtype: logits.dtype,
+                };
+                ctx.decode_dyn = dyn_slot(col_dyn, i);
+                ranges.push(samplers[s].record_chain(ctx, col)?);
+            }
+            ranges.push(v.residual.range());
+            Ok(ranges)
+        })?;
+        let sampled: Vec<u32> = (0..n_total).map(|i| outs[i][0].to_bits()).collect();
+        let residual = outs[n_total].clone();
+        Ok(VerifyUnifiedOut {
+            sampled,
+            residual,
+            q_starts,
+        })
+    }
+
+    /// Commit each verified sequence's accepted SSM snapshot into its slot's live
+    /// recurrent state (one fenced submit) — the batched form of the finalize at
+    /// the end of [`Self::decode_speculative`]. `slots`/`accept_lens` are in the
+    /// batch order of the preceding [`Self::verify_unified`] (lane `s` →
+    /// `slots[s]`). No-op for attention-only models (no snapshots to roll back).
+    pub fn finalize_spec_batched(
+        &mut self,
+        model: &dyn crate::models::Model,
+        batch: &mut kv_cache::BatchKvCache,
+        slots: &[u32],
+        accept_lens: &[u32],
+    ) -> Result<(), Box<dyn Error>> {
+        let weights = model.weights();
+        self.run_spec_record(weights, |ctx| {
+            model.record_ssm_finalize_batched(ctx, batch, slots, accept_lens)?;
+            Ok(vec![])
+        })?;
+        Ok(())
     }
 
     /// Run [`Model::record_forward_full`] and read back the logits plus the

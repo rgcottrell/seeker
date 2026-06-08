@@ -502,13 +502,10 @@ struct Worker {
     /// Leading-prefix snapshot cache (`SEEKER_PREFIX_CACHE`). `None` when the
     /// feature is off — every seed/capture branch then short-circuits.
     prefix_cache: Option<PrefixCache>,
-    /// Max MTP draft tokens per spec step (`0` = disabled). When `> 0` and
-    /// exactly one request is active, the worker decodes it speculatively.
+    /// Max MTP draft tokens per spec step (`0` = disabled). When `> 0` and every
+    /// active request is spec-seeded, the worker drafts + verifies them together
+    /// in one batched forward ([`Worker::spec_step`]).
     spec_n_max: u32,
-    /// Shared per-position SSM checkpoint buffers for the spec verify (hybrid
-    /// models only; `None` for attention-only models or when spec is off). One
-    /// set suffices — the single-stream path runs one verify at a time.
-    spec_snapshots: Option<crate::inference::kv_cache::SsmSnapshotSet>,
     /// Logical context ceiling (`= ctx_size`). The physical slab depth is
     /// `logical_ctx + (spec_n_max+1)` so a spec verify can write `n+1` lookahead
     /// before truncating; LOGICAL guards use this, not `batch.config.max_seq_len`.
@@ -658,17 +655,20 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
             ssm.gdn_state_floats,
         )?;
     }
-    // Shared SSM checkpoint snapshot set for single-stream spec rollback (hybrid
-    // models only; attention-only models like gemma4 roll nothing back). One set
-    // suffices — the single-stream spec path verifies one sequence at a time.
-    let spec_snapshots = match (spec_n_max > 0, &ssm_dims) {
-        (true, Some(ssm)) => Some(crate::inference::kv_cache::SsmSnapshotSet::new(
+    // Per-lane SSM checkpoint snapshot pool for the batched spec verify (hybrid
+    // models only; attention-only models like gemma4 roll nothing back). One lane
+    // per slot — a batched spec step verifies every active sequence at once, each
+    // into its own lane, then finalize rolls each slot to its accepted length.
+    if spec_n_max > 0
+        && let Some(ssm) = &ssm_dims
+    {
+        batch.allocate_ssm_snapshot_lanes(
             &engine.device,
             ssm,
             spec_n_max.clamp(1, 8) + 1,
-        )?),
-        _ => None,
-    };
+            n_slots,
+        )?;
+    }
 
     let mib = 1u64 << 20;
     tracing::info!(
@@ -762,7 +762,6 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         scratch_bytes,
         prefix_cache,
         spec_n_max,
-        spec_snapshots,
         logical_ctx: cfg.ctx_size,
     })
 }
@@ -981,11 +980,11 @@ fn worker_main(
                 // regardless of the global unified flag.
                 Some(job) if job.image.is_some() => worker.admit_image(job),
                 Some(job) if job.audio.is_some() => worker.admit_audio(job),
-                // Solo text request + spec enabled → single-pass spec prefill
-                // (captures h_last + seeds the draft). Long prompts fall through
-                // to chunked non-spec prefill (admit_spec is single-pass). Only
-                // from the idle branch, so concurrent (drained) requests stay
-                // batched.
+                // Text request + spec enabled → single-pass spec prefill (captures
+                // h_last + seeds the draft KV so the sequence is spec-seeded). The
+                // drain loop below admits concurrent requests the same way, so a
+                // multi-request batch drafts + verifies together. Long prompts fall
+                // through to chunked non-spec prefill (admit_spec is single-pass).
                 Some(job)
                     if worker.spec_n_max > 0 && job.tokens.len() <= SPEC_PREFILL_MAX_PROMPT =>
                 {
@@ -997,17 +996,21 @@ fn worker_main(
             }
         }
         // Drain queued jobs into any free slabs without blocking the step. With
-        // spec on, a SOLO request decodes speculatively (`spec_step`); once a 2nd
-        // request is admitted the speccer DEMOTES to the batched `forward_unified`
-        // (its slab is left committed/clean by `decode_speculative`, so it joins
-        // seamlessly; `h_last` goes unused while batched). The per-step `kv_lens`
-        // guard + scratch/readback caps make a corrupted batch a clean error
-        // rather than a wedge. (Concurrent *batched spec* — every seq drafting +
-        // verifying together — is the later phase.)
+        // spec on, each text request is admitted spec-seeded (single-pass spec
+        // prefill capturing `h_last` + seeding the draft KV); when EVERY active
+        // request is spec-seeded the worker drafts + verifies them all together in
+        // one batched forward (`spec_step`). A non-eligible request (long prompt →
+        // chunked `admit_unified`, penalty sampler, or image) leaves the batch not
+        // all-seeded → the step DEMOTES to plain batched decode (clearing
+        // `spec_seeded`). The per-step `kv_lens` guard + scratch/readback caps make
+        // a corrupted batch a clean error rather than a wedge.
         while worker.free_slabs() > 0 {
             match jobs.try_recv() {
                 Ok(job) if job.image.is_some() => worker.admit_image(job),
                 Ok(job) if job.audio.is_some() => worker.admit_audio(job),
+                Ok(job) if worker.spec_n_max > 0 && job.tokens.len() <= SPEC_PREFILL_MAX_PROMPT => {
+                    worker.admit_spec(job)
+                }
                 Ok(job) if unified => worker.admit_unified(job),
                 Ok(job) => worker.admit(job),
                 Err(_) => break, // empty or all-senders-dropped
@@ -2091,82 +2094,193 @@ impl Worker {
         self.active.push(seq);
     }
 
-    /// True when the single-stream spec path should run this step: spec enabled,
-    /// exactly one live request, seeded (`h_last` valid), in decode phase, and
-    /// the verify's `n+1` lookahead fits the physical slab.
+    /// True when the BATCHED spec path should run this step: spec enabled and
+    /// EVERY active request is spec-eligible — seeded (`h_last` valid), in decode
+    /// phase, penalty-free (per-column GPU verify can't honor a within-step
+    /// recent-token ring), image-free (`rope_lag == 0`; the MTP draft uses the raw
+    /// position), and with full `n+1` lookahead room below the logical ceiling.
+    /// Any non-eligible sequence demotes the whole step to plain batched decode
+    /// (which clears `spec_seeded`); first cut does not re-promote.
     fn spec_ready(&self) -> bool {
-        if self.spec_n_max == 0 || self.active.len() != 1 {
+        if self.spec_n_max == 0 || self.active.is_empty() {
             return false;
         }
-        let s = &self.active[0];
-        s.terminal.is_none()
-            && !s.disconnected
-            && s.spec_seeded
-            && s.h_last.is_some()
-            // Decode phase: every logical token but the last (`last_token`) is in KV.
-            && s.num_computed as usize == s.prompt.len() + s.generated.len() - 1
-            && self.batch.positions[s.slab as usize] + self.spec_n_max < self.batch.config.max_seq_len
+        let n = self.spec_n_max;
+        let max_phys = self.batch.config.max_seq_len;
+        self.active.iter().all(|s| {
+            let pos = self.batch.positions[s.slab as usize];
+            s.terminal.is_none()
+                && !s.disconnected
+                && s.spec_seeded
+                && s.h_last.is_some()
+                && !s.sampler.config().any_penalty()
+                && self.batch.rope_lag[s.slab as usize] == 0
+                // Decode phase: every logical token but the last (`last_token`) is in KV.
+                && s.num_computed as usize == s.prompt.len() + s.generated.len() - 1
+                // Full n+1 lookahead room below the LOGICAL ceiling (and the
+                // physical slab depth = logical_ctx + (n_max+1)).
+                && pos + n < self.logical_ctx
+                && pos + n < max_phys
+        })
     }
 
-    /// One speculative decode step on the sole active sequence's borrowed slot:
-    /// `decode_speculative` drafts + verifies + commits (truncating K/V and
-    /// finalizing SSM, so the slab stays a valid batched-decode state), then we
-    /// stream the 1..=n+1 emitted tokens and carry `h_last`/`last_token` forward.
+    /// One BATCHED speculative step over all (spec-seeded) active sequences:
+    /// draft each sequence's `n` tokens on its own slot (per-slot MTP KV), verify
+    /// them ALL in one varlen forward (checkpoint mode → per-lane SSM snapshots),
+    /// accept each sequence's longest draft-matching prefix independently, roll
+    /// each slot's KV + SSM back to its accepted length, then stream + carry
+    /// `h_last`/`last_token` forward. Lossless and concurrency-independent: each
+    /// sequence's emitted tokens are faithful target samples (same primitive as
+    /// non-spec), regardless of batch composition.
     fn spec_step(&mut self) {
-        let slab = self.active[0].slab;
-        let position = self.batch.positions[slab as usize];
-        let last_token = self.active[0].last_token;
-        let h_last = self.active[0]
-            .h_last
-            .take()
-            .expect("spec_ready guarantees h_last");
+        let n = self.spec_n_max;
+        let b = self.active.len();
+        let slots: Vec<u32> = self.active.iter().map(|s| s.slab).collect();
 
-        let mut sc = self.batch.slot_kvcache(slab);
-        sc.position = position;
-        if let Some(set) = &self.spec_snapshots {
-            sc.attach_ssm_snapshots(set);
-        }
-        let out = match self.engine.decode_speculative(
-            &*self.model,
-            &mut sc,
-            last_token,
-            &h_last,
-            position,
-            &mut self.active[0].sampler,
-            self.spec_n_max,
-        ) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(error = %e, "serve: spec_step failed");
-                let _ = self.active[0]
-                    .reply
-                    .blocking_send(GenEvent::Error(e.to_string()));
-                self.active[0].disconnected = true;
-                self.active[0].terminal = Some(StopReason::ContextFull);
-                return;
+        // ── 1. Draft each sequence (serialized; each writes its own slot's MTP
+        //       KV slab) and pack the flat verify batch [last_s, drafts_s…]. The
+        //       per-token `positions` are the rope base; gated on `rope_lag == 0`,
+        //       so they equal the absolute KV positions (= `batch.positions[slot]`,
+        //       which the verify reads as its KV write base — left unchanged until
+        //       the accept step below).
+        let mut drafts: Vec<Vec<u32>> = Vec::with_capacity(b);
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut positions: Vec<u32> = Vec::new();
+        let mut seq_lens: Vec<u32> = Vec::with_capacity(b);
+        for i in 0..b {
+            let slab = self.active[i].slab;
+            let pos = self.batch.positions[slab as usize];
+            let last = self.active[i].last_token;
+            let h = self.active[i]
+                .h_last
+                .take()
+                .expect("spec_ready guarantees h_last");
+            let mut sc = self.batch.slot_kvcache(slab);
+            sc.position = pos;
+            let d = match self
+                .engine
+                .draft_tokens(&*self.model, &mut sc, last, &h, pos, n)
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    drop(sc);
+                    return self.fail_spec_step(&e.to_string());
+                }
+            };
+            drop(sc);
+            tokens.push(last);
+            positions.push(pos);
+            for (k, &dk) in d.iter().enumerate() {
+                tokens.push(dk);
+                positions.push(pos + 1 + k as u32);
             }
-        };
-        self.batch.positions[slab as usize] = sc.position;
-        self.batch.rope_lag[slab as usize] = sc.rope_position_lag;
-        drop(sc);
+            seq_lens.push(d.len() as u32 + 1);
+            drafts.push(d);
+        }
 
-        // Stream the accepted prefix + bonus token; EOS / stop / max-tokens stop
-        // mid-emit (post-stop drafts are never streamed).
-        for &tk in &out.emitted {
-            process_token(
-                &self.model.tokenizer().tokenizer,
-                &self.eog_ids,
-                &mut self.active[0],
-                tk,
-            );
-            if self.active[0].terminal.is_some() || self.active[0].disconnected {
+        // ── 2. Verify all sequences in one varlen forward (checkpoint mode →
+        //       per-lane SSM snapshots; positions NOT committed).
+        let verify = {
+            let mut samplers: Vec<&mut Sampler> =
+                self.active.iter_mut().map(|s| &mut s.sampler).collect();
+            self.engine.verify_unified(
+                &*self.model,
+                &mut self.batch,
+                &tokens,
+                &positions,
+                &seq_lens,
+                &slots,
+                &mut samplers,
+            )
+        };
+        let v = match verify {
+            Ok(v) => v,
+            Err(e) => return self.fail_spec_step(&e.to_string()),
+        };
+        let hidden = v.residual.len() / tokens.len();
+
+        // ── 3. Per-sequence accept: emit the GPU sample at each column, accept
+        //       the draft while it matches, stop at the first mismatch. Truncate
+        //       each slot's KV to its accepted length; capture its next `h_last`.
+        let mut accept_lens: Vec<u32> = Vec::with_capacity(b);
+        let mut emitted_all: Vec<Vec<u32>> = Vec::with_capacity(b);
+        let mut h_last_all: Vec<Vec<f32>> = Vec::with_capacity(b);
+        for i in 0..b {
+            let q0 = v.q_starts[i] as usize;
+            let li = seq_lens[i] as usize; // n_i + 1
+            let mut emitted = Vec::with_capacity(li);
+            // Walk this sequence's `li` verify columns: emit each GPU sample,
+            // accept the matching draft, stop at the first mismatch (the last
+            // column has no draft to match → always the stopping bonus token).
+            for (j, &s) in v.sampled[q0..q0 + li].iter().enumerate() {
+                self.active[i].sampler.accept(s);
+                emitted.push(s);
+                if j + 1 < li && s == drafts[i][j] {
+                    continue;
+                }
                 break;
             }
+            let accept_len = emitted.len() - 1;
+            let col = q0 + accept_len;
+            h_last_all.push(v.residual[col * hidden..(col + 1) * hidden].to_vec());
+            // Truncate the slot's K/V to the accepted length (stale draft K/V past
+            // here is never read); the SSM rolls back in the finalize below.
+            let new_pos = positions[q0] + accept_len as u32 + 1;
+            self.batch.positions[slots[i] as usize] = new_pos;
+            accept_lens.push(accept_len as u32);
+            emitted_all.push(emitted);
         }
-        self.active[0].num_computed = self.batch.positions[slab as usize];
-        self.active[0].last_token = out.last_token;
-        self.active[0].h_last = Some(out.h_last);
-        self.active[0].spec_seeded = true;
+
+        // ── 4. Roll each slot's SSM state forward to its accepted snapshot.
+        if self.batch.n_snapshot_lanes() > 0
+            && let Err(e) = self.engine.finalize_spec_batched(
+                &*self.model,
+                &mut self.batch,
+                &slots,
+                &accept_lens,
+            )
+        {
+            return self.fail_spec_step(&e.to_string());
+        }
+
+        // ── 5. Stream each sequence's emitted tokens + carry spec state forward.
+        for i in 0..b {
+            for &tk in &emitted_all[i] {
+                process_token(
+                    &self.model.tokenizer().tokenizer,
+                    &self.eog_ids,
+                    &mut self.active[i],
+                    tk,
+                );
+                if self.active[i].terminal.is_some() || self.active[i].disconnected {
+                    break;
+                }
+            }
+            self.active[i].num_computed = self.batch.positions[slots[i] as usize];
+            self.active[i].last_token = *emitted_all[i].last().unwrap();
+            self.active[i].h_last = Some(std::mem::take(&mut h_last_all[i]));
+            self.active[i].spec_seeded = true;
+        }
+        if std::env::var("SEEKER_SPEC_DEBUG").is_ok() {
+            let acc: u32 = accept_lens.iter().sum();
+            eprintln!(
+                "SPEC batched: b={b} accepted={acc}/{} (per-seq {accept_lens:?})",
+                b as u32 * n,
+            );
+        }
+    }
+
+    /// Fail the current batched spec step: report the error to every active
+    /// sequence and mark them terminal so the step unwinds cleanly rather than
+    /// wedging. A spec failure is unrecoverable for the batch (the KV / SSM state
+    /// may be mid-rollback across slots).
+    fn fail_spec_step(&mut self, err: &str) {
+        tracing::error!(error = %err, "serve: batched spec_step failed");
+        for seq in self.active.iter_mut() {
+            let _ = seq.reply.blocking_send(GenEvent::Error(err.to_string()));
+            seq.disconnected = true;
+            seq.terminal = Some(StopReason::ContextFull);
+        }
     }
 
     /// One batched decode step: gather the active sequences that still have

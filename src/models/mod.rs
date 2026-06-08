@@ -306,6 +306,22 @@ pub trait Model: Send + Sync {
         Err("model does not support record_ssm_finalize (MTP spec decode)".into())
     }
 
+    /// Batched form of [`Self::record_ssm_finalize`] for the concurrent spec
+    /// verify: for each verified sequence `s`, commit lane `s`'s per-position
+    /// snapshots at `accept_lens[s]` into slot `slots[s]`'s live recurrent state
+    /// (one `cmd_copy_buffer` per SSM layer for the GDN state + a strided conv
+    /// extract). `slots`/`accept_lens` are in the same batch order as the verify;
+    /// lane `s` is `batch.snapshot_lane(s)`. Default: unimplemented.
+    fn record_ssm_finalize_batched(
+        &self,
+        _ctx: &mut DispatchContext,
+        _batch: &mut crate::inference::kv_cache::BatchKvCache,
+        _slots: &[u32],
+        _accept_lens: &[u32],
+    ) -> Result<(), Box<dyn Error>> {
+        Err("model does not support record_ssm_finalize_batched (concurrent spec)".into())
+    }
+
     /// Populate the MTP draft head's KV cache for positions
     /// `[position_offset, position_offset + tokens.len())` from the main
     /// model's hidden states (`hiddens`, `[n_embd, L]` row-major by
