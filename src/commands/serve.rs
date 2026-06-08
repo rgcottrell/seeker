@@ -186,6 +186,13 @@ pub struct ServeArgs {
     /// carry images (OpenAI `image_url` content).
     #[arg(long = "no-mmproj")]
     no_mmproj: bool,
+
+    /// Speculative-decode draft model and max draft tokens per step
+    /// (`--spec-draft-model` / `--spec-draft-hf` / `--spec-draft-n-max`). With a
+    /// draft and `n_max > 0`, a SINGLE active request decodes speculatively
+    /// (concurrent requests fall back to plain batched decode).
+    #[command(flatten)]
+    spec: crate::commands::download::SpecDraftArgs,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -328,6 +335,16 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         None
     };
 
+    // Optional MTP draft model (local path or HF repo) for single-stream
+    // speculative decode. Resolved here (async); the worker attaches it.
+    let spec_draft_path = crate::commands::download::resolve_spec_draft(
+        args.spec.spec_draft_model.clone(),
+        args.spec.spec_draft_hf.clone(),
+        args.hf_token.clone(),
+        args.offline,
+    )
+    .await?;
+
     let (handle, ready) = InferenceHandle::spawn(WorkerConfig {
         model_path: path.clone(),
         mmproj_path,
@@ -340,6 +357,8 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         parallel_max: args.parallel_max,
         mem_fraction: args.mem_fraction,
         pin_prefix_tokens,
+        spec_draft_path,
+        spec_draft_n_max: args.spec.spec_draft_n_max,
     });
     // The worker reports the *resolved* slot count (auto-sizing may differ from
     // the request) so `/slots` + `/props` report the real number.

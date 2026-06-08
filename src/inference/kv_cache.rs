@@ -149,6 +149,72 @@ pub struct KvCache {
     device: Arc<DeviceShared>,
 }
 
+/// Detached owner of the per-position SSM checkpoint buffers used by spec-decode
+/// verify. The single-sequence path allocates these directly on its `KvCache`
+/// ([`KvCache::allocate_ssm_snapshots`]); the serve worker — which runs spec on a
+/// *borrowed* single-slot cache — owns one `SsmSnapshotSet` and
+/// [`KvCache::attach_ssm_snapshots`]es it to the borrowed view each step (only
+/// one verify is ever in flight at a time, so a single shared set suffices).
+pub struct SsmSnapshotSet {
+    gdn_region: Region,
+    conv_region: Region,
+    gdn_snaps: Vec<crate::inference::buffer::BufferRange>,
+    conv_backs: Vec<crate::inference::buffer::BufferRange>,
+    max_snapshots: u32,
+    conv_kernel: u32,
+    conv_channels: u32,
+}
+
+impl SsmSnapshotSet {
+    /// Allocate the GDN snapshot + conv backup regions for `max_snapshots`
+    /// (= n_draft+1) lookahead positions. Only call with `n_ssm_layers > 0` and
+    /// `max_snapshots > 0` (the single-seq `allocate_ssm_snapshots` guards both).
+    pub fn new(
+        device: &Device,
+        dims: &crate::models::SsmStateDims,
+        max_snapshots: u32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let n = dims.n_ssm_layers as u64;
+        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST;
+        let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        // GDN: max_snapshots × gdn_state_floats per layer.
+        let gdn_bytes = (max_snapshots as u64) * (dims.gdn_state_floats as u64) * 4;
+        let gdn_aligned = align_up(gdn_bytes, align);
+        let gdn_region = Region::new(device, (n * gdn_aligned).max(1), usage, mem)?;
+        // Conv: [(conv_kernel-1)+max_snapshots] × conv_channels per layer.
+        let n_padded = (dims.conv_kernel - 1 + max_snapshots) as u64;
+        let conv_bytes = n_padded * (dims.conv_channels as u64) * 4;
+        let conv_aligned = align_up(conv_bytes, align);
+        let conv_region = Region::new(device, (n * conv_aligned).max(1), usage, mem)?;
+        let mut gdn_snaps = Vec::with_capacity(dims.n_ssm_layers as usize);
+        let mut conv_backs = Vec::with_capacity(dims.n_ssm_layers as usize);
+        for i in 0..n {
+            gdn_snaps.push(crate::inference::buffer::BufferRange {
+                buffer: gdn_region.buffer,
+                offset: i * gdn_aligned,
+                size: gdn_bytes,
+            });
+            conv_backs.push(crate::inference::buffer::BufferRange {
+                buffer: conv_region.buffer,
+                offset: i * conv_aligned,
+                size: conv_bytes,
+            });
+        }
+        Ok(Self {
+            gdn_region,
+            conv_region,
+            gdn_snaps,
+            conv_backs,
+            max_snapshots,
+            conv_kernel: dims.conv_kernel,
+            conv_channels: dims.conv_channels,
+        })
+    }
+}
+
 impl KvCache {
     pub fn new(
         device: &Device,
@@ -375,45 +441,32 @@ impl KvCache {
         if max_snapshots == 0 || dims.n_ssm_layers == 0 {
             return Ok(());
         }
-        let n = dims.n_ssm_layers as u64;
-        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST;
-        let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-
-        // GDN: max_snapshots × gdn_state_floats per layer.
-        let gdn_bytes = (max_snapshots as u64) * (dims.gdn_state_floats as u64) * 4;
-        let gdn_aligned = align_up(gdn_bytes, align);
-        let gdn_region = Region::new(device, (n * gdn_aligned).max(1), usage, mem)?;
-        // Conv: [(conv_kernel-1)+max_snapshots] × conv_channels per layer.
-        let n_padded = (dims.conv_kernel - 1 + max_snapshots) as u64;
-        let conv_bytes = n_padded * (dims.conv_channels as u64) * 4;
-        let conv_aligned = align_up(conv_bytes, align);
-        let conv_region = Region::new(device, (n * conv_aligned).max(1), usage, mem)?;
-
-        let mut gdn_snaps = Vec::with_capacity(dims.n_ssm_layers as usize);
-        let mut conv_backs = Vec::with_capacity(dims.n_ssm_layers as usize);
-        for i in 0..n {
-            gdn_snaps.push(crate::inference::buffer::BufferRange {
-                buffer: gdn_region.buffer,
-                offset: i * gdn_aligned,
-                size: gdn_bytes,
-            });
-            conv_backs.push(crate::inference::buffer::BufferRange {
-                buffer: conv_region.buffer,
-                offset: i * conv_aligned,
-                size: conv_bytes,
-            });
-        }
-        self.ssm_gdn_snap_region = Some(gdn_region);
-        self.ssm_gdn_snapshots = gdn_snaps;
-        self.ssm_conv_backup_region = Some(conv_region);
-        self.ssm_conv_backups = conv_backs;
-        self.ssm_max_snapshots = max_snapshots;
-        self.ssm_conv_kernel = dims.conv_kernel;
-        self.ssm_conv_channels = dims.conv_channels;
+        // Build a detached set, then take ownership of its regions onto self so
+        // this cache's `Drop` frees them (the single-seq / owning-cache case).
+        let set = SsmSnapshotSet::new(device, dims, max_snapshots)?;
+        self.ssm_gdn_snapshots = set.gdn_snaps;
+        self.ssm_conv_backups = set.conv_backs;
+        self.ssm_max_snapshots = set.max_snapshots;
+        self.ssm_conv_kernel = set.conv_kernel;
+        self.ssm_conv_channels = set.conv_channels;
+        self.ssm_gdn_snap_region = Some(set.gdn_region);
+        self.ssm_conv_backup_region = Some(set.conv_region);
         Ok(())
+    }
+
+    /// Point this (borrowed-slot) cache's snapshot *views* at a worker-owned
+    /// [`SsmSnapshotSet`] without taking ownership of its regions — the set
+    /// outlives the borrow. The `*_region` fields stay `None`, so this cache's
+    /// `Drop` frees nothing. Used by `serve`'s single-stream spec step, which
+    /// borrows a slot via [`BatchKvCache::slot_kvcache`] (which leaves the
+    /// snapshot fields empty) and attaches the shared set before
+    /// `decode_speculative`.
+    pub fn attach_ssm_snapshots(&mut self, set: &SsmSnapshotSet) {
+        self.ssm_gdn_snapshots = set.gdn_snaps.clone();
+        self.ssm_conv_backups = set.conv_backs.clone();
+        self.ssm_max_snapshots = set.max_snapshots;
+        self.ssm_conv_kernel = set.conv_kernel;
+        self.ssm_conv_channels = set.conv_channels;
     }
 
     /// Reset the write cursor to 0, starting a fresh sequence.

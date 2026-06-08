@@ -245,6 +245,21 @@ impl Engine {
     /// `n_ubatch` / context — llama.cpp-style worst-case reservation. Must be
     /// called once after the model is opened, before any forward.
     pub fn allocate_scratch(&mut self, bytes: u64) -> Result<(), Box<dyn Error>> {
+        // Defensive cap: a real scratch reservation is at most a few GiB. A size
+        // far above that means a corrupted length computation upstream (e.g. an
+        // underflowed token/position count). Refuse it with a clear error rather
+        // than handing the driver a wedge-the-box allocation — a ~100 GiB scratch
+        // request once hard-locked the machine.
+        const SCRATCH_MAX_BYTES: u64 = 24 << 30; // 24 GiB
+        if bytes > SCRATCH_MAX_BYTES {
+            return Err(format!(
+                "refusing scratch allocation of {} MiB (> {} GiB cap) — likely a \
+                 corrupted length upstream",
+                bytes / (1 << 20),
+                SCRATCH_MAX_BYTES >> 30,
+            )
+            .into());
+        }
         // No work can be in flight (scratch is replaced wholesale, and any
         // cached decode recording binds the old buffer).
         unsafe { self.device.device.device_wait_idle()? };
@@ -1829,6 +1844,19 @@ impl Engine {
     fn ensure_readback(&mut self, bytes: u64) -> Result<(), Box<dyn Error>> {
         if self.readback.size >= bytes {
             return Ok(());
+        }
+        // Defensive cap (see allocate_scratch): a readback staging buffer holds a
+        // handful of result tensors — never tens of GiB. A huge size signals a
+        // corrupted length upstream; refuse rather than wedge the box.
+        const READBACK_MAX_BYTES: u64 = 24 << 30; // 24 GiB
+        if bytes > READBACK_MAX_BYTES {
+            return Err(format!(
+                "refusing readback allocation of {} MiB (> {} GiB cap) — likely a \
+                 corrupted length upstream",
+                bytes / (1 << 20),
+                READBACK_MAX_BYTES >> 30,
+            )
+            .into());
         }
         let new = new_readback_region(&self.device, bytes.max(self.readback.size * 2))?;
         let mut old = std::mem::replace(&mut self.readback, new);
