@@ -193,6 +193,26 @@ pub trait Model: Send + Sync {
         Err("record_forward_unified (varlen prefill+decode) not implemented for this model".into())
     }
 
+    /// Spec batched-verify forward: like [`Self::record_forward_unified`] but
+    /// returns logits for ALL `N_total` positions (not just each sequence's last)
+    /// plus the per-position residual, and does NOT commit per-slot `positions`
+    /// (the caller truncates each slot to its accepted length). See
+    /// [`UnifiedVerifyOut`]. Default: unimplemented.
+    fn record_forward_unified_verify(
+        &self,
+        _ctx: &mut DispatchContext,
+        _batch: &mut crate::inference::kv_cache::BatchKvCache,
+        _tokens: &[u32],
+        _positions: &[u32],
+        _seq_lens: &[u32],
+        _slots: &[u32],
+    ) -> Result<UnifiedVerifyOut, Box<dyn Error>> {
+        Err(
+            "record_forward_unified_verify (batched spec verify) not implemented for this model"
+                .into(),
+        )
+    }
+
     /// Whether image tokens use a 2D M-RoPE cursor (qwen-VL) vs plain sequential
     /// 1D positions (gemma4). When `true` (default), the engine advances the
     /// M-RoPE cursor by `max(nx,ny)` after an image and tracks the
@@ -330,6 +350,17 @@ pub trait Model: Send + Sync {
 /// always populates it.
 pub struct ForwardFullOut {
     pub logits: Option<TensorView>,
+    pub residual: TensorView,
+}
+
+/// Output of [`Model::record_forward_unified_verify`]: per-position logits +
+/// residual over the flat varlen batch. Sequence `s` owns columns
+/// `[q_starts[s], q_starts[s] + seq_lens[s])` (prefix-sum of `seq_lens`), which
+/// the caller slices to sample/compare its `n+1` draft positions.
+pub struct UnifiedVerifyOut {
+    /// `[vocab, N_total]`.
+    pub logits: TensorView,
+    /// `[n_embd, N_total]`.
     pub residual: TensorView,
 }
 

@@ -615,7 +615,23 @@ impl Model for Qwen35MoeModel {
         seq_lens: &[u32],
         slots: &[u32],
     ) -> Result<TensorView, Box<dyn Error>> {
-        self.forward_unified_impl(ctx, batch, tokens, positions, seq_lens, slots)
+        let (logits, _residual) =
+            self.forward_unified_impl(ctx, batch, tokens, positions, seq_lens, slots, false)?;
+        Ok(logits)
+    }
+
+    fn record_forward_unified_verify(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        seq_lens: &[u32],
+        slots: &[u32],
+    ) -> Result<crate::models::UnifiedVerifyOut, Box<dyn Error>> {
+        let (logits, residual) =
+            self.forward_unified_impl(ctx, batch, tokens, positions, seq_lens, slots, true)?;
+        Ok(crate::models::UnifiedVerifyOut { logits, residual })
     }
 }
 
@@ -1564,6 +1580,12 @@ impl Qwen35MoeModel {
     /// sequences). MoE FFN is token-parallel → reused on `N_total`. Returns each
     /// sequence's last-token logits, `[vocab, B]`.
     #[allow(clippy::too_many_arguments)]
+    /// Returns `(logits, residual)`. Normal mode: `logits = [vocab, B]` (each
+    /// sequence's LAST-token column) and per-slot `positions` are committed.
+    /// `verify` mode (spec batched verify): `logits = [vocab, N_total]` (every
+    /// position) and `positions` are NOT committed — the caller sets each slot's
+    /// accepted length. `residual` is `[n_embd, N_total]` in both.
+    #[allow(clippy::too_many_arguments)]
     fn forward_unified_impl(
         &self,
         ctx: &mut DispatchContext,
@@ -1572,7 +1594,8 @@ impl Qwen35MoeModel {
         positions: &[u32],
         seq_lens: &[u32],
         slots: &[u32],
-    ) -> Result<TensorView, Box<dyn Error>> {
+        verify: bool,
+    ) -> Result<(TensorView, TensorView), Box<dyn Error>> {
         use crate::inference::command::record_global_barrier;
         let p = &self.params;
         let b = seq_lens.len();
@@ -1795,42 +1818,59 @@ impl Qwen35MoeModel {
         }
         ctx.scratch_restore(layer_checkpoint);
 
-        // Epilogue: gather each sequence's last-token column → norm + lm_head.
-        let last_hidden = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
-        record_global_barrier(ctx.device, ctx.cmd);
-        unsafe {
-            use ash::vk;
-            for s in 0..b {
-                let src_col = q_starts[s] + seq_lens[s] as u64 - 1;
-                let copy = vk::BufferCopy::default()
-                    .src_offset(residual.byte_offset + src_col * hidden * elem)
-                    .dst_offset(last_hidden.byte_offset + s as u64 * hidden * elem)
-                    .size(hidden * elem);
-                ctx.device.device.cmd_copy_buffer(
-                    ctx.cmd,
-                    residual.buffer,
-                    last_hidden.buffer,
-                    std::slice::from_ref(&copy),
-                );
-            }
-        }
-        record_global_barrier(ctx.device, ctx.cmd);
-        let final_norm = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
-        rms_norm::record(
-            ctx,
-            last_hidden,
-            self.weights.output_norm,
-            final_norm,
-            p.rms_eps,
-        )?;
         let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
-        let logits = ctx.alloc_tensor([vocab, b as u64, 1, 1], GgmlType::F32)?;
-        matmul::record(ctx, lm_head, final_norm, logits)?;
-
-        for s in 0..b {
-            batch.positions[slots[s] as usize] = kv_lens[s];
-        }
-        Ok(logits)
+        let logits = if verify {
+            // Verify (spec batched): norm + project ALL N_total positions, so the
+            // caller can sample/compare each draft column. Positions are NOT
+            // committed — the caller truncates each slot to its accepted length.
+            let final_norm = ctx.alloc_tensor([hidden, n_total, 1, 1], GgmlType::F32)?;
+            rms_norm::record(
+                ctx,
+                residual,
+                self.weights.output_norm,
+                final_norm,
+                p.rms_eps,
+            )?;
+            let logits = ctx.alloc_tensor([vocab, n_total, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, lm_head, final_norm, logits)?;
+            logits
+        } else {
+            // Normal: gather each sequence's last-token column → norm + lm_head.
+            let last_hidden = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
+            record_global_barrier(ctx.device, ctx.cmd);
+            unsafe {
+                use ash::vk;
+                for s in 0..b {
+                    let src_col = q_starts[s] + seq_lens[s] as u64 - 1;
+                    let copy = vk::BufferCopy::default()
+                        .src_offset(residual.byte_offset + src_col * hidden * elem)
+                        .dst_offset(last_hidden.byte_offset + s as u64 * hidden * elem)
+                        .size(hidden * elem);
+                    ctx.device.device.cmd_copy_buffer(
+                        ctx.cmd,
+                        residual.buffer,
+                        last_hidden.buffer,
+                        std::slice::from_ref(&copy),
+                    );
+                }
+            }
+            record_global_barrier(ctx.device, ctx.cmd);
+            let final_norm = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
+            rms_norm::record(
+                ctx,
+                last_hidden,
+                self.weights.output_norm,
+                final_norm,
+                p.rms_eps,
+            )?;
+            let logits = ctx.alloc_tensor([vocab, b as u64, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, lm_head, final_norm, logits)?;
+            for s in 0..b {
+                batch.positions[slots[s] as usize] = kv_lens[s];
+            }
+            logits
+        };
+        Ok((logits, residual))
     }
 }
 
