@@ -2137,12 +2137,17 @@ impl Worker {
         let b = self.active.len();
         let slots: Vec<u32> = self.active.iter().map(|s| s.slab).collect();
 
+        let dbg = std::env::var("SEEKER_SPEC_DEBUG").is_ok();
+        let t_draft = std::time::Instant::now();
         // ── 1. Draft each sequence (serialized; each writes its own slot's MTP
         //       KV slab) and pack the flat verify batch [last_s, drafts_s…]. The
         //       per-token `positions` are the rope base; gated on `rope_lag == 0`,
         //       so they equal the absolute KV positions (= `batch.positions[slot]`,
         //       which the verify reads as its KV write base — left unchanged until
-        //       the accept step below).
+        //       the accept step below). The draft is GPU-bound (~3.5ms/MTP forward,
+        //       lm_head over the full vocab) so co-recording the B submits doesn't
+        //       help; a real B≥2 win needs a batched MTP forward (weights read once
+        //       for all B) — see the per-phase timing below.
         let mut drafts: Vec<Vec<u32>> = Vec::with_capacity(b);
         let mut tokens: Vec<u32> = Vec::new();
         let mut positions: Vec<u32> = Vec::new();
@@ -2178,6 +2183,8 @@ impl Worker {
             drafts.push(d);
         }
 
+        let draft_ms = t_draft.elapsed().as_secs_f64() * 1000.0;
+        let t_verify = std::time::Instant::now();
         // ── 2. Verify all sequences in one varlen forward (checkpoint mode →
         //       per-lane SSM snapshots; positions NOT committed).
         let verify = {
@@ -2197,6 +2204,8 @@ impl Worker {
             Ok(v) => v,
             Err(e) => return self.fail_spec_step(&e.to_string()),
         };
+        let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+        let t_fin = std::time::Instant::now();
         let hidden = v.residual.len() / tokens.len();
 
         // ── 3. Per-sequence accept: emit the GPU sample at each column, accept
@@ -2261,10 +2270,12 @@ impl Worker {
             self.active[i].h_last = Some(std::mem::take(&mut h_last_all[i]));
             self.active[i].spec_seeded = true;
         }
-        if std::env::var("SEEKER_SPEC_DEBUG").is_ok() {
+        if dbg {
             let acc: u32 = accept_lens.iter().sum();
+            let fin_ms = t_fin.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
-                "SPEC batched: b={b} accepted={acc}/{} (per-seq {accept_lens:?})",
+                "SPEC batched: b={b} accepted={acc}/{} (per-seq {accept_lens:?}) \
+                 draft={draft_ms:.1}ms verify={verify_ms:.1}ms finalize+stream={fin_ms:.1}ms",
                 b as u32 * n,
             );
         }
