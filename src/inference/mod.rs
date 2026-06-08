@@ -1858,7 +1858,13 @@ impl Engine {
             )
             .into());
         }
-        let new = new_readback_region(&self.device, bytes.max(self.readback.size * 2))?;
+        // Clamp the doubling growth heuristic to the cap too — otherwise an
+        // already-large buffer could resize above it even when `bytes` is under
+        // (defeating the guard). `bytes <= cap` here, so `target >= bytes`.
+        let target = bytes
+            .max(self.readback.size.saturating_mul(2))
+            .min(READBACK_MAX_BYTES);
+        let new = new_readback_region(&self.device, target)?;
         let mut old = std::mem::replace(&mut self.readback, new);
         old.destroy(&self.device.device);
         Ok(())

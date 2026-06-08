@@ -163,6 +163,9 @@ pub struct SsmSnapshotSet {
     max_snapshots: u32,
     conv_kernel: u32,
     conv_channels: u32,
+    /// Owns the device so `Drop` can free the two regions (this is a detached
+    /// owner; the regions aren't tracked by any `KvCache`).
+    device: Arc<DeviceShared>,
 }
 
 impl SsmSnapshotSet {
@@ -174,35 +177,8 @@ impl SsmSnapshotSet {
         dims: &crate::models::SsmStateDims,
         max_snapshots: u32,
     ) -> Result<Self, Box<dyn Error>> {
-        let n = dims.n_ssm_layers as u64;
-        let align = device.limits.min_storage_buffer_offset_alignment.max(1);
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST;
-        let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        // GDN: max_snapshots × gdn_state_floats per layer.
-        let gdn_bytes = (max_snapshots as u64) * (dims.gdn_state_floats as u64) * 4;
-        let gdn_aligned = align_up(gdn_bytes, align);
-        let gdn_region = Region::new(device, (n * gdn_aligned).max(1), usage, mem)?;
-        // Conv: [(conv_kernel-1)+max_snapshots] × conv_channels per layer.
-        let n_padded = (dims.conv_kernel - 1 + max_snapshots) as u64;
-        let conv_bytes = n_padded * (dims.conv_channels as u64) * 4;
-        let conv_aligned = align_up(conv_bytes, align);
-        let conv_region = Region::new(device, (n * conv_aligned).max(1), usage, mem)?;
-        let mut gdn_snaps = Vec::with_capacity(dims.n_ssm_layers as usize);
-        let mut conv_backs = Vec::with_capacity(dims.n_ssm_layers as usize);
-        for i in 0..n {
-            gdn_snaps.push(crate::inference::buffer::BufferRange {
-                buffer: gdn_region.buffer,
-                offset: i * gdn_aligned,
-                size: gdn_bytes,
-            });
-            conv_backs.push(crate::inference::buffer::BufferRange {
-                buffer: conv_region.buffer,
-                offset: i * conv_aligned,
-                size: conv_bytes,
-            });
-        }
+        let (gdn_region, conv_region, gdn_snaps, conv_backs) =
+            alloc_ssm_snapshot_regions(device, dims, max_snapshots)?;
         Ok(Self {
             gdn_region,
             conv_region,
@@ -211,8 +187,68 @@ impl SsmSnapshotSet {
             max_snapshots,
             conv_kernel: dims.conv_kernel,
             conv_channels: dims.conv_channels,
+            device: device.shared(),
         })
     }
+}
+
+impl Drop for SsmSnapshotSet {
+    fn drop(&mut self) {
+        let dev = self.device.raw();
+        self.gdn_region.destroy(dev);
+        self.conv_region.destroy(dev);
+    }
+}
+
+/// Allocate the GDN snapshot + conv backup regions (packed per SSM layer) plus
+/// the per-layer `BufferRange` slices for `max_snapshots` lookahead positions.
+/// Shared by [`SsmSnapshotSet::new`] (serve's detached owner) and
+/// [`KvCache::allocate_ssm_snapshots`] (the owning single-seq cache). Caller
+/// guarantees `n_ssm_layers > 0` and `max_snapshots > 0`.
+#[allow(clippy::type_complexity)]
+fn alloc_ssm_snapshot_regions(
+    device: &Device,
+    dims: &crate::models::SsmStateDims,
+    max_snapshots: u32,
+) -> Result<
+    (
+        Region,
+        Region,
+        Vec<crate::inference::buffer::BufferRange>,
+        Vec<crate::inference::buffer::BufferRange>,
+    ),
+    Box<dyn Error>,
+> {
+    let n = dims.n_ssm_layers as u64;
+    let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+    let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+        | vk::BufferUsageFlags::TRANSFER_SRC
+        | vk::BufferUsageFlags::TRANSFER_DST;
+    let mem = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    // GDN: max_snapshots × gdn_state_floats per layer.
+    let gdn_bytes = (max_snapshots as u64) * (dims.gdn_state_floats as u64) * 4;
+    let gdn_aligned = align_up(gdn_bytes, align);
+    let gdn_region = Region::new(device, (n * gdn_aligned).max(1), usage, mem)?;
+    // Conv: [(conv_kernel-1)+max_snapshots] × conv_channels per layer.
+    let n_padded = (dims.conv_kernel - 1 + max_snapshots) as u64;
+    let conv_bytes = n_padded * (dims.conv_channels as u64) * 4;
+    let conv_aligned = align_up(conv_bytes, align);
+    let conv_region = Region::new(device, (n * conv_aligned).max(1), usage, mem)?;
+    let mut gdn_snaps = Vec::with_capacity(dims.n_ssm_layers as usize);
+    let mut conv_backs = Vec::with_capacity(dims.n_ssm_layers as usize);
+    for i in 0..n {
+        gdn_snaps.push(crate::inference::buffer::BufferRange {
+            buffer: gdn_region.buffer,
+            offset: i * gdn_aligned,
+            size: gdn_bytes,
+        });
+        conv_backs.push(crate::inference::buffer::BufferRange {
+            buffer: conv_region.buffer,
+            offset: i * conv_aligned,
+            size: conv_bytes,
+        });
+    }
+    Ok((gdn_region, conv_region, gdn_snaps, conv_backs))
 }
 
 impl KvCache {
@@ -441,16 +477,17 @@ impl KvCache {
         if max_snapshots == 0 || dims.n_ssm_layers == 0 {
             return Ok(());
         }
-        // Build a detached set, then take ownership of its regions onto self so
-        // this cache's `Drop` frees them (the single-seq / owning-cache case).
-        let set = SsmSnapshotSet::new(device, dims, max_snapshots)?;
-        self.ssm_gdn_snapshots = set.gdn_snaps;
-        self.ssm_conv_backups = set.conv_backs;
-        self.ssm_max_snapshots = set.max_snapshots;
-        self.ssm_conv_kernel = set.conv_kernel;
-        self.ssm_conv_channels = set.conv_channels;
-        self.ssm_gdn_snap_region = Some(set.gdn_region);
-        self.ssm_conv_backup_region = Some(set.conv_region);
+        // Allocate the regions and take ownership onto self, so this cache's
+        // `Drop` frees them (the single-seq / owning-cache case).
+        let (gdn_region, conv_region, gdn_snaps, conv_backs) =
+            alloc_ssm_snapshot_regions(device, dims, max_snapshots)?;
+        self.ssm_gdn_snapshots = gdn_snaps;
+        self.ssm_conv_backups = conv_backs;
+        self.ssm_max_snapshots = max_snapshots;
+        self.ssm_conv_kernel = dims.conv_kernel;
+        self.ssm_conv_channels = dims.conv_channels;
+        self.ssm_gdn_snap_region = Some(gdn_region);
+        self.ssm_conv_backup_region = Some(conv_region);
         Ok(())
     }
 
