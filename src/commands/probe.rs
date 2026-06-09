@@ -457,6 +457,9 @@ async fn bench_concurrent(args: ProbeArgs) -> Result<(), Box<dyn Error>> {
         pin_prefix_tokens: None, // bench uses --prewarm, not the system-prompt pin
         spec_draft_path: None,   // probe measures plain throughput, no spec
         spec_draft_n_max: 0,
+        embeddings: false,
+        pooling: None,
+        embd_normalize: 2,
     };
     let plan = BenchPlan {
         batches,

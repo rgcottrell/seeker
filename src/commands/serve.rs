@@ -100,6 +100,27 @@ pub struct ServeArgs {
     #[arg(long = "mem-fraction", default_value_t = 0.9)]
     mem_fraction: f32,
 
+    /// Run in embedding-only mode (like llama-server's `--embeddings`): the
+    /// `/embeddings` (native) and `/v1/embeddings` (OpenAI) endpoints serve pooled
+    /// vectors and generation is disabled. Requires an embedding model (one with
+    /// an `output_norm.weight`, e.g. Qwen3-Embedding).
+    #[arg(long = "embeddings")]
+    embeddings: bool,
+
+    /// Pooling for embedding mode. Defaults to the model's GGUF `pooling_type`
+    /// (Qwen3-Embedding = last).
+    #[arg(long = "pooling", value_enum)]
+    pooling: Option<crate::inference::embed::Pooling>,
+
+    /// Embedding normalization (llama.cpp `--embd-normalize`): -1 none, 0 max-abs,
+    /// 1 taxicab/L1, 2 euclidean/L2 (default), p>2 p-norm. Per-request overridable.
+    #[arg(
+        long = "embd-normalize",
+        default_value_t = 2,
+        allow_negative_numbers = true
+    )]
+    embd_normalize: i32,
+
     /// KV cache K dtype. One of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1
     /// (quant + turbo* require the per-block BatchKvCache path).
     #[arg(long = "cache-type-k", default_value = "f16", value_parser = parse_dtype_arg)]
@@ -349,7 +370,13 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         model_path: path.clone(),
         mmproj_path,
         n_ubatch: args.ubatch_size,
-        n_batch: args.batch_size,
+        // Embedding mode does one single-pass forward per input; match llama.cpp
+        // and pin n_batch = n_ubatch (no chunked prefill across the pooled forward).
+        n_batch: if args.embeddings {
+            args.ubatch_size
+        } else {
+            args.batch_size
+        },
         ctx_size,
         ctx_auto: args.ctx_size == 0,
         cache_type_k: args.cache_type_k,
@@ -360,6 +387,9 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         pin_prefix_tokens,
         spec_draft_path,
         spec_draft_n_max: args.spec.spec_draft_n_max,
+        embeddings: args.embeddings,
+        pooling: args.pooling,
+        embd_normalize: args.embd_normalize,
     });
     // The worker reports the *resolved* slot count (auto-sizing may differ from
     // the request) so `/slots` + `/props` report the real number.
@@ -396,6 +426,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         model_path: path.display().to_string(),
         vision_config,
         audio_config,
+        embeddings: args.embeddings,
     }))
 }
 

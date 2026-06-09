@@ -10,6 +10,48 @@ use serde_json::Value;
 use super::common::Usage;
 
 // ---------------------------------------------------------------------------
+// /v1/embeddings  (also reused by the native /embeddings handler)
+// ---------------------------------------------------------------------------
+
+/// Embeddings request. `input` (OpenAI) or `content` (llama.cpp native) carries
+/// the text — a string, an array of strings, or pre-tokenized id array(s).
+#[derive(Debug, Default, Deserialize)]
+pub struct EmbeddingRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub input: Option<Value>,
+    /// llama.cpp-native alias for `input` (not OpenAI-compatible).
+    #[serde(default)]
+    pub content: Option<Value>,
+    /// `"float"` (default) or `"base64"` (OpenAI only).
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+    /// Per-request normalization override (-1/0/1/2/p).
+    #[serde(default)]
+    pub embd_normalize: Option<i32>,
+}
+
+/// OpenAI `/v1/embeddings` response: one pooled vector per input.
+#[derive(Debug, Serialize)]
+pub struct EmbeddingResponse {
+    pub object: &'static str, // "list"
+    pub data: Vec<EmbeddingObject>,
+    pub model: String,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingObject {
+    pub object: &'static str, // "embedding"
+    pub index: u32,
+    /// A flat float array, or a base64 string when `encoding_format=="base64"`.
+    pub embedding: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<&'static str>,
+}
+
+// ---------------------------------------------------------------------------
 // /v1/chat/completions
 // ---------------------------------------------------------------------------
 

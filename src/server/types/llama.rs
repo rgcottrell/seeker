@@ -4,6 +4,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
+// /embeddings (llama-server native) — request reuses the OpenAI
+// `EmbeddingRequest` (it carries both `input` and `content`).
+// ---------------------------------------------------------------------------
+
+/// One element of the native bare-array embeddings response. `embedding` is a
+/// **2D** array (`[[...]]`): per-token rows for `--pooling none`, else one row.
+#[derive(Debug, Serialize)]
+pub struct NativeEmbeddingObject {
+    pub index: u32,
+    pub embedding: Value,
+}
+
+// ---------------------------------------------------------------------------
 // /completion (llama-server native)
 // ---------------------------------------------------------------------------
 

@@ -52,6 +52,9 @@ struct Inner {
     /// encoder. The chat handler uses it to size the `<|audio|>` block;
     /// `None` ⇒ audio requests are rejected.
     audio_config: Option<crate::audio::AudioConfig>,
+    /// `--embeddings`: the server is in embedding-only mode. The embedding
+    /// endpoints serve vectors; generation endpoints error.
+    embeddings: bool,
 }
 
 /// Everything needed to build an `AppState` with a loaded model. Built by
@@ -70,6 +73,7 @@ pub struct AppStateInit {
     pub model_path: String,
     pub vision_config: Option<crate::vision::VisionConfig>,
     pub audio_config: Option<crate::audio::AudioConfig>,
+    pub embeddings: bool,
 }
 
 impl AppState {
@@ -90,8 +94,14 @@ impl AppState {
                 model_path: Some(init.model_path),
                 vision_config: init.vision_config,
                 audio_config: init.audio_config,
+                embeddings: init.embeddings,
             }),
         }
+    }
+
+    /// Whether the server was started in embedding-only mode (`--embeddings`).
+    pub fn embeddings_enabled(&self) -> bool {
+        self.inner.embeddings
     }
 
     /// The vision projector config, if an mmproj was loaded (image input).

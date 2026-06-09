@@ -18,7 +18,8 @@ use crate::server::stream::{gen_id, openai_chat_stream, openai_completion_stream
 use crate::server::types::common::Usage;
 use crate::server::types::openai::{
     ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
-    CompletionRequest, CompletionResponse, Model, ModelListResponse,
+    CompletionRequest, CompletionResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
+    Model, ModelListResponse,
 };
 
 pub async fn chat_completions(
@@ -201,10 +202,81 @@ pub async fn models(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-pub async fn embeddings() -> Response {
-    error::not_supported(
-        "embeddings are not supported by seeker serve (causal-LM with no embedding/pooling path)",
-    )
+/// `POST /v1/embeddings` — OpenAI-compatible. One pooled vector per input; the
+/// `{object:"list", data, model, usage}` envelope. `--pooling none` is rejected
+/// (not OAI-compatible). `encoding_format: "base64"` returns LE-f32 base64.
+pub async fn embeddings(
+    State(state): State<AppState>,
+    Json(req): Json<EmbeddingRequest>,
+) -> Response {
+    // Embeddings disabled (or no model) → llama.cpp's "start with --embeddings".
+    if !state.embeddings_enabled() {
+        return error::not_supported(
+            "This server does not support embeddings. Start it with `--embeddings`",
+        );
+    }
+    let (Some(handle), Some(bundle)) = (state.inference(), state.tokenizer()) else {
+        return error::no_model_openai();
+    };
+    let Some(input) = req.input.as_ref().or(req.content.as_ref()) else {
+        return error::bad_request("\"input\" must be provided");
+    };
+    let base64 = match req.encoding_format.as_deref() {
+        Some("base64") => true,
+        Some("float") | None => false,
+        Some(_) => return error::bad_request("encoding_format must be either float or base64"),
+    };
+    let inputs = match convert::embedding_inputs_to_tokens(bundle, input) {
+        Ok(t) => t,
+        Err(e) => return error::bad_request(e),
+    };
+    let n_tokens: u32 = inputs.iter().map(|t| t.len() as u32).sum();
+    let outs = match handle.embed(inputs, req.embd_normalize).await {
+        Ok(o) => o,
+        Err(e) => return error::internal(e),
+    };
+    let mut data = Vec::with_capacity(outs.len());
+    for (i, out) in outs.into_iter().enumerate() {
+        // OpenAI returns a single pooled vector per input.
+        if out.vectors.len() != 1 {
+            return error::bad_request(
+                "Pooling type 'none' is not OAI compatible. Please use a different pooling type",
+            );
+        }
+        let v = &out.vectors[0];
+        let embedding = if base64 {
+            Value::String(f32_base64(v))
+        } else {
+            serde_json::json!(v)
+        };
+        data.push(EmbeddingObject {
+            object: "embedding",
+            index: i as u32,
+            embedding,
+            encoding_format: base64.then_some("base64"),
+        });
+    }
+    Json(EmbeddingResponse {
+        object: "list",
+        data,
+        model: state.model_id().to_string(),
+        usage: Usage {
+            prompt_tokens: n_tokens,
+            completion_tokens: 0,
+            total_tokens: n_tokens,
+        },
+    })
+    .into_response()
+}
+
+/// Base64 of an embedding's little-endian f32 bytes (OpenAI `encoding_format`).
+pub(crate) fn f32_base64(v: &[f32]) -> String {
+    use base64::Engine;
+    let mut bytes = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(&bytes)
 }
 
 pub async fn rerank() -> Response {
@@ -217,4 +289,25 @@ pub async fn responses() -> Response {
 
 pub async fn audio_transcriptions() -> Response {
     error::not_supported("audio transcription is not supported by seeker serve")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f32_base64_round_trips_le() {
+        use base64::Engine;
+        let v = [1.0f32, -2.5, 0.0, 3.25];
+        let b64 = f32_base64(&v);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .unwrap();
+        assert_eq!(bytes.len(), v.len() * 4);
+        let back: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(back, v);
+    }
 }
