@@ -312,6 +312,47 @@ pub fn encode(bundle: &TokenizerBundle, text: &str, add_special: bool) -> Result
         .map_err(|e| format!("tokenize failed: {e}"))
 }
 
+/// Parse an embeddings `input`/`content` JSON value into one tokenized sequence
+/// per input. Accepts a string, an array of strings, a pre-tokenized array of
+/// ints, or an array of int arrays (mixed string/array elements allowed).
+/// Strings are encoded with special tokens (BOS/EOS per the model), matching
+/// llama.cpp.
+pub fn embedding_inputs_to_tokens(
+    bundle: &TokenizerBundle,
+    value: &serde_json::Value,
+) -> Result<Vec<Vec<u32>>, String> {
+    use serde_json::Value;
+    // An all-integer array → a single pre-tokenized input.
+    let as_tokens = |arr: &[Value]| -> Option<Vec<u32>> {
+        arr.iter()
+            .map(|v| v.as_u64().map(|n| n as u32))
+            .collect::<Option<Vec<u32>>>()
+    };
+    match value {
+        Value::String(s) => Ok(vec![encode(bundle, s, true)?]),
+        Value::Array(items) if items.is_empty() => Err("`input` is empty".into()),
+        Value::Array(items) => {
+            if let Some(toks) = as_tokens(items) {
+                return Ok(vec![toks]); // array of ints → one pre-tokenized input
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    Value::String(s) => out.push(encode(bundle, s, true)?),
+                    Value::Array(inner) => {
+                        out.push(as_tokens(inner).ok_or(
+                            "`input` array elements must be strings or integer token arrays",
+                        )?)
+                    }
+                    other => return Err(format!("unsupported `input` element: {other}")),
+                }
+            }
+            Ok(out)
+        }
+        other => Err(format!("unsupported `input`: {other}")),
+    }
+}
+
 /// Apply the chat template to `messages` (injecting the CLI default system
 /// prompt when absent) and encode the result to token ids — the prompt the
 /// engine prefills for chat / messages requests. Errors (no template, render

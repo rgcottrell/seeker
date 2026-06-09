@@ -13,21 +13,10 @@ use clap::{Args, ValueEnum};
 use crate::commands::download::{self, HfResolveArgs, Resolved};
 use crate::gguf::GgufFile;
 use crate::inference::Engine;
+use crate::inference::embed::{self, Pooling};
 use crate::inference::kv_cache::{KvCacheConfig, parse_dtype};
 use crate::tokenizer::build_tokenizer;
 use crate::{gguf::GgmlType, models};
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Pooling {
-    /// Hidden state of the last token (Qwen3-Embedding default).
-    Last,
-    /// Mean over all token positions.
-    Mean,
-    /// First token ([CLS]).
-    Cls,
-    /// No pooling — emit one (L2-normalized) vector per token.
-    None,
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -178,14 +167,9 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
         .collect();
 
     // ---- pooling default from GGUF (3 = last for Qwen3-Embedding) ----
-    let pooling = args.pooling.unwrap_or_else(|| {
-        match gguf.meta_u32(&format!("{arch}.pooling_type")) {
-            Some(1) => Pooling::Mean,
-            Some(2) => Pooling::Cls,
-            Some(0) => Pooling::None,
-            _ => Pooling::Last, // 3 (last) or unspecified
-        }
-    });
+    let pooling = args
+        .pooling
+        .unwrap_or_else(|| Pooling::from_gguf(gguf.meta_u32(&format!("{arch}.pooling_type"))));
 
     // ---- collect inputs ----
     let mut inputs: Vec<String> = args.prompt.clone();
@@ -248,21 +232,15 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
         cache.reset();
         let (_logits, residual) = engine
             .forward_full_readback(&*model, &mut cache, tokens, 0, /*full_logits=*/ false)?;
-        let l = residual.len() / n_embd;
-        // output_norm applied per position (llama.cpp order: norm-all then pool).
-        let normed: Vec<Vec<f32>> = (0..l)
-            .map(|t| {
-                rmsnorm_col(
-                    &residual[t * n_embd..(t + 1) * n_embd],
-                    &output_norm,
-                    rms_eps,
-                )
-            })
-            .collect();
-        for mut v in pool(&normed, pooling) {
-            normalize(&mut v, args.embd_normalize);
-            all.push(v);
-        }
+        // output_norm per position, pool, normalize (the shared host-side path).
+        all.extend(embed::pool_and_normalize(
+            &residual,
+            n_embd,
+            &output_norm,
+            rms_eps,
+            pooling,
+            args.embd_normalize,
+        ));
     }
 
     // ---- output ----
@@ -281,65 +259,7 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// ─── pure host-side math (unit-tested) ───────────────────────────────
-
-/// RMSNorm a single hidden-state column with the learned weight (matches the
-/// `rms_norm.slang` kernel: `x / sqrt(mean(x²)+eps) * w`).
-fn rmsnorm_col(col: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
-    let n = col.len() as f32;
-    let ms = col.iter().map(|x| x * x).sum::<f32>() / n;
-    let inv = 1.0 / (ms + eps).sqrt();
-    col.iter().zip(weight).map(|(x, w)| x * inv * w).collect()
-}
-
-/// Pool the per-position (already output_norm'd) vectors into the embedding(s).
-fn pool(normed: &[Vec<f32>], pooling: Pooling) -> Vec<Vec<f32>> {
-    match pooling {
-        Pooling::Last => vec![normed.last().cloned().unwrap_or_default()],
-        Pooling::Cls => vec![normed.first().cloned().unwrap_or_default()],
-        Pooling::Mean => {
-            let l = normed.len().max(1);
-            let dim = normed.first().map(Vec::len).unwrap_or(0);
-            let mut acc = vec![0.0f32; dim];
-            for v in normed {
-                for (a, x) in acc.iter_mut().zip(v) {
-                    *a += *x;
-                }
-            }
-            for a in &mut acc {
-                *a /= l as f32;
-            }
-            vec![acc]
-        }
-        Pooling::None => normed.to_vec(),
-    }
-}
-
-/// In-place embedding normalization, matching llama.cpp `common_embd_normalize`:
-/// p<0 none, 0 max-abs, 1 L1/taxicab, 2 L2/euclidean, p>2 p-norm.
-fn normalize(v: &mut [f32], p: i32) {
-    let sum: f64 = match p {
-        i32::MIN..=-1 => 1.0,
-        0 => v.iter().fold(0.0f64, |m, x| m.max(x.abs() as f64)),
-        1 => v.iter().map(|x| x.abs() as f64).sum(),
-        2 => v
-            .iter()
-            .map(|x| (*x as f64) * (*x as f64))
-            .sum::<f64>()
-            .sqrt(),
-        p => {
-            let pf = p as f64;
-            v.iter()
-                .map(|x| (x.abs() as f64).powf(pf))
-                .sum::<f64>()
-                .powf(1.0 / pf)
-        }
-    };
-    let norm = if sum > 0.0 { 1.0 / sum } else { 0.0 };
-    for x in v.iter_mut() {
-        *x = (*x as f64 * norm) as f32;
-    }
-}
+// ─── CLI-only output helpers ─────────────────────────────────────────
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f64;
@@ -400,51 +320,6 @@ fn print_similarity_matrix(all: &[Vec<f32>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rmsnorm_col_matches_hand_compute() {
-        // x=[1,2,3], w=[1,1,1], eps=0 → ms=14/3, inv=1/sqrt(14/3).
-        let out = rmsnorm_col(&[1.0, 2.0, 3.0], &[1.0, 1.0, 1.0], 0.0);
-        let inv = 1.0f32 / (14.0f32 / 3.0).sqrt();
-        for (o, x) in out.iter().zip([1.0, 2.0, 3.0]) {
-            assert!((o - x * inv).abs() < 1e-6, "{o} vs {}", x * inv);
-        }
-    }
-
-    #[test]
-    fn rmsnorm_col_applies_weight() {
-        let out = rmsnorm_col(&[1.0, 1.0], &[2.0, 4.0], 0.0);
-        // ms=1, inv=1 → out = [2,4].
-        assert!((out[0] - 2.0).abs() < 1e-6 && (out[1] - 4.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn pool_selects_right_column() {
-        let cols = vec![vec![1.0, 0.0], vec![2.0, 0.0], vec![3.0, 0.0]];
-        assert_eq!(pool(&cols, Pooling::Last)[0], vec![3.0, 0.0]);
-        assert_eq!(pool(&cols, Pooling::Cls)[0], vec![1.0, 0.0]);
-        assert_eq!(pool(&cols, Pooling::Mean)[0], vec![2.0, 0.0]);
-        assert_eq!(pool(&cols, Pooling::None).len(), 3);
-    }
-
-    #[test]
-    fn normalize_l2_is_unit() {
-        let mut v = vec![3.0, 4.0];
-        normalize(&mut v, 2);
-        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
-        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((n - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn normalize_l1_and_none() {
-        let mut v = vec![1.0, 3.0];
-        normalize(&mut v, 1);
-        assert!((v[0] - 0.25).abs() < 1e-6 && (v[1] - 0.75).abs() < 1e-6);
-        let mut w = vec![1.0, 3.0];
-        normalize(&mut w, -1);
-        assert_eq!(w, vec![1.0, 3.0]);
-    }
 
     #[test]
     fn cosine_basics() {

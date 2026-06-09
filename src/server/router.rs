@@ -36,7 +36,9 @@ pub fn build_router(cors: bool, state: AppState) -> Router {
         .route("/v1/completions", post(openai::completions))
         .route("/responses", post(openai::responses))
         .route("/v1/responses", post(openai::responses))
-        .route("/embeddings", post(openai::embeddings))
+        // `/embeddings` is the llama.cpp-NATIVE endpoint (2D array response);
+        // `/v1/embeddings` is the OpenAI-compatible one (1D vectors + envelope).
+        .route("/embeddings", post(llama::embedding))
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/rerank", post(openai::rerank))
         .route("/reranking", post(openai::rerank))
@@ -56,7 +58,6 @@ pub fn build_router(cors: bool, state: AppState) -> Router {
         .route("/infill", post(llama::infill))
         .route("/tokenize", post(llama::tokenize))
         .route("/detokenize", post(llama::detokenize))
-        .route("/embedding", post(llama::embedding))
         .route("/apply-template", post(llama::apply_template))
         // Static-asset fallback: fires only when NO route above matched the
         // request path (a matched path with a wrong method still gets the
@@ -129,7 +130,7 @@ mod tests {
     async fn unsupported_endpoints_501() {
         for uri in [
             "/v1/embeddings",
-            "/embedding",
+            "/embeddings",
             "/v1/rerank",
             "/v1/audio/transcriptions",
         ] {

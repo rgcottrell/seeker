@@ -73,6 +73,15 @@ pub struct WorkerConfig {
     pub spec_draft_path: Option<PathBuf>,
     /// Max MTP draft tokens per spec step (`0` = speculative decode disabled).
     pub spec_draft_n_max: u32,
+    /// `--embeddings`: run in embedding-only mode (the embedding endpoints serve
+    /// pooled vectors; generation requests are rejected). Requires a model with
+    /// an `output_norm.weight`.
+    pub embeddings: bool,
+    /// Pooling for embedding mode (`--pooling`); `None` ⇒ the GGUF default.
+    pub pooling: Option<crate::inference::embed::Pooling>,
+    /// Default embedding normalization (`--embd-normalize`; -1/0/1/2/p). Per
+    /// request overridable.
+    pub embd_normalize: i32,
 }
 
 /// Per-request generation parameters. The CLI sampling flags form the base
@@ -134,6 +143,42 @@ pub struct GenJob {
     /// *dropped* receiver (client disconnect) makes `blocking_send` return Err,
     /// which the decode loop treats as cancellation.
     pub reply: mpsc::Sender<GenEvent>,
+}
+
+/// What the worker thread receives: either a generation job or an embedding job.
+/// One channel keeps the worker's single-threaded loop simple. The size
+/// disparity is fine — it's a transient channel message (16-deep), moved once.
+#[allow(clippy::large_enum_variant)]
+pub enum WorkerRequest {
+    Gen(GenJob),
+    Emb(EmbeddingJob),
+}
+
+/// One embedding request — a batch of tokenized inputs to embed in one forward
+/// each. Replied to once (no streaming) via the oneshot.
+pub struct EmbeddingJob {
+    pub inputs: Vec<Vec<u32>>,
+    /// Per-request normalization override (llama.cpp `embd_normalize`); `None`
+    /// uses the server default (`--embd-normalize`).
+    pub embd_normalize: Option<i32>,
+    pub reply: oneshot::Sender<Result<Vec<EmbeddingOut>, String>>,
+}
+
+/// One input's embedding result: `vectors` holds a single pooled vector for
+/// last/mean/cls pooling, or `L` per-token vectors for `Pooling::None`.
+pub struct EmbeddingOut {
+    pub vectors: Vec<Vec<f32>>,
+    pub n_tokens: u32,
+}
+
+/// Cached embedding-mode state (built at setup; the `GgufFile` is gone by request
+/// time). `output_norm` is the final RMSNorm weight (F32 `[n_embd]`).
+struct EmbedCtx {
+    output_norm: Vec<f32>,
+    eps: f32,
+    pooling: crate::inference::embed::Pooling,
+    n_embd: usize,
+    embd_normalize: i32,
 }
 
 /// The vision tower built once in the worker thread (when an mmproj was
@@ -216,7 +261,7 @@ pub enum GenEvent {
 /// Cheaply-cloneable handle stored in `AppState`. Wraps the job sender.
 #[derive(Clone)]
 pub struct InferenceHandle {
-    jobs: mpsc::Sender<GenJob>,
+    jobs: mpsc::Sender<WorkerRequest>,
 }
 
 impl InferenceHandle {
@@ -226,7 +271,7 @@ impl InferenceHandle {
     /// job loop, so the caller can fail fast on a bad model / missing GPU and
     /// learn the auto-sized `n_slots` for `/slots` + `/props`.
     pub fn spawn(cfg: WorkerConfig) -> (InferenceHandle, oneshot::Receiver<Result<u32, String>>) {
-        let (jobs_tx, jobs_rx) = mpsc::channel::<GenJob>(16);
+        let (jobs_tx, jobs_rx) = mpsc::channel::<WorkerRequest>(16);
         let (ready_tx, ready_rx) = oneshot::channel();
         std::thread::Builder::new()
             .name("seeker-inference".into())
@@ -241,9 +286,37 @@ impl InferenceHandle {
         (InferenceHandle { jobs: jobs_tx }, ready_rx)
     }
 
-    /// Queue a job. Errors (returning the job) only if the worker has shut down.
+    /// Queue a generation job. Errors (returning the job) only if the worker has
+    /// shut down.
     pub async fn submit(&self, job: GenJob) -> Result<(), GenJob> {
-        self.jobs.send(job).await.map_err(|e| e.0)
+        self.jobs
+            .send(WorkerRequest::Gen(job))
+            .await
+            .map_err(|e| match e.0 {
+                WorkerRequest::Gen(j) => j,
+                WorkerRequest::Emb(_) => unreachable!("sent a Gen job"),
+            })
+    }
+
+    /// Embed a batch of tokenized inputs (embedding mode). Returns one
+    /// [`EmbeddingOut`] per input, or an error string (worker unavailable, not in
+    /// embedding mode, or a forward failure).
+    pub async fn embed(
+        &self,
+        inputs: Vec<Vec<u32>>,
+        embd_normalize: Option<i32>,
+    ) -> Result<Vec<EmbeddingOut>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.jobs
+            .send(WorkerRequest::Emb(EmbeddingJob {
+                inputs,
+                embd_normalize,
+                reply: tx,
+            }))
+            .await
+            .map_err(|_| "inference worker is unavailable".to_string())?;
+        rx.await
+            .map_err(|_| "inference worker dropped the embedding request".to_string())?
     }
 
     /// Submit a job built from `tokens` + `config` and return the reply channel.
@@ -517,6 +590,9 @@ struct Worker {
     /// `logical_ctx + (spec_n_max+1)` so a spec verify can write `n+1` lookahead
     /// before truncating; LOGICAL guards use this, not `batch.config.max_seq_len`.
     logical_ctx: u32,
+    /// Embedding-mode state (final-norm weight + pooling), `Some` iff the server
+    /// was started with `--embeddings`. Drives [`Worker::admit_embedding`].
+    embed_ctx: Option<EmbedCtx>,
 }
 
 /// Length of the longest common prefix of two token sequences.
@@ -591,6 +667,56 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         model.attach_mtp_draft(&dg, dw)?;
         tracing::info!(path = ?p, "attached MTP draft model for serve spec");
     }
+
+    // Embedding mode (`--embeddings`): cache the final-norm weight + pooling now,
+    // since the `GgufFile` is dropped at the end of `setup`. Fail fast if the
+    // model is not an embedding model (no `output_norm.weight`).
+    let embed_ctx = if cfg.embeddings {
+        let arch = gguf.architecture().unwrap_or("").to_string();
+        let n_embd = gguf
+            .meta_u32(&format!("{arch}.embedding_length"))
+            .ok_or("--embeddings: model is missing <arch>.embedding_length")?
+            as usize;
+        let on = gguf
+            .tensor_data("output_norm.weight")
+            .ok_or("--embeddings: model has no output_norm.weight (not an embedding model)")?;
+        if on.len() != n_embd * 4 {
+            return Err(format!(
+                "--embeddings: output_norm.weight is {} bytes, expected {} (F32 [{n_embd}])",
+                on.len(),
+                n_embd * 4
+            )
+            .into());
+        }
+        let output_norm: Vec<f32> = on
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let eps = gguf
+            .meta_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+            .unwrap_or(1e-6);
+        let pooling = cfg.pooling.unwrap_or_else(|| {
+            crate::inference::embed::Pooling::from_gguf(
+                gguf.meta_u32(&format!("{arch}.pooling_type")),
+            )
+        });
+        tracing::info!(
+            ?pooling,
+            n_embd,
+            normalize = cfg.embd_normalize,
+            "embedding mode enabled"
+        );
+        Some(EmbedCtx {
+            output_norm,
+            eps,
+            pooling,
+            n_embd,
+            embd_normalize: cfg.embd_normalize,
+        })
+    } else {
+        None
+    };
+
     // Spec runs only on `supports_unified()` models: when a 2nd request arrives
     // the speccing sequence DEMOTES to the batched decode path, which must work.
     // Non-unified models (e.g. gemma4) have no batched decode in serve at all, so
@@ -708,15 +834,21 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     // Resolve the slot count: an explicit `--parallel N` is honored verbatim
     // (fail-fast below if N×ctx doesn't fit); `0` auto-sizes from the device
     // memory budget (capped at `parallel_max`).
-    let n_slots = resolve_n_slots(
-        &engine.device,
-        &dims,
-        cache_config,
-        ssm_dims.as_ref(),
-        weights_bytes,
-        scratch_bytes,
-        cfg,
-    );
+    // Embedding mode runs one synchronous forward per request on slot 0 — a
+    // single slab is all it needs (no concurrent generation).
+    let n_slots = if cfg.embeddings {
+        1
+    } else {
+        resolve_n_slots(
+            &engine.device,
+            &dims,
+            cache_config,
+            ssm_dims.as_ref(),
+            weights_bytes,
+            scratch_bytes,
+            cfg,
+        )
+    };
     // One BatchKvCache with N slabs: idle slabs keep their conversation's
     // prefix (reuse); the active subset batches in one forward. Allocated
     // eagerly (fail-fast if N×ctx doesn't fit).
@@ -860,6 +992,7 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         prefix_cache,
         spec_n_max,
         logical_ctx: ctx_size,
+        embed_ctx,
     })
 }
 
@@ -1040,7 +1173,7 @@ fn build_vision(engine: &Engine, mmproj_path: &Path) -> Result<VisionCtx, Box<dy
 /// continuous-batching scheduler until every `InferenceHandle` is dropped.
 fn worker_main(
     mut cfg: WorkerConfig,
-    mut jobs: mpsc::Receiver<GenJob>,
+    mut jobs: mpsc::Receiver<WorkerRequest>,
     ready: oneshot::Sender<Result<u32, String>>,
 ) {
     let mut worker = match setup(&cfg) {
@@ -1053,6 +1186,13 @@ fn worker_main(
     // Report the resolved slot count (auto-sizing may differ from the request).
     if ready.send(Ok(worker.slots.len() as u32)).is_err() {
         // `serve::run` gave up waiting (process exiting). Nothing to serve.
+        return;
+    }
+
+    // Embedding-only mode (`--embeddings`): a simple synchronous loop, no
+    // generation scheduler. Each request runs one forward per input on slot 0.
+    if worker.embed_ctx.is_some() {
+        embedding_loop(&mut worker, &mut jobs);
         return;
     }
 
@@ -1073,22 +1213,27 @@ fn worker_main(
         if worker.active.is_empty() {
             // Idle: block for the next job (or shutdown).
             match jobs.blocking_recv() {
+                Some(WorkerRequest::Emb(job)) => {
+                    let _ = job.reply.send(Err(
+                        "server is not in embeddings mode; start it with --embeddings".into(),
+                    ));
+                }
                 // Media jobs prefill single-pass (the splice can't be chunked),
                 // regardless of the global unified flag.
-                Some(job) if job.image.is_some() => worker.admit_image(job),
-                Some(job) if job.audio.is_some() => worker.admit_audio(job),
+                Some(WorkerRequest::Gen(job)) if job.image.is_some() => worker.admit_image(job),
+                Some(WorkerRequest::Gen(job)) if job.audio.is_some() => worker.admit_audio(job),
                 // Text request + spec enabled → single-pass spec prefill (captures
                 // h_last + seeds the draft KV so the sequence is spec-seeded). The
                 // drain loop below admits concurrent requests the same way, so a
                 // multi-request batch drafts + verifies together. Long prompts fall
                 // through to chunked non-spec prefill (admit_spec is single-pass).
-                Some(job)
+                Some(WorkerRequest::Gen(job))
                     if worker.spec_n_max > 0 && job.tokens.len() <= SPEC_PREFILL_MAX_PROMPT =>
                 {
                     worker.admit_spec(job)
                 }
-                Some(job) if unified => worker.admit_unified(job),
-                Some(job) => worker.admit(job),
+                Some(WorkerRequest::Gen(job)) if unified => worker.admit_unified(job),
+                Some(WorkerRequest::Gen(job)) => worker.admit(job),
                 None => return,
             }
         }
@@ -1103,13 +1248,20 @@ fn worker_main(
         // a corrupted batch a clean error rather than a wedge.
         while worker.free_slabs() > 0 {
             match jobs.try_recv() {
-                Ok(job) if job.image.is_some() => worker.admit_image(job),
-                Ok(job) if job.audio.is_some() => worker.admit_audio(job),
-                Ok(job) if worker.spec_n_max > 0 && job.tokens.len() <= SPEC_PREFILL_MAX_PROMPT => {
+                Ok(WorkerRequest::Emb(job)) => {
+                    let _ = job.reply.send(Err(
+                        "server is not in embeddings mode; start it with --embeddings".into(),
+                    ));
+                }
+                Ok(WorkerRequest::Gen(job)) if job.image.is_some() => worker.admit_image(job),
+                Ok(WorkerRequest::Gen(job)) if job.audio.is_some() => worker.admit_audio(job),
+                Ok(WorkerRequest::Gen(job))
+                    if worker.spec_n_max > 0 && job.tokens.len() <= SPEC_PREFILL_MAX_PROMPT =>
+                {
                     worker.admit_spec(job)
                 }
-                Ok(job) if unified => worker.admit_unified(job),
-                Ok(job) => worker.admit(job),
+                Ok(WorkerRequest::Gen(job)) if unified => worker.admit_unified(job),
+                Ok(WorkerRequest::Gen(job)) => worker.admit(job),
                 Err(_) => break, // empty or all-senders-dropped
             }
         }
@@ -1126,10 +1278,113 @@ fn worker_main(
     }
 }
 
+/// Reject a generation job that arrived on an embedding-only server.
+fn reject_embedding(job: GenJob) {
+    let _ = job.reply.blocking_send(GenEvent::Error(
+        "server is in embeddings mode (--embeddings); generation is disabled".into(),
+    ));
+}
+
+/// Embedding-only worker loop: block for the next request, run one forward per
+/// input on slot 0, pool + normalize, reply once. A stray generation job is
+/// rejected. Exits when all senders drop.
+fn embedding_loop(worker: &mut Worker, jobs: &mut mpsc::Receiver<WorkerRequest>) {
+    while let Some(req) = jobs.blocking_recv() {
+        match req {
+            WorkerRequest::Emb(job) => {
+                let result = worker.run_embeddings(&job.inputs, job.embd_normalize);
+                let _ = job.reply.send(result);
+            }
+            WorkerRequest::Gen(job) => reject_embedding(job),
+        }
+    }
+}
+
 impl Worker {
     /// Number of slabs not currently owned by an active sequence.
     fn free_slabs(&self) -> usize {
         self.slots.iter().filter(|s| !s.active).count()
+    }
+
+    /// Compute pooled, normalized embeddings for a batch of tokenized inputs —
+    /// one single-pass forward each on slot 0 (embedding-mode only). Returns one
+    /// [`EmbeddingOut`] per input.
+    fn run_embeddings(
+        &mut self,
+        inputs: &[Vec<u32>],
+        embd_normalize: Option<i32>,
+    ) -> Result<Vec<EmbeddingOut>, String> {
+        // Snapshot the (small) embed context so the per-input loop can mutably
+        // borrow engine/batch/model without aliasing `self.embed_ctx`.
+        let (output_norm, eps, n_embd, pooling, default_norm) = {
+            let ec = self
+                .embed_ctx
+                .as_ref()
+                .ok_or("server is not in embeddings mode")?;
+            (
+                ec.output_norm.clone(),
+                ec.eps,
+                ec.n_embd,
+                ec.pooling,
+                ec.embd_normalize,
+            )
+        };
+        let normalize = embd_normalize.unwrap_or(default_norm);
+        let k_dtype = self.batch.config.k_dtype;
+        let v_dtype = self.batch.config.v_dtype;
+
+        let mut outs = Vec::with_capacity(inputs.len());
+        for tokens in inputs {
+            if tokens.is_empty() {
+                return Err("empty input".into());
+            }
+            if tokens.len() as u32 > self.logical_ctx {
+                return Err(format!(
+                    "input has {} tokens, exceeds the server context ({})",
+                    tokens.len(),
+                    self.logical_ctx
+                ));
+            }
+            // Grow scratch for this input's single-pass forward if needed.
+            let need = self
+                .model
+                .scratch_bytes_estimate(0, tokens.len() as u32, k_dtype, v_dtype);
+            if need > self.scratch_bytes {
+                self.engine
+                    .allocate_scratch(need)
+                    .map_err(|e| e.to_string())?;
+                self.scratch_bytes = need;
+            }
+            self.batch.reset_slot(0);
+            let residual = {
+                let mut sc = self.batch.slot_kvcache(0);
+                sc.position = 0;
+                let (_logits, residual) = self
+                    .engine
+                    .forward_full_readback(
+                        &*self.model,
+                        &mut sc,
+                        tokens,
+                        0,
+                        /*full_logits=*/ false,
+                    )
+                    .map_err(|e| e.to_string())?;
+                residual
+            };
+            let vectors = crate::inference::embed::pool_and_normalize(
+                &residual,
+                n_embd,
+                &output_norm,
+                eps,
+                pooling,
+                normalize,
+            );
+            outs.push(EmbeddingOut {
+                vectors,
+                n_tokens: tokens.len() as u32,
+            });
+        }
+        Ok(outs)
     }
 
     /// Pick a *free* slab to serve `new_tokens` — prefix-reuse, else LRU (see

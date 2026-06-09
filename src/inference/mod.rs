@@ -13,6 +13,7 @@ pub mod context;
 pub mod decode_dyn;
 pub mod descriptor;
 pub mod device;
+pub mod embed;
 pub mod kv_cache;
 pub mod memory;
 pub mod ops;

@@ -1,5 +1,5 @@
 //! llama-server native handlers: completion, infill, tokenize, detokenize,
-//! embedding, apply-template.
+//! embeddings, apply-template.
 
 use axum::Json;
 use axum::extract::State;
@@ -14,8 +14,10 @@ use crate::server::state::AppState;
 use crate::server::stream::llama_completion_stream;
 use crate::server::types::llama::{
     ApplyTemplateRequest, ApplyTemplateResponse, CompletionRequest, CompletionResponse,
-    DetokenizeRequest, DetokenizeResponse, InfillRequest, TokenizeRequest, TokenizeResponse,
+    DetokenizeRequest, DetokenizeResponse, InfillRequest, NativeEmbeddingObject, TokenizeRequest,
+    TokenizeResponse,
 };
+use crate::server::types::openai::EmbeddingRequest;
 
 pub async fn completion(
     State(state): State<AppState>,
@@ -182,8 +184,43 @@ pub async fn detokenize(
     Json(DetokenizeResponse { content }).into_response()
 }
 
-pub async fn embedding() -> Response {
-    error::not_supported("embeddings are not supported by seeker serve")
+/// `POST /embeddings` — llama.cpp-NATIVE. Returns a bare JSON array
+/// `[{index, embedding:[[...]]}]`; `embedding` is 2D (per-token rows for
+/// `--pooling none`, else a single row). `input` or `content` accepted.
+pub async fn embedding(
+    State(state): State<AppState>,
+    Json(req): Json<EmbeddingRequest>,
+) -> Response {
+    if !state.embeddings_enabled() {
+        return error::not_supported(
+            "This server does not support embeddings. Start it with `--embeddings`",
+        );
+    }
+    let (Some(handle), Some(bundle)) = (state.inference(), state.tokenizer()) else {
+        return error::no_model_openai();
+    };
+    let Some(input) = req.input.as_ref().or(req.content.as_ref()) else {
+        return error::bad_request("\"input\" or \"content\" must be provided");
+    };
+    let inputs = match convert::embedding_inputs_to_tokens(bundle, input) {
+        Ok(t) => t,
+        Err(e) => return error::bad_request(e),
+    };
+    let outs = match handle.embed(inputs, req.embd_normalize).await {
+        Ok(o) => o,
+        Err(e) => return error::internal(e),
+    };
+    // Native shape: bare array, `embedding` is the 2D `vectors` (float; native
+    // does not base64-encode — that is OpenAI-only).
+    let arr: Vec<NativeEmbeddingObject> = outs
+        .into_iter()
+        .enumerate()
+        .map(|(i, out)| NativeEmbeddingObject {
+            index: i as u32,
+            embedding: serde_json::json!(out.vectors),
+        })
+        .collect();
+    Json(arr).into_response()
 }
 
 pub async fn apply_template(
