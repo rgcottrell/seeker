@@ -365,7 +365,8 @@ pub fn record_ssm_norm_gate(
         push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
     }
 
-    let key = PipelineKey::dense("ssm_norm_gate_f32", 4, SSM_NORM_GATE_PUSH_BYTES, Vec::new());
+    let key = PipelineKey::dense("ssm_norm_gate_f32", 4, SSM_NORM_GATE_PUSH_BYTES, Vec::new())
+        .with_subgroup_size(32);
     let pipeline =
         *ctx.pipelines
             .get(ctx.device, key, shaders::SSM_NORM_GATE_F32_SPV.as_bytes())?;
@@ -652,7 +653,8 @@ fn record_l2_norm_inner(
     debug_assert_eq!(src.dtype, GgmlType::F32);
     debug_assert_eq!(dst.dtype, GgmlType::F32);
     let push = super::unary_params_bytes(&src, &dst, eps, 0.0);
-    let key = PipelineKey::dense("l2_norm_f32", 2, super::UNARY_PARAMS_BYTES, Vec::new());
+    let key = PipelineKey::dense("l2_norm_f32", 2, super::UNARY_PARAMS_BYTES, Vec::new())
+        .with_subgroup_size(32);
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::L2_NORM_F32_SPV.as_bytes())?;

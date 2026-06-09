@@ -189,7 +189,8 @@ pub fn record_rms_norm_rope_to_cache_f16_nofence(
     let _ = d_offset; // value already lives in DecodeDyn
     debug_assert_eq!(w, PUSH_BYTES as usize);
 
-    let key = PipelineKey::dense("rms_norm_rope_multi_to_f16", 6, PUSH_BYTES, vec![ne00]);
+    let key = PipelineKey::dense("rms_norm_rope_multi_to_f16", 6, PUSH_BYTES, vec![ne00])
+        .with_subgroup_size(32);
     let pipeline = *ctx.pipelines.get(
         ctx.device,
         key,
@@ -290,7 +291,8 @@ fn record_rms_norm_rope_impl(
 
     // Spec-const NUM_THREADS = head_dim (= ne00). Same head_dim for both
     // Q and K, so this caches as one pipeline.
-    let key = PipelineKey::dense("rms_norm_rope_multi_f32", 5, PUSH_BYTES, vec![ne00]);
+    let key = PipelineKey::dense("rms_norm_rope_multi_f32", 5, PUSH_BYTES, vec![ne00])
+        .with_subgroup_size(32);
     let pipeline = *ctx.pipelines.get(
         ctx.device,
         key,

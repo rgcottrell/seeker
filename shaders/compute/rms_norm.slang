@@ -12,12 +12,11 @@ import glsl;  // for gl_NumWorkGroups
 
 #include "generic_binary_head.slang"
 #include "types.slang"
+#include "reduce_funcs.slang"
 
 static const uint BLOCK_SIZE = 512;
 
 [SpecializationConstant] const bool do_multiply = false;
-
-groupshared FLOAT_TYPE sumsh[BLOCK_SIZE];
 
 void rms_norm(uint num_iters,
               uint3 gl_WorkGroupID,
@@ -48,16 +47,7 @@ void rms_norm(uint num_iters,
         sum += xi * xi;
     }
 
-    sumsh[tid] = sum;
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (tid < uint(s)) {
-            sum += sumsh[tid + s];
-            sumsh[tid] = sum;
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    sum = sumsh[0];
+    sum = workgroup_sum(sum, tid, BLOCK_SIZE);
 
     const FLOAT_TYPE mean  = sum / FLOAT_TYPE(ncols);
     const FLOAT_TYPE scale = rsqrt(mean + FLOAT_TYPE(p.param1));

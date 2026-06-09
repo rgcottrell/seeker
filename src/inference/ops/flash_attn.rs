@@ -1081,7 +1081,9 @@ fn record_split_k_combine(
         binding_indices: vec![0, 1, 2, 3],
         push_size: FA_SPLIT_K_PUSH_BYTES,
         spec_constants: vec![32], // BLOCK_SIZE
-        required_subgroup_size: None,
+        // The reduce kernel is one 32-wide wave (bare WaveActiveMax/Sum,
+        // no shared memory) — pin wave32 so workgroup == subgroup.
+        required_subgroup_size: Some(32),
     };
     let pipeline = *ctx.pipelines.get(
         ctx.device,

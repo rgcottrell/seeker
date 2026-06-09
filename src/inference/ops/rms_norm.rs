@@ -74,7 +74,8 @@ fn record_noweight_inner(
         3,
         super::BINARY_PARAMS_BYTES,
         vec![0, 0], // norepeat=false, do_multiply=false
-    );
+    )
+    .with_subgroup_size(32);
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::RMS_NORM_F32_SPV.as_bytes())?;
@@ -111,7 +112,8 @@ fn record_inner(
         3,
         super::BINARY_PARAMS_BYTES,
         vec![0, 1], // norepeat=false, do_multiply=true
-    );
+    )
+    .with_subgroup_size(32);
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::RMS_NORM_F32_SPV.as_bytes())?;

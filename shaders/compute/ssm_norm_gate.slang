@@ -11,6 +11,8 @@
 //  f32: A_TYPE=float
 //@end-variants
 
+#include "reduce_funcs.slang"
+
 [SpecializationConstant] const uint BLOCK_SIZE = 128;
 
 struct SsmNormGateParams {
@@ -28,8 +30,6 @@ struct SsmNormGateParams {
 [[vk::binding(2, 0)]] StructuredBuffer<A_TYPE>   z_buf;      // [value_dim, L]
 [[vk::binding(3, 0)]] RWStructuredBuffer<A_TYPE> dst;        // [value_dim, L]
 
-groupshared float sumsh[BLOCK_SIZE];
-
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void main(uint3 gl_WorkGroupID : SV_GroupID,
@@ -46,26 +46,17 @@ void main(uint3 gl_WorkGroupID : SV_GroupID,
     const uint z_base   = gdn_base;
     const uint dst_base = gdn_base;
 
-    // Reduce sum-of-squares over s_v elements.
-    float local_sum = 0.0f;
+    // Reduce sum-of-squares over s_v elements (wave-cooperative).
+    float x = 0.0f;
     if (tid < p.s_v) {
-        const float x = float(gdn_attn[gdn_base + tid]);
-        local_sum = x * x;
+        x = float(gdn_attn[gdn_base + tid]);
     }
-    sumsh[tid] = local_sum;
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (tid < uint(s)) {
-            sumsh[tid] += sumsh[tid + s];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
+    const float sum = workgroup_sum(x * x, tid, BLOCK_SIZE);
 
-    const float mean  = sumsh[0] / float(p.s_v);
+    const float mean  = sum / float(p.s_v);
     const float scale = rsqrt(mean + p.eps);
 
     if (tid < p.s_v) {
-        const float x        = float(gdn_attn[gdn_base + tid]);
         const float w        = float(ssm_norm[tid]);
         const float z        = float(z_buf[z_base + tid]);
         const float silu_z   = z / (1.0f + exp(-z));

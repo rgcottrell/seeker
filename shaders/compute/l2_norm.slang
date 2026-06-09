@@ -7,10 +7,9 @@
 
 #include "generic_unary_head.slang"
 #include "types.slang"
+#include "reduce_funcs.slang"
 
 static const uint BLOCK_SIZE = 512;
-
-groupshared FLOAT_TYPE sum[BLOCK_SIZE];
 
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
@@ -24,20 +23,16 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     const uint i2_offset = i2 * p.ne11;
     const uint i1        = row - i3_offset - i2_offset;
 
-    sum[tid] = FLOAT_TYPE(0.0f);
+    FLOAT_TYPE partial = FLOAT_TYPE(0.0f);
 
     [unroll] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
         const FLOAT_TYPE xi = FLOAT_TYPE(data_a[i3 * p.nb03 + i2 * p.nb02 + i1 * p.nb01 + i0]);
-        sum[tid] += xi * xi;
+        partial += xi * xi;
     }
 
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (tid < uint(s)) { sum[tid] += sum[tid + s]; }
-        GroupMemoryBarrierWithGroupSync();
-    }
+    const FLOAT_TYPE sum = workgroup_sum(partial, tid, BLOCK_SIZE);
 
-    const FLOAT_TYPE scale = 1.0f / max(sqrt(sum[0]), FLOAT_TYPE(p.param1));
+    const FLOAT_TYPE scale = 1.0f / max(sqrt(sum), FLOAT_TYPE(p.param1));
 
     [unroll] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
         data_d[i3 * p.nb13 + i2 * p.nb12 + i1 * p.nb11 + i0] =

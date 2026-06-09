@@ -61,6 +61,12 @@ static const uint HSV_PER_THREAD = (HSV + THREADS_PER_ROWGROUP - 1) / THREADS_PE
 
 static const float NEG_BIG = -1.0e30f;
 
+// Online softmax runs in the log2 domain (Q pre-scaled by scale*log2(e),
+// mask scaled on add) so every exp() is the cheaper exp2(). Split-K (L, M)
+// partials are in the log2 domain too — matches flash_attn.slang and
+// flash_attn_split_k_reduce.
+static const float LOG2E = 1.44269504088896340736f;
+
 struct FaParams {
     uint N;
     uint KV;
@@ -151,7 +157,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         const uint gr = i_row0 + r;
         if (d < HSK && gr < p.N) {
             const uint q_off = iq3 * p.nb03 + iq2 * p.nb02 + gr * p.nb01;
-            v = float16_t(float(data_q[q_off + d]) * p.scale);
+            v = float16_t(float(data_q[q_off + d]) * (p.scale * LOG2E));
         }
         Q_sh[r * Q_STRIDE + d] = v;
     }
@@ -174,8 +180,26 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     // sets k_num=1, split_kv=num_blocks for the single-pass case). Each split
     // walks only [start_block, end_block) so no workgroup walks the whole KV —
     // the per-dispatch watchdog cap that single-pass tripped past ~14k keys.
-    const uint num_blocks = (p.KV + Bc - 1) / Bc;
-    const uint start_block = split * p.split_kv;
+    uint num_blocks = (p.KV + Bc - 1) / Bc;
+    // Causal upper bound: the host mask is the within-chunk causal triangle
+    // (see m_off_base comment / write_causal_mask), so the largest row in this
+    // tile sees no key past mask_kv_offset + (last row index). Clamp the walk
+    // instead of computing fully-masked trailing blocks.
+    if (MASK_ENABLE != 0) {
+        const uint max_qpos = p.mask_kv_offset + min(i_row0 + Br, p.N) - 1u;
+        num_blocks = min(num_blocks, max_qpos / Bc + 1u);
+    }
+    // Sliding-window lower bound: no row in this tile sees a key below
+    // min_qpos - swa_window + 1 (same qpos formula as the per-element SWA
+    // mask below) — skip whole blocks before that.
+    uint swa_first_block = 0u;
+    if (p.swa_window != 0u) {
+        const uint min_qpos = p.mask_kv_offset + i_row0;
+        if (min_qpos + 1u > p.swa_window) {
+            swa_first_block = (min_qpos + 1u - p.swa_window) / Bc;
+        }
+    }
+    const uint start_block = max(split * p.split_kv, swa_first_block);
     const uint end_block = min(num_blocks, (split + 1) * p.split_kv);
     for (uint j = start_block; j < end_block; ++j) {
         const uint kv_base = j * Bc;
@@ -214,8 +238,10 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                         const uint row = row_tid * ROWS_PER_THREAD + r;
                         if (i_row0 + row < p.N) {
                             const uint m_off = m_off_base + (i_row0 + row) * p.N;
+                            // Mask is a natural-log-domain bias (0 / -inf);
+                            // scale into the log2 domain of the S scores.
                             S_sh[c * S_STRIDE + row] +=
-                                float(data_m[m_off + (kv_base + c - p.mask_kv_offset)]);
+                                float(data_m[m_off + (kv_base + c - p.mask_kv_offset)]) * LOG2E;
                         }
                     }
                 }
@@ -258,7 +284,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
             rowmax = WaveActiveMax(rowmax);          // reduce over the subgroup (= row)
             const float m_old = Mf[r];
             Mf[r] = max(rowmax, m_old);
-            eMf[r] = exp(m_old - Mf[r]);
+            eMf[r] = exp2(m_old - Mf[r]);
             Lf[r] = eMf[r] * Lf[r];
         }
 
@@ -276,7 +302,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                 const uint row = row_tid * ROWS_PER_THREAD + r;
                 float pc = 0.0f;
                 if (!(CLAMP != 0 && kv_base + c >= p.KV)) {
-                    pc = exp(S_sh[c * S_STRIDE + row] - Mf[r]);
+                    pc = exp2(S_sh[c * S_STRIDE + row] - Mf[r]);
                     Lf[r] += pc;
                 }
                 P_sh[c * P_STRIDE + row] = float16_t(pc);

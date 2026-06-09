@@ -6,6 +6,7 @@
 //@end-variants
 
 #include "types.slang"
+#include "reduce_funcs.slang"
 
 struct SoftMaxParams {
     uint KX;
@@ -36,8 +37,6 @@ struct SoftMaxParams {
 
 [SpecializationConstant] const uint BLOCK_SIZE = 32;
 static const uint DATA_CACHE_SIZE = 16;
-
-groupshared FLOAT_TYPE vals[BLOCK_SIZE];
 
 void soft_max(uint num_iters, uint3 gl_WorkGroupID, uint tid) {
     const uint rowx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -82,14 +81,7 @@ void soft_max(uint num_iters, uint3 gl_WorkGroupID, uint tid) {
     }
 
     // Reduce max across workgroup.
-    vals[tid] = max_val;
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) { vals[tid] = max(vals[tid], vals[tid + s]); }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    max_val = vals[0];
-    GroupMemoryBarrierWithGroupSync();
+    max_val = workgroup_max(max_val, tid, BLOCK_SIZE);
 
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
 
@@ -117,13 +109,7 @@ void soft_max(uint num_iters, uint3 gl_WorkGroupID, uint tid) {
     }
 
     // Reduce sum across workgroup.
-    vals[tid] = sum;
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) { vals[tid] += vals[tid + s]; }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    sum = vals[0];
+    sum = workgroup_sum(sum, tid, BLOCK_SIZE);
 
     if (p.has_sinks != 0) {
         sum += FLOAT_TYPE(exp(FLOAT_TYPE(data_c[i02]) - max_val));
