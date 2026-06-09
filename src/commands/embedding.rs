@@ -197,7 +197,10 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
         } else {
             std::fs::read_to_string(pf)?
         };
-        inputs.extend(text.lines().filter(|l| !l.is_empty()).map(str::to_string));
+        // Keep every line (including blanks) so output rows / --sim indices stay
+        // aligned with the source file; a blank line still tokenizes to its
+        // special tokens and yields a (degenerate) embedding.
+        inputs.extend(text.lines().map(str::to_string));
     }
     if inputs.is_empty() {
         return Err("no input — pass --prompt/-p (repeatable) or --prompt-file/-f".into());

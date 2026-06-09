@@ -511,16 +511,39 @@ fn parse_params(gguf: &GgufFile) -> Result<Qwen3Params, Box<dyn Error>> {
     let u32_or = |k: &'static str, d: u32| -> u32 { gguf.get(k).and_then(coerce_u32).unwrap_or(d) };
     let f32_or = |k: &'static str, d: f32| -> f32 { gguf.get(k).and_then(coerce_f32).unwrap_or(d) };
 
+    let bad = |key: &'static str, detail: String| -> Box<dyn Error> {
+        ModelError::BadMetadata { key, detail }.into()
+    };
+
     let n_layer = u32_key("qwen3.block_count")?;
     let n_head = u32_key("qwen3.attention.head_count")?;
+    if n_head == 0 {
+        return Err(bad("qwen3.attention.head_count", "must be > 0".into()));
+    }
     let n_head_kv = u32_or("qwen3.attention.head_count_kv", n_head);
+    if n_head_kv == 0 || !n_head.is_multiple_of(n_head_kv) {
+        return Err(bad(
+            "qwen3.attention.head_count_kv",
+            format!("must be > 0 and divide head_count ({n_head}), got {n_head_kv}"),
+        ));
+    }
     let n_embd = u32_key("qwen3.embedding_length")?;
     let n_ff = u32_key("qwen3.feed_forward_length")?;
     let n_ctx_train = u32_or("qwen3.context_length", 32768);
     let rms_eps = f32_or("qwen3.attention.layer_norm_rms_epsilon", 1e-6);
+    // `n_head > 0` is guaranteed above, so the `n_embd / n_head` default is safe.
     let head_dim = u32_or("qwen3.attention.key_length", n_embd / n_head);
+    if head_dim == 0 {
+        return Err(bad("qwen3.attention.key_length", "must be > 0".into()));
+    }
     let rope_freq_base = f32_or("qwen3.rope.freq_base", 1_000_000.0);
     let rope_dim = u32_or("qwen3.rope.dimension_count", head_dim);
+    if rope_dim == 0 || rope_dim > head_dim {
+        return Err(bad(
+            "qwen3.rope.dimension_count",
+            format!("must be in 1..={head_dim} (head_dim), got {rope_dim}"),
+        ));
+    }
     let n_vocab = u32_key("qwen3.vocab_size").or_else(|_| derive_vocab(gguf))?;
 
     Ok(Qwen3Params {
