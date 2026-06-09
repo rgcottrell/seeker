@@ -2,7 +2,7 @@
 //
 // Q4_K's superblock dequant (per-2-bit-packed sub-scales, no high-bit plane)
 // has no generic `dequantize(ib, iqs)` overload, so — like `get_rows_q5_k.slang`
-// for Q5_K — this mirrors `dequant_q4_k.slang`'s per-element formula but adds
+// for Q5_K — this open-codes the superblock dequant formula but adds
 // row indirection so each workgroup targets a single output row. It is exactly
 // `get_rows_q5_k.slang` minus the 1-bit `qh` high plane (Q4_K has no `qh`); the
 // `dm`/`scales` unpack into (d1,m1,d2,m2) is byte-for-byte identical.
@@ -45,37 +45,14 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     const uint y_base = out_row * p.nb21 + block_in_row * QUANT_K + 64 * il + 2 * ir;
     const uint qs_idx = 32 * il + 2 * ir;
 
-    uint scidx0      = (is < 4) ? is        : (is + 4);
-    uint scidx1      = (is < 4) ? is        : (is - 4);
-    uint scidxmask1  = (is < 4) ? 0x30      : 0xC0;
-    uint scidxshift1 = (is < 4) ? 0         : 2;
-    uint mbidx0      = is + 4;
-    uint mbidx1      = (is < 4) ? is + 4    : is;
-    uint mbidxmask0  = (is < 4) ? 0xF       : 0xF0;
-    uint mbidxshift0 = (is < 4) ? 0         : 4;
-    uint mbidxmask1  = (is < 4) ? 0x30      : 0xC0;
-    uint mbidxshift1 = (is < 4) ? 0         : 2;
-
-    uint8_t sc    = uint8_t((data_a[ib].scales[scidx0] & 0xF) | ((data_a[ib].scales[scidx1] & scidxmask1) >> scidxshift1));
-    uint8_t mbyte = uint8_t((data_a[ib].scales[mbidx0] & mbidxmask0) >> mbidxshift0 | ((data_a[ib].scales[mbidx1] & mbidxmask1) >> mbidxshift1));
-
+    // `is` is even (= 2*il), so sub-blocks `is` and `is+1` never straddle the
+    // (is < 4) packing boundary differently than the unrolled original.
+    uint sc, mbyte;
+    unpack_q4k_scale_min(data_a[ib].scales, is, sc, mbyte);
     const FLOAT_TYPE d1 = dall * sc;
     const FLOAT_TYPE m1 = dmin * mbyte;
 
-    scidx0      = (is < 4) ? is + 1 : (is + 5);
-    scidx1      = (is < 4) ? is + 1 : (is - 3);
-    scidxmask1  = (is < 4) ? 0x30   : 0xC0;
-    scidxshift1 = (is < 4) ? 0      : 2;
-    mbidx0      = is + 5;
-    mbidx1      = (is < 4) ? is + 5 : is + 1;
-    mbidxmask0  = (is < 4) ? 0xF    : 0xF0;
-    mbidxshift0 = (is < 4) ? 0      : 4;
-    mbidxmask1  = (is < 4) ? 0x30   : 0xC0;
-    mbidxshift1 = (is < 4) ? 0      : 2;
-
-    sc    = uint8_t((data_a[ib].scales[scidx0] & 0xF) | ((data_a[ib].scales[scidx1] & scidxmask1) >> scidxshift1));
-    mbyte = uint8_t((data_a[ib].scales[mbidx0] & mbidxmask0) >> mbidxshift0 | ((data_a[ib].scales[mbidx1] & mbidxmask1) >> mbidxshift1));
-
+    unpack_q4k_scale_min(data_a[ib].scales, is + 1, sc, mbyte);
     const FLOAT_TYPE d2 = dall * sc;
     const FLOAT_TYPE m2 = dmin * mbyte;
 

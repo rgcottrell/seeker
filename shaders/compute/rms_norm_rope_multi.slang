@@ -24,6 +24,7 @@
 
 #include "types.slang"
 #include "rope_params.slang"
+#include "reduce_funcs.slang"
 
 [SpecializationConstant] const uint BLOCK_SIZE = 256;
 
@@ -49,7 +50,6 @@ struct rms_norm_rope_params {
 
 [[vk::push_constant]] ConstantBuffer<rms_norm_rope_params> pc;
 
-groupshared float sum_shared[BLOCK_SIZE];
 groupshared float norm_shared[BLOCK_SIZE];
 
 [shader("compute")]
@@ -74,19 +74,12 @@ void main(uint3 gl_WorkGroupID : SV_GroupID,
     if (tid < pc.rope.ne00) {
         x = float(data_a[a_row + tid]);
     }
-    sum_shared[tid] = x * x;
-    GroupMemoryBarrierWithGroupSync();
 
-    // Phase 2: workgroup reduction (BLOCK_SIZE-wide tree).
-    [unroll] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (tid < uint(s)) {
-            sum_shared[tid] += sum_shared[tid + s];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
+    // Phase 2: workgroup reduction (wave-cooperative).
+    const float sum = workgroup_sum(x * x, tid, BLOCK_SIZE);
 
     // Phase 3: normalize and apply weight.
-    const float mean  = sum_shared[0] / float(pc.rope.ne00);
+    const float mean  = sum / float(pc.rope.ne00);
     const float scale = rsqrt(mean + pc.eps);
     float w = 1.0f;
     if (tid < pc.rope.ne00) {

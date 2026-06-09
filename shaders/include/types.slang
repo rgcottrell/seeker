@@ -110,6 +110,26 @@ struct block_q4_K_packed32 {
     uint       qs[32];       // QUANT_K/2/4
 };
 
+// Unpack the 6-bit (scale, min) pair for sub-block `is` (0..7) from the
+// 12-byte packed `scales` array shared by Q4_K and Q5_K superblocks.
+// Used by the scalar get_rows dequant paths (the K-quant matvec kernels use
+// a vectorized packed16/packed32 unpack instead).
+void unpack_q4k_scale_min(const uint8_t scales[12], uint is, out uint sc, out uint mbyte) {
+    const uint scidx0      = (is < 4) ? is        : (is + 4);
+    const uint scidx1      = (is < 4) ? is        : (is - 4);
+    const uint scidxmask1  = (is < 4) ? 0x30      : 0xC0;
+    const uint scidxshift1 = (is < 4) ? 0         : 2;
+    const uint mbidx0      = is + 4;
+    const uint mbidx1      = (is < 4) ? is + 4    : is;
+    const uint mbidxmask0  = (is < 4) ? 0xF       : 0xF0;
+    const uint mbidxshift0 = (is < 4) ? 0         : 4;
+    const uint mbidxmask1  = (is < 4) ? 0x30      : 0xC0;
+    const uint mbidxshift1 = (is < 4) ? 0         : 2;
+    sc    = (uint(scales[scidx0]) & 0xF) | ((uint(scales[scidx1]) & scidxmask1) >> scidxshift1);
+    mbyte = ((uint(scales[mbidx0]) & mbidxmask0) >> mbidxshift0)
+          | ((uint(scales[mbidx1]) & mbidxmask1) >> mbidxshift1);
+}
+
 #define QUANT_K_Q5_K 256
 struct block_q5_K {
     float16_t2 dm;

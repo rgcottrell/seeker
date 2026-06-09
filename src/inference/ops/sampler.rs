@@ -738,7 +738,8 @@ fn record_soft_max(
     // data_b (mask, unused → bind logits again), data_c (sinks, unused),
     // data_d (output). When KY=0 and has_sinks=0 the shader ignores b/c
     // bindings, but Vulkan still requires valid descriptors.
-    let key = PipelineKey::dense("soft_max_f32", 4, SOFT_MAX_PARAMS_BYTES, Vec::new());
+    let key = PipelineKey::dense("soft_max_f32", 4, SOFT_MAX_PARAMS_BYTES, Vec::new())
+        .with_subgroup_size(32);
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::SOFT_MAX_F32_SPV.as_bytes())?;
@@ -818,7 +819,8 @@ fn record_sum_rows(
 ) -> Result<(), Box<dyn Error>> {
     let n_cols: u32 = src.dims[0] as u32;
     let push = sum_rows_params_bytes(n_cols, &src, &dst, 1.0);
-    let key = PipelineKey::dense("sum_rows_f32", 2, SUM_ROWS_PARAMS_BYTES, Vec::new());
+    let key = PipelineKey::dense("sum_rows_f32", 2, SUM_ROWS_PARAMS_BYTES, Vec::new())
+        .with_subgroup_size(32);
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::SUM_ROWS_F32_SPV.as_bytes())?;
