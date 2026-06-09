@@ -7,6 +7,7 @@ use crate::commands::bench::{self, BenchArgs};
 use crate::commands::chat::{self, ChatArgs};
 use crate::commands::detokenize::{self, DetokenizeArgs};
 use crate::commands::download::{self, DownloadArgs};
+use crate::commands::embedding::{self, EmbeddingArgs};
 use crate::commands::inspect::{self, InspectArgs};
 use crate::commands::probe::{self, ProbeArgs};
 use crate::commands::run::{self as run_cmd, RunArgs};
@@ -65,6 +66,8 @@ enum Command {
     /// Internal diagnostics/perf harness: single-seq prefill+decode timing,
     /// perplexity, logit dumps, and the concurrent scheduler throughput sweep.
     Probe(ProbeArgs),
+    /// Produce text embeddings (like llama-embedding): forward + pool + normalize.
+    Embedding(EmbeddingArgs),
 }
 
 #[tokio::main]
@@ -87,6 +90,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Run(args) => run_cmd::run(args).await,
         Command::Bench(args) => bench::run(args).await,
         Command::Probe(args) => probe::run(args).await,
+        Command::Embedding(args) => embedding::run(args).await,
     }
 }
 

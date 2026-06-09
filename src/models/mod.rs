@@ -14,6 +14,7 @@ use crate::tokenizer::TokenizerBundle;
 pub mod gemma4;
 pub mod gemma4_assistant;
 pub mod llama;
+pub mod qwen3;
 pub mod qwen35moe;
 
 #[derive(Debug, thiserror::Error)]
@@ -433,6 +434,7 @@ pub fn open(
             gguf, weights, tokenizer,
         )?)),
         "llama" => Ok(Box::new(llama::LlamaModel::new(gguf, weights, tokenizer)?)),
+        "qwen3" => Ok(Box::new(qwen3::Qwen3Model::new(gguf, weights, tokenizer)?)),
         "qwen35moe" => Ok(Box::new(qwen35moe::Qwen35MoeModel::new(
             gguf,
             weights,
