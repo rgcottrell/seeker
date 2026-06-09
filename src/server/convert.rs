@@ -322,10 +322,16 @@ pub fn embedding_inputs_to_tokens(
     value: &serde_json::Value,
 ) -> Result<Vec<Vec<u32>>, String> {
     use serde_json::Value;
-    // An all-integer array → a single pre-tokenized input.
+    // An all-integer array → a single pre-tokenized input. A value outside the
+    // u32 token-id range yields `None` (→ the caller errors) rather than
+    // silently truncating, matching `prompt_value_to_tokens`.
     let as_tokens = |arr: &[Value]| -> Option<Vec<u32>> {
         arr.iter()
-            .map(|v| v.as_u64().map(|n| n as u32))
+            .map(|v| {
+                v.as_u64()
+                    .filter(|&n| n <= u32::MAX as u64)
+                    .map(|n| n as u32)
+            })
             .collect::<Option<Vec<u32>>>()
     };
     match value {
