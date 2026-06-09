@@ -3,6 +3,7 @@ pub mod chat;
 pub mod chat_cache;
 pub mod detokenize;
 pub mod download;
+pub mod embedding;
 pub mod inspect;
 pub mod probe;
 pub mod run;
