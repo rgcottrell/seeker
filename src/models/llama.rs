@@ -442,6 +442,10 @@ impl Model for LlamaModel {
         true
     }
 
+    fn supports_batch_decode(&self) -> bool {
+        true
+    }
+
     /// Batched decode: B sequences, one token each, in one forward. The dense
     /// ops (embedding, RMSNorm, all matmuls, RoPE, FFN) process the `B`-wide
     /// token dimension unchanged; only the attention is per-sequence (own KV
