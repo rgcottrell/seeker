@@ -231,6 +231,16 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Whether [`Self::record_forward_batch`] is implemented. Keep this in sync
+    /// with the `record_forward_batch` impl: when `false`, the server clamps
+    /// `--parallel` to 1 and decodes through the single-sequence path
+    /// (`forward_sampled` on the borrowed slot cache) instead of the batched
+    /// step — without it, serve generation fails after prefill on the first
+    /// decode token. Default `false`.
+    fn supports_batch_decode(&self) -> bool {
+        false
+    }
+
     /// Conservative upper bound (in bytes) on the transient scratch one
     /// forward pass of `≤ n_ubatch` tokens needs, used to size the engine's
     /// scratch region (llama.cpp-style worst-case compute-buffer reservation).

@@ -573,6 +573,10 @@ struct Worker {
     /// scheduler uses the token-budget / chunked-prefill loop; otherwise it
     /// falls back to serial-prefill + batched-decode.
     unified: bool,
+    /// Whether the model implements the batched decode forward. When false
+    /// (e.g. gemma4) `n_slots` is clamped to 1 at startup and `decode_step`
+    /// advances the lone sequence through the single-sequence path instead.
+    batch_decode: bool,
     /// The vision tower (when an mmproj was resolved) — lets chat requests carry
     /// images. `None` → text-only serving.
     vision: Option<VisionCtx>,
@@ -838,6 +842,19 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     // single slab is all it needs (no concurrent generation).
     let n_slots = if cfg.embeddings {
         1
+    } else if !model.supports_batch_decode() {
+        // No batched-decode forward (e.g. gemma4): decode runs through the
+        // single-sequence path on the borrowed slot cache, whose persistent
+        // decode-replay cmdbuf binds one slot's buffers — multiple slots would
+        // replay against the wrong slab. Serve single-stream; queued requests
+        // wait for the slot.
+        if cfg.n_slots > 1 || cfg.parallel_max > 1 {
+            tracing::warn!(
+                "this model has no batched decode; clamping --parallel to 1 \
+                 (requests are served one at a time)"
+            );
+        }
+        1
     } else {
         resolve_n_slots(
             &engine.device,
@@ -910,6 +927,7 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
 
     let eog_ids = model.tokenizer().eog_ids.clone();
     let unified = model.supports_unified();
+    let batch_decode = model.supports_batch_decode();
     // Per-step token budget = n_ubatch: the scratch region is sized for one
     // n_ubatch-token forward (`scratch_bytes_estimate(n_ubatch, ...)` above), so
     // a unified step must not pack more than that or it overflows scratch.
@@ -987,6 +1005,7 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         clock: 0,
         max_batch_tokens,
         unified,
+        batch_decode,
         vision,
         scratch_bytes,
         prefix_cache,
@@ -1629,6 +1648,14 @@ impl Worker {
             p_seed
         } else {
             self.batch.reset_slot(idx as u32);
+            // `reset_slot` zeroes only the SSM state. Clear the slab's M-RoPE
+            // lag too: a slab last used by an image request keeps its lag, and
+            // `schedule_step` subtracts it from every position — a fresh text
+            // request inheriting a dead request's lag would rope-rotate the
+            // whole prompt wrong. (Pure-extension reuse above correctly KEEPS
+            // the lag — there the cached prefix really contains the image; the
+            // prefix-cache seed path resets it inside `try_seed_prefix`.)
+            self.batch.rope_lag[idx] = 0;
             0
         };
         self.batch.positions[idx] = num_computed;
@@ -2672,6 +2699,17 @@ impl Worker {
             return;
         }
 
+        // Models without a batched-decode forward (gemma4) advance through the
+        // single-sequence path. n_slots is clamped to 1 at startup for them, so
+        // there is exactly one participant and the persistent decode-replay
+        // cmdbuf always binds the right (only) slab.
+        if !self.batch_decode {
+            for &i in &parts {
+                self.decode_one_single(i);
+            }
+            return;
+        }
+
         // Advance every active sequence in one batched forward — even a lone
         // sequence (B=1). Routing B=1 through the single-sequence path (decode
         // replay + split-K flash) would be faster per token, but the single-seq
@@ -2731,6 +2769,46 @@ impl Worker {
             );
             self.active[i].last_token = token;
             self.active[i].spec_seeded = false; // batched touch ⇒ stale spec state
+        }
+    }
+
+    /// Advance one sequence by one token through the single-sequence path
+    /// (`forward_sampled` on the borrowed slot cache) — the decode for models
+    /// without [`record_forward_batch`]. The borrowed cache carries the slot's
+    /// position and M-RoPE lag; both are synced back after the step so the
+    /// slab metadata stays the source of truth.
+    ///
+    /// [`record_forward_batch`]: crate::models::Model::record_forward_batch
+    fn decode_one_single(&mut self, i: usize) {
+        let idx = self.active[i].slab as usize;
+        let mut sc = self.batch.slot_kvcache(idx as u32);
+        let last = self.active[i].last_token;
+        let pos = self.batch.positions[idx];
+        match self.engine.forward_sampled(
+            &*self.model,
+            &mut sc,
+            &[last],
+            pos,
+            &mut self.active[i].sampler,
+        ) {
+            Ok(token) => {
+                self.batch.positions[idx] = sc.position;
+                self.batch.rope_lag[idx] = sc.rope_position_lag;
+                process_token(
+                    &self.model.tokenizer().tokenizer,
+                    &self.eog_ids,
+                    &mut self.active[i],
+                    token,
+                );
+                self.active[i].last_token = token;
+            }
+            Err(e) => {
+                let _ = self.active[i]
+                    .reply
+                    .blocking_send(GenEvent::Error(e.to_string()));
+                self.active[i].disconnected = true; // suppress a duplicate Done
+                self.active[i].terminal = Some(StopReason::ContextFull);
+            }
         }
     }
 

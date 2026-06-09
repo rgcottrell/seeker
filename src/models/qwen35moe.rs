@@ -616,6 +616,10 @@ impl Model for Qwen35MoeModel {
         true
     }
 
+    fn supports_batch_decode(&self) -> bool {
+        true
+    }
+
     fn record_forward_unified(
         &self,
         ctx: &mut DispatchContext,
