@@ -78,6 +78,13 @@ import glsl;  // gl_SubgroupInvocationID, gl_LocalInvocationIndex
 
 static const uint WORKGROUP_SIZE = 32;
 
+// The online softmax runs in the log2 domain: Q is pre-scaled by
+// scale*log2(e) and the host mask is scaled by log2(e) on add, so every
+// exp() becomes the cheaper exp2() (saves the per-element ex2 input
+// multiply on RDNA). The split-K (L, M) partials are therefore ALSO in the
+// log2 domain — flash_attn_split_k_reduce combines with exp2 to match.
+static const float LOG2E = 1.44269504088896340736f;
+
 struct FaParams {
     uint N;
     uint KV;
@@ -416,7 +423,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         : iq3 * p.nb03 + iq2 * p.nb02 + i_row * p.nb01;
 
     for (uint d = tid; d < HSK; d += WORKGROUP_SIZE) {
-        Q_sh[d] = float(data_q[q_off + d]) * p.scale;
+        Q_sh[d] = float(data_q[q_off + d]) * (p.scale * LOG2E);
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -436,14 +443,33 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     // Per-row causal length: VARLEN row i_row sees [0, base + i_row]; legacy
     // uses the full kv_len (decode attends to all of it; prefill relies on the
     // host mask). This is the only KV bound — no host mask in the VARLEN path.
-    const uint eff_kv = (VARLEN != 0u) ? (base + i_row + 1u) : p_KV;
+    uint eff_kv = (VARLEN != 0u) ? (base + i_row + 1u) : p_KV;
+    // The host mask is the within-chunk causal triangle (see write_causal_mask
+    // and the m_off comment above): row i_row sees no key past
+    // mask_kv_offset + i_row. Clamping the walk skips the fully-masked tail
+    // blocks instead of computing and then discarding them.
+    if (VARLEN == 0u && MASK_ENABLE != 0u) {
+        eff_kv = min(eff_kv, p.mask_kv_offset + i_row + 1u);
+    }
     const uint num_blocks  = (eff_kv + Bc - 1) / Bc;
+    // Sliding-window lower bound: keys below first_visible are masked for this
+    // row (same qpos formula as the per-element SWA mask below) — skip whole
+    // blocks before them. Split-K combine already weights empty splits
+    // (Lf=0, Mf=-1e30) to ~0, so a split that lands entirely below the window
+    // contributes nothing, exactly like a split past the end.
+    uint swa_first_block = 0u;
+    if (p.swa_window != 0u) {
+        const uint qpos = p.mask_kv_offset + i_row;
+        if (qpos + 1u > p.swa_window) {
+            swa_first_block = (qpos + 1u - p.swa_window) / Bc;
+        }
+    }
     // This workgroup handles only its split's slice of the KV blocks.
     // k_num == 1 ⇒ split_kv == num_blocks ⇒ [0, num_blocks): full range.
     // A split past the end (block_start >= num_blocks) runs zero iterations
     // and leaves Mf=-1e30, Lf=0 — the combine kernel weights it to ~0.
-    const uint block_start = split * p_split_kv;
-    const uint block_end   = min(block_start + p_split_kv, num_blocks);
+    const uint block_start = max(split * p_split_kv, swa_first_block);
+    const uint block_end   = min(split * p_split_kv + p_split_kv, num_blocks);
     for (uint j = block_start; j < block_end; ++j) {
         const uint kv_base = j * Bc;
 
@@ -457,7 +483,9 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                     s += Q_sh[d] * read_k_element(k_off + d);
                 }
                 if (MASK_ENABLE != 0 && kv_base + c >= p.mask_kv_offset) {
-                    s += data_m[m_off + (kv_base + c - p.mask_kv_offset)];
+                    // Mask values are natural-log-domain biases (0 / -inf);
+                    // scale into the log2 domain to match the pre-scaled Q.
+                    s += data_m[m_off + (kv_base + c - p.mask_kv_offset)] * LOG2E;
                 }
                 // Sliding-window attention: mask keys outside [qpos-window+1, qpos].
                 if (p.swa_window != 0u) {
@@ -478,15 +506,15 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
             M_new = max(M_new, S_sh[c]);
         }
 
-        // 3) Online softmax accumulate.
-        const float m_scale = exp(Mf - M_new);
+        // 3) Online softmax accumulate (log2 domain — see LOG2E above).
+        const float m_scale = exp2(Mf - M_new);
         Lf *= m_scale;
         [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {
             Of[d] *= m_scale;
         }
         [unroll] for (uint c = 0; c < Bc; ++c) {
             if (kv_base + c >= eff_kv) { break; }
-            const float p_c = exp(S_sh[c] - M_new);
+            const float p_c = exp2(S_sh[c] - M_new);
             Lf += p_c;
             const uint v_off = kv_slot * p.nb23 + iv2 * p.nb22 + (kv_base + c) * p.nb21;
             [unroll] for (uint d = 0; d < HSV_PER_THREAD; ++d) {

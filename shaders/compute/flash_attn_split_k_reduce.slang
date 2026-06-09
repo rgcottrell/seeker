@@ -11,6 +11,12 @@
 
 [SpecializationConstant] const uint BLOCK_SIZE = 32;
 
+// The FA kernels run their online softmax in the log2 domain (Q pre-scaled
+// by log2(e)), so the per-split (L, M) partials are log2-domain values and
+// the merge uses exp2. Sinks arrive in the natural-log domain from the host
+// and are converted on read.
+static const float LOG2E = 1.44269504088896340736f;
+
 struct FaSplitKParams {
     uint D;
     uint ne1;
@@ -31,8 +37,6 @@ struct FaSplitKParams {
 // instead of the push struct so the recorded cmdbuf is replay-stable.
 #include "decode_dyn.slang"
 [[vk::binding(3, 0)]] StructuredBuffer<DecodeDyn> data_dyn;
-
-groupshared float tmpsh[BLOCK_SIZE];
 
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
@@ -56,43 +60,26 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         m_max = max(m_max, m);
     }
 
-    tmpsh[tid] = m_max;
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            m_max = max(m_max, tmpsh[tid + s]);
-            tmpsh[tid] = m_max;
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    m_max = tmpsh[0];
-    GroupMemoryBarrierWithGroupSync();
+    // BLOCK_SIZE == 32 and the pipeline pins subgroup size 32, so the
+    // workgroup is exactly one wave — reduce without shared memory.
+    m_max = WaveActiveMax(m_max);
 
     float L = 0.0f;
     for (uint k = 0; k + tid < k_num; k += BLOCK_SIZE) {
         const float l = data_a[l_offset + (k + tid) * lm_stride];
         const float m = data_a[m_offset + (k + tid) * lm_stride];
-        L += exp(m - m_max) * l;
+        L += exp2(m - m_max) * l;
     }
 
-    tmpsh[tid] = L;
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            L += tmpsh[tid + s];
-            tmpsh[tid] = L;
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    L = tmpsh[0];
+    L = WaveActiveSum(L);
 
     float sink = 0.0f;
     if (p.sinks != 0) {
-        sink = data_s[n];
+        sink = data_s[n] * LOG2E;  // host sinks are natural-log domain
         float ms = 1.0f;
         float vs = 1.0f;
-        if (sink > m_max) { ms = exp(m_max - sink); }
-        else              { vs = exp(sink  - m_max); }
+        if (sink > m_max) { ms = exp2(m_max - sink); }
+        else              { vs = exp2(sink  - m_max); }
         L = L * ms + vs;
     }
 
@@ -104,10 +91,10 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         [unroll] for (uint k = 0; k < k_num; ++k) {
             const uint o_offset = D * p.ne1 * (k + k_num * (i2 + p.ne2 * i3)) + D * n + d;
             const float m = data_a[m_offset + k * lm_stride];
-            O += exp(m - m_max) * data_a[o_offset];
+            O += exp2(m - m_max) * data_a[o_offset];
         }
         if (p.sinks != 0 && sink > m_max) {
-            O *= exp(m_max - sink);
+            O *= exp2(m_max - sink);
         }
         O *= L;
 

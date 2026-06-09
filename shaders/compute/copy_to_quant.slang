@@ -1,7 +1,7 @@
 // Ported from llama.cpp ggml-vulkan copy_to_quant.comp, MIT license — see LICENSE.llama-cpp
 //
 // Quantize an f32 source into one of the legacy GGML block formats. Each block is owned by
-// a single thread; 32 threads per workgroup. SET_ROWS adds an i32/i64 row-index gather.
+// a single thread; 32 threads per workgroup.
 //
 // Aliased data_a_packed16 view is declared at binding 3 by the consuming shader before
 // dequant_funcs.slang is pulled in (IQ4_NL path needs it).
@@ -12,18 +12,10 @@
 //  q5_0:        DATA_A_Q5_0=1     D_TYPE=float   FLOAT_TYPE=float
 //  q5_1:        DATA_A_Q5_1=1     D_TYPE=float   FLOAT_TYPE=float
 //  q8_0:        DATA_A_Q8_0=1     D_TYPE=float   FLOAT_TYPE=float
-//  q1_0:        DATA_A_Q1_0=1     D_TYPE=float   FLOAT_TYPE=float
 //  iq4_nl:      DATA_A_IQ4_NL=1   D_TYPE=float   FLOAT_TYPE=float
 //  turbo2:      DATA_A_TURBO2_0=1 D_TYPE=float   FLOAT_TYPE=float
 //  turbo3:      DATA_A_TURBO3_0=1 D_TYPE=float   FLOAT_TYPE=float
 //  turbo4:      DATA_A_TURBO4_0=1 D_TYPE=float   FLOAT_TYPE=float
-//  set_rows_q4_0_i32: SET_ROWS=1  DATA_A_Q4_0=1   B_TYPE=uint   B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
-//  set_rows_q4_1_i32: SET_ROWS=1  DATA_A_Q4_1=1   B_TYPE=uint   B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
-//  set_rows_q5_0_i32: SET_ROWS=1  DATA_A_Q5_0=1   B_TYPE=uint   B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
-//  set_rows_q5_1_i32: SET_ROWS=1  DATA_A_Q5_1=1   B_TYPE=uint   B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
-//  set_rows_q8_0_i32: SET_ROWS=1  DATA_A_Q8_0=1   B_TYPE=uint   B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
-//  set_rows_q1_0_i32: SET_ROWS=1  DATA_A_Q1_0=1   B_TYPE=uint   B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
-//  set_rows_iq4_nl_i32: SET_ROWS=1 DATA_A_IQ4_NL=1 B_TYPE=uint  B_SIZE=32   D_TYPE=float   FLOAT_TYPE=float
 //@end-variants
 
 import glsl;  // gl_WorkGroupSize, gl_LocalInvocationIndex
@@ -31,11 +23,7 @@ import glsl;  // gl_WorkGroupSize, gl_LocalInvocationIndex
 #include "types.slang"
 #include "turbo_consts.slang" // TURBO_S1/S2, TURBO_INV_SQRT_128, TURBO*_THRESH (turbo quantize)
 
-#if defined(SET_ROWS) && QUANT_K == 1
-static const uint BLOCK_SIZE = 512;
-#else
 static const uint BLOCK_SIZE = 32;
-#endif
 
 // generic_unary_head / generic_binary_head declare data_a / data_d at slots 0/1, so we
 // can't include them here without colliding with our own data_s / data_q. Inline only the
@@ -43,16 +31,6 @@ static const uint BLOCK_SIZE = 32;
 
 #include "utils.slang"
 
-#if defined(SET_ROWS)
-struct CopyParams {
-    uint ne;
-    uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
-    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
-    uint ne20; uint ne21; uint ne22; uint ne23; uint nb20; uint nb21; uint nb22; uint nb23;
-    uint misalign_offsets;
-    float param1; float param2; int param3;
-};
-#else
 struct CopyParams {
     uint ne;
     uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
@@ -66,34 +44,22 @@ struct CopyParams {
     uint ne1_01mp;  uint ne1_01L;
     uint ne1_0mp;   uint ne1_0L;
 };
-#endif
 
 [[vk::push_constant]] ConstantBuffer<CopyParams> p;
 
 [[vk::binding(0, 0)]] StructuredBuffer<float>    data_s;
-#if defined(SET_ROWS)
-[[vk::binding(1, 0)]] StructuredBuffer<B_TYPE>   data_i;
-[[vk::binding(2, 0)]] RWStructuredBuffer<A_TYPE> data_q;
-#else
 [[vk::binding(1, 0)]] RWStructuredBuffer<A_TYPE> data_q;
-#endif
 
 #if defined(A_TYPE_PACKED16)
 [[vk::binding(3, 0)]] StructuredBuffer<A_TYPE_PACKED16> data_a_packed16;
 #endif
 
 uint get_aoffset() { return p.misalign_offsets >> 16; }
-#if defined(SET_ROWS)
-uint get_boffset() { return (p.misalign_offsets >> 8) & 0xFFu; }
-uint get_doffset() { return  p.misalign_offsets       & 0xFFu; }
-#else
 uint get_doffset() { return p.misalign_offsets & 0xFFFFu; }
-#endif
 
 uint mulhi_u32(uint a, uint b) { return uint((uint64_t(a) * uint64_t(b)) >> 32); }
 uint fastdiv(uint n, uint mp, uint L) { return (mulhi_u32(n, mp) + n) >> L; }
 
-#if !defined(SET_ROWS)
 uint src0_idx(uint idx) {
     const uint i03 = fastdiv(idx, p.ne0_012mp, p.ne0_012L);
     const uint i03_offset = i03 * p.ne02 * p.ne01 * p.ne00;
@@ -113,25 +79,6 @@ uint dst_idx_quant(uint idx, uint qk) {
     const uint i10 = idx - i13_offset - i12_offset - i11 * p.ne10;
     return i13 * p.nb13 + i12 * p.nb12 + i11 * p.nb11 + (i10 / qk) * p.nb10;
 }
-#endif
-
-#if defined(SET_ROWS)
-void get_indices(uint idx, out uint i00, out uint i01, out uint i02, out uint i03) {
-    get_indices(idx, i00, i01, i02, i03, p.ne00, p.ne01, p.ne02, p.ne03);
-}
-uint src0_idx(uint i00, uint i01, uint i02, uint i03) {
-    return i03 * p.nb03 + i02 * p.nb02 + i01 * p.nb01 + i00 * p.nb00;
-}
-uint src1_idx(uint i00, uint i01, uint i02, uint i03) {
-    return fastmod(i03, p.ne13) * p.nb13
-         + fastmod(i02, p.ne12) * p.nb12
-         + fastmod(i01, p.ne11) * p.nb11
-         + fastmod(i00, p.ne10) * p.nb10;
-}
-uint dst_idx(uint i00, uint i01, uint i02, uint i03) {
-    return i03 * p.nb23 + i02 * p.nb22 + i01 * p.nb21 + i00 * p.nb20;
-}
-#endif
 
 #if defined(DATA_A_IQ4_NL)
 // kvalues_iq4nl is defined in types.slang (groupshared, populated by init_iq_shmem).
@@ -257,28 +204,6 @@ void quantize(uint dst_idx, uint src_idx) {
 }
 #endif
 
-#if defined(DATA_A_Q1_0)
-void quantize(uint dst_idx, uint src_idx) {
-    float sum_abs = 0.0f;
-    [unroll] for (uint j = 0; j < QUANT_K_Q1_0; j++) {
-        sum_abs += abs(data_s[src_idx + j]);
-    }
-    const float d = sum_abs / float(QUANT_K_Q1_0);
-    data_q[dst_idx].d = float16_t(d);
-
-    uint packed[QUANT_K_Q1_0 / 8];
-    [unroll] for (uint j = 0; j < QUANT_K_Q1_0 / 8; ++j) { packed[j] = 0u; }
-    [unroll] for (uint j = 0; j < QUANT_K_Q1_0; ++j) {
-        if (data_s[src_idx + j] >= 0.0f) {
-            packed[j / 8] |= 1u << (j % 8);
-        }
-    }
-    [unroll] for (uint j = 0; j < QUANT_K_Q1_0 / 8; ++j) {
-        data_q[dst_idx].qs[j] = uint8_t(packed[j]);
-    }
-}
-#endif
-
 #if defined(DATA_A_IQ4_NL)
 void quantize(uint dst_idx, uint src_idx) {
     float amax = 0.0f, vmax = 0.0f;
@@ -326,7 +251,7 @@ void quantize(uint dst_idx, uint src_idx) {
 // Each thread owns a whole 128-element block (= one head's WHT group): L2
 // normalize → forward WHT (S1, butterfly, S2·1/√128) → nearest PolarQuant
 // centroid → pack indices + store the corrected fp16 norm `gnrm/√Σcentroid²`.
-// Matches the fork's copy_to_quant.comp SET_ROWS turbo path; the FA dequant in
+// Matches the fork's copy_to_quant.comp turbo path; the FA dequant in
 // flash_attn.slang is the exact inverse of this packing.
 #if defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO4_0)
 float turbo_forward_rotate(uint src, out float x[128]) {
@@ -436,35 +361,6 @@ void quantize(uint dst_idx, uint src_idx) {
 }
 #endif
 
-#if defined(SET_ROWS)
-[shader("compute")]
-[numthreads(BLOCK_SIZE, 1, 1)]
-void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_GroupThreadID) {
-#ifdef NEEDS_INIT_IQ_SHMEM
-    init_iq_shmem(gl_WorkGroupSize);
-#endif
-    const uint idx = ((gl_WorkGroupID.z * 262144u + gl_WorkGroupID.y * 512u + gl_WorkGroupID.x) * BLOCK_SIZE + gl_LocalInvocationID.x) * QUANT_K;
-    if (idx >= p.ne) { return; }
-
-    uint i00, i01, i02, i03;
-    get_indices(idx, i00, i01, i02, i03);
-
-    const uint i12 = fastmod(i03, p.ne12);
-    const uint i11 = fastmod(i02, p.ne11);
-    const uint i10 = i01;
-
-    // B_TYPE may be uint (i32 index) or uint2 (i64 index swizzled to .x); both reduce to a uint here.
-#if B_SIZE == 64
-    const uint i1 = data_i[src1_idx(i10, i11, i12, 0) + get_boffset()].x;
-#else
-    const uint i1 = uint(data_i[src1_idx(i10, i11, i12, 0) + get_boffset()]);
-#endif
-
-    const uint s0_idx = src0_idx(i00, i01, i02, i03) + get_aoffset();
-    const uint d_idx  = dst_idx(i00 / QUANT_K, i1, i02, i03) + get_doffset();
-    quantize(d_idx, s0_idx);
-}
-#else
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_GroupThreadID) {
@@ -478,4 +374,3 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     const uint s_idx = get_aoffset() + src0_idx(idx);
     quantize(d_idx, s_idx);
 }
-#endif

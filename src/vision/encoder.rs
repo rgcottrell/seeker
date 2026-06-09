@@ -1010,7 +1010,8 @@ fn record_layernorm_affine(
     let mut push = [0u8; GENERIC_PARAMS_BYTES as usize];
     push[0..4].copy_from_slice(&ne00.to_ne_bytes()); // KX
     push[8..12].copy_from_slice(&eps.to_ne_bytes()); // param1 = eps
-    let key = PipelineKey::dense("norm_f32", 2, GENERIC_PARAMS_BYTES, Vec::new());
+    let key =
+        PipelineKey::dense("norm_f32", 2, GENERIC_PARAMS_BYTES, Vec::new()).with_subgroup_size(32);
     let pipeline = *ctx
         .pipelines
         .get(ctx.device, key, shaders::NORM_F32_SPV.as_bytes())?;
