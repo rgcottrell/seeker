@@ -282,13 +282,20 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
         .saturating_add(spec_lookahead)
         .max(tokens.len() as u32);
     let decoder_scratch = if media_setup.is_some() {
-        model.scratch_bytes_estimate(0, max_seq_len, args.cache_type_k, args.cache_type_v)
+        model.scratch_bytes_estimate(
+            0,
+            max_seq_len,
+            args.cache_type_k,
+            args.cache_type_v,
+            /*max_batch=*/ 1,
+        )
     } else {
         model.scratch_bytes_estimate(
             args.ubatch_size,
             max_seq_len,
             args.cache_type_k,
             args.cache_type_v,
+            /*max_batch=*/ 1,
         )
     };
     let media_scratch = match &media_setup {

@@ -250,12 +250,17 @@ pub trait Model: Send + Sync {
     /// scratch; with a homogeneous cache the estimate is context-independent.
     /// The bump allocator's region-OOM error remains the precise backstop if
     /// this under-estimates.
+    /// `max_batch` is the largest batched-decode width the scratch must
+    /// serve (serve: the resolved/explicit `--parallel`, capped by
+    /// `--parallel-max` in auto mode; single-sequence callers pass 1) —
+    /// the epilogue allocates `[vocab, B]` logits in batched mode.
     fn scratch_bytes_estimate(
         &self,
         n_ubatch: u32,
         max_seq_len: u32,
         k_dtype: crate::gguf::GgmlType,
         v_dtype: crate::gguf::GgmlType,
+        max_batch: u32,
     ) -> u64;
 
     // ─── MTP speculative-decode hooks (optional; default unsupported) ───

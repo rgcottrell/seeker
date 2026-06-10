@@ -193,6 +193,7 @@ pub async fn run(args: ProbeArgs) -> Result<(), Box<dyn Error>> {
         max_seq_len,
         args.cache_type_k,
         args.cache_type_v,
+        /*max_batch=*/ 1,
     ))?;
     let dims = model.cache_dims();
     let cache_config = KvCacheConfig {

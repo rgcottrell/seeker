@@ -210,6 +210,7 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
         max_len,
         args.cache_type_k,
         args.cache_type_v,
+        /*max_batch=*/ 1,
     );
     engine.allocate_scratch(scratch)?;
     let dims = model.cache_dims();

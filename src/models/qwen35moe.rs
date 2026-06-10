@@ -391,6 +391,7 @@ impl Model for Qwen35MoeModel {
         max_seq_len: u32,
         k_dtype: GgmlType,
         v_dtype: GgmlType,
+        max_batch: u32,
     ) -> u64 {
         let p = &self.params;
         // Per-pass token count: bounded by n_ubatch, or the whole context when
@@ -420,7 +421,8 @@ impl Model for Qwen35MoeModel {
         let per_layer = summed_width * l * 4;
         let residual = hidden * l * 4;
         let mask = l * l * 4;
-        let logits = vocab * 4;
+        // One column per sequence: [vocab, 1] single-seq, [vocab, B] batched.
+        let logits = vocab * 4 * max_batch.max(1) as u64;
         // Heterogeneous K/V caches materialize the [0, ctx) prefix to F32 per
         // layer; homogeneous caches bind directly.
         let staging = if k_dtype != v_dtype {

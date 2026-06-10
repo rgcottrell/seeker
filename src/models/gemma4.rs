@@ -195,6 +195,7 @@ impl Model for Gemma4Model {
         max_seq_len: u32,
         _k_dtype: GgmlType,
         _v_dtype: GgmlType,
+        max_batch: u32,
     ) -> u64 {
         let p = &self.params;
         let l = if n_ubatch == 0 {
@@ -220,13 +221,12 @@ impl Model for Gemma4Model {
         let per_layer = (8 * n_embd + 4 * q_dim_max + 6 * kv_dim_max + 5 * n_ff) * l * 4;
         let residual = n_embd * l * 4;
         let mask = l * l * 4;
-        // Single-seq epilogue computes one [vocab, 1] column, but batched serve
-        // decode (`record_forward_batch`) allocates [vocab, B]. Budget 16
-        // columns (2× the default `--parallel-max` 8) so the 256K-entry vocab
-        // doesn't lean on the slack margin at high `--parallel`. The per-layer
-        // [_, B] transients are covered many times over by the `l = n_ubatch`
-        // sizing (B ≤ slots ≪ n_ubatch).
-        let logits = vocab * 4 * 16;
+        // Single-seq epilogue computes one [vocab, 1] column; batched serve
+        // decode (`record_forward_batch`) allocates [vocab, B] — budget the
+        // caller-declared width (matters at this 256K-entry vocab). The
+        // per-layer [_, B] transients are covered many times over by the
+        // `l = n_ubatch` sizing (B ≤ slots ≪ n_ubatch).
+        let logits = vocab * 4 * max_batch.max(1) as u64;
         // Flash-attn prefill split-K partials (deepest split this context can
         // produce); mirrors llama.rs's accounting with the max head/q dims.
         let fa_walk = 8192u64;
