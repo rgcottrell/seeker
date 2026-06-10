@@ -139,10 +139,12 @@ pub struct FlashAttnParams {
     pub scale: f32,     // 1 / sqrt(head_dim)
     /// Sliding-window attention span. `0` = no window (full causal, the
     /// default). When `> 0`, key column `kc` is masked for query row `r` unless
-    /// `kc <= qpos && qpos - kc < swa_window`, where `qpos = mask_kv_offset + r`
-    /// (absolute query position). Applied analytically in-shader on top of any
-    /// host mask, independent of `MASK_ENABLE`, so it covers prefill, chunked
-    /// prefill, and decode (split-K) uniformly. Gemma4's sliding layers set this.
+    /// `kc <= qpos && qpos - kc < swa_window`, where the absolute query
+    /// position `qpos = kv_len - n_query + r` is derived per sequence from
+    /// `DecodeDyn`. Applied analytically in-shader on top of any host mask,
+    /// independent of `MASK_ENABLE`, so it covers prefill, chunked prefill,
+    /// decode (split-K), and batched decode uniformly. Gemma4's sliding
+    /// layers set this.
     pub swa_window: u32,
 }
 
@@ -890,7 +892,7 @@ pub fn record_batched(
     put_f(&mut push, &mut w, 0.0); // logit_softcap
     put_u(&mut push, &mut w, 0); // mask_kv_offset (no prefix mask on decode)
     put_f(&mut push, &mut w, 0.0); // m0
-    put_f(&mut push, &mut w, 0.0); // m1
+    put_u(&mut push, &mut w, params.swa_window); // swa_window (repurposed ALiBi m1 slot)
     put_u(&mut push, &mut w, params.gqa_ratio);
     put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
     put_u(&mut push, &mut w, k_num);

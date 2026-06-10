@@ -255,6 +255,253 @@ impl Model for Gemma4Model {
             .0)
     }
 
+    fn supports_batch_decode(&self) -> bool {
+        true
+    }
+
+    /// Batched decode: B sequences, one token each, in one forward. The dense
+    /// ops (embedding+scale, norms, matmuls, RoPE, GeGLU FFN, per-layer output
+    /// scale) process the `B`-wide token dimension exactly as the single-seq
+    /// layer loop processes `L`; only the attention is per-sequence (own KV
+    /// slab + length via `flash_attn::record_batched`, sliding-window applied
+    /// analytically in-shader from each sequence's `kv_len`) and the K/V
+    /// writes fan out one column per sequence into its slab. Per-layer dims
+    /// (head_dim / n_head_kv / SWA window / rope base / freq-factors) vary as
+    /// in [`Self::forward_inner`].
+    fn record_forward_batch(
+        &self,
+        ctx: &mut DispatchContext,
+        batch: &mut crate::inference::kv_cache::BatchKvCache,
+        tokens: &[u32],
+        positions: &[u32],
+        slots: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        use crate::inference::command::record_compute_barriers;
+        let p = &self.params;
+        let b = tokens.len() as u64;
+        if b == 0 {
+            return Err("record_forward_batch: empty batch".into());
+        }
+        if positions.len() != tokens.len() || slots.len() != tokens.len() {
+            return Err("record_forward_batch: tokens/positions/slots length mismatch".into());
+        }
+        let hidden = p.n_embd as u64;
+        let n_ff = p.n_ff as u64;
+        let n_head = p.n_head as u64;
+        let vocab = p.n_vocab as u64;
+        let elem = 4u64;
+        // Each sequence attends over [0, position + 1).
+        let kv_lens: Vec<u32> = positions.iter().map(|&pos| pos + 1).collect();
+
+        // ---- prologue: B token ids + B positions (one per sequence) ----
+        let token_buf = ctx.alloc_scratch(b * 4)?;
+        write_u32(ctx, token_buf, tokens)?;
+        let positions_buf = ctx.alloc_scratch(b * 4)?;
+        write_u32(ctx, positions_buf, positions)?;
+
+        // Embedding lookup + ×√n_embd scale (text tokens only reach decode).
+        let residual = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, b as u32, residual)?;
+        elementwise::record_scale(ctx, residual, residual, p.embd_scale, 0.0)?;
+        // Persistent per-forward DecodeDyn array for batched flash-attn — must
+        // live above `layer_checkpoint` so per-layer `scratch_restore` cannot
+        // reclaim it (the shader reads `kv_len` at execute time, after submit).
+        let fa_dyn_range = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
+        let layer_checkpoint = ctx.scratch_checkpoint();
+
+        for (layer_idx, block) in self.weights.blocks.iter().enumerate() {
+            ctx.scratch_restore(layer_checkpoint);
+
+            let head_dim = p.head_dim(layer_idx) as u64;
+            let n_head_kv = p.n_head_kv[layer_idx] as u64;
+            let q_dim = p.q_dim(layer_idx) as u64;
+            let kv_dim = p.kv_dim(layer_idx) as u64;
+            let n_rot = head_dim as u32; // full rotation
+            let rope_params = rope::RopeParams::llama_default(n_rot, p.rope_base(layer_idx));
+            let freq_factors = if p.swa[layer_idx] {
+                None
+            } else {
+                self.weights.rope_freqs.as_ref().map(|t| t.range())
+            };
+            let fa_params = flash_attn::FlashAttnParams {
+                head_dim_k: head_dim as u32,
+                head_dim_v: head_dim as u32,
+                gqa_ratio: (n_head / n_head_kv).max(1) as u32,
+                scale: 1.0, // gemma4: NO 1/sqrt(head_dim)
+                // Sliding layers attend only to the most recent `sliding_window`
+                // keys (analytic in-shader mask off each sequence's own kv_len);
+                // global layers (swa[il]==false) use full causal (0).
+                swa_window: if p.swa[layer_idx] {
+                    p.sliding_window
+                } else {
+                    0
+                },
+            };
+
+            // input norm
+            let x_norm = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, residual, block.attn_norm, x_norm, p.rms_eps)?;
+
+            // Q/K/V projections (V only on SWA layers; global reuses K).
+            let q = ctx.alloc_tensor([q_dim, b, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.wq, x_norm, q)?;
+            let k = ctx.alloc_tensor([kv_dim, b, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.wk, x_norm, k)?;
+            let v_proj = if let Some(wv) = block.wv {
+                let v = ctx.alloc_tensor([kv_dim, b, 1, 1], GgmlType::F32)?;
+                matmul::record_nofence(ctx, wv, x_norm, v)?;
+                record_compute_barriers(ctx.device, ctx.cmd, &[q.range(), k.range(), v.range()]);
+                v
+            } else {
+                record_compute_barriers(ctx.device, ctx.cmd, &[q.range(), k.range()]);
+                k // global layer: V := K projection
+            };
+
+            // Per-head Q-norm / K-norm (over head_dim), then NEOX RoPE.
+            let q_view = reshape_for_rope(q, head_dim, n_head, b);
+            let q_normed = ctx.alloc_tensor(q_view.dims, GgmlType::F32)?;
+            rms_norm::record_nofence(ctx, q_view, block.attn_q_norm, q_normed, p.rms_eps)?;
+            let k_view = reshape_for_rope(k, head_dim, n_head_kv, b);
+            let k_normed = ctx.alloc_tensor(k_view.dims, GgmlType::F32)?;
+            rms_norm::record_nofence(ctx, k_view, block.attn_k_norm, k_normed, p.rms_eps)?;
+            // V-norm: weightless RMSNorm (no weight, no rope).
+            let v_view = reshape_for_rope(v_proj, head_dim, n_head_kv, b);
+            let v_normed = ctx.alloc_tensor(v_view.dims, GgmlType::F32)?;
+            rms_norm::record_noweight_nofence(ctx, v_view, v_normed, p.rms_eps)?;
+            record_compute_barriers(
+                ctx.device,
+                ctx.cmd,
+                &[q_normed.range(), k_normed.range(), v_normed.range()],
+            );
+
+            let q_roped = ctx.alloc_tensor(q_view.dims, GgmlType::F32)?;
+            let k_roped = ctx.alloc_tensor(k_view.dims, GgmlType::F32)?;
+            rope::record_neox_nofence(
+                ctx,
+                q_normed,
+                positions_buf,
+                q_roped,
+                rope_params,
+                freq_factors,
+            )?;
+            rope::record_neox_nofence(
+                ctx,
+                k_normed,
+                positions_buf,
+                k_roped,
+                rope_params,
+                freq_factors,
+            )?;
+            record_compute_barriers(ctx.device, ctx.cmd, &[q_roped.range(), k_roped.range()]);
+
+            // Per-sequence K/V cache writes (K post-rope, V normed): column s →
+            // slot s's slab at its position, packed at this layer's natural
+            // per-token stride (record_write derives it from the SOURCE dims).
+            let k_natural = reshape_for_rope(k_roped, head_dim, n_head_kv, b);
+            let v_natural = reshape_for_rope(v_normed, head_dim, n_head_kv, b);
+            let col_stride = kv_dim * elem; // bytes between sequence columns
+            for s in 0..tokens.len() {
+                let k_col = column_view(k_natural, s as u64, col_stride, head_dim, n_head_kv);
+                let v_col = column_view(v_natural, s as u64, col_stride, head_dim, n_head_kv);
+                cache_io::record_write(
+                    ctx,
+                    k_col,
+                    batch.slot_k_view(slots[s], layer_idx as u32),
+                    positions[s],
+                )?;
+                cache_io::record_write(
+                    ctx,
+                    v_col,
+                    batch.slot_v_view(slots[s], layer_idx as u32),
+                    positions[s],
+                )?;
+            }
+
+            // Batched attention: each sequence attends to its own slab
+            // (slots[s]) and length; the K/V views bind all slabs, the flash
+            // picks per sequence via DecodeDyn::slot. The `_dims` variants
+            // carry this layer's real head_dim/n_head_kv (the slab packing) —
+            // the uniform views stride at the allocation max, wrong for the
+            // hybrid SWA/global dims.
+            let q_attn = batched_q_attn_view(q_roped, head_dim, n_head, b, q_dim);
+            let k_attn =
+                batch.batched_k_attn_view_dims(layer_idx as u32, head_dim as u32, n_head_kv as u32);
+            let v_attn =
+                batch.batched_v_attn_view_dims(layer_idx as u32, head_dim as u32, n_head_kv as u32);
+            let attn_out = ctx.alloc_tensor([q_dim, b, 1, 1], GgmlType::F32)?;
+            flash_attn::record_batched(
+                ctx,
+                q_attn,
+                k_attn,
+                v_attn,
+                attn_out,
+                fa_params,
+                &kv_lens,
+                fa_dyn_range,
+                Some(slots),
+                /*query_lens=*/ None,
+            )?;
+
+            // O-proj → post_attention_norm → residual add.
+            let proj = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, block.wo, attn_out, proj)?;
+            let proj_normed = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, proj, block.post_attn_norm, proj_normed, p.rms_eps)?;
+            elementwise::record_add(ctx, residual, proj_normed, residual)?;
+
+            // FFN: ffn_norm → GeGLU(gelu-tanh) → post_ffw_norm → residual add.
+            let x_norm2 = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, residual, block.ffn_norm, x_norm2, p.rms_eps)?;
+            let gate = ctx.alloc_tensor([n_ff, b, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.ffn_gate, x_norm2, gate)?;
+            let up = ctx.alloc_tensor([n_ff, b, 1, 1], GgmlType::F32)?;
+            matmul::record_nofence(ctx, block.ffn_up, x_norm2, up)?;
+            record_compute_barriers(ctx.device, ctx.cmd, &[gate.range(), up.range()]);
+            let gate_gelu = ctx.alloc_tensor([n_ff, b, 1, 1], GgmlType::F32)?;
+            elementwise::record_gelu(ctx, gate, gate_gelu)?;
+            let ffn_hidden = ctx.alloc_tensor([n_ff, b, 1, 1], GgmlType::F32)?;
+            elementwise::record_mul(ctx, gate_gelu, up, ffn_hidden)?;
+            let down = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            matmul::record(ctx, block.ffn_down, ffn_hidden, down)?;
+            let down_normed = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+            rms_norm::record(ctx, down, block.post_ffw_norm, down_normed, p.rms_eps)?;
+            elementwise::record_add(ctx, residual, down_normed, residual)?;
+
+            // Per-layer output scalar (× layer_output_scale[il]).
+            let scale = p.layer_output_scale[layer_idx];
+            if scale != 1.0 {
+                elementwise::record_scale(ctx, residual, residual, scale, 0.0)?;
+            }
+        }
+        ctx.scratch_restore(layer_checkpoint);
+
+        // Final norm + lm_head over ALL B columns (each column is its
+        // sequence's last — and only — token this step), then the
+        // final-logit softcap cap·tanh(x/cap) in place.
+        let final_norm = ctx.alloc_tensor([hidden, b, 1, 1], GgmlType::F32)?;
+        rms_norm::record(
+            ctx,
+            residual,
+            self.weights.output_norm,
+            final_norm,
+            p.rms_eps,
+        )?;
+        let lm_head = self.weights.output.unwrap_or(self.weights.token_embd);
+        let logits = ctx.alloc_tensor([vocab, b, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, lm_head, final_norm, logits)?;
+        if p.final_logit_softcap != 0.0 {
+            let cap = p.final_logit_softcap;
+            elementwise::record_scale(ctx, logits, logits, 1.0 / cap, 0.0)?;
+            elementwise::record_tanh(ctx, logits, logits)?;
+            elementwise::record_scale(ctx, logits, logits, cap, 0.0)?;
+        }
+
+        for (s, &pos) in positions.iter().enumerate() {
+            batch.positions[slots[s] as usize] = pos + 1;
+        }
+        Ok(logits)
+    }
+
     /// gemma4 image tokens use plain sequential 1D positions (no M-RoPE), so the
     /// engine must not apply a `rope_position_lag` after an image.
     fn image_uses_mrope(&self) -> bool {
@@ -890,6 +1137,55 @@ fn permute_to_attn(t: TensorView, head_dim: u64, l: u64, n_heads: u64) -> Tensor
             elem * head_dim * n_heads * l,
         ],
         element_stride: [1, head_dim * n_heads, head_dim, head_dim * n_heads * l],
+        dtype: t.dtype,
+    }
+}
+
+/// A single-column `[head_dim, n_head_kv, 1]` view of a `[head_dim, n_head_kv,
+/// B]` tensor (sequence `s`), for the per-sequence KV cache write.
+fn column_view(
+    t: TensorView,
+    s: u64,
+    col_stride: u64,
+    head_dim: u64,
+    n_head_kv: u64,
+) -> TensorView {
+    let elem = t.byte_stride[0];
+    TensorView {
+        buffer: t.buffer,
+        byte_offset: t.byte_offset + s * col_stride,
+        byte_size: head_dim * n_head_kv * elem,
+        dims: [head_dim, n_head_kv, 1, 1],
+        byte_stride: [
+            elem,
+            elem * head_dim,
+            elem * head_dim * n_head_kv,
+            elem * head_dim * n_head_kv,
+        ],
+        element_stride: [1, head_dim, head_dim * n_head_kv, head_dim * n_head_kv],
+        dtype: t.dtype,
+    }
+}
+
+/// Reinterpret a contiguous `[head_dim, n_head, B]` (post-RoPE) Q as the
+/// `[head_dim, 1, n_head, B]` flash-attn batched-decode layout (one query row
+/// per head per sequence; batch stride = the layer's q_dim, which in gemma is
+/// n_head·head_dim ≠ n_embd).
+fn batched_q_attn_view(
+    t: TensorView,
+    head_dim: u64,
+    n_head: u64,
+    b: u64,
+    q_dim: u64,
+) -> TensorView {
+    let elem = t.byte_stride[0];
+    TensorView {
+        buffer: t.buffer,
+        byte_offset: t.byte_offset,
+        byte_size: t.byte_size,
+        dims: [head_dim, 1, n_head, b],
+        byte_stride: [elem, elem * head_dim, elem * head_dim, elem * q_dim],
+        element_stride: [1, head_dim, head_dim, q_dim],
         dtype: t.dtype,
     }
 }

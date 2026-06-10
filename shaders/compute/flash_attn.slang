@@ -125,10 +125,10 @@ struct FaParams {
     float m0;          // ALiBi slope (unused)
     // Sliding-window span (repurposed ALiBi m1 slot). 0 = full causal. When >0,
     // a key at absolute position kpos is masked for a query at absolute position
-    // qpos = mask_kv_offset + query_row unless kpos <= qpos && qpos - kpos <
-    // swa_window. Applied analytically below, independent of MASK_ENABLE, so it
-    // covers prefill / chunked prefill / decode (split-K) uniformly. (Gemma4
-    // sliding layers; the non-VARLEN query-position form is used.)
+    // qpos = kv_len - n_query + query_row (per-sequence, from DecodeDyn) unless
+    // kpos <= qpos && qpos - kpos < swa_window. Applied analytically below,
+    // independent of MASK_ENABLE, so it covers prefill / chunked prefill /
+    // decode (split-K) / batched decode uniformly. (Gemma4 sliding layers.)
     uint swa_window;
 
     uint gqa_ratio;
@@ -461,9 +461,18 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     // Coverage holds for any host sizing: k_num * blocks_per_split >= num_blocks
     // >= num_blocks - swa_first_block, and splits past the end run empty
     // (Lf=0, Mf=-1e30 → the combine weights them to ~0).
+    //
+    // qpos = p_KV - p_nq + i_row: the query's absolute position derived from
+    // the PER-SEQUENCE kv_len (DecodeDyn) instead of the shared mask_kv_offset
+    // push value. One formula covers all four paths: single-seq prefill
+    // (kv_len = mask_kv_offset + N → mask_kv_offset + i_row), single-seq
+    // decode (kv_len - 1, and replay-safe — DecodeDyn is host-updated per
+    // token while the push is baked at record time), batched decode (each
+    // sequence's own kv_len - 1; a shared push value cannot express this),
+    // and VARLEN (base + i_row).
     uint swa_first_block = 0u;
     if (p.swa_window != 0u) {
-        const uint qpos = p.mask_kv_offset + i_row;
+        const uint qpos = p_KV - p_nq + i_row;
         if (qpos + 1u > p.swa_window) {
             swa_first_block = (qpos + 1u - p.swa_window) / Bc;
         }
@@ -491,9 +500,12 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                     // scale into the log2 domain to match the pre-scaled Q.
                     s += data_m[m_off + (kv_base + c - p.mask_kv_offset)] * LOG2E;
                 }
-                // Sliding-window attention: mask keys outside [qpos-window+1, qpos].
+                // Sliding-window attention: mask keys outside [qpos-window+1,
+                // qpos]. qpos from the per-sequence kv_len — see the
+                // swa_first_block comment above for why this form covers
+                // prefill / decode / batched decode / VARLEN alike.
                 if (p.swa_window != 0u) {
-                    const uint qpos = p.mask_kv_offset + i_row;
+                    const uint qpos = p_KV - p_nq + i_row;
                     const uint kpos = kv_base + c;
                     if (kpos > qpos || qpos - kpos >= p.swa_window) { s = -1.0e30f; }
                 }
