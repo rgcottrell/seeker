@@ -102,11 +102,14 @@ pub static FA_SPLIT_DISABLED: LazyLock<bool> =
 pub static FA_SPLIT_KNUM: LazyLock<Option<u32>> = LazyLock::new(|| env_u32("SEEKER_FA_SPLIT_KNUM"));
 
 /// `SEEKER_SSM_BATCH=0` — force the per-sequence SSM loop in the unified
-/// forward. Default-on: a pure-decode batched step routes the SSM block through
+/// forward (both the pure-decode batched step and the mixed-step decode-run
+/// subset). Default-on: batched steps route the SSM block through
 /// `ssm_block_batch` so the in/out projections read their weights once for all
-/// B sequences (matvec → one matmul) instead of re-reading per sequence. The
-/// batched path is byte-identical to the per-sequence loop at the serve scale
-/// (B ≤ 8, below the CoopMat N≥32 gate); this flag is the revert / diff lever.
+/// B sequences (matvec → one matmul) instead of re-reading per sequence.
+/// NOTE (measured 2026-06-10): the batched path is NOT strictly byte-identical
+/// to the per-sequence loop — low-bit rounding differs and a long greedy run
+/// can drift tokens (see the matching note in qwen35moe's unified SSM block).
+/// This flag is the revert / diff lever.
 pub static SSM_BATCH_DISABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("SEEKER_SSM_BATCH")
         .map(|v| v == "0")
