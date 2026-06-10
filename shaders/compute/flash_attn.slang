@@ -453,10 +453,14 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     }
     const uint num_blocks  = (eff_kv + Bc - 1) / Bc;
     // Sliding-window lower bound: keys below first_visible are masked for this
-    // row (same qpos formula as the per-element SWA mask below) — skip whole
-    // blocks before them. Split-K combine already weights empty splits
-    // (Lf=0, Mf=-1e30) to ~0, so a split that lands entirely below the window
-    // contributes nothing, exactly like a split past the end.
+    // row (same qpos formula as the per-element SWA mask below). The split
+    // ranges below are REBASED at this block, so the k_num splits partition the
+    // visible window instead of idling below it — each split walks a useful
+    // slice of the window rather than one split doing all the work. With
+    // swa_window == 0 this is 0 and the mapping is identical to plain split-K.
+    // Coverage holds for any host sizing: k_num * blocks_per_split >= num_blocks
+    // >= num_blocks - swa_first_block, and splits past the end run empty
+    // (Lf=0, Mf=-1e30 → the combine weights them to ~0).
     uint swa_first_block = 0u;
     if (p.swa_window != 0u) {
         const uint qpos = p.mask_kv_offset + i_row;
@@ -468,8 +472,8 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     // k_num == 1 ⇒ split_kv == num_blocks ⇒ [0, num_blocks): full range.
     // A split past the end (block_start >= num_blocks) runs zero iterations
     // and leaves Mf=-1e30, Lf=0 — the combine kernel weights it to ~0.
-    const uint block_start = max(split * p_split_kv, swa_first_block);
-    const uint block_end   = min(split * p_split_kv + p_split_kv, num_blocks);
+    const uint block_start = swa_first_block + split * p_split_kv;
+    const uint block_end   = min(block_start + p_split_kv, num_blocks);
     for (uint j = block_start; j < block_end; ++j) {
         const uint kv_base = j * Bc;
 

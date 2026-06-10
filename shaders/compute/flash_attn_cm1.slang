@@ -191,7 +191,10 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     }
     // Sliding-window lower bound: no row in this tile sees a key below
     // min_qpos - swa_window + 1 (same qpos formula as the per-element SWA
-    // mask below) — skip whole blocks before that.
+    // mask below). The split ranges are REBASED at this block so splits
+    // partition the visible window instead of idling below it; with
+    // swa_window == 0 this is 0 and the mapping is identical to plain
+    // split-K. Splits past the clamped end run empty (combine-safe).
     uint swa_first_block = 0u;
     if (p.swa_window != 0u) {
         const uint min_qpos = p.mask_kv_offset + i_row0;
@@ -199,8 +202,8 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
             swa_first_block = (min_qpos + 1u - p.swa_window) / Bc;
         }
     }
-    const uint start_block = max(split * p.split_kv, swa_first_block);
-    const uint end_block = min(num_blocks, (split + 1) * p.split_kv);
+    const uint start_block = swa_first_block + split * p.split_kv;
+    const uint end_block = min(num_blocks, start_block + p.split_kv);
     for (uint j = start_block; j < end_block; ++j) {
         const uint kv_base = j * Bc;
         GroupMemoryBarrierWithGroupSync();
