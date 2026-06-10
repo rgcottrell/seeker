@@ -2950,19 +2950,21 @@ fn ssm_block(
     ctx.tap(&format!("attn_output_pre_proj-{layer_idx}"), gated_attn)?;
 
     // ssm_out @ gated_attn — when no debug dump is active, fuse the
-    // residual add into the matvec via the ACCUMULATE spec constant
-    // and skip the `proj` scratch slot entirely. Decode-only (L=1
-    // matvec path).
+    // residual add into the matmul via record_accumulate: fused matvec
+    // at L=1 (decode), fused batched-column matvec at 2..=MAX_BATCH_COLS
+    // (short unified chunks / spec verify), and the identical
+    // scratch+add fallback at large-L prefill — byte-identical across
+    // all three (see record_accumulate).
     let dump = crate::runtime_flags::qwen_ssm_dump();
-    if dump.is_none() && l == 1 {
+    if dump.is_none() {
         matmul::record_accumulate(ctx, ssm_w.ssm_out, gated_attn, residual)?;
         ctx.tap(&format!("attn_output-{layer_idx}"), residual)?;
         ctx.tap(&format!("attn_residual-{layer_idx}"), residual)?;
         return Ok(());
     }
 
-    // Slow path (prefill or dump mode): allocate proj, matmul, optional
-    // dump, then a separate residual add.
+    // Dump path: allocate proj, matmul, dump the requested stage, then a
+    // separate residual add.
     let proj = ctx.alloc_tensor([hidden, l_u, 1, 1], GgmlType::F32)?;
     matmul::record(ctx, ssm_w.ssm_out, gated_attn, proj)?;
     ctx.tap(&format!("attn_output-{layer_idx}"), proj)?;

@@ -1655,6 +1655,13 @@ impl Worker {
             // whole prompt wrong. (Pure-extension reuse above correctly KEEPS
             // the lag — there the cached prefix really contains the image; the
             // prefix-cache seed path resets it inside `try_seed_prefix`.)
+            if self.batch.rope_lag[idx] != 0 {
+                tracing::debug!(
+                    slab = idx,
+                    stale_lag = self.batch.rope_lag[idx],
+                    "serve: clearing stale image rope_lag on fresh admission"
+                );
+            }
             self.batch.rope_lag[idx] = 0;
             0
         };
