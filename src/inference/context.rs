@@ -31,6 +31,11 @@ pub struct FlushState {
     pub node_budget: u32,
     pub bytes_since_flush: u64,
     pub nodes_since_flush: u32,
+    /// Accumulated submit + fence-wait time across the mid-forward flushes.
+    /// GPU execution happens inside those waits, so without this the entire
+    /// flushed workload is misattributed to host "record" time by profiling
+    /// (`PROF step:` used to show `gpu=0.06ms` for real forwards).
+    pub gpu_wait: std::time::Duration,
 }
 
 pub struct DispatchContext<'a> {
@@ -228,6 +233,7 @@ impl<'a> DispatchContext<'a> {
         let dev = &self.device.device;
         let cmd = self.cmd;
         let queue = self.device.queue;
+        let t0 = std::time::Instant::now();
         unsafe {
             dev.end_command_buffer(cmd)?;
             dev.reset_fences(&[fence])?;
@@ -238,6 +244,9 @@ impl<'a> DispatchContext<'a> {
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             dev.begin_command_buffer(cmd, &begin)?;
+        }
+        if let Some(f) = self.flush.as_mut() {
+            f.gpu_wait += t0.elapsed();
         }
         Ok(())
     }

@@ -668,7 +668,7 @@ impl Engine {
         #[cfg(feature = "profile_gpu")]
         self.profile.reset(&self.device, self.command_buffer);
 
-        let token_ranges: Vec<BufferRange> = {
+        let (token_ranges, flush_gpu): (Vec<BufferRange>, std::time::Duration) = {
             let mut ctx = DispatchContext {
                 flush: Self::build_flush(self.fence, model.weights()),
                 device: &self.device,
@@ -711,7 +711,12 @@ impl Engine {
                 ctx.decode_dyn = dyn_slot(sampler_dyn, s);
                 ranges.push(sampler.record_chain(&mut ctx, col)?);
             }
-            ranges
+            let flush_gpu = ctx
+                .flush
+                .as_ref()
+                .map(|f| f.gpu_wait)
+                .unwrap_or(std::time::Duration::ZERO);
+            (ranges, flush_gpu)
         };
         #[cfg(feature = "profile_gpu")]
         self.profile.mark(
@@ -736,10 +741,12 @@ impl Engine {
             (t_record, t_gpu0.elapsed())
         };
         if *crate::runtime_flags::PROF_STEP {
-            let (r, g) = (
-                t_record.as_secs_f64() * 1000.0,
-                t_gpu.as_secs_f64() * 1000.0,
-            );
+            // Mid-forward flushes (submission splitting) execute GPU work
+            // inside the RECORD span; reattribute their fence-wait time so
+            // `gpu=` reflects actual GPU execution and `record=` host work.
+            let f = flush_gpu.as_secs_f64() * 1000.0;
+            let r = (t_record.as_secs_f64() * 1000.0 - f).max(0.0);
+            let g = t_gpu.as_secs_f64() * 1000.0 + f;
             eprintln!(
                 "PROF step: b={} n_tok={} record={r:.2}ms gpu={g:.2}ms record_frac={:.0}%",
                 b,
@@ -1677,6 +1684,7 @@ impl Engine {
             node_budget: 100,
             bytes_since_flush: 0,
             nodes_since_flush: 0,
+            gpu_wait: std::time::Duration::ZERO,
         })
     }
 
