@@ -1894,13 +1894,34 @@ impl Qwen35MoeModel {
                     // matmul over [·,B]) and the GDN/conv run as a single n_seqs=B
                     // dispatch, amortizing the SSM weight traffic (37% of decode)
                     // across the batch. This is the exact call the legacy
-                    // batched-decode path already uses, and is byte-identical to
-                    // the per-sequence loop at the serve scale (B ≤ 8): the
-                    // projections take the per-column matvec fallback (below the
-                    // CoopMat N≥32 gate, so column math matches a B=1 matvec) and
-                    // GDN/conv index sequence as an independent workgroup axis.
+                    // batched-decode path already uses. NOTE (measured
+                    // 2026-06-10): batched-vs-per-seq is NOT strictly
+                    // byte-identical — low-bit rounding differs and a long
+                    // greedy run can drift tokens (`SEEKER_SSM_BATCH=0` changes
+                    // concurrent outputs on main); serve outputs were already
+                    // step-composition-dependent before this path existed.
                     // `SEEKER_SSM_BATCH=0` forces the per-seq loop (revert / diff).
                     let all_decode = seq_lens.iter().all(|&l| l == 1);
+                    // Mixed (prefill-chunk + decode) steps: the decode (L==1)
+                    // subset still batches when it forms one CONTIGUOUS run of
+                    // flat columns — the dominant packing (older decoding
+                    // sequences sort before the newest request's prefill chunk),
+                    // checked via q_start adjacency. Same accuracy envelope as
+                    // the default-on all_decode batching above (see the NOTE
+                    // there: low-bit rounding vs the per-seq loop, not strictly
+                    // byte-identical). Interleaved layouts (an older sequence
+                    // still prefilling past a newer decoding one) fall back to
+                    // the per-seq loop; verify always keeps it (per-sequence
+                    // checkpoint lanes).
+                    let decode_run: Option<(usize, usize)> = {
+                        let idx: Vec<usize> = (0..b).filter(|&s| seq_lens[s] == 1).collect();
+                        (!verify
+                            && !all_decode
+                            && idx.len() > 1
+                            && !*crate::runtime_flags::SSM_BATCH_DISABLED
+                            && idx.windows(2).all(|w| q_starts[w[1]] == q_starts[w[0]] + 1))
+                        .then(|| (idx[0], idx.len()))
+                    };
                     if all_decode && b > 1 && !*crate::runtime_flags::SSM_BATCH_DISABLED {
                         ssm_block_batch(
                             ctx,
@@ -1915,6 +1936,38 @@ impl Qwen35MoeModel {
                             slots,
                         )?;
                     } else {
+                        // Batched decode-run subset (mixed step): one [hidden, bd]
+                        // sub-view of the flat residual; the per-seq loop below
+                        // skips these sequences and handles only prefill chunks.
+                        if let Some((s0, bd)) = decode_run {
+                            let off = q_starts[s0] * hidden * elem;
+                            let sub = TensorView {
+                                byte_offset: residual.byte_offset + off,
+                                byte_size: bd as u64 * hidden * elem,
+                                dims: [hidden, bd as u64, 1, 1],
+                                byte_stride: [
+                                    elem,
+                                    hidden * elem,
+                                    hidden * elem * bd as u64,
+                                    hidden * elem * bd as u64,
+                                ],
+                                element_stride: [1, hidden, hidden * bd as u64, hidden * bd as u64],
+                                ..residual
+                            };
+                            let sub_slots: Vec<u32> = (s0..s0 + bd).map(|s| slots[s]).collect();
+                            ssm_block_batch(
+                                ctx,
+                                ssm_w,
+                                batch,
+                                sub,
+                                p,
+                                hidden,
+                                bd as u64,
+                                ssm_layer_idx,
+                                positions,
+                                &sub_slots,
+                            )?;
+                        }
                         // Per-sequence GDN/conv recurrence (sequential): each runs
                         // its L_s-token scan over its slab's state, writing its own
                         // disjoint residual columns. Each ssm_block uses FRESH
@@ -1927,6 +1980,10 @@ impl Qwen35MoeModel {
                         // scratch ⇒ no inter-sequence barrier needed. Also handles
                         // mixed (prefill-chunk + decode) steps and B==1.
                         for s in 0..b {
+                            // Decode-run sequences were batched above.
+                            if decode_run.is_some_and(|(s0, bd)| s >= s0 && s < s0 + bd) {
+                                continue;
+                            }
                             let l = seq_lens[s];
                             let off = q_starts[s] * hidden * elem;
                             let residual_slice = TensorView {
