@@ -78,8 +78,8 @@ static const uint TK = 16;
 // gk % QUANT_K. Keeping BK fixed at 32 also caps the shmem footprint at ~5 KB.
 static const uint BK = 32;
 
-static const uint BM = 32;
-static const uint BN = 32;
+static const uint BM = 64;
+static const uint BN = 64;
 
 static const uint WORKGROUP_SIZE = 128;
 static const uint SUBGROUP_SIZE  = 32;
@@ -93,10 +93,18 @@ static const uint SUBGROUP_SIZE  = 32;
 // serve N % 16 ≠ 0 (e.g. the vision tower's n_pos=16104).
 [SpecializationConstant] const uint ALLOW_PARTIAL_N = 0;
 
-// 2×2 warp layout over the 32×32 output. Each subgroup owns a 16×16 fragment.
-static const uint WM = BM / 2;
-static const uint WN = BN / 2;
-static const uint WARPS_PER_ROW = BM / WM;
+// 2×2 subgroup grid over the BM×BN output. Each subgroup owns a WM×WN block,
+// which is a WMITER×WNITER grid of 16×16 CoopMat fragments. At BM=BN=64 that's
+// a 32×32 block per subgroup = 2×2 = 4 accumulator fragments each (register
+// blocking): one staged A/B shmem tile feeds 4 output fragments, so global A/B
+// operand traffic drops vs the 32×32 single-fragment tile. WMITER=WNITER=1
+// (BM=BN=32) reduces to the original one-fragment layout.
+static const uint WARPS_PER_ROW = 2;
+static const uint WARPS_PER_COL = 2;
+static const uint WM = BM / WARPS_PER_ROW;
+static const uint WN = BN / WARPS_PER_COL;
+static const uint WMITER = WM / TM;
+static const uint WNITER = WN / TN;
 
 struct MulMmCmParams {
     uint M;
@@ -909,8 +917,15 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
     init_iq_shmem(uint3(WORKGROUP_SIZE, 1, 1));
 #endif
 
-    var sums = CoopMat<float, MemoryScope.Subgroup, TM, TN,
-                       CoopMatMatrixUse::MatrixAccumulator>(0.0f);
+    // WMITER×WNITER accumulator fragments per subgroup (register blocking).
+    CoopMat<float, MemoryScope.Subgroup, TM, TN, CoopMatMatrixUse::MatrixAccumulator>
+        sums[WMITER][WNITER];
+    [unroll] for (uint im = 0; im < WMITER; im++) {
+        [unroll] for (uint in = 0; in < WNITER; in++) {
+            sums[im][in] = CoopMat<float, MemoryScope.Subgroup, TM, TN,
+                                   CoopMatMatrixUse::MatrixAccumulator>(0.0f);
+        }
+    }
 
     for (uint k0 = 0; k0 < p.K; k0 += BK) {
         stage_a_tile(row0, k0, tid, a_base);
@@ -933,23 +948,34 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
         GroupMemoryBarrierWithGroupSync();
 
         [unroll] for (uint kk = 0; kk < BK; kk += TK) {
-            // Slang's `linalg::CoopMat::Load` is a static-method that
-            // RETURNS the loaded matrix; the instance-method form
-            // `someMat.Load(...)` emits an OpCooperativeMatrixLoadKHR
-            // but discards the result. (See `mma-linear-layout-help.slang`
-            // in the Slang stdlib: `MatA.Load<RowMajor, ...>(...)` —
-            // `MatA` is the *type*, not an instance.)
-            let matA = CoopMat<float16_t, MemoryScope.Subgroup, TM, TK,
-                               CoopMatMatrixUse::MatrixA>
-                .Load<CoopMatMatrixLayout::RowMajor>(buf_a,
-                                                    warp_r * WM * AS_STRIDE + kk,
-                                                    AS_STRIDE);
-            let matB = CoopMat<float16_t, MemoryScope.Subgroup, TK, TN,
-                               CoopMatMatrixUse::MatrixB>
-                .Load<CoopMatMatrixLayout::ColumnMajor>(buf_b,
-                                                       warp_c * WN * BS_STRIDE + kk,
-                                                       BS_STRIDE);
-            sums = coopMatMulAdd<float, false>(matA, matB, sums);
+            // Load each subgroup's WMITER A row-fragments and WNITER B
+            // col-fragments once, then cross them into WMITER×WNITER MulAdds —
+            // each staged shmem fragment is reused across the other dimension's
+            // fragments (the arithmetic-intensity win of register blocking).
+            // Slang's `CoopMat::Load` is a STATIC method that RETURNS the matrix
+            // (the instance form `m.Load(...)` discards the result — see
+            // `mma-linear-layout-help.slang` in the stdlib).
+            CoopMat<float16_t, MemoryScope.Subgroup, TM, TK, CoopMatMatrixUse::MatrixA>
+                matA[WMITER];
+            [unroll] for (uint im = 0; im < WMITER; im++) {
+                matA[im] = CoopMat<float16_t, MemoryScope.Subgroup, TM, TK,
+                                   CoopMatMatrixUse::MatrixA>
+                    .Load<CoopMatMatrixLayout::RowMajor>(
+                        buf_a, (warp_r * WM + im * TM) * AS_STRIDE + kk, AS_STRIDE);
+            }
+            CoopMat<float16_t, MemoryScope.Subgroup, TK, TN, CoopMatMatrixUse::MatrixB>
+                matB[WNITER];
+            [unroll] for (uint in = 0; in < WNITER; in++) {
+                matB[in] = CoopMat<float16_t, MemoryScope.Subgroup, TK, TN,
+                                   CoopMatMatrixUse::MatrixB>
+                    .Load<CoopMatMatrixLayout::ColumnMajor>(
+                        buf_b, (warp_c * WN + in * TN) * BS_STRIDE + kk, BS_STRIDE);
+            }
+            [unroll] for (uint im = 0; im < WMITER; im++) {
+                [unroll] for (uint in = 0; in < WNITER; in++) {
+                    sums[im][in] = coopMatMulAdd<float, false>(matA[im], matB[in], sums[im][in]);
+                }
+            }
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -962,16 +988,23 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
     // sub_col) corner expressed in column-major and stride to stride_d.
     //
     // Matches llama.cpp's mul_mm.comp ColumnMajor store (line 404).
-    const uint sub_row = row0 + warp_r * WM;
-    const uint sub_col = col0 + warp_c * WN;
+    // Each of the subgroup's WMITER×WNITER fragments owns a 16×16 sub-tile at
+    // local (warp_r*WM + im*TM, warp_c*WN + in*TN). Output is column-major in
+    // (m, n) per ggml convention: D[m, n] at element `n * stride_d + m`,
+    // stride_d = M. Store<ColumnMajor> writes sums[r,c] to `base + r + c*stride`.
     if (ALLOW_PARTIAL_N != 0 && (col0 + BN > p.N || row0 + BM > p.M)) {
         // Partial output tile: a full 16×16 CoopMat store would overrun data_d.
-        // Stage every warp's fragment into store_buf (row-major, local coords),
-        // then copy only the in-bounds (m<M, n<N) elements out. The branch is
+        // Stage every fragment into store_buf (row-major, local coords), then
+        // copy only the in-bounds (m<M, n<N) elements out. The branch is
         // workgroup-uniform (row0/col0), so all warps reach the barrier.
-        sums.Store<CoopMatMatrixLayout::RowMajor>(store_buf,
-                                                  warp_r * WM * BN + warp_c * WN,
-                                                  BN);
+        [unroll] for (uint im = 0; im < WMITER; im++) {
+            [unroll] for (uint in = 0; in < WNITER; in++) {
+                const uint lrow = warp_r * WM + im * TM;
+                const uint lcol = warp_c * WN + in * TN;
+                sums[im][in].Store<CoopMatMatrixLayout::RowMajor>(
+                    store_buf, lrow * BN + lcol, BN);
+            }
+        }
         GroupMemoryBarrierWithGroupSync();
         for (uint i = tid; i < BM * BN; i += WORKGROUP_SIZE) {
             const uint lr = i / BN;
@@ -982,9 +1015,16 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
                 data_d[d_base + gn * p.stride_d + gm] = D_TYPE(store_buf[lr * BN + lc]);
             }
         }
-    } else if (sub_row < p.M && sub_col < p.N) {
-        sums.Store<CoopMatMatrixLayout::ColumnMajor>(data_d,
-                                                     d_base + sub_col * p.stride_d + sub_row,
-                                                     p.stride_d);
+    } else {
+        [unroll] for (uint im = 0; im < WMITER; im++) {
+            [unroll] for (uint in = 0; in < WNITER; in++) {
+                const uint sub_row = row0 + warp_r * WM + im * TM;
+                const uint sub_col = col0 + warp_c * WN + in * TN;
+                if (sub_row < p.M && sub_col < p.N) {
+                    sums[im][in].Store<CoopMatMatrixLayout::ColumnMajor>(
+                        data_d, d_base + sub_col * p.stride_d + sub_row, p.stride_d);
+                }
+            }
+        }
     }
 }
