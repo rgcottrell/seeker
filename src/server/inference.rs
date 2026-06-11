@@ -22,9 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::gguf::{GgmlType, GgufFile};
 use crate::inference::Engine;
 use crate::inference::budget;
-use crate::inference::kv_cache::{
-    BatchKvCache, KvCacheConfig, PrefixSnapshot, estimate_batch_slot_bytes, estimate_ssm_bytes,
-};
+use crate::inference::kv_cache::{BatchKvCache, KvCacheConfig, PrefixSnapshot, estimate_ssm_bytes};
 use crate::inference::sample::{Sampler, SamplerConfig};
 use crate::tokenizer::{Tokenizer, build_tokenizer};
 use crate::vision::encoder::{HostWeights, VisionEncoder};
@@ -778,12 +776,18 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
                 max_seq_len: ctx + spec_lookahead,
                 n_head: dims.n_head,
             };
-            let kv = estimate_batch_slot_bytes(
+            // Price the slot at its ring (window-capped) per-layer cost so the
+            // auto-fit picks the larger ctx the real allocation actually fits.
+            // Depths depend on this trial ctx (global layers = ctx + lookahead),
+            // so recompute per ctx.
+            let depths = model.cache_slab_depths(cfgc.max_seq_len, cfg.n_ubatch);
+            let kv = crate::inference::kv_cache::estimate_batch_slot_bytes_with_depths(
                 dims.n_layer,
                 dims.head_dim,
                 dims.n_head_kv,
                 &cfgc,
                 align,
+                depths.as_deref(),
             );
             let scratch = model.scratch_bytes_estimate(
                 cfg.n_ubatch,

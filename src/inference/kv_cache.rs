@@ -966,6 +966,21 @@ pub fn estimate_batch_slot_bytes(
     config: &KvCacheConfig,
     align: u64,
 ) -> u64 {
+    estimate_batch_slot_bytes_with_depths(n_layer, head_dim, n_head_kv, config, align, None)
+}
+
+/// As [`estimate_batch_slot_bytes`], but `slab_depths` (length `n_layer`) gives
+/// each layer's token capacity — so the serve `--ctx-size 0` fitter prices a
+/// ring (window-capped) cache at its real (smaller) per-layer cost instead of
+/// full-context everywhere. `None` ⇒ uniform `max_seq_len`.
+pub fn estimate_batch_slot_bytes_with_depths(
+    n_layer: u32,
+    head_dim: u32,
+    n_head_kv: u32,
+    config: &KvCacheConfig,
+    align: u64,
+    slab_depths: Option<&[u32]>,
+) -> u64 {
     let (k_dtypes, v_dtypes) = resolve_layer_dtypes(
         config.k_dtype,
         config.v_dtype,
@@ -975,11 +990,13 @@ pub fn estimate_batch_slot_bytes(
     );
     let hd = head_dim as u64;
     let nkv = n_head_kv as u64;
-    let msl = config.max_seq_len as u64;
     (0..n_layer as usize)
         .map(|il| {
-            slab_stride_for(hd, msl, nkv, align, k_dtypes[il])
-                + slab_stride_for(hd, msl, nkv, align, v_dtypes[il])
+            let depth = slab_depths
+                .map(|d| d[il].clamp(1, config.max_seq_len))
+                .unwrap_or(config.max_seq_len) as u64;
+            slab_stride_for(hd, depth, nkv, align, k_dtypes[il])
+                + slab_stride_for(hd, depth, nkv, align, v_dtypes[il])
         })
         .sum()
 }
@@ -1103,7 +1120,11 @@ impl BatchKvCache {
         // needs more than the full context).
         let slab_depths: Vec<u32> = match slab_depths {
             Some(d) => {
-                assert_eq!(d.len(), n_layer as usize, "slab_depths length mismatch");
+                if d.len() != n_layer as usize {
+                    return Err(
+                        format!("slab_depths length {} != n_layer {n_layer}", d.len()).into(),
+                    );
+                }
                 d.iter().map(|&x| x.clamp(1, config.max_seq_len)).collect()
             }
             None => vec![config.max_seq_len; n_layer as usize],

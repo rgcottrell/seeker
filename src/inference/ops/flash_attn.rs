@@ -482,6 +482,12 @@ pub fn record(
     } else {
         prefill_fa_kv_walk()
     };
+    // NOTE: a ring layer's shader caps the walk to `min(kv_len, ring_depth)`, so
+    // sizing split-K from the logical `kv` over-splits (empty tail splits the
+    // combine weights to ~0) — correct but slightly wasteful at long context.
+    // Right-sizing it to `min(kv, ring_depth)` is a deferred perf follow-up: a
+    // first cut broke greedy parity (the partials/combine layout is sensitive to
+    // the split count), and the over-split is the validated-correct behavior.
     let long_walk_split = n > 1 && kv > walk;
     let (k_num, blocks_per_split) = if long_walk_split {
         let num_blocks = kv.div_ceil(FA_BC).max(1);
@@ -818,6 +824,10 @@ pub fn record_batched(
     let ne3 = b;
     // Grid x-dim = query rows. Decode: 1 row/seq, split KV via the heuristic.
     // Varlen: max_rows rows/seq (the L_s rows already fill the grid → no split).
+    // NOTE: ring layers cap the walk to `min(kv_len, ring_depth)` in-shader, so
+    // sizing split-K from `max_kv` over-splits at long context (empty tail
+    // splits → ~0 in the combine) — correct but wasteful. Right-sizing is a
+    // deferred follow-up (a first cut broke greedy parity).
     let (n, k_num, blocks_per_split) = if varlen {
         (max_rows, 1u32, max_kv.div_ceil(FA_BC).max(1))
     } else {

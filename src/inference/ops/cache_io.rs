@@ -215,6 +215,17 @@ fn record_write_inner(
     // the write doesn't wrap.
     let per_token_bytes = per_token_bytes(head_dim, n_head_kv, dtype);
     let depth = cache_layer.dims[2].max(1);
+    // The split below handles ONE boundary crossing. `l > depth` would need a
+    // second wrap and the post-wrap copy would overrun into the next slab/slot
+    // — reject it. This never happens by design (a ring slab is sized
+    // `sliding_window + n_ubatch − 1 >= n_ubatch >= chunk length`), so it only
+    // guards a future miscalculation.
+    if l > depth {
+        return Err(format!(
+            "KV write length {l} exceeds slab depth {depth} (multi-wrap unsupported)"
+        )
+        .into());
+    }
     let start_phys = (position as u64) % depth;
     let first = (depth - start_phys).min(l); // tokens before the wrap
     let copy_at = |scratch_tok: u64, phys_tok: u64, n_tok: u64| {
