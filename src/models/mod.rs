@@ -310,6 +310,34 @@ pub trait Model: Send + Sync {
         Err("model does not support record_forward_full (MTP spec decode)".into())
     }
 
+    /// Batched embedding prefill: process `seq_lens.len()` independent texts
+    /// packed flat into `tokens` (text `s` is `seq_lens[s]` tokens, in order)
+    /// in ONE forward, and return the `[n_embd, N_total]` pre-output-norm
+    /// residual (column `t` = packed token `t`'s hidden). Each text attends
+    /// only within itself (block-diagonal causal mask) and restarts RoPE
+    /// positions at 0, so the result is identical to prefilling each text
+    /// separately — but the weights are read once for the whole batch instead
+    /// of once per text. The caller slices the residual by `seq_lens` and
+    /// pools/normalizes each text. `cache` is a scratch slab (position 0,
+    /// holds `N_total` tokens); no state persists. Default unsupported;
+    /// implemented by embedding models (qwen3).
+    fn record_forward_embed_batch(
+        &self,
+        _ctx: &mut DispatchContext,
+        _cache: &mut KvCache,
+        _tokens: &[u32],
+        _seq_lens: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        Err("model does not support batched embedding".into())
+    }
+
+    /// Whether [`Self::record_forward_embed_batch`] is implemented — lets the
+    /// embedding server pack multiple texts into one forward. Default `false`
+    /// (callers fall back to one forward per text).
+    fn supports_embed_batch(&self) -> bool {
+        false
+    }
+
     /// Commit the per-position SSM snapshots from a checkpoint verify into
     /// the live recurrent state, selecting the state as of the accepted
     /// position (`accept_len`). Replaces the partial-acceptance re-run.
