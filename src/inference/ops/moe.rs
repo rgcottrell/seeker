@@ -353,31 +353,34 @@ fn record_matvec_kquant_id(
         vec![0, 1, 2, 3, b_alias_slot, 7]
     };
 
-    // Spec-const order on `mul_mat_vec_head.slang`: BLOCK_SIZE, NUM_ROWS,
-    // ACCUMULATE. MoE matvec_id always writes a fresh dst slice, so
-    // accumulate stays 0.
-    let key = PipelineKey {
-        name: name.to_string(),
-        binding_indices: bindings.clone(),
-        push_size: MULMATVEC_ID_PUSH_BYTES,
-        spec_constants: vec![32, 2, 0],
-        required_subgroup_size: Some(32),
-    };
-    let pipeline = *ctx.pipelines.get(ctx.device, key, spv)?;
-    let workgroups = [n_rows.div_ceil(2), n_expert_used, 1];
+    // Bind array mirrors `bindings`: the packed32 alias (slot 6) is present
+    // only when `has_packed32` (Q4_K/Q5_K), absent for Q6_K. Same for every
+    // dispatch below (token axis differs only by grid Z / push), so build once.
+    let mut buffers: Vec<BufferRange> = vec![
+        a.range(),   // 0: data_a
+        b.range(),   // 1: data_b
+        dst.range(), // 2: data_d
+        a.range(),   // 3: data_a_packed16 (alias of A)
+        b.range(),   // 4 or 5: data_b_v4 / data_b_v2 (alias of B)
+    ];
+    if has_packed32 {
+        buffers.push(a.range()); // 6: data_a_packed32 (alias of A)
+    }
+    buffers.push(ids); // 7: data_ids
 
-    // Per-token sweep: dispatch once per token with `expert_i1` set to the
-    // current token index. Mirrors llama.cpp ggml-vulkan.cpp:9020. ids
-    // row stride is `n_experts` (the topk_moe shader writes one expert
-    // pick array per token at `n_experts * row`), so pass that as nbi1.
+    // ids row stride is `n_experts` (topk_moe writes one expert-pick array per
+    // token at `n_experts * row`), passed as nbi1.
     let n_experts = (ids.size / ((n_tokens.max(1) as u64) * 4)) as u32;
-    for expert_i1 in 0..n_tokens {
+
+    fn put_u(out: &mut [u8], w: &mut usize, v: u32) {
+        out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
+        *w += 4;
+    }
+    // Push is identical across tokens except `expert_i1`; the folded path
+    // leaves it 0 (the shader reads the token from grid Z instead).
+    let build_push = |expert_i1: u32| {
         let mut push = [0u8; MULMATVEC_ID_PUSH_BYTES as usize];
         let mut w = 0;
-        fn put_u(out: &mut [u8], w: &mut usize, v: u32) {
-            out[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
-            *w += 4;
-        }
         put_u(&mut push, &mut w, ncols);
         put_u(&mut push, &mut w, stride_a);
         put_u(&mut push, &mut w, stride_b);
@@ -388,23 +391,40 @@ fn record_matvec_kquant_id(
         put_u(&mut push, &mut w, 0); // fusion_flags
         put_u(&mut push, &mut w, n_expert_used); // nei0
         put_u(&mut push, &mut w, 1); // ne11 = 1 (cur reshaped to [n_embd,1,n_tokens])
-        put_u(&mut push, &mut w, expert_i1); // expert_i1 = current token
+        put_u(&mut push, &mut w, expert_i1); // expert_i1 (folded path: 0, unused)
         put_u(&mut push, &mut w, n_experts); // nbi1 — ids row stride (= n_experts)
+        push
+    };
 
-        // Bind array mirrors `bindings`: the packed32 alias (slot 6) is
-        // present only when `has_packed32` (Q4_K/Q5_K), absent for Q6_K.
-        let mut buffers: Vec<BufferRange> = vec![
-            a.range(),   // 0: data_a
-            b.range(),   // 1: data_b
-            dst.range(), // 2: data_d
-            a.range(),   // 3: data_a_packed16 (alias of A)
-            b.range(),   // 4 or 5: data_b_v4 / data_b_v2 (alias of B)
-        ];
-        if has_packed32 {
-            buffers.push(a.range()); // 6: data_a_packed32 (alias of A)
-        }
-        buffers.push(ids); // 7: data_ids
-
+    // Spec-const order on `mul_mat_vec_head.slang`: BLOCK_SIZE, NUM_ROWS,
+    // ACCUMULATE, NUM_COLS, ID_TOKEN_ON_Z. MoE matvec_id writes a fresh dst
+    // slice (accumulate 0). For an L>1 prefill chunk, fold the per-token sweep
+    // into ONE dispatch with the token axis on grid Z (ID_TOKEN_ON_Z=1) —
+    // L-fewer host record+submit cycles. Decode (L==1) keeps the push path so
+    // the persistent decode-replay cmdbuf is byte-for-byte unchanged.
+    if n_tokens > 1 {
+        let key = PipelineKey {
+            name: name.to_string(),
+            binding_indices: bindings.clone(),
+            push_size: MULMATVEC_ID_PUSH_BYTES,
+            spec_constants: vec![32, 2, 0, 1, 1], // …, NUM_COLS=1, ID_TOKEN_ON_Z=1
+            required_subgroup_size: Some(32),
+        };
+        let pipeline = *ctx.pipelines.get(ctx.device, key, spv)?;
+        let workgroups = [n_rows.div_ceil(2), n_expert_used, n_tokens];
+        let push = build_push(0);
+        super::bind_and_dispatch(ctx, &pipeline, &bindings, &buffers, &push, workgroups)?;
+    } else {
+        let key = PipelineKey {
+            name: name.to_string(),
+            binding_indices: bindings.clone(),
+            push_size: MULMATVEC_ID_PUSH_BYTES,
+            spec_constants: vec![32, 2, 0], // ID_TOKEN_ON_Z defaults 0 (push path)
+            required_subgroup_size: Some(32),
+        };
+        let pipeline = *ctx.pipelines.get(ctx.device, key, spv)?;
+        let workgroups = [n_rows.div_ceil(2), n_expert_used, 1];
+        let push = build_push(0);
         super::bind_and_dispatch(ctx, &pipeline, &bindings, &buffers, &push, workgroups)?;
     }
     if fence {
