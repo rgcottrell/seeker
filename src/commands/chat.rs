@@ -454,6 +454,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
                 ctx,
                 args.cache_type_k,
                 args.cache_type_v,
+                /*max_batch=*/ 1,
             );
             kv + scratch
         };
@@ -509,6 +510,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         ctx_size,
         args.cache_type_k,
         args.cache_type_v,
+        /*max_batch=*/ 1,
     );
     engine.allocate_scratch(scratch_bytes)?;
 
@@ -1306,6 +1308,7 @@ impl ChatSession {
                 (common + delta.len()) as u32,
                 self.cache.config.k_dtype,
                 self.cache.config.v_dtype,
+                /*max_batch=*/ 1,
             );
             if need > self.scratch_bytes {
                 self.engine.allocate_scratch(need)?;

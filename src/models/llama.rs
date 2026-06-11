@@ -118,6 +118,7 @@ impl Model for LlamaModel {
         max_seq_len: u32,
         k_dtype: GgmlType,
         v_dtype: GgmlType,
+        max_batch: u32,
     ) -> u64 {
         let p = &self.params;
         // Per-pass token count: bounded by n_ubatch, or the whole context when
@@ -137,7 +138,8 @@ impl Model for LlamaModel {
         let per_layer = (7 * hidden + 3 * n_kv + 4 * n_ff) * l * 4;
         let residual = hidden * l * 4; // persistent across the layer loop
         let mask = l * l * 4; // within-chunk only
-        let logits = vocab * 4; // last token only
+        // One column per sequence: [vocab, 1] single-seq, [vocab, B] batched.
+        let logits = vocab * 4 * max_batch.max(1) as u64;
         // Heterogeneous K/V caches materialize the [0, ctx) prefix to F32 per
         // layer (cache_io::record_read); homogeneous caches bind directly.
         let staging = if k_dtype != v_dtype {

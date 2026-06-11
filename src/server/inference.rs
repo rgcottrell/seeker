@@ -785,8 +785,13 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
                 &cfgc,
                 align,
             );
-            let scratch =
-                model.scratch_bytes_estimate(cfg.n_ubatch, ctx, cfg.cache_type_k, cfg.cache_type_v);
+            let scratch = model.scratch_bytes_estimate(
+                cfg.n_ubatch,
+                ctx,
+                cfg.cache_type_k,
+                cfg.cache_type_v,
+                max_decode_batch(cfg),
+            );
             kv + scratch
         };
         match budget::fit_ctx(
@@ -825,8 +830,13 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     // Scratch is sized per-ubatch/ctx and shared across slots (one forward runs
     // at a time), so it does not scale with the slot count. Sized for the
     // (possibly auto-reduced) ctx.
-    let scratch_bytes =
-        model.scratch_bytes_estimate(cfg.n_ubatch, ctx_size, cfg.cache_type_k, cfg.cache_type_v);
+    let scratch_bytes = model.scratch_bytes_estimate(
+        cfg.n_ubatch,
+        ctx_size,
+        cfg.cache_type_k,
+        cfg.cache_type_v,
+        max_decode_batch(cfg),
+    );
     engine.allocate_scratch(scratch_bytes)?;
 
     let cache_config = KvCacheConfig {
@@ -1297,6 +1307,18 @@ fn worker_main(
     }
 }
 
+/// Largest batched-decode width the scratch must serve: the explicit
+/// `--parallel`, or its auto-mode cap (`--parallel-max`) when slots are
+/// resolved later from the memory budget (resolution needs the scratch size,
+/// so the cap breaks the circularity; auto can never exceed it).
+fn max_decode_batch(cfg: &WorkerConfig) -> u32 {
+    if cfg.n_slots >= 1 {
+        cfg.n_slots
+    } else {
+        cfg.parallel_max.max(1)
+    }
+}
+
 /// Reject a generation job that arrived on an embedding-only server.
 fn reject_embedding(job: GenJob) {
     let _ = job.reply.blocking_send(GenEvent::Error(
@@ -1365,9 +1387,13 @@ impl Worker {
                 ));
             }
             // Grow scratch for this input's single-pass forward if needed.
-            let need = self
-                .model
-                .scratch_bytes_estimate(0, tokens.len() as u32, k_dtype, v_dtype);
+            let need = self.model.scratch_bytes_estimate(
+                0,
+                tokens.len() as u32,
+                k_dtype,
+                v_dtype,
+                self.batch.positions.len() as u32,
+            );
             if need > self.scratch_bytes {
                 self.engine
                     .allocate_scratch(need)
@@ -1929,6 +1955,7 @@ impl Worker {
             prompt_tokens,
             self.batch.config.k_dtype,
             self.batch.config.v_dtype,
+            self.batch.positions.len() as u32,
         );
         if need > self.scratch_bytes {
             if let Err(e) = self.engine.allocate_scratch(need) {
@@ -2088,6 +2115,7 @@ impl Worker {
             prompt_tokens,
             self.batch.config.k_dtype,
             self.batch.config.v_dtype,
+            self.batch.positions.len() as u32,
         );
         if need > self.scratch_bytes {
             if let Err(e) = self.engine.allocate_scratch(need) {
@@ -2378,6 +2406,7 @@ impl Worker {
             prompt_tokens,
             self.batch.config.k_dtype,
             self.batch.config.v_dtype,
+            self.batch.positions.len() as u32,
         );
         if need > self.scratch_bytes {
             if let Err(e) = self.engine.allocate_scratch(need) {

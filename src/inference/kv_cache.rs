@@ -1418,6 +1418,51 @@ impl BatchKvCache {
         )
     }
 
+    /// Per-layer-dims variants of [`Self::batched_k_attn_view`] /
+    /// [`Self::batched_v_attn_view`] for models whose head_dim / n_head_kv
+    /// vary per layer (gemma4's hybrid SWA/global pattern). The slot spacing
+    /// stays the allocation's uniform-max slab stride; only the within-slab
+    /// strides use the layer's real dims — the packing both the per-slot
+    /// prefill (single-seq forward into `slot_kvcache`) and the batched
+    /// `cache_io::record_write` actually produce, since each derives the
+    /// per-token stride from its SOURCE tensor's dims, not the slab's
+    /// declared (uniform) maxima.
+    pub fn batched_k_attn_view_dims(
+        &self,
+        layer: u32,
+        head_dim: u32,
+        n_head_kv: u32,
+    ) -> TensorView {
+        batched_attn_view(
+            self.k_regions[layer as usize].buffer,
+            0,
+            self.k_slab_stride[layer as usize],
+            head_dim as u64,
+            self.config.max_seq_len as u64,
+            n_head_kv as u64,
+            self.n_slots,
+            self.k_dtypes[layer as usize],
+        )
+    }
+
+    pub fn batched_v_attn_view_dims(
+        &self,
+        layer: u32,
+        head_dim: u32,
+        n_head_kv: u32,
+    ) -> TensorView {
+        batched_attn_view(
+            self.v_regions[layer as usize].buffer,
+            0,
+            self.v_slab_stride[layer as usize],
+            head_dim as u64,
+            self.config.max_seq_len as u64,
+            n_head_kv as u64,
+            self.n_slots,
+            self.v_dtypes[layer as usize],
+        )
+    }
+
     /// A non-owning single-sequence `KvCache` over slot `slot` (its slabs +
     /// current position). Use it to prefill one sequence into its slab via the
     /// existing single-sequence forward path; afterwards copy its `position`

@@ -138,6 +138,7 @@ impl Model for Qwen3Model {
         max_seq_len: u32,
         _k_dtype: GgmlType,
         _v_dtype: GgmlType,
+        max_batch: u32,
     ) -> u64 {
         let p = &self.params;
         let l = if n_ubatch == 0 {
@@ -156,7 +157,8 @@ impl Model for Qwen3Model {
         let per_layer = (4 * n_embd + 4 * q_dim + 4 * kv_dim + 4 * n_ff) * l * 4;
         let residual = n_embd * l * 4;
         let mask = l * l * 4;
-        let logits = vocab * 4;
+        // One column per sequence: [vocab, 1] single-seq, [vocab, B] batched.
+        let logits = vocab * 4 * max_batch.max(1) as u64;
         // Flash-attn prefill split-K partials (deepest split this context produces).
         let fa_walk = 8192u64;
         let fa_partials = if max_seq_len as u64 > fa_walk {
