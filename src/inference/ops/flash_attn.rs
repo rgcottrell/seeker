@@ -907,7 +907,7 @@ pub fn record_batched(
     put_f(&mut push, &mut w, 0.0); // max_bias
     put_f(&mut push, &mut w, 0.0); // logit_softcap
     put_u(&mut push, &mut w, 0); // mask_kv_offset (no prefix mask on decode)
-    put_f(&mut push, &mut w, 0.0); // m0
+    put_u(&mut push, &mut w, params.ring_depth); // ring_depth (repurposed ALiBi m0 slot)
     put_u(&mut push, &mut w, params.swa_window); // swa_window (repurposed ALiBi m1 slot)
     put_u(&mut push, &mut w, params.gqa_ratio);
     put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
