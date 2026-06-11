@@ -180,7 +180,15 @@ impl Model for Qwen3Model {
         compute_logits: bool,
     ) -> Result<Option<TensorView>, Box<dyn Error>> {
         Ok(self
-            .forward_inner(ctx, cache, tokens, position_offset, compute_logits, false)?
+            .forward_inner(
+                ctx,
+                cache,
+                tokens,
+                position_offset,
+                compute_logits,
+                false,
+                None,
+            )?
             .0)
     }
 
@@ -194,14 +202,40 @@ impl Model for Qwen3Model {
         _checkpoint: bool, // qwen3 has no SSM state → no per-position snapshots
     ) -> Result<crate::models::ForwardFullOut, Box<dyn Error>> {
         let (logits, residual) =
-            self.forward_inner(ctx, cache, tokens, position_offset, true, full_logits)?;
+            self.forward_inner(ctx, cache, tokens, position_offset, true, full_logits, None)?;
         Ok(crate::models::ForwardFullOut { logits, residual })
+    }
+
+    fn record_forward_embed_batch(
+        &self,
+        ctx: &mut DispatchContext,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        seq_lens: &[u32],
+    ) -> Result<TensorView, Box<dyn Error>> {
+        if seq_lens.is_empty() || tokens.is_empty() {
+            return Err("record_forward_embed_batch: empty batch".into());
+        }
+        if seq_lens.iter().map(|&l| l as usize).sum::<usize>() != tokens.len() {
+            return Err("record_forward_embed_batch: seq_lens don't sum to tokens.len()".into());
+        }
+        // Packed-flat prefill at position 0; the block-diagonal mask isolates
+        // each text, so this returns the same residual as prefilling each text
+        // alone. compute_logits=false → residual only (the embedding hook).
+        let (_logits, residual) =
+            self.forward_inner(ctx, cache, tokens, 0, false, false, Some(seq_lens))?;
+        Ok(residual)
+    }
+
+    fn supports_embed_batch(&self) -> bool {
+        true
     }
 }
 
 impl Qwen3Model {
     /// Shared forward body. Returns `(optional logits, pre-output_norm residual
     /// [n_embd, L])`. The residual is the embedding hook for `seeker embedding`.
+    #[allow(clippy::too_many_arguments)] // high-arity by nature (flags + varlen plan)
     fn forward_inner(
         &self,
         ctx: &mut DispatchContext,
@@ -210,6 +244,12 @@ impl Qwen3Model {
         position_offset: u32,
         compute_logits: bool,
         full_logits: bool,
+        // `Some(seq_lens)` = batched embedding: `tokens` packs N independent
+        // texts; each restarts RoPE at 0 and attends only within itself
+        // (block-diagonal causal mask). Requires `position_offset == 0` and
+        // `!compute_logits` (residual-only). `None` = the normal single causal
+        // sequence.
+        embed_seq_lens: Option<&[u32]>,
     ) -> Result<(Option<TensorView>, TensorView), Box<dyn Error>> {
         use crate::inference::command::record_compute_barriers;
         let p = &self.params;
@@ -239,13 +279,24 @@ impl Qwen3Model {
         let token_buf = ctx.alloc_scratch((l as u64) * 4)?;
         write_u32(ctx, token_buf, tokens)?;
         let positions_buf = ctx.alloc_scratch((l as u64) * 4)?;
-        let positions: Vec<u32> = (position_offset..position_offset + l).collect();
+        // Batched embedding restarts each text's positions at 0; otherwise the
+        // contiguous [position_offset, position_offset + l) sequence.
+        let positions: Vec<u32> = match embed_seq_lens {
+            Some(lens) => lens.iter().flat_map(|&ls| 0..ls).collect(),
+            None => (position_offset..position_offset + l).collect(),
+        };
         write_u32(ctx, positions_buf, &positions)?;
 
         let cache_direct = flash_attn::supports_pair(cache.config.k_dtype, cache.config.v_dtype);
 
-        // Within-chunk causal mask (the cached prefix is always-visible shader-side).
-        let mask = if l > 1 {
+        // Mask: block-diagonal causal for a packed embedding batch (each text
+        // sees only its own [start, i] prefix), else the within-chunk causal
+        // triangle (the cached prefix is always-visible shader-side).
+        let mask = if let Some(lens) = embed_seq_lens {
+            let m = ctx.alloc_tensor([l as u64, l as u64, 1, 1], GgmlType::F32)?;
+            write_block_diagonal_causal_mask(ctx, m, lens)?;
+            Some(m)
+        } else if l > 1 {
             let m = ctx.alloc_tensor([l as u64, l as u64, 1, 1], GgmlType::F32)?;
             write_causal_mask(ctx, m, l)?;
             Some(m)
@@ -491,6 +542,43 @@ fn write_causal_mask(
         for jc in 0..l {
             buf[i * l + jc] = if jc <= i { 0.0 } else { f32::NEG_INFINITY };
         }
+    }
+    unsafe {
+        let dst = host_ptr.add(mask.byte_offset as usize) as *mut f32;
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len());
+    }
+    Ok(())
+}
+
+/// Block-diagonal causal mask for a packed embedding batch: query row `i`
+/// (in text `s`) attends key `jc` iff `jc` is in the same text AND `jc <= i`.
+/// Cross-text entries are `-inf`, so the packed forward is identical to
+/// prefilling each text alone. Same `[N_total, N_total]` row-major layout +
+/// 0/-inf convention as [`write_causal_mask`] (a single-text batch reduces to
+/// exactly the causal triangle).
+fn write_block_diagonal_causal_mask(
+    ctx: &mut DispatchContext,
+    mask: TensorView,
+    seq_lens: &[u32],
+) -> Result<(), Box<dyn Error>> {
+    let host_ptr = ctx
+        .scratch
+        .host_ptr
+        .ok_or("scratch region not host-visible")?;
+    let n_total: usize = seq_lens.iter().map(|&l| l as usize).sum();
+    let mut buf: Vec<f32> = vec![f32::NEG_INFINITY; n_total * n_total];
+    let mut start = 0usize;
+    for &ls in seq_lens {
+        let ls = ls as usize;
+        // Within text block [start, start+ls): lower-triangular (causal).
+        for r in 0..ls {
+            let i = start + r;
+            let row = i * n_total;
+            for c in 0..=r {
+                buf[row + start + c] = 0.0;
+            }
+        }
+        start += ls;
     }
     unsafe {
         let dst = host_ptr.add(mask.byte_offset as usize) as *mut f32;

@@ -1374,7 +1374,7 @@ impl Worker {
         let k_dtype = self.batch.config.k_dtype;
         let v_dtype = self.batch.config.v_dtype;
 
-        let mut outs = Vec::with_capacity(inputs.len());
+        // Validate up front so a bad input aborts before any GPU work.
         for tokens in inputs {
             if tokens.is_empty() {
                 return Err("empty input".into());
@@ -1386,50 +1386,109 @@ impl Worker {
                     self.logical_ctx
                 ));
             }
-            // Grow scratch for this input's single-pass forward if needed.
-            let need = self.model.scratch_bytes_estimate(
-                0,
-                tokens.len() as u32,
-                k_dtype,
-                v_dtype,
-                self.batch.positions.len() as u32,
-            );
-            if need > self.scratch_bytes {
-                self.engine
-                    .allocate_scratch(need)
-                    .map_err(|e| e.to_string())?;
-                self.scratch_bytes = need;
-            }
-            self.batch.reset_slot(0);
-            let residual = {
-                let mut sc = self.batch.slot_kvcache(0);
-                sc.position = 0;
-                let (_logits, residual) = self
-                    .engine
-                    .forward_full_readback(
-                        &*self.model,
-                        &mut sc,
-                        tokens,
-                        0,
-                        /*full_logits=*/ false,
-                    )
-                    .map_err(|e| e.to_string())?;
-                residual
-            };
-            let vectors = crate::inference::embed::pool_and_normalize(
-                &residual,
+        }
+
+        let pool = |residual: &[f32], n_tokens: u32| EmbeddingOut {
+            vectors: crate::inference::embed::pool_and_normalize(
+                residual,
                 n_embd,
                 &output_norm,
                 eps,
                 pooling,
                 normalize,
-            );
-            outs.push(EmbeddingOut {
-                vectors,
-                n_tokens: tokens.len() as u32,
-            });
+            ),
+            n_tokens,
+        };
+
+        // Per-text fallback (models without a batched embedding forward).
+        if !self.model.supports_embed_batch() {
+            let mut outs = Vec::with_capacity(inputs.len());
+            for tokens in inputs {
+                self.grow_scratch_for(tokens.len() as u32, k_dtype, v_dtype)?;
+                self.batch.reset_slot(0);
+                let mut sc = self.batch.slot_kvcache(0);
+                sc.position = 0;
+                let (_logits, residual) = self
+                    .engine
+                    .forward_full_readback(&*self.model, &mut sc, tokens, 0, false)
+                    .map_err(|e| e.to_string())?;
+                outs.push(pool(&residual, tokens.len() as u32));
+            }
+            return Ok(outs);
+        }
+
+        // Batched: pack texts into ≤ budget-token forwards (one weight read per
+        // batch instead of per text). A single text larger than the budget runs
+        // alone — its [N×N] block-diagonal mask is then just its own causal
+        // triangle, identical to the per-text path. Budget bounds the N²-float
+        // mask + the O(N²) attention; the throughput win is on many short texts.
+        let budget = (self.max_batch_tokens as usize).max(1);
+        let slab_cap = self.batch.config.max_seq_len as usize;
+        let mut outs = Vec::with_capacity(inputs.len());
+        let mut i = 0;
+        while i < inputs.len() {
+            let mut packed: Vec<u32> = Vec::new();
+            let mut seq_lens: Vec<u32> = Vec::new();
+            while i < inputs.len() {
+                let t = &inputs[i];
+                // Keep batches under both the token budget (mask/attention) and
+                // the slab depth (KV writes land in [0, N_total)). Always admit
+                // the first text even if it alone exceeds the budget.
+                let n_after = packed.len() + t.len();
+                if !packed.is_empty() && (n_after > budget || n_after > slab_cap) {
+                    break;
+                }
+                packed.extend_from_slice(t);
+                seq_lens.push(t.len() as u32);
+                i += 1;
+                if packed.len() >= budget {
+                    break;
+                }
+            }
+
+            self.grow_scratch_for(packed.len() as u32, k_dtype, v_dtype)?;
+            self.batch.reset_slot(0);
+            let residual = {
+                let mut sc = self.batch.slot_kvcache(0);
+                sc.position = 0;
+                self.engine
+                    .forward_embed_batch_readback(&*self.model, &mut sc, &packed, &seq_lens)
+                    .map_err(|e| e.to_string())?
+            };
+            // Slice the [n_embd, N_total] residual into per-text [n_embd, L_s].
+            let mut off = 0usize;
+            for &ls in &seq_lens {
+                let ls = ls as usize;
+                let slice = &residual[off * n_embd..(off + ls) * n_embd];
+                outs.push(pool(slice, ls as u32));
+                off += ls;
+            }
         }
         Ok(outs)
+    }
+
+    /// Grow the shared scratch region if a forward over `n_tokens` needs more
+    /// than is currently allocated. (Embedding forwards are single-pass.)
+    fn grow_scratch_for(
+        &mut self,
+        n_tokens: u32,
+        k_dtype: crate::gguf::GgmlType,
+        v_dtype: crate::gguf::GgmlType,
+    ) -> Result<(), String> {
+        let need = self.model.scratch_bytes_estimate(
+            0,
+            n_tokens,
+            k_dtype,
+            v_dtype,
+            self.batch.positions.len() as u32,
+        );
+        if need > self.scratch_bytes {
+            self.engine
+                .allocate_scratch(need)
+                .map_err(|e| e.to_string())?;
+            self.scratch_bytes = need;
+        }
+        Ok(())
     }
 
     /// Pick a *free* slab to serve `new_tokens` — prefix-reuse, else LRU (see

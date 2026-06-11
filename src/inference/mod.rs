@@ -2417,6 +2417,27 @@ impl Engine {
         Ok((logits, residual))
     }
 
+    /// Batched embedding prefill: process all texts packed in `tokens`
+    /// (`seq_lens[s]` tokens each) in ONE forward and read back the
+    /// `[n_embd, N_total]` residual as a flat `Vec<f32>` (column-major over
+    /// tokens: `residual[t * n_embd .. (t+1) * n_embd]` is packed token `t`).
+    /// The caller slices it by `seq_lens` to pool each text. `cache` is a
+    /// scratch slab at position 0.
+    pub fn forward_embed_batch_readback(
+        &mut self,
+        model: &dyn crate::models::Model,
+        cache: &mut kv_cache::KvCache,
+        tokens: &[u32],
+        seq_lens: &[u32],
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
+        let weights = model.weights();
+        let outs = self.run_spec_record(weights, |ctx| {
+            let residual = model.record_forward_embed_batch(ctx, cache, tokens, seq_lens)?;
+            Ok(vec![residual.range()])
+        })?;
+        Ok(outs.into_iter().next().expect("one readback range"))
+    }
+
     /// Populate the MTP draft head's KV cache for `tokens.len()` positions
     /// from the given main-model hidden states (see
     /// [`Model::record_mtp_seed`]). Used to seed the head from the prompt
