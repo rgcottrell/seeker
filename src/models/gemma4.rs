@@ -203,8 +203,8 @@ impl Model for Gemma4Model {
     }
 
     fn cache_slab_depths(&self, max_seq_len: u32, n_ubatch: u32) -> Option<Vec<u32>> {
-        // Default-off revert lever while the ring write/read paths bake in.
-        if !*crate::runtime_flags::SWA_RING {
+        // Default-on; `SEEKER_SWA_RING=0` is the revert lever (back to full slabs).
+        if *crate::runtime_flags::SWA_RING_DISABLED {
             return None;
         }
         let depths: Vec<u32> = (0..self.params.n_layer as usize)
