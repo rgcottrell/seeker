@@ -117,6 +117,16 @@ struct MulMatVecParams {
 // The per-column math is unchanged, so the batched result is byte-identical.
 [SpecializationConstant] const uint NUM_COLS = 1;
 
+// ID_TOKEN_ON_Z (MUL_MAT_ID only): when 1, the per-token index comes from
+// `gl_WorkGroupID.z` instead of the `expert_i1` push constant — so the whole
+// L-token MoE matvec_id is ONE dispatch (token axis = grid Z) instead of L
+// host dispatches each re-pushing `expert_i1`. Declared LAST (spec-id 4) so
+// callers that omit it keep the default 0 (push-constant path) — every
+// existing matvec dispatch is byte-identical. Only the prefill (L>1) MoE path
+// sets it; decode (L=1) keeps the push path, so the decode replay cmdbuf is
+// unchanged. Mirrors llama.cpp's mul_mat_id grid (token axis on ne12 / z).
+[SpecializationConstant] const uint ID_TOKEN_ON_Z = 0;
+
 // Per-DATA_A_X dequantize / dequantize4 / get_dm overloads live in dequant_funcs.slang.
 // Including here after the buffer bindings so the helpers can reference data_a /
 // data_a_packed16 at file scope.
@@ -128,10 +138,12 @@ void get_offsets(uint3 wg_id, out uint a_offset, out uint b_offset, out uint d_o
     // experts we're computing. The actual expert *id* (slab index in
     // `data_a`) comes from the topk_moe output buffer.
     const uint expert_i0 = wg_id.y;
-    const uint expert_id = uint(data_ids[expert_i0 + p.expert_i1 * p.nbi1]);
+    // Token index: grid Z when folded (ID_TOKEN_ON_Z), else the push value.
+    const uint tok = (ID_TOKEN_ON_Z != 0u) ? wg_id.z : p.expert_i1;
+    const uint expert_id = uint(data_ids[expert_i0 + tok * p.nbi1]);
     a_offset = expert_id * (p.batch_stride_a / QUANT_K);
-    b_offset = (expert_i0 % p.ne11) * p.stride_b + p.expert_i1 * p.batch_stride_b;
-    d_offset = expert_i0 * p.stride_d + p.expert_i1 * p.batch_stride_d;
+    b_offset = (expert_i0 % p.ne11) * p.stride_b + tok * p.batch_stride_b;
+    d_offset = expert_i0 * p.stride_d + tok * p.batch_stride_d;
 #else
     const uint batch_idx = wg_id.y + p.base_work_group_y;
 
