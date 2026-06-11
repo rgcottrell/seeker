@@ -33,6 +33,14 @@ use crate::shaders;
 const BM: u32 = 32;
 const BN: u32 = 32;
 
+/// Coopmat (`mul_mm_cm.slang`) output-tile dims — must match the shader's
+/// `BM`/`BN`. Separate from the scalar `mul_mm` 32×32 tile: the coopmat kernel
+/// register-blocks a 64×64 tile (2×2 subgroups × 2×2 fragments). The last
+/// row/col tile straddles unless M/N are multiples of these, so a non-multiple
+/// selects the kernel's `ALLOW_PARTIAL_N` staged store.
+const MM_CM_BM: u32 = 64;
+const MM_CM_BN: u32 = 64;
+
 const MUL_MM_PARAMS_BYTES: u32 = 14 * 4;
 const MUL_MM_CM_PARAMS_BYTES: u32 = 14 * 4;
 const MUL_MAT_VEC_PARAMS_BYTES: u32 = 13 * 4;
@@ -425,8 +433,7 @@ fn record_inner(
         // groupshared and writes only in-bounds columns (the vision tower's
         // n_pos, e.g. 16104, is not 16-aligned). The aligned path (N % 16 == 0,
         // text decoder) is byte-identical and skips that staging.
-        let partial_n = !n.is_multiple_of(16);
-        return record_mul_mm_cm(ctx, &variant, partial_n, a, b, d, fence);
+        return record_mul_mm_cm(ctx, &variant, a, b, d, fence);
     }
 
     if a.dtype == GgmlType::F16 && n > 1 {
@@ -584,10 +591,6 @@ fn record_mul_mm(
 fn record_mul_mm_cm(
     ctx: &mut DispatchContext,
     variant: &MmCmVariant,
-    // When the N (or M) dimension isn't a multiple of the 32-wide tile, select
-    // the kernel's `ALLOW_PARTIAL_N` specialization (groupshared-staged,
-    // in-bounds-only store). `false` → the aligned full-fragment store.
-    partial_n: bool,
     a: TensorView,
     b: TensorView,
     d: TensorView,
@@ -596,6 +599,12 @@ fn record_mul_mm_cm(
     let k = a.dims[0] as u32;
     let m = a.dims[1] as u32;
     let n = b.dims[1] as u32;
+
+    // A last row/col tile straddles the M/N edge unless both are multiples of
+    // the coopmat output tile (MM_CM_BM/BN); a straddling tile takes the kernel's
+    // `ALLOW_PARTIAL_N` staged store (in-bounds elements only). Aligned tiles use
+    // the direct full-fragment store.
+    let partial = !m.is_multiple_of(MM_CM_BM) || !n.is_multiple_of(MM_CM_BN);
 
     // For the llama path there's no batched matmul: ne02 = ne12 = 1,
     // num_batches = 1, broadcasts = 1. Keep the wiring simple; bail if a
@@ -642,11 +651,11 @@ fn record_mul_mm_cm(
         variant.name,
         3,
         MUL_MM_CM_PARAMS_BYTES,
-        vec![partial_n as u32],
+        vec![partial as u32],
     )
     .with_subgroup_size(32);
     let pipeline = *ctx.pipelines.get(ctx.device, key, variant.spv)?;
-    let workgroups = [m.div_ceil(BM), n.div_ceil(BN), 1];
+    let workgroups = [m.div_ceil(MM_CM_BM), n.div_ceil(MM_CM_BN), 1];
     super::bind_and_dispatch(
         ctx,
         &pipeline,
