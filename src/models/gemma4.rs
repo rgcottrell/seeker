@@ -88,6 +88,27 @@ impl Gemma4Params {
     fn kv_dim(&self, il: usize) -> u32 {
         self.n_head_kv[il] * self.head_dim(il)
     }
+
+    /// KV slab token capacity for layer `il`. Global layers need the full
+    /// `max_seq_len`. Sliding-window layers attend only the last
+    /// `sliding_window` keys, so their slab is a ring of depth
+    /// `sliding_window + (n_ubatch − 1)` — the `+ (n_ubatch − 1)` headroom
+    /// guarantees a single prefill chunk (≤ `n_ubatch` tokens) never overwrites
+    /// an in-window key it still needs. Capped at `max_seq_len` (no point
+    /// allocating more than the full context); when the cap binds, the layer is
+    /// a plain full slab (no wrap). `n_ubatch == 0` (unbounded single-pass) ⇒
+    /// `max_seq_len` (no ring). The forward detects "is a ring" as
+    /// `slab_depth < max_seq_len`, so this is the single source of truth for the
+    /// depth shared by allocation and the forward.
+    fn slab_depth(&self, il: usize, max_seq_len: u32, n_ubatch: u32) -> u32 {
+        if !self.swa[il] || n_ubatch == 0 {
+            return max_seq_len;
+        }
+        let d = self
+            .sliding_window
+            .saturating_add(n_ubatch.saturating_sub(1));
+        d.min(max_seq_len).max(1)
+    }
 }
 
 pub struct Gemma4BlockWeights {
@@ -179,6 +200,19 @@ impl Model for Gemma4Model {
             .map(|il| self.params.head_dim(il))
             .collect();
         Some((head_dims, self.params.n_head_kv.clone()))
+    }
+
+    fn cache_slab_depths(&self, max_seq_len: u32, n_ubatch: u32) -> Option<Vec<u32>> {
+        // Default-off revert lever while the ring write/read paths bake in.
+        if !*crate::runtime_flags::SWA_RING {
+            return None;
+        }
+        let depths: Vec<u32> = (0..self.params.n_layer as usize)
+            .map(|il| self.params.slab_depth(il, max_seq_len, n_ubatch))
+            .collect();
+        // No ring at all (every layer full) ⇒ None, so serve takes the plain
+        // allocation path. Only return Some when at least one layer is capped.
+        depths.iter().any(|&d| d < max_seq_len).then_some(depths)
     }
 
     fn weights(&self) -> &WeightsHandle {

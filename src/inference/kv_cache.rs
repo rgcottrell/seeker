@@ -1071,19 +1071,43 @@ impl BatchKvCache {
         n_slots: u32,
         config: KvCacheConfig,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_depths(device, n_layer, head_dim, n_head_kv, n_slots, config, None)
+    }
+
+    /// As [`new`], but `slab_depths` (length `n_layer`) gives each layer's KV
+    /// slab token capacity. `None` ⇒ uniform `max_seq_len` (the normal full-
+    /// context cache). gemma4's sliding-window layers pass a shorter depth
+    /// (`sliding_window + n_ubatch − 1`) so their slabs are RING buffers
+    /// (logical position `p` → physical slot `p % depth`), cutting KV memory at
+    /// long context. A depth `>= max_seq_len` is just a normal slab (no wrap).
+    pub fn new_with_depths(
+        device: &Device,
+        n_layer: u32,
+        head_dim: u32,
+        n_head_kv: u32,
+        n_slots: u32,
+        config: KvCacheConfig,
+        slab_depths: Option<&[u32]>,
+    ) -> Result<Self, Box<dyn Error>> {
         validate_dtype(config.k_dtype, "K")?;
         validate_dtype(config.v_dtype, "V")?;
         validate_head_dim(head_dim, config.k_dtype, "K")?;
         validate_head_dim(head_dim, config.v_dtype, "V")?;
 
-        let _max_seq_len = config.max_seq_len as u64;
         let head_dim_u = head_dim as u64;
         let n_head_kv_u = n_head_kv as u64;
         let align = device.limits.min_storage_buffer_offset_alignment.max(1);
 
-        // Per-layer slab depth. Uniform `max_seq_len` here; the ring-buffer
-        // variant (gemma4 SWA) sets shorter per-layer depths via `with_depths`.
-        let slab_depths = vec![config.max_seq_len; n_layer as usize];
+        // Per-layer slab depth: caller-supplied (ring layers shorter) or
+        // uniform `max_seq_len`. Each is clamped to `max_seq_len` (a slab never
+        // needs more than the full context).
+        let slab_depths: Vec<u32> = match slab_depths {
+            Some(d) => {
+                assert_eq!(d.len(), n_layer as usize, "slab_depths length mismatch");
+                d.iter().map(|&x| x.clamp(1, config.max_seq_len)).collect()
+            }
+            None => vec![config.max_seq_len; n_layer as usize],
+        };
 
         // Per-layer dtypes (turbo auto-asymmetric / Boundary-V). Uniform for
         // non-turbo configs.

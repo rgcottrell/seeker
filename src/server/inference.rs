@@ -845,6 +845,12 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         max_seq_len: ctx_size + spec_lookahead,
         n_head: dims.n_head,
     };
+    // Per-layer KV slab depths: gemma4's sliding-window layers get ring-buffer
+    // slabs (depth `sliding_window + n_ubatch − 1`) instead of full-context, so
+    // serving long context fits far more slots. `None` for full-context models.
+    // Computed against the cache's `max_seq_len` (= ctx + spec lookahead) and
+    // used for BOTH the slot-count probe and the real allocation.
+    let slab_depths = model.cache_slab_depths(cache_config.max_seq_len, cfg.n_ubatch);
     // Resolve the slot count: an explicit `--parallel N` is honored verbatim
     // (fail-fast below if N×ctx doesn't fit); `0` auto-sizes from the device
     // memory budget (capped at `parallel_max`).
@@ -871,6 +877,7 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
             &dims,
             cache_config,
             ssm_dims.as_ref(),
+            slab_depths.as_deref(),
             weights_bytes,
             scratch_bytes,
             cfg,
@@ -879,13 +886,14 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     // One BatchKvCache with N slabs: idle slabs keep their conversation's
     // prefix (reuse); the active subset batches in one forward. Allocated
     // eagerly (fail-fast if N×ctx doesn't fit).
-    let mut batch = BatchKvCache::new(
+    let mut batch = BatchKvCache::new_with_depths(
         &engine.device,
         dims.n_layer,
         dims.head_dim,
         dims.n_head_kv,
         n_slots,
         cache_config,
+        slab_depths.as_deref(),
     )?;
     if let Some(ssm) = &ssm_dims {
         batch.allocate_ssm_state(
@@ -1031,11 +1039,13 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
 /// allows after weights + scratch, clamped to `[1, parallel_max]`. Rounds down
 /// and fail-soft to 1 — on unified DDR5 (DEVICE_LOCAL == system RAM) an
 /// over-commit would OOM the box, not just a discrete GPU.
+#[allow(clippy::too_many_arguments)] // high-arity by nature (dims/budget inputs)
 fn resolve_n_slots(
     device: &crate::inference::device::Device,
     dims: &crate::models::CacheDims,
     cache_config: KvCacheConfig,
     ssm_dims: Option<&crate::models::SsmStateDims>,
+    slab_depths: Option<&[u32]>,
     weights_bytes: u64,
     scratch_bytes: u64,
     cfg: &WorkerConfig,
@@ -1046,8 +1056,9 @@ fn resolve_n_slots(
     let parallel_max = cfg.parallel_max.max(1);
     // Per-slot bytes via a throwaway 1-slot cache: exact (no estimator that
     // could drift from the allocator), and dropped before the real N-slot
-    // allocation so it adds no memory peak.
-    let per_slot = match probe_per_slot_bytes(device, dims, cache_config, ssm_dims) {
+    // allocation so it adds no memory peak. Uses the same ring depths as the
+    // real allocation, so SWA models size slots at their (smaller) ring cost.
+    let per_slot = match probe_per_slot_bytes(device, dims, cache_config, ssm_dims, slab_depths) {
         Ok(b) if b > 0 => b,
         _ => {
             tracing::warn!("auto --parallel: could not size a KV slot; falling back to 1");
@@ -1098,14 +1109,16 @@ fn probe_per_slot_bytes(
     dims: &crate::models::CacheDims,
     cache_config: KvCacheConfig,
     ssm_dims: Option<&crate::models::SsmStateDims>,
+    slab_depths: Option<&[u32]>,
 ) -> Result<u64, Box<dyn Error>> {
-    let mut probe = BatchKvCache::new(
+    let mut probe = BatchKvCache::new_with_depths(
         device,
         dims.n_layer,
         dims.head_dim,
         dims.n_head_kv,
         1,
         cache_config,
+        slab_depths,
     )?;
     if let Some(ssm) = ssm_dims {
         probe.allocate_ssm_state(

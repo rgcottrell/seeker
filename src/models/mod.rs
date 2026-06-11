@@ -44,6 +44,20 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Per-layer KV slab token capacity for a serve `BatchKvCache`. `None` ⇒
+    /// every layer holds the full `max_seq_len` (the default). A model with
+    /// sliding-window-attention layers (gemma4) returns `Some(depths)` (length
+    /// `cache_dims().n_layer`) capping its SWA layers at the ring-buffer depth
+    /// `sliding_window + (n_ubatch − 1)` — so those slabs wrap instead of
+    /// growing with context, cutting KV memory at long context. A depth `>=
+    /// max_seq_len` means that layer is a normal full slab. The model's forward
+    /// must drive the matching ring write/read for any capped layer (detected
+    /// from the slab view's depth). Serve-only for now (single-seq run/chat
+    /// keep full slabs).
+    fn cache_slab_depths(&self, _max_seq_len: u32, _n_ubatch: u32) -> Option<Vec<u32>> {
+        None
+    }
+
     /// Optional per-layer SSM state. Pure-attention models return None.
     /// Hybrid models (qwen35moe) return Some so the engine allocates a
     /// persistent state region on the KvCache.
