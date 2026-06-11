@@ -50,8 +50,9 @@ const CM1_MAX_HEAD_DIM: u32 = 512;
 /// so its (offset, size) descriptor binding stays stable across decode
 /// tokens — required for the persistent-decode-cmdbuf optimization,
 /// where the host changes only the indirect-dispatch wg count between
-/// submits. On qwen35moe Strix Halo decode the heuristic naturally
-/// saturates at ~8 (target=80 / base_wgs=10); 16 leaves headroom.
+/// submits. On Strix Halo decode the heuristic drives k_num to this cap at
+/// depth (each split then walks `kv / 16` keys) — the measured sweet spot
+/// (see `FA_SPLIT_DECODE_OCC_MULT`); the partials buffer is always sized for it.
 pub const FA_MAX_K_NUM: u32 = 16;
 
 /// Max KV keys a single split-K workgroup may walk before the RADV/Strix-Halo
@@ -61,6 +62,24 @@ pub const FA_MAX_K_NUM: u32 = 16;
 /// the walk is only guaranteed ≤ this up to `kv ≈ FA_MAX_K_NUM · this` (~128k);
 /// beyond that the walk grows again (256k+ decode is not yet watchdog-safe).
 const FA_SPLIT_MAX_WALK: u32 = 8192;
+
+/// Decode split-K occupancy target, as a multiple of the device shader-core
+/// count: `pick_k_num` aims for ~`core_count · this` total (head × split)
+/// workgroups so a single-token decode (base_wgs = n_head, tiny) splits its long
+/// serial KV walk across many workgroups, while a large concurrent batch (bigger
+/// base_wgs) splits less (already saturated). MEASURED on Strix Halo (40 cores):
+/// the old `2×core_count` target left decode k_num≈2–5 and badly under-saturated
+/// the GPU at depth; raising it (so k_num reaches `FA_MAX_K_NUM` at ≥4k ctx) gave
+/// +26%/+43% qwen tok/s @ 8k/16k and +38% gemma @ 4k. 16× makes occ_split ≥
+/// FA_MAX_K_NUM for any n_head ≤ core_count, so `walk_cap`/`FA_MAX_K_NUM` bind.
+const FA_SPLIT_DECODE_OCC_MULT: u32 = 16;
+
+/// Min KV keys a decode split-K workgroup should walk: `pick_k_num` won't split
+/// so finely that each split covers fewer than this many keys, so the combine
+/// pass's per-partial overhead never dominates a shallow-context decode (it
+/// collapses k_num→1 below this). 256 ≈ the measured sweet spot (k_num=16 at
+/// 4k ctx walks 256 keys/split and was fastest; finer splits start to regress).
+const FA_SPLIT_MIN_WALK: u32 = 256;
 
 /// Max KV keys a single flash-attn workgroup may walk in the VISION
 /// full-attention path before we force a KV-split. The vision tower attends
@@ -1031,27 +1050,31 @@ pub fn pick_k_num(shader_core_count: u32, base_wgs: u32, kv: u32) -> (u32, u32) 
         return (k, num_blocks.div_ceil(k));
     }
 
-    // Placeholder core count when the device doesn't report one; target is
-    // 2× that, the same as llama.cpp.
+    // Placeholder core count when the device doesn't report one.
     let core_count = if shader_core_count != 0 {
         shader_core_count
     } else {
         FA_SPLIT_CORE_COUNT_FALLBACK
     };
-    let target = core_count * 2;
-
-    let mut split_k = 1u32;
-    if base_wgs < target {
-        split_k = target / base_wgs.max(1);
-    }
-    // Watchdog floor: force enough splits that no single workgroup walks more
-    // than `FA_SPLIT_MAX_WALK` keys, even when base parallelism alone wouldn't
-    // split (deep-context decode has base_wgs = n_head ≥ target, so the
-    // heuristic leaves split_k = 1 and one workgroup walks all `kv` keys →
-    // RADV device-lost past ~14k). A const (not the env helper) keeps the
-    // decode hot path free of getenv.
+    // Decode-only heuristic: prefill (n>1) splits via its own `long_walk_split`
+    // path and never reaches here, so `base_wgs` is `n_head (× batch)` — tiny.
+    // A single workgroup walking all of KV serially is LATENCY-bound (the GPU is
+    // occupancy-starved, NOT compute-saturated), so split that walk across many
+    // workgroups. The old `base_wgs < 2·core_count` test counted workgroups but
+    // ignored the per-workgroup walk length → it left decode at k_num≈2–5 and
+    // badly under-saturated the GPU at depth (measured: +26–43% recoverable).
+    //
+    // occ_split: aim for ~`core_count · OCC_MULT` total (head × split) workgroups
+    //   — a bigger concurrent batch (larger base_wgs) splits LESS (already busy).
+    // walk_cap: keep each split walking ≥ MIN_WALK keys, so the combine's
+    //   per-partial cost never dominates a shallow context (k_num→1 at short ctx).
+    // walk_floor: the FA_SPLIT_MAX_WALK device-lost watchdog — a hard safety
+    //   lower bound (since MAX_WALK > MIN_WALK it is always ≤ walk_cap). Consts
+    //   (not the env helper) keep the decode hot path free of getenv.
+    let occ_split = (core_count * FA_SPLIT_DECODE_OCC_MULT / base_wgs.max(1)).max(1);
+    let walk_cap = (kv / FA_SPLIT_MIN_WALK).max(1);
     let walk_floor = kv.div_ceil(FA_SPLIT_MAX_WALK).max(1);
-    split_k = split_k.max(walk_floor);
+    let split_k = occ_split.min(walk_cap).max(walk_floor);
     if split_k <= 1 {
         return (1, num_blocks);
     }
