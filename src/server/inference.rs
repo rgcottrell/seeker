@@ -1084,7 +1084,10 @@ fn resolve_n_slots(
     let budget = (heap as f64 * frac) as u64;
     // Reserve the leading-prefix snapshot pool out of the budget so N×ctx + pool
     // still fits (each pool entry ≈ one sequence's SSM + `max_cached_len` of KV).
-    let pool_bytes = if *crate::runtime_flags::PREFIX_CACHE {
+    // Only when it will actually be allocated: `setup()` forces `prefix_cache =
+    // None` for ring (SWA-depth) runs, so reserving here for `slab_depths.is_some()`
+    // would under-resolve `n_slots` against a pool that never exists.
+    let pool_bytes = if *crate::runtime_flags::PREFIX_CACHE && slab_depths.is_none() {
         let slots = crate::runtime_flags::PREFIX_CACHE_SLOTS.unwrap_or(2).max(1) as u64;
         let max_cached_len = crate::runtime_flags::PREFIX_CACHE_MAXLEN
             .unwrap_or_else(|| cache_config.max_seq_len.min(4096));
