@@ -146,6 +146,13 @@ pub struct FlashAttnParams {
     /// decode (split-K), and batched decode uniformly. Gemma4's sliding
     /// layers set this.
     pub swa_window: u32,
+    /// Ring-buffer depth (tokens) of the K/V slab for a sliding-window layer,
+    /// or `0` for a normal full-context slab. When `> 0` the slab wraps
+    /// (logical position `p` at physical slot `p % ring_depth`): the kernel
+    /// iterates `min(kv_len, ring_depth)` physical slots and recovers each
+    /// slot's logical position for the causal + window mask. Pair with
+    /// `swa_window > 0` and a full-slab (depth-`ring_depth`) K/V view.
+    pub ring_depth: u32,
 }
 
 /// Whether the scalar flash-attn kernel has a compiled variant that can read
@@ -386,11 +393,19 @@ pub fn record(
     let cm1_head_ok =
         params.head_dim_k <= CM1_MAX_HEAD_DIM && params.head_dim_v <= CM1_MAX_HEAD_DIM;
 
+    // Ring (SWA window-capped) layers always take the scalar path: the ring
+    // bounds the per-query walk to ≤ ring_depth keys (so it's watchdog-safe at
+    // any context, removing cm1's reason to exist here), and the scalar kernel
+    // is the one taught the physical-slot → logical-position ring mask. A ring
+    // layer also passes `mask = None`, which would otherwise fall into the
+    // maskless (bidirectional) cm1 vision path below — wrong for causal SWA.
+    // (cm1 ring read is a perf follow-up.)
     if ctx.device.coop_matrix
         && k.dtype == GgmlType::F16
         && v.dtype == GgmlType::F16
         && !*crate::runtime_flags::FA_CM_DISABLED
         && cm1_head_ok
+        && params.ring_depth == 0
         && let Some(m) = mask
     {
         return record_cm1(ctx, q, k, v, Some(m), out, params, kv_actual);
@@ -406,6 +421,7 @@ pub fn record(
         && mask.is_none()
         && q.dims[1] > 1
         && cm1_head_ok
+        && params.ring_depth == 0
     {
         return record_cm1(ctx, q, k, v, None, out, params, kv_actual);
     }
@@ -466,6 +482,12 @@ pub fn record(
     } else {
         prefill_fa_kv_walk()
     };
+    // NOTE: a ring layer's shader caps the walk to `min(kv_len, ring_depth)`, so
+    // sizing split-K from the logical `kv` over-splits (empty tail splits the
+    // combine weights to ~0) — correct but slightly wasteful at long context.
+    // Right-sizing it to `min(kv, ring_depth)` is a deferred perf follow-up: a
+    // first cut broke greedy parity (the partials/combine layout is sensitive to
+    // the split count), and the over-split is the validated-correct behavior.
     let long_walk_split = n > 1 && kv > walk;
     let (k_num, blocks_per_split) = if long_walk_split {
         let num_blocks = kv.div_ceil(FA_BC).max(1);
@@ -520,7 +542,7 @@ pub fn record(
     put_f(&mut push, &mut w, 0.0); // max_bias
     put_f(&mut push, &mut w, 0.0); // logit_softcap
     put_u(&mut push, &mut w, prefix_len); // mask_kv_offset (was mask_n_head_log2)
-    put_f(&mut push, &mut w, 0.0); // m0 (ALiBi, unused)
+    put_u(&mut push, &mut w, params.ring_depth); // ring_depth (repurposed ALiBi m0 slot)
     put_u(&mut push, &mut w, params.swa_window); // swa_window (repurposed ALiBi m1 slot)
     put_u(&mut push, &mut w, params.gqa_ratio);
     put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
@@ -802,6 +824,10 @@ pub fn record_batched(
     let ne3 = b;
     // Grid x-dim = query rows. Decode: 1 row/seq, split KV via the heuristic.
     // Varlen: max_rows rows/seq (the L_s rows already fill the grid → no split).
+    // NOTE: ring layers cap the walk to `min(kv_len, ring_depth)` in-shader, so
+    // sizing split-K from `max_kv` over-splits at long context (empty tail
+    // splits → ~0 in the combine) — correct but wasteful. Right-sizing is a
+    // deferred follow-up (a first cut broke greedy parity).
     let (n, k_num, blocks_per_split) = if varlen {
         (max_rows, 1u32, max_kv.div_ceil(FA_BC).max(1))
     } else {
@@ -891,7 +917,7 @@ pub fn record_batched(
     put_f(&mut push, &mut w, 0.0); // max_bias
     put_f(&mut push, &mut w, 0.0); // logit_softcap
     put_u(&mut push, &mut w, 0); // mask_kv_offset (no prefix mask on decode)
-    put_f(&mut push, &mut w, 0.0); // m0
+    put_u(&mut push, &mut w, params.ring_depth); // ring_depth (repurposed ALiBi m0 slot)
     put_u(&mut push, &mut w, params.swa_window); // swa_window (repurposed ALiBi m1 slot)
     put_u(&mut push, &mut w, params.gqa_ratio);
     put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
@@ -1340,7 +1366,7 @@ fn record_cm1(
     put_f(&mut push, &mut w, 0.0);
     put_f(&mut push, &mut w, 0.0);
     put_u(&mut push, &mut w, prefix_len); // mask_kv_offset: cols < this are visible prefix
-    put_f(&mut push, &mut w, 0.0); // m0 (ALiBi, unused)
+    put_u(&mut push, &mut w, params.ring_depth); // ring_depth (repurposed ALiBi m0 slot)
     put_u(&mut push, &mut w, params.swa_window); // swa_window (repurposed ALiBi m1 slot)
     put_u(&mut push, &mut w, params.gqa_ratio);
     put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)

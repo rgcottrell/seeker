@@ -206,25 +206,51 @@ fn record_write_inner(
     // The cast's compute write must be visible before the upcoming TRANSFER read.
     record_global_barrier(ctx.device, ctx.cmd);
 
-    // Copy into the cache at the right byte offset.
+    // Copy into the cache. The slab depth `D = cache_layer.dims[2]` is the
+    // physical token capacity: a full-context slab has `D = max_seq_len` (so
+    // `position % D == position`, no wrap), a sliding-window ring slab has a
+    // shorter `D` and `position` wraps. When the `l`-token write straddles the
+    // ring boundary (`start_phys + l > D`) it splits into two copies. This is
+    // unconditional and self-correcting — identical to a single copy whenever
+    // the write doesn't wrap.
     let per_token_bytes = per_token_bytes(head_dim, n_head_kv, dtype);
-    let dst_offset = cache_layer.byte_offset + position as u64 * per_token_bytes;
-    let copy_size = l * per_token_bytes;
-    record_copy(
-        ctx.device,
-        ctx.cmd,
-        BufferRange {
-            buffer: scratch_cache.buffer,
-            offset: scratch_cache.byte_offset,
-            size: copy_size,
-        },
-        BufferRange {
-            buffer: cache_layer.buffer,
-            offset: dst_offset,
-            size: copy_size,
-        },
-        copy_size,
-    );
+    let depth = cache_layer.dims[2].max(1);
+    // The split below handles ONE boundary crossing. `l > depth` would need a
+    // second wrap and the post-wrap copy would overrun into the next slab/slot
+    // — reject it. This never happens by design (a ring slab is sized
+    // `sliding_window + n_ubatch − 1 >= n_ubatch >= chunk length`), so it only
+    // guards a future miscalculation.
+    if l > depth {
+        return Err(format!(
+            "KV write length {l} exceeds slab depth {depth} (multi-wrap unsupported)"
+        )
+        .into());
+    }
+    let start_phys = (position as u64) % depth;
+    let first = (depth - start_phys).min(l); // tokens before the wrap
+    let copy_at = |scratch_tok: u64, phys_tok: u64, n_tok: u64| {
+        if n_tok == 0 {
+            return;
+        }
+        let sz = n_tok * per_token_bytes;
+        record_copy(
+            ctx.device,
+            ctx.cmd,
+            BufferRange {
+                buffer: scratch_cache.buffer,
+                offset: scratch_cache.byte_offset + scratch_tok * per_token_bytes,
+                size: sz,
+            },
+            BufferRange {
+                buffer: cache_layer.buffer,
+                offset: cache_layer.byte_offset + phys_tok * per_token_bytes,
+                size: sz,
+            },
+            sz,
+        );
+    };
+    copy_at(0, start_phys, first); // [start_phys, D) — pre-wrap span
+    copy_at(first, 0, l - first); // wrapped remainder at physical 0 (0 if no wrap)
     if fence {
         // Cache write must complete before the upcoming cache read.
         record_global_barrier(ctx.device, ctx.cmd);

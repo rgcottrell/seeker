@@ -966,6 +966,21 @@ pub fn estimate_batch_slot_bytes(
     config: &KvCacheConfig,
     align: u64,
 ) -> u64 {
+    estimate_batch_slot_bytes_with_depths(n_layer, head_dim, n_head_kv, config, align, None)
+}
+
+/// As [`estimate_batch_slot_bytes`], but `slab_depths` (length `n_layer`) gives
+/// each layer's token capacity — so the serve `--ctx-size 0` fitter prices a
+/// ring (window-capped) cache at its real (smaller) per-layer cost instead of
+/// full-context everywhere. `None` ⇒ uniform `max_seq_len`.
+pub fn estimate_batch_slot_bytes_with_depths(
+    n_layer: u32,
+    head_dim: u32,
+    n_head_kv: u32,
+    config: &KvCacheConfig,
+    align: u64,
+    slab_depths: Option<&[u32]>,
+) -> u64 {
     let (k_dtypes, v_dtypes) = resolve_layer_dtypes(
         config.k_dtype,
         config.v_dtype,
@@ -975,11 +990,13 @@ pub fn estimate_batch_slot_bytes(
     );
     let hd = head_dim as u64;
     let nkv = n_head_kv as u64;
-    let msl = config.max_seq_len as u64;
     (0..n_layer as usize)
         .map(|il| {
-            slab_stride_for(hd, msl, nkv, align, k_dtypes[il])
-                + slab_stride_for(hd, msl, nkv, align, v_dtypes[il])
+            let depth = slab_depths
+                .map(|d| d[il].clamp(1, config.max_seq_len))
+                .unwrap_or(config.max_seq_len) as u64;
+            slab_stride_for(hd, depth, nkv, align, k_dtypes[il])
+                + slab_stride_for(hd, depth, nkv, align, v_dtypes[il])
         })
         .sum()
 }
@@ -1021,6 +1038,12 @@ pub struct BatchKvCache {
     /// give layers different K/V dtypes (and hence slab sizes).
     k_slab_stride: Vec<u64>,
     v_slab_stride: Vec<u64>,
+    /// Per-layer KV slab DEPTH (token capacity). `max_seq_len` for normal
+    /// (full-context) layers; for gemma4's sliding-window layers it is the
+    /// ring-buffer depth `sliding_window + (n_ubatch − 1)` (< max_seq_len at
+    /// long context), so position `p` writes physical slot `p % slab_depths[il]`.
+    /// All views/strides/budget key off this per-layer depth.
+    slab_depths: Vec<u32>,
     /// Per-layer resolved K/V dtypes (see [`resolve_layer_dtypes`]).
     k_dtypes: Vec<GgmlType>,
     v_dtypes: Vec<GgmlType>,
@@ -1065,15 +1088,47 @@ impl BatchKvCache {
         n_slots: u32,
         config: KvCacheConfig,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_depths(device, n_layer, head_dim, n_head_kv, n_slots, config, None)
+    }
+
+    /// As [`new`], but `slab_depths` (length `n_layer`) gives each layer's KV
+    /// slab token capacity. `None` ⇒ uniform `max_seq_len` (the normal full-
+    /// context cache). gemma4's sliding-window layers pass a shorter depth
+    /// (`sliding_window + n_ubatch − 1`) so their slabs are RING buffers
+    /// (logical position `p` → physical slot `p % depth`), cutting KV memory at
+    /// long context. A depth `>= max_seq_len` is just a normal slab (no wrap).
+    pub fn new_with_depths(
+        device: &Device,
+        n_layer: u32,
+        head_dim: u32,
+        n_head_kv: u32,
+        n_slots: u32,
+        config: KvCacheConfig,
+        slab_depths: Option<&[u32]>,
+    ) -> Result<Self, Box<dyn Error>> {
         validate_dtype(config.k_dtype, "K")?;
         validate_dtype(config.v_dtype, "V")?;
         validate_head_dim(head_dim, config.k_dtype, "K")?;
         validate_head_dim(head_dim, config.v_dtype, "V")?;
 
-        let max_seq_len = config.max_seq_len as u64;
         let head_dim_u = head_dim as u64;
         let n_head_kv_u = n_head_kv as u64;
         let align = device.limits.min_storage_buffer_offset_alignment.max(1);
+
+        // Per-layer slab depth: caller-supplied (ring layers shorter) or
+        // uniform `max_seq_len`. Each is clamped to `max_seq_len` (a slab never
+        // needs more than the full context).
+        let slab_depths: Vec<u32> = match slab_depths {
+            Some(d) => {
+                if d.len() != n_layer as usize {
+                    return Err(
+                        format!("slab_depths length {} != n_layer {n_layer}", d.len()).into(),
+                    );
+                }
+                d.iter().map(|&x| x.clamp(1, config.max_seq_len)).collect()
+            }
+            None => vec![config.max_seq_len; n_layer as usize],
+        };
 
         // Per-layer dtypes (turbo auto-asymmetric / Boundary-V). Uniform for
         // non-turbo configs.
@@ -1090,11 +1145,27 @@ impl BatchKvCache {
         // per-slot prefill path) AND to a multiple of the block byte size (so
         // flash-attn's `elem / QUANT_K` block index lands on slot boundaries for
         // block-quant turbo). For block_size==1 the type size divides the
-        // alignment, so this reduces to `align_up(bytes, align)`.
-        let slab_stride =
-            |dtype: GgmlType| slab_stride_for(head_dim_u, max_seq_len, n_head_kv_u, align, dtype);
-        let k_slab_stride: Vec<u64> = k_dtypes.iter().map(|&d| slab_stride(d)).collect();
-        let v_slab_stride: Vec<u64> = v_dtypes.iter().map(|&d| slab_stride(d)).collect();
+        // alignment, so this reduces to `align_up(bytes, align)`. Depth is the
+        // layer's slab depth (max_seq_len here; per-layer for the ring variant).
+        let slab_stride = |il: usize, dtype: GgmlType| {
+            slab_stride_for(
+                head_dim_u,
+                slab_depths[il] as u64,
+                n_head_kv_u,
+                align,
+                dtype,
+            )
+        };
+        let k_slab_stride: Vec<u64> = k_dtypes
+            .iter()
+            .enumerate()
+            .map(|(il, &d)| slab_stride(il, d))
+            .collect();
+        let v_slab_stride: Vec<u64> = v_dtypes
+            .iter()
+            .enumerate()
+            .map(|(il, &d)| slab_stride(il, d))
+            .collect();
 
         // Holistic backstop preflight (same as KvCache::new): the `n_slots`
         // slabs plus the already-resident weights + scratch must fit the heap,
@@ -1160,6 +1231,7 @@ impl BatchKvCache {
             alignment,
             k_slab_stride,
             v_slab_stride,
+            slab_depths,
             k_dtypes,
             v_dtypes,
             positions: vec![0; n_slots as usize],
@@ -1364,12 +1436,25 @@ impl BatchKvCache {
         self.v_dtypes[layer as usize]
     }
 
+    /// Ring-buffer depth (tokens) of `layer`'s slab, or `0` if it's a normal
+    /// full-context slab (depth `>= max_seq_len`, no wrap). gemma4's SWA layers
+    /// return their `sliding_window + n_ubatch − 1` ring depth; the forward
+    /// passes this to flash-attn so the read wraps + window-masks analytically.
+    pub fn ring_depth(&self, layer: u32) -> u32 {
+        let d = self.slab_depths[layer as usize];
+        if (d as u64) < self.config.max_seq_len as u64 {
+            d
+        } else {
+            0
+        }
+    }
+
     pub fn slot_k_view(&self, slot: u32, layer: u32) -> TensorView {
         make_view(
             self.k_regions[layer as usize].buffer,
             slot as u64 * self.k_slab_stride[layer as usize],
             self.head_dim as u64,
-            self.config.max_seq_len as u64,
+            self.slab_depths[layer as usize] as u64,
             self.n_head_kv as u64,
             self.k_dtypes[layer as usize],
         )
@@ -1380,7 +1465,7 @@ impl BatchKvCache {
             self.v_regions[layer as usize].buffer,
             slot as u64 * self.v_slab_stride[layer as usize],
             self.head_dim as u64,
-            self.config.max_seq_len as u64,
+            self.slab_depths[layer as usize] as u64,
             self.n_head_kv as u64,
             self.v_dtypes[layer as usize],
         )
@@ -1398,7 +1483,7 @@ impl BatchKvCache {
             0,
             self.k_slab_stride[layer as usize],
             self.head_dim as u64,
-            self.config.max_seq_len as u64,
+            self.slab_depths[layer as usize] as u64,
             self.n_head_kv as u64,
             self.n_slots,
             self.k_dtypes[layer as usize],
@@ -1411,7 +1496,7 @@ impl BatchKvCache {
             0,
             self.v_slab_stride[layer as usize],
             self.head_dim as u64,
-            self.config.max_seq_len as u64,
+            self.slab_depths[layer as usize] as u64,
             self.n_head_kv as u64,
             self.n_slots,
             self.v_dtypes[layer as usize],
@@ -1438,7 +1523,7 @@ impl BatchKvCache {
             0,
             self.k_slab_stride[layer as usize],
             head_dim as u64,
-            self.config.max_seq_len as u64,
+            self.slab_depths[layer as usize] as u64,
             n_head_kv as u64,
             self.n_slots,
             self.k_dtypes[layer as usize],
@@ -1456,7 +1541,7 @@ impl BatchKvCache {
             0,
             self.v_slab_stride[layer as usize],
             head_dim as u64,
-            self.config.max_seq_len as u64,
+            self.slab_depths[layer as usize] as u64,
             n_head_kv as u64,
             self.n_slots,
             self.v_dtypes[layer as usize],

@@ -101,6 +101,17 @@ pub static FA_SPLIT_DISABLED: LazyLock<bool> =
 /// Read per decode forward; cache to avoid a per-token getenv + parse.
 pub static FA_SPLIT_KNUM: LazyLock<Option<u32>> = LazyLock::new(|| env_u32("SEEKER_FA_SPLIT_KNUM"));
 
+/// `SEEKER_SWA_RING=0` — disable window-capped ring-buffer KV slabs for a
+/// sliding-window model's (gemma4's) SWA layers in `seeker serve`. DEFAULT-ON:
+/// those layers allocate a `sliding_window + n_ubatch − 1`-deep ring instead of
+/// a full `max_seq_len` slab (logical position `p` → physical slot `p % depth`),
+/// cutting gemma4 serve KV ~3× at ctx 8192 and far more at long context, so more
+/// `--parallel` slots fit. Token-identical to the full slab (validated); this
+/// flag is the revert lever. The forward detects a ring layer from its slab
+/// depth, so disabling only changes allocation back to full slabs.
+pub static SWA_RING_DISABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("SEEKER_SWA_RING").is_ok_and(|v| v == "0"));
+
 /// `SEEKER_SSM_BATCH=0` — force the per-sequence SSM loop in the unified
 /// forward (both the pure-decode batched step and the mixed-step decode-run
 /// subset). Default-on: batched steps route the SSM block through

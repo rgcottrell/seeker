@@ -818,6 +818,7 @@ impl Qwen35MoeModel {
             gqa_ratio: (p.n_head / p.n_head_kv).max(1),
             scale,
             swa_window: 0,
+            ring_depth: 0,
         };
         // Bind the cache layers straight into flash-attn whenever the kernel has
         // a variant for this (K, V) pair — all symmetric pairs and the exposed
@@ -1114,6 +1115,7 @@ impl Qwen35MoeModel {
             gqa_ratio: (p.n_head / p.n_head_kv).max(1),
             scale,
             swa_window: 0,
+            ring_depth: 0,
         };
         // Bind the cache layers straight into flash-attn whenever the kernel has
         // a variant for this (K, V) pair — all symmetric pairs and the exposed
@@ -1294,6 +1296,7 @@ impl Qwen35MoeModel {
             gqa_ratio: (p.n_head / p.n_head_kv).max(1),
             scale,
             swa_window: 0,
+            ring_depth: 0,
         };
         // Bind the cache layers straight into flash-attn whenever the kernel has
         // a variant for this (K, V) pair — all symmetric pairs and the exposed
@@ -1635,6 +1638,7 @@ impl Qwen35MoeModel {
             gqa_ratio: (p.n_head / p.n_head_kv).max(1),
             scale,
             swa_window: 0,
+            ring_depth: 0,
         };
         let kv_lens: Vec<u32> = positions.iter().map(|&pp| pp + 1).collect();
 
@@ -1853,6 +1857,7 @@ impl Qwen35MoeModel {
             gqa_ratio: (p.n_head / p.n_head_kv).max(1),
             scale,
             swa_window: 0,
+            ring_depth: 0,
         };
 
         for (layer_idx, block) in self.weights.blocks.iter().enumerate() {

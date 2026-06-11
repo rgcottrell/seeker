@@ -1455,6 +1455,7 @@ fn fa_batch_smoke_test(
             gqa_ratio: gqa,
             scale,
             swa_window: 0,
+            ring_depth: 0,
         };
         let fa_dyn = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
         flash_attn::record_batched(ctx, q, k, v, out, params, &kv_lens, fa_dyn, None, None)?;
@@ -1652,6 +1653,7 @@ fn fa_varlen_smoke_test(
             gqa_ratio: gqa,
             scale,
             swa_window: 0,
+            ring_depth: 0,
         };
         let fa_dyn = crate::inference::decode_dyn::alloc_array(ctx, b as u32)?;
         flash_attn::record_batched(

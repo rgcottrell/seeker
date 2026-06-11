@@ -88,6 +88,27 @@ impl Gemma4Params {
     fn kv_dim(&self, il: usize) -> u32 {
         self.n_head_kv[il] * self.head_dim(il)
     }
+
+    /// KV slab token capacity for layer `il`. Global layers need the full
+    /// `max_seq_len`. Sliding-window layers attend only the last
+    /// `sliding_window` keys, so their slab is a ring of depth
+    /// `sliding_window + (n_ubatch − 1)` — the `+ (n_ubatch − 1)` headroom
+    /// guarantees a single prefill chunk (≤ `n_ubatch` tokens) never overwrites
+    /// an in-window key it still needs. Capped at `max_seq_len` (no point
+    /// allocating more than the full context); when the cap binds, the layer is
+    /// a plain full slab (no wrap). `n_ubatch == 0` (unbounded single-pass) ⇒
+    /// `max_seq_len` (no ring). The forward detects "is a ring" as
+    /// `slab_depth < max_seq_len`, so this is the single source of truth for the
+    /// depth shared by allocation and the forward.
+    fn slab_depth(&self, il: usize, max_seq_len: u32, n_ubatch: u32) -> u32 {
+        if !self.swa[il] || n_ubatch == 0 {
+            return max_seq_len;
+        }
+        let d = self
+            .sliding_window
+            .saturating_add(n_ubatch.saturating_sub(1));
+        d.min(max_seq_len).max(1)
+    }
 }
 
 pub struct Gemma4BlockWeights {
@@ -179,6 +200,19 @@ impl Model for Gemma4Model {
             .map(|il| self.params.head_dim(il))
             .collect();
         Some((head_dims, self.params.n_head_kv.clone()))
+    }
+
+    fn cache_slab_depths(&self, max_seq_len: u32, n_ubatch: u32) -> Option<Vec<u32>> {
+        // Default-on; `SEEKER_SWA_RING=0` is the revert lever (back to full slabs).
+        if *crate::runtime_flags::SWA_RING_DISABLED {
+            return None;
+        }
+        let depths: Vec<u32> = (0..self.params.n_layer as usize)
+            .map(|il| self.params.slab_depth(il, max_seq_len, n_ubatch))
+            .collect();
+        // No ring at all (every layer full) ⇒ None, so serve takes the plain
+        // allocation path. Only return Some when at least one layer is capped.
+        depths.iter().any(|&d| d < max_seq_len).then_some(depths)
     }
 
     fn weights(&self) -> &WeightsHandle {
@@ -342,6 +376,11 @@ impl Model for Gemma4Model {
                 } else {
                     0
                 },
+                // Ring-buffer slab for capped SWA layers (0 = full slab). The
+                // K/V attn views below bind the whole (depth-`ring_depth`) slab;
+                // the shader wraps + window-masks analytically off each
+                // sequence's own kv_len.
+                ring_depth: batch.ring_depth(layer_idx as u32),
             };
 
             // input norm
@@ -739,7 +778,19 @@ impl Gemma4Model {
                 } else {
                     0
                 },
+                // Ring slab (capped SWA layer) ⇒ wrap + analytic mask; 0 = full
+                // slab. Detected from the slab view's depth: a ring layer's
+                // slab is shorter than the full context.
+                ring_depth: {
+                    let d = cache.k_layers[layer_idx].dims[2];
+                    if d < cache.config.max_seq_len as u64 {
+                        d as u32
+                    } else {
+                        0
+                    }
+                },
             };
+            let is_ring = fa_params.ring_depth != 0;
 
             // input norm
             let x_norm = ctx.alloc_tensor([hidden, l as u64, 1, 1], GgmlType::F32)?;
@@ -808,25 +859,46 @@ impl Gemma4Model {
             )?;
             cache_io::record_write(ctx, v_natural, cache.v_layers[layer_idx], position_offset)?;
 
-            let (k_src, v_src) = if cache_direct {
+            // Ring layer: bind the WHOLE (depth-`ring_depth`) slab and let the
+            // shader walk min(kv_len, depth) physical slots with the analytic
+            // causal+window mask — the cached prefix [0, kv_len) is NOT
+            // physically contiguous once the ring wraps, so `slice_cache_prefix`
+            // (and the host causal mask) would be wrong. Requires an FA-readable
+            // KV dtype (no F32 staging path for a wrapped ring); gemma4 serve's
+            // f16 KV is. Non-ring layers keep the contiguous prefix slice.
+            let (k_src, v_src, kv_seq) = if is_ring {
+                if !cache_direct {
+                    return Err("SWA ring KV needs an FA-readable dtype (f16/bf16); \
+                                use those KV types or unset SEEKER_SWA_RING"
+                        .into());
+                }
+                let depth = cache.k_layers[layer_idx].dims[2];
+                (cache.k_layers[layer_idx], cache.v_layers[layer_idx], depth)
+            } else if cache_direct {
                 (
                     slice_cache_prefix(cache.k_layers[layer_idx], kv_len_u),
                     slice_cache_prefix(cache.v_layers[layer_idx], kv_len_u),
+                    kv_len_u,
                 )
             } else {
                 (
                     cache_io::record_read(ctx, cache.k_layers[layer_idx], total_len)?,
                     cache_io::record_read(ctx, cache.v_layers[layer_idx], total_len)?,
+                    kv_len_u,
                 )
             };
 
             let q_perm = permute_to_attn(q_roped, head_dim, l as u64, n_head);
-            let k_perm = permute_to_attn(k_src, head_dim, kv_len_u, n_head_kv);
-            let v_perm = permute_to_attn(v_src, head_dim, kv_len_u, n_head_kv);
+            let k_perm = permute_to_attn(k_src, head_dim, kv_seq, n_head_kv);
+            let v_perm = permute_to_attn(v_src, head_dim, kv_seq, n_head_kv);
 
+            // Ring layers mask analytically in-shader (causal + window from each
+            // key's logical position) — no host mask. Non-ring keep the host
+            // within-chunk causal triangle.
+            let mask_arg = if is_ring { None } else { mask };
             let attn_out = ctx.alloc_tensor([q_dim, l as u64, 1, 1], GgmlType::F32)?;
             flash_attn::record(
-                ctx, q_perm, k_perm, v_perm, mask, attn_out, fa_params, total_len,
+                ctx, q_perm, k_perm, v_perm, mask_arg, attn_out, fa_params, total_len,
             )?;
 
             // O-proj → post_attention_norm → residual add.
@@ -1018,6 +1090,9 @@ impl Gemma4Model {
                 gqa_ratio: (n_head / base_n_head_kv).max(1) as u32,
                 scale: 1.0, // gemma4: NO 1/sqrt(head_dim)
                 swa_window: if dp.swa[il] { dp.sliding_window } else { 0 },
+                // MTP draft runs only on run/chat (serve gemma4 is non-unified
+                // → spec off), where the base cache uses full slabs — no ring.
+                ring_depth: 0,
             };
 
             // input norm → Q proj → per-head Q-norm → NEOX RoPE.
