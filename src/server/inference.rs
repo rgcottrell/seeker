@@ -983,7 +983,17 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
 
     // Optional leading-prefix snapshot cache (default-off). Its pool memory was
     // already reserved out of the auto `--parallel` budget in `resolve_n_slots`.
-    let prefix_cache = if *crate::runtime_flags::PREFIX_CACHE {
+    // Incompatible with ring (SWA window-capped) slabs: its seed/capture copy a
+    // contiguous `KV[0, P)`, which a wrapped ring is not. Disable it there (the
+    // wrap-split copy is a follow-up). Both are opt-in, so this only fires if a
+    // user enables both at once.
+    if slab_depths.is_some() && *crate::runtime_flags::PREFIX_CACHE {
+        tracing::warn!(
+            "SEEKER_PREFIX_CACHE is incompatible with SWA ring slabs (SEEKER_SWA_RING); \
+             serving without the prefix cache"
+        );
+    }
+    let prefix_cache = if *crate::runtime_flags::PREFIX_CACHE && slab_depths.is_none() {
         let cap = crate::runtime_flags::PREFIX_CACHE_SLOTS.unwrap_or(2).max(1);
         let max_cached_len = crate::runtime_flags::PREFIX_CACHE_MAXLEN
             .unwrap_or_else(|| ctx_size.min(4096))

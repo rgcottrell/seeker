@@ -317,6 +317,7 @@ impl Qwen3Model {
             gqa_ratio: (n_head / n_head_kv).max(1) as u32,
             scale,
             swa_window: 0,
+            ring_depth: 0,
         };
 
         // ---- per-layer loop ----

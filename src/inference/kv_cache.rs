@@ -1415,6 +1415,19 @@ impl BatchKvCache {
         self.v_dtypes[layer as usize]
     }
 
+    /// Ring-buffer depth (tokens) of `layer`'s slab, or `0` if it's a normal
+    /// full-context slab (depth `>= max_seq_len`, no wrap). gemma4's SWA layers
+    /// return their `sliding_window + n_ubatch − 1` ring depth; the forward
+    /// passes this to flash-attn so the read wraps + window-masks analytically.
+    pub fn ring_depth(&self, layer: u32) -> u32 {
+        let d = self.slab_depths[layer as usize];
+        if (d as u64) < self.config.max_seq_len as u64 {
+            d
+        } else {
+            0
+        }
+    }
+
     pub fn slot_k_view(&self, slot: u32, layer: u32) -> TensorView {
         make_view(
             self.k_regions[layer as usize].buffer,

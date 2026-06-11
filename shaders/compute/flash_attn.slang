@@ -122,7 +122,14 @@ struct FaParams {
     // KV columns < mask_kv_offset are unconditionally visible. (Repurposed
     // from the unused ALiBi `mask_n_head_log2` slot — keeps push ≤ 128 B.)
     uint  mask_kv_offset;
-    float m0;          // ALiBi slope (unused)
+    // Ring-buffer depth for sliding-window (SWA) layers (repurposed ALiBi m0
+    // slot). 0 = normal full slab (physical slot == logical position). When >0,
+    // the K/V slab is a ring of this many tokens: logical position p lives at
+    // physical slot p % ring_depth. The kernel then iterates the min(kv_len,
+    // ring_depth) physical slots, maps each back to its logical position, and
+    // applies causal + sliding-window analytically — no host mask. Set by
+    // gemma4's SWA layers; full layers / other models leave it 0.
+    uint  ring_depth;
     // Sliding-window span (repurposed ALiBi m1 slot). 0 = full causal. When >0,
     // a key at absolute position kpos is masked for a query at absolute position
     // qpos = kv_len - n_query + query_row (per-sequence, from DecodeDyn) unless
@@ -451,6 +458,13 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     if (VARLEN == 0u && MASK_ENABLE != 0u) {
         eff_kv = min(eff_kv, p.mask_kv_offset + i_row + 1u);
     }
+    // Ring layer: iterate the physically-present slots [0, min(kv_len, depth)).
+    // Each holds an in- or near-window key (physical slot order is scrambled
+    // once the ring wraps); the per-element causal + window test below uses the
+    // slot's LOGICAL position, so the physical order is irrelevant.
+    if (p.ring_depth != 0u) {
+        eff_kv = min(p_KV, p.ring_depth);
+    }
     const uint num_blocks  = (eff_kv + Bc - 1) / Bc;
     // Sliding-window lower bound: keys below first_visible are masked for this
     // row (same qpos formula as the per-element SWA mask below). The split
@@ -470,8 +484,11 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     // token while the push is baked at record time), batched decode (each
     // sequence's own kv_len - 1; a shared push value cannot express this),
     // and VARLEN (base + i_row).
+    // The block-skip rebase assumes physical slot index == logical position; a
+    // ring scrambles that, so a ring layer iterates from block 0 and relies on
+    // the analytic per-slot mask. (Non-ring: unchanged.)
     uint swa_first_block = 0u;
-    if (p.swa_window != 0u) {
+    if (p.swa_window != 0u && p.ring_depth == 0u) {
         const uint qpos = p_KV - p_nq + i_row;
         if (qpos + 1u > p.swa_window) {
             swa_first_block = (qpos + 1u - p.swa_window) / Bc;
@@ -503,10 +520,20 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
                 // Sliding-window attention: mask keys outside [qpos-window+1,
                 // qpos]. qpos from the per-sequence kv_len — see the
                 // swa_first_block comment above for why this form covers
-                // prefill / decode / batched decode / VARLEN alike.
+                // prefill / decode / batched decode / VARLEN alike. For a RING
+                // layer the key's LOGICAL position is recovered from its
+                // physical slot (`kv_base + c`): the present window [lo, kv_len)
+                // maps bijectively onto the physical slots, slot s holding the
+                // logical position ≡ s (mod depth). This one test then enforces
+                // both causal (kpos > qpos) and window (qpos - kpos >= window).
                 if (p.swa_window != 0u) {
                     const uint qpos = p_KV - p_nq + i_row;
-                    const uint kpos = kv_base + c;
+                    uint kpos = kv_base + c;
+                    if (p.ring_depth != 0u) {
+                        const uint D  = p.ring_depth;
+                        const uint lo = (p_KV > D) ? (p_KV - D) : 0u;
+                        kpos = lo + ((kpos + D - (lo % D)) % D);
+                    }
                     if (kpos > qpos || qpos - kpos >= p.swa_window) { s = -1.0e30f; }
                 }
             } else {

@@ -146,6 +146,13 @@ pub struct FlashAttnParams {
     /// decode (split-K), and batched decode uniformly. Gemma4's sliding
     /// layers set this.
     pub swa_window: u32,
+    /// Ring-buffer depth (tokens) of the K/V slab for a sliding-window layer,
+    /// or `0` for a normal full-context slab. When `> 0` the slab wraps
+    /// (logical position `p` at physical slot `p % ring_depth`): the kernel
+    /// iterates `min(kv_len, ring_depth)` physical slots and recovers each
+    /// slot's logical position for the causal + window mask. Pair with
+    /// `swa_window > 0` and a full-slab (depth-`ring_depth`) K/V view.
+    pub ring_depth: u32,
 }
 
 /// Whether the scalar flash-attn kernel has a compiled variant that can read
@@ -386,11 +393,19 @@ pub fn record(
     let cm1_head_ok =
         params.head_dim_k <= CM1_MAX_HEAD_DIM && params.head_dim_v <= CM1_MAX_HEAD_DIM;
 
+    // Ring (SWA window-capped) layers always take the scalar path: the ring
+    // bounds the per-query walk to ≤ ring_depth keys (so it's watchdog-safe at
+    // any context, removing cm1's reason to exist here), and the scalar kernel
+    // is the one taught the physical-slot → logical-position ring mask. A ring
+    // layer also passes `mask = None`, which would otherwise fall into the
+    // maskless (bidirectional) cm1 vision path below — wrong for causal SWA.
+    // (cm1 ring read is a perf follow-up.)
     if ctx.device.coop_matrix
         && k.dtype == GgmlType::F16
         && v.dtype == GgmlType::F16
         && !*crate::runtime_flags::FA_CM_DISABLED
         && cm1_head_ok
+        && params.ring_depth == 0
         && let Some(m) = mask
     {
         return record_cm1(ctx, q, k, v, Some(m), out, params, kv_actual);
@@ -406,6 +421,7 @@ pub fn record(
         && mask.is_none()
         && q.dims[1] > 1
         && cm1_head_ok
+        && params.ring_depth == 0
     {
         return record_cm1(ctx, q, k, v, None, out, params, kv_actual);
     }
@@ -520,7 +536,7 @@ pub fn record(
     put_f(&mut push, &mut w, 0.0); // max_bias
     put_f(&mut push, &mut w, 0.0); // logit_softcap
     put_u(&mut push, &mut w, prefix_len); // mask_kv_offset (was mask_n_head_log2)
-    put_f(&mut push, &mut w, 0.0); // m0 (ALiBi, unused)
+    put_u(&mut push, &mut w, params.ring_depth); // ring_depth (repurposed ALiBi m0 slot)
     put_u(&mut push, &mut w, params.swa_window); // swa_window (repurposed ALiBi m1 slot)
     put_u(&mut push, &mut w, params.gqa_ratio);
     put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
@@ -1340,7 +1356,7 @@ fn record_cm1(
     put_f(&mut push, &mut w, 0.0);
     put_f(&mut push, &mut w, 0.0);
     put_u(&mut push, &mut w, prefix_len); // mask_kv_offset: cols < this are visible prefix
-    put_f(&mut push, &mut w, 0.0); // m0 (ALiBi, unused)
+    put_u(&mut push, &mut w, params.ring_depth); // ring_depth (repurposed ALiBi m0 slot)
     put_u(&mut push, &mut w, params.swa_window); // swa_window (repurposed ALiBi m1 slot)
     put_u(&mut push, &mut w, params.gqa_ratio);
     put_u(&mut push, &mut w, blocks_per_split); // split_kv (blocks per split)
