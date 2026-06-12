@@ -730,12 +730,12 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     // keeps the lane size (`n+1` checkpoints) and the verify width consistent even
     // if a user passes `--spec-draft-n-max > 8`.
     let spec_n_max = if cfg.spec_draft_n_max > 0 && model.supports_mtp_spec() {
-        if model.supports_unified() {
+        if model.supports_unified_verify() {
             cfg.spec_draft_n_max.min(8)
         } else {
             tracing::warn!(
-                "speculative decode requested but this model has no unified/batched serve path \
-                 (concurrent demotion would fail); serving without spec"
+                "speculative decode requested but this model has no unified spec-verify serve \
+                 path (only qwen35moe's in-GGUF MTP is wired); serving without spec"
             );
             0
         }
