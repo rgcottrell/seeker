@@ -802,29 +802,40 @@ impl Model for Gemma4Model {
         }
         ctx.scratch_restore(layer_checkpoint);
 
-        // Gather each sequence's LAST-token column (flat index q_start+L-1) into a
-        // packed [hidden, B] tensor, then norm + lm_head + softcap only on those B
-        // columns (avoids an N_total-wide lm_head). Column s = seq s's next-token
-        // logits (valid iff s just finished prefill / is decoding).
-        let last_hidden = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
-        record_global_barrier(ctx.device, ctx.cmd);
-        unsafe {
-            use ash::vk;
-            for s in 0..b {
-                let src_col = q_starts[s] + seq_lens[s] as u64 - 1;
-                let copy = vk::BufferCopy::default()
-                    .src_offset(residual.byte_offset + src_col * hidden * elem)
-                    .dst_offset(last_hidden.byte_offset + s as u64 * hidden * elem)
-                    .size(hidden * elem);
-                ctx.device.device.cmd_copy_buffer(
-                    ctx.cmd,
-                    residual.buffer,
-                    last_hidden.buffer,
-                    std::slice::from_ref(&copy),
-                );
+        // Reduce to each sequence's LAST-token column, then norm + lm_head +
+        // softcap only on those B columns (avoids an N_total-wide lm_head).
+        // Column s = seq s's next-token logits (valid iff s just finished prefill
+        // / is decoding). Fast path: a PURE-DECODE step (every L_s == 1, so
+        // N_total == B) already has `residual` as exactly the B last-token
+        // columns in slot order — skip the gather copy + its two global barriers
+        // (identity reshuffle, but ~8% of a B=1 decode step here). Only a step
+        // that carries a prefill chunk (some L_s > 1) needs to pluck the last
+        // column of each chunk.
+        let all_decode = seq_lens.iter().all(|&l| l == 1);
+        let last_hidden = if all_decode {
+            residual
+        } else {
+            let lh = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
+            record_global_barrier(ctx.device, ctx.cmd);
+            unsafe {
+                use ash::vk;
+                for s in 0..b {
+                    let src_col = q_starts[s] + seq_lens[s] as u64 - 1;
+                    let copy = vk::BufferCopy::default()
+                        .src_offset(residual.byte_offset + src_col * hidden * elem)
+                        .dst_offset(lh.byte_offset + s as u64 * hidden * elem)
+                        .size(hidden * elem);
+                    ctx.device.device.cmd_copy_buffer(
+                        ctx.cmd,
+                        residual.buffer,
+                        lh.buffer,
+                        std::slice::from_ref(&copy),
+                    );
+                }
             }
-        }
-        record_global_barrier(ctx.device, ctx.cmd);
+            record_global_barrier(ctx.device, ctx.cmd);
+            lh
+        };
 
         let final_norm = ctx.alloc_tensor([hidden, b as u64, 1, 1], GgmlType::F32)?;
         rms_norm::record(
