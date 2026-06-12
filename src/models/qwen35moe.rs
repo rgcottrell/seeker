@@ -618,6 +618,10 @@ impl Model for Qwen35MoeModel {
         true
     }
 
+    fn supports_unified_verify(&self) -> bool {
+        true
+    }
+
     fn supports_batch_decode(&self) -> bool {
         true
     }

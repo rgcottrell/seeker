@@ -245,6 +245,16 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Whether [`Self::record_forward_unified_verify`] is implemented — the
+    /// batched spec-verify forward the serve speculative path needs. Gating serve
+    /// spec on THIS (not just `supports_unified`) keeps a model that has unified
+    /// decode but no verify (e.g. gemma4, or a draft-equipped llama) out of the
+    /// spec path, which would otherwise hit the unimplemented verify. Default
+    /// `false`; qwen35moe (in-GGUF MTP) overrides to `true`.
+    fn supports_unified_verify(&self) -> bool {
+        false
+    }
+
     /// Whether [`Self::record_forward_batch`] is implemented. Keep this in sync
     /// with the `record_forward_batch` impl: when `false`, the server clamps
     /// `--parallel` to 1 and decodes through the single-sequence path
