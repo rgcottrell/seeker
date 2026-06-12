@@ -669,6 +669,7 @@ pub fn record(
                 ne3,
                 k_num,
                 dyn_range,
+                /*varlen=*/ false,
             )?;
             return Ok(());
         }
@@ -743,6 +744,7 @@ pub fn record(
             ne3,
             k_num,
             dyn_range,
+            /*varlen=*/ false,
         )?;
     }
     Ok(())
@@ -841,14 +843,24 @@ pub fn record_batched(
     // split, identical to the pre-split single pass.
     let ne2 = q.dims[2] as u32; // n_head
     let ne3 = b;
-    // Grid x-dim = query rows. Decode: 1 row/seq, split KV via the heuristic.
-    // Varlen: max_rows rows/seq (the L_s rows already fill the grid → no split).
+    // Grid x-dim = query rows; grid.y packs (head, split); k_num splits each
+    // (row, head)'s KV walk when the base grid under-fills the GPU. `base_wgs`
+    // is the no-split workgroup count: rows × heads × seqs. Decode (n=1 row/seq)
+    // → base_wgs = heads × seqs, small → split. Varlen with a prefill chunk →
+    // base_wgs = max_rows × heads × seqs, already full → k_num=1. So a
+    // decode-DOMINATED varlen step (few rows) splits its KV for occupancy — the
+    // same win the batched-decode path gets — while a prefill-heavy step doesn't
+    // (the rows already saturate). The combine writes flat token-major for varlen
+    // (skipping rows past each seq's n_query). When k_num==1, `pick_k_num`
+    // returns blocks_per_split == ceil(max_kv/Bc) — the whole range, one split.
     // NOTE: ring layers cap the walk to `min(kv_len, ring_depth)` in-shader, so
     // sizing split-K from `max_kv` over-splits at long context (empty tail
     // splits → ~0 in the combine) — correct but wasteful. Right-sizing is a
     // deferred follow-up (a first cut broke greedy parity).
     let (n, k_num, blocks_per_split) = if varlen {
-        (max_rows, 1u32, max_kv.div_ceil(FA_BC).max(1))
+        let base_wgs = max_rows * ne2 * ne3;
+        let (k, bps) = pick_k_num_clamped(ctx.device.shader_core_count, base_wgs, max_kv);
+        (max_rows, k, bps)
     } else {
         let base_wgs = ne2 * ne3; // one wg per (head, seq)
         let (k, bps) = pick_k_num_clamped(ctx.device.shader_core_count, base_wgs, max_kv);
@@ -1022,6 +1034,7 @@ pub fn record_batched(
             ne3,
             k_num,
             dyn_range,
+            varlen,
         )?;
     }
     Ok(())
@@ -1113,6 +1126,10 @@ fn record_split_k_combine(
     // `write_field_ctx`); batched decode passes its per-forward dyn_range whose
     // entry 0 carries the same k_num.
     dyn_range: crate::inference::buffer::BufferRange,
+    // When `true`, the reduce writes flat token-major (q_start + row) and skips
+    // rows past each sequence's `n_query` — matching the VARLEN single-pass FA
+    // output. `false` → the legacy `[HSV, n_head, ne1, B]` layout.
+    varlen: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut push = [0u8; FA_SPLIT_K_PUSH_BYTES as usize];
     let mut w = 0usize;
@@ -1131,7 +1148,7 @@ fn record_split_k_combine(
         name: "flash_attn_split_k_reduce_f32".to_string(),
         binding_indices: vec![0, 1, 2, 3],
         push_size: FA_SPLIT_K_PUSH_BYTES,
-        spec_constants: vec![32], // BLOCK_SIZE
+        spec_constants: vec![32, varlen as u32], // BLOCK_SIZE, VARLEN
         // The reduce kernel is one 32-wide wave (bare WaveActiveMax/Sum,
         // no shared memory) — pin wave32 so workgroup == subgroup.
         required_subgroup_size: Some(32),
@@ -1469,6 +1486,7 @@ fn record_cm1(
         ne3,
         k_num,
         dyn_range,
+        /*varlen=*/ false,
     )?;
     Ok(())
 }

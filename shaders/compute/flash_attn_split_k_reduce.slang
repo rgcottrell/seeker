@@ -10,6 +10,14 @@
 #include "types.slang"
 
 [SpecializationConstant] const uint BLOCK_SIZE = 32;
+// When 1, the merged output is written FLAT token-major to match the
+// VARLEN single-pass FA write: sequence i3 contributes data_dyn[i3].n_query
+// rows packed at data_dyn[i3].q_start (so row `n` of seq i3 → flat token
+// `q_start + n`). Rows `n >= n_query` are not this sequence's (the main
+// kernel skipped them, leaving garbage partials) — skip them so we neither
+// read garbage nor write past / into another sequence's columns. When 0,
+// the legacy [HSV, n_head, ne1, B] layout is written (n = row within seq i3).
+[SpecializationConstant] const uint VARLEN = 0;
 
 // The FA kernels run their online softmax in the log2 domain (Q pre-scaled
 // by log2(e)), so the per-split (L, M) partials are log2-domain values and
@@ -45,6 +53,15 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     const uint tid = gl_LocalInvocationID.x;
     const uint i2  = gl_WorkGroupID.z % p.ne2;
     const uint i3  = gl_WorkGroupID.z / p.ne2;
+
+    // VARLEN: row `n` belongs to sequence i3 only if n < its n_query; the flat
+    // output column is q_start + n. (Uniform across the wave, so the early-out
+    // doesn't break the WaveActive reductions below.)
+    uint q_start = 0u;
+    if (VARLEN != 0u) {
+        if (n >= data_dyn[i3].n_query) { return; }
+        q_start = data_dyn[i3].q_start;
+    }
 
     const uint D     = p.D;
     // k_num varies per decode token — read from DecodeDyn rather than push.
@@ -103,7 +120,13 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
 
         // seeker layout: [HSV, n_head, L] (matches flash_attn.slang's single-
         // pass write), so the wo matmul reads attn_out directly. (llama.cpp's
-        // original wrote [HSV, L, n_head] here.)
-        data_d[i3 * p.ne2 * p.ne1 * D + n * p.ne2 * D + i2 * D + d] = O;
+        // original wrote [HSV, L, n_head] here.) VARLEN writes flat token-major
+        // at (q_start + n) — matching the VARLEN single-pass FA write — so the
+        // unified forward's wo matmul reads the N_total-packed attn_out directly.
+        if (VARLEN != 0u) {
+            data_d[(q_start + n) * p.ne2 * D + i2 * D + d] = O;
+        } else {
+            data_d[i3 * p.ne2 * p.ne1 * D + n * p.ne2 * D + i2 * D + d] = O;
+        }
     }
 }
