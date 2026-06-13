@@ -1801,7 +1801,7 @@ impl ChatSession {
             n_vocab,
             &eog_ids,
             &cfg,
-            |full, n_prompt| engine.forward_diffusion(model, full, n_prompt),
+            |full, n_prompt, sc| engine.forward_diffusion(model, full, n_prompt, sc),
             |block| {
                 for &tok in block {
                     if let Ok(Some(piece)) = stream.step(tok) {

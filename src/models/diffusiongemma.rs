@@ -45,7 +45,7 @@ use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
 
 use super::gemma4::{coerce_f32, coerce_u32, read_bool_array, read_scalar_f32, read_u32_array};
-use super::{CacheDims, DiffusionScInput, Model, ModelError};
+use super::{CacheDims, Model, ModelError};
 
 const ARCH: &str = "diffusion-gemma";
 
@@ -287,9 +287,9 @@ impl Model for DiffusiongemmaModel {
         ctx: &mut DispatchContext,
         tokens: &[u32],
         n_prompt: u32,
-        sc: Option<DiffusionScInput>,
+        sc_prev_argmax: Option<&[u32]>,
     ) -> Result<TensorView, Box<dyn Error>> {
-        self.forward_unified(ctx, tokens, n_prompt, sc)
+        self.forward_unified(ctx, tokens, n_prompt, sc_prev_argmax)
     }
 }
 
@@ -390,7 +390,7 @@ impl DiffusiongemmaModel {
         ctx: &mut DispatchContext,
         tokens: &[u32],
         n_prompt: u32,
-        sc: Option<DiffusionScInput>,
+        sc_prev_argmax: Option<&[u32]>,
     ) -> Result<TensorView, Box<dyn Error>> {
         let p = &self.params;
         let n = tokens.len() as u32;
@@ -423,7 +423,7 @@ impl DiffusiongemmaModel {
         let residual = ctx.alloc_tensor([hidden, nu, 1, 1], GgmlType::F32)?;
         elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, n, residual)?;
         elementwise::record_scale(ctx, residual, residual, p.embd_scale, 0.0)?;
-        self.canvas_embed(ctx, residual, big_p, canvas, sc)?;
+        self.canvas_embed(ctx, residual, big_p, canvas, sc_prev_argmax)?;
 
         let layer_cp = ctx.scratch_checkpoint();
         for (il, block) in self.weights.blocks.iter().enumerate() {
@@ -477,14 +477,14 @@ impl DiffusiongemmaModel {
         residual: TensorView,
         big_p: u32,
         canvas: u32,
-        sc: Option<DiffusionScInput>,
+        sc_prev_argmax: Option<&[u32]>,
     ) -> Result<(), Box<dyn Error>> {
         let hidden = self.params.n_embd as u64;
         let canvas_view = col_slice(residual, big_p as u64, canvas as u64);
-        // Self-conditioning (phase 3) adds its correction into `canvas_view`
-        // before the norm; without it the canvas is just rms_norm_noscale.
-        if let Some(sc) = sc {
-            self.self_condition(ctx, canvas_view, canvas, sc)?;
+        // Self-conditioning adds its correction into `canvas_view` before the
+        // norm; without it the canvas is just rms_norm_noscale.
+        if let Some(prev) = sc_prev_argmax {
+            self.self_condition(ctx, canvas_view, canvas, prev)?;
         }
         // rms_norm(noscale) into a temp, then copy back into the canvas columns.
         let normed = ctx.alloc_tensor([hidden, canvas as u64, 1, 1], GgmlType::F32)?;
@@ -758,29 +758,65 @@ impl DiffusiongemmaModel {
         Ok(())
     }
 
-    /// Self-conditioning correction added into the canvas columns before the
-    /// canvas norm. **Not yet implemented** — the denoiser runs with `sc_use = 0`
-    /// (the driver always passes `sc = None`), which is exact for step 0 (the
-    /// clean Gate-A logit-parity check) and an approximation for later steps.
-    ///
-    /// The faithful subgraph (llama.cpp `dg_canvas_embed`) is:
-    /// `probs = softmax(prev_logits·temp_inv)` over vocab; `soft = sc_embT·probs
-    /// · √n_embd` (where `sc_embT` is the transposed/dequantized token embedding,
-    /// `[n_vocab, n_embd]` F16); then the gated MLP `sc_down(gelu(sc_gate·n) ·
-    /// (sc_up·n))` with `n = rms_norm_noscale(soft)`, gated by `sc_use`, added to
-    /// the canvas. The `self_cond_*` weights are already loaded
-    /// ([`DiffusionScWeights`]) and the [`DiffusionScInput`] hook is plumbed
-    /// through [`Model::record_forward_diffusion`]; what remains is building
-    /// `sc_embT` (host/GPU dequant + transpose to F16) and a softmax-over-vocab
-    /// op — neither exists in seeker yet. Tracked as a follow-up.
+    /// Self-conditioning: add the gated-MLP correction of the previous step's
+    /// prediction into the canvas columns, before the canvas norm. Mirrors
+    /// llama.cpp's `dg_canvas_embed` SC subgraph, with the soft-embedding
+    /// `softmax(prev_logits·temp_inv) · tok_embd` approximated by the **hard**
+    /// embedding of `prev_argmax` (the SC softmax is extremely peaked under the
+    /// temperature schedule, so the argmax token carries ~all the mass):
+    ///   `soft = tok_embd[prev_argmax] · √n_embd`
+    ///   `n    = rms_norm(soft, sc_pre_norm)`
+    ///   `canvas += sc_down( gelu(sc_gate·n) · (sc_up·n) )`
     fn self_condition(
         &self,
-        _ctx: &mut DispatchContext,
-        _canvas: TensorView,
-        _canvas_len: u32,
-        _sc: DiffusionScInput,
+        ctx: &mut DispatchContext,
+        canvas: TensorView,
+        canvas_len: u32,
+        prev_argmax: &[u32],
     ) -> Result<(), Box<dyn Error>> {
-        Err("diffusion self-conditioning not yet implemented (denoiser runs sc_use=0)".into())
+        let sc = self
+            .weights
+            .sc
+            .as_ref()
+            .ok_or("self-conditioning requested but self_cond_* weights are absent")?;
+        let p = &self.params;
+        let hidden = p.n_embd as u64;
+        let n_ff = p.n_ff as u64;
+        let c = canvas_len as u64;
+        let eps = p.rms_eps;
+        if prev_argmax.len() != canvas_len as usize {
+            return Err(format!(
+                "self-conditioning: prev_argmax len {} != canvas {canvas_len}",
+                prev_argmax.len()
+            )
+            .into());
+        }
+
+        // soft = √n_embd · tok_embd[prev_argmax]  (hard-argmax soft-embedding)
+        let idx = ctx.alloc_scratch(c * 4)?;
+        write_u32(ctx, idx, prev_argmax)?;
+        let soft = ctx.alloc_tensor([hidden, c, 1, 1], GgmlType::F32)?;
+        elementwise::record_get_rows(ctx, self.weights.token_embd, idx, canvas_len, soft)?;
+        elementwise::record_scale(ctx, soft, soft, p.embd_scale, 0.0)?;
+
+        // n = rms_norm(soft, sc_pre_norm); gated MLP sc_down(gelu(sc_gate·n)·(sc_up·n))
+        let normed = ctx.alloc_tensor([hidden, c, 1, 1], GgmlType::F32)?;
+        rms_norm::record(ctx, soft, sc.pre_norm, normed, eps)?;
+        let g = ctx.alloc_tensor([n_ff, c, 1, 1], GgmlType::F32)?;
+        matmul::record_nofence(ctx, sc.gate, normed, g)?;
+        let up = ctx.alloc_tensor([n_ff, c, 1, 1], GgmlType::F32)?;
+        matmul::record_nofence(ctx, sc.up, normed, up)?;
+        record_compute_barriers(ctx.device, ctx.cmd, &[g.range(), up.range()]);
+        let g_gelu = ctx.alloc_tensor([n_ff, c, 1, 1], GgmlType::F32)?;
+        elementwise::record_gelu(ctx, g, g_gelu)?;
+        let h = ctx.alloc_tensor([n_ff, c, 1, 1], GgmlType::F32)?;
+        elementwise::record_mul(ctx, g_gelu, up, h)?;
+        let sc_sig = ctx.alloc_tensor([hidden, c, 1, 1], GgmlType::F32)?;
+        matmul::record(ctx, sc.down, h, sc_sig)?;
+
+        // canvas += sc_sig (use_sc = 1; step 0 passes None so this never runs there)
+        elementwise::record_add(ctx, canvas, sc_sig, canvas)?;
+        Ok(())
     }
 }
 

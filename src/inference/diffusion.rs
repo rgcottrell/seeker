@@ -149,7 +149,7 @@ fn denoise_block<F>(
     forward: &mut F,
 ) -> Result<Vec<u32>, Box<dyn Error>>
 where
-    F: FnMut(&[u32], u32) -> Result<Vec<f32>, Box<dyn Error>>,
+    F: FnMut(&[u32], u32, Option<&[u32]>) -> Result<Vec<f32>, Box<dyn Error>>,
 {
     let big_p = prompt_ext.len();
     let c = canvas_len;
@@ -159,6 +159,9 @@ where
     let mut canvas: Vec<u32> = (0..c).map(|_| rng.gen_range(0..vocab_u)).collect();
     let mut argmax_canvas = vec![0u32; c];
     let mut prev_argmax = vec![u32::MAX; c];
+    // Self-conditioning feed: the previous step's argmax canvas (`None` on the
+    // first step of the block, which gates SC off — exact there).
+    let mut sc_prev: Option<Vec<u32>> = None;
     let mut held = 0u32;
     let mut full: Vec<u32> = Vec::with_capacity(big_p + c);
 
@@ -170,7 +173,7 @@ where
         let t = cfg.t_min + (cfg.t_max - cfg.t_min) * (cur_step as f32 / s as f32);
         let temp_inv = 1.0 / t;
 
-        let logits = forward(&full, big_p as u32)?;
+        let logits = forward(&full, big_p as u32, sc_prev.as_deref())?;
         if logits.len() != c * n_vocab {
             return Err(format!(
                 "diffusion forward returned {} logits, expected {}",
@@ -228,6 +231,8 @@ where
             break;
         }
         prev_argmax.copy_from_slice(&argmax_canvas);
+        // Feed this step's prediction to the next step's self-conditioning.
+        sc_prev = Some(argmax_canvas.clone());
     }
 
     Ok(argmax_canvas)
@@ -247,7 +252,7 @@ pub fn generate<F>(
     mut on_block: impl FnMut(&[u32]),
 ) -> Result<Vec<u32>, Box<dyn Error>>
 where
-    F: FnMut(&[u32], u32) -> Result<Vec<f32>, Box<dyn Error>>,
+    F: FnMut(&[u32], u32, Option<&[u32]>) -> Result<Vec<f32>, Box<dyn Error>>,
 {
     let mut rng = StdRng::seed_from_u64(cfg.seed);
     let mut prompt_ext = prompt.to_vec();
@@ -321,7 +326,10 @@ mod tests {
             ..Default::default()
         };
         // Logits: position p gets argmax token (p<2 ? p+1 : 9).
-        let forward = |full: &[u32], n_prompt: u32| -> Result<Vec<f32>, Box<dyn Error>> {
+        let forward = |full: &[u32],
+                       n_prompt: u32,
+                       _sc: Option<&[u32]>|
+         -> Result<Vec<f32>, Box<dyn Error>> {
             let c = full.len() - n_prompt as usize;
             let mut logits = vec![0f32; c * n_vocab];
             for pos in 0..c {

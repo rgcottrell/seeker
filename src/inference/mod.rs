@@ -2451,16 +2451,19 @@ impl Engine {
     /// **canvas** logits `[vocab, C]` as a flat `Vec<f32>` (column-major:
     /// column `j` = canvas position `j`, `vocab` contiguous). Drives the
     /// non-autoregressive denoiser in [`diffusion`]. No KV cache: the whole
-    /// sequence is re-forwarded each step. Self-conditioning is wired later.
+    /// sequence is re-forwarded each step. `sc_prev_argmax` is the
+    /// self-conditioning feed (the previous step's argmax canvas, or `None` on
+    /// the first step).
     pub fn forward_diffusion(
         &mut self,
         model: &dyn crate::models::Model,
         tokens: &[u32],
         n_prompt: u32,
+        sc_prev_argmax: Option<&[u32]>,
     ) -> Result<Vec<f32>, Box<dyn Error>> {
         let weights = model.weights();
         let mut outs = self.run_spec_record(weights, |ctx| {
-            let logits = model.record_forward_diffusion(ctx, tokens, n_prompt, None)?;
+            let logits = model.record_forward_diffusion(ctx, tokens, n_prompt, sc_prev_argmax)?;
             Ok(vec![logits.range()])
         })?;
         Ok(outs.pop().expect("one diffusion readback range"))

@@ -442,29 +442,23 @@ pub trait Model: Send + Sync {
     /// canvas); `n_prompt` = `P`, so the canvas is the trailing
     /// `tokens.len() − n_prompt` tokens. Returns the **canvas** logits
     /// `[vocab, C]` (column `j` = canvas position `j`, after the final-logit
-    /// softcap). `sc` carries the optional self-conditioning feed (the previous
-    /// step's canvas logits + gate/temperature); `None` ⇒ zero self-conditioning
-    /// (exact for step 0). Default: unsupported.
+    /// softcap).
+    ///
+    /// `sc_prev_argmax` is the **self-conditioning** feed: `Some(tokens)` (one
+    /// per canvas position — the previous denoising step's argmax prediction)
+    /// turns the SC subgraph on; `None` (the first step) leaves it off, which is
+    /// exact there. The soft-embedding is approximated by the hard embedding of
+    /// these tokens (the SC softmax is extremely peaked under the temperature
+    /// schedule). Default: unsupported.
     fn record_forward_diffusion(
         &self,
         _ctx: &mut DispatchContext,
         _tokens: &[u32],
         _n_prompt: u32,
-        _sc: Option<DiffusionScInput>,
+        _sc_prev_argmax: Option<&[u32]>,
     ) -> Result<TensorView, Box<dyn Error>> {
         Err("model does not support diffusion generation".into())
     }
-}
-
-/// Self-conditioning feed for [`Model::record_forward_diffusion`]: the previous
-/// denoising step's canvas logits (`[vocab, C]`, F32, GPU-resident) plus the
-/// runtime gate and temperature. `use_sc` is `0.0` on the first step (gates the
-/// SC subgraph off) and `1.0` afterward; `temp_inv` is `1 / t_prev`.
-#[derive(Clone, Copy)]
-pub struct DiffusionScInput {
-    pub prev_logits: TensorView,
-    pub use_sc: f32,
-    pub temp_inv: f32,
 }
 
 /// Output of [`Model::record_forward_full`]: logits (last-position or all
