@@ -25,6 +25,14 @@
 //! use `rope_freqs`), sandwich norms, ×√n_embd embeddings, final-logit softcap.
 //! The FFN is the Gemma-4 **dual** block: a dense shared MLP **plus** a
 //! 128-expert MoE (the "A4B"), combined and post-normed (see [`Self::ffn_moe`]).
+//!
+//! **Status / not-yet-done:** the denoiser runs with self-conditioning OFF
+//! (`sc_use = 0`) — exact for step-0 logit parity (the Gate-A check) but
+//! quality-affecting for later steps; see [`Self::self_condition`]. The forward
+//! also takes the simple UNIFIED path (re-forwards `[prompt|canvas]` each step)
+//! and reads the `[vocab, C]` canvas logits back to the host for the per-position
+//! reduction — the prompt-KV cache, a GPU reduce, and device-resident
+//! self-conditioning are perf follow-ups.
 
 use std::error::Error;
 
@@ -714,7 +722,20 @@ impl DiffusiongemmaModel {
     }
 
     /// Self-conditioning correction added into the canvas columns before the
-    /// canvas norm (phase 3). Stub for phase 2 (no SC).
+    /// canvas norm. **Not yet implemented** — the denoiser runs with `sc_use = 0`
+    /// (the driver always passes `sc = None`), which is exact for step 0 (the
+    /// clean Gate-A logit-parity check) and an approximation for later steps.
+    ///
+    /// The faithful subgraph (llama.cpp `dg_canvas_embed`) is:
+    /// `probs = softmax(prev_logits·temp_inv)` over vocab; `soft = sc_embT·probs
+    /// · √n_embd` (where `sc_embT` is the transposed/dequantized token embedding,
+    /// `[n_vocab, n_embd]` F16); then the gated MLP `sc_down(gelu(sc_gate·n) ·
+    /// (sc_up·n))` with `n = rms_norm_noscale(soft)`, gated by `sc_use`, added to
+    /// the canvas. The `self_cond_*` weights are already loaded
+    /// ([`DiffusionScWeights`]) and the [`DiffusionScInput`] hook is plumbed
+    /// through [`Model::record_forward_diffusion`]; what remains is building
+    /// `sc_embT` (host/GPU dequant + transpose to F16) and a softmax-over-vocab
+    /// op — neither exists in seeker yet. Tracked as a follow-up.
     fn self_condition(
         &self,
         _ctx: &mut DispatchContext,
@@ -722,7 +743,7 @@ impl DiffusiongemmaModel {
         _canvas_len: u32,
         _sc: DiffusionScInput,
     ) -> Result<(), Box<dyn Error>> {
-        Err("diffusion self-conditioning not yet implemented".into())
+        Err("diffusion self-conditioning not yet implemented (denoiser runs sc_use=0)".into())
     }
 }
 
