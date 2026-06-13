@@ -225,20 +225,17 @@ impl Model for DiffusiongemmaModel {
 
     fn scratch_bytes_estimate(
         &self,
-        n_ubatch: u32,
+        _n_ubatch: u32,
         max_seq_len: u32,
         _k_dtype: GgmlType,
         _v_dtype: GgmlType,
         _max_batch: u32,
     ) -> u64 {
         let p = &self.params;
-        // The UNIFIED forward processes the whole [prompt|canvas] in one pass;
-        // size for the largest such N this engine is configured to allow.
-        let l = if n_ubatch == 0 {
-            max_seq_len.max(1)
-        } else {
-            n_ubatch
-        } as u64;
+        // The UNIFIED forward processes the whole [prompt|canvas] in ONE pass
+        // (a bidirectional forward can't be ubatch-chunked), so size for the
+        // full context `N = max_seq_len`, not n_ubatch.
+        let l = max_seq_len.max(1) as u64;
         let n_embd = p.n_embd as u64;
         let n_ff = p.n_ff as u64;
         let vocab = p.n_vocab as u64;

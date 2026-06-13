@@ -13,6 +13,7 @@ pub mod context;
 pub mod decode_dyn;
 pub mod descriptor;
 pub mod device;
+pub mod diffusion;
 pub mod embed;
 pub mod kv_cache;
 pub mod memory;
@@ -2415,6 +2416,26 @@ impl Engine {
         let logits = outs[0].clone();
         let residual = outs[1].clone();
         Ok((logits, residual))
+    }
+
+    /// One bidirectional diffusion forward over `[prompt | canvas]`
+    /// (`tokens` = the full `P + C` sequence, `n_prompt = P`). Reads back the
+    /// **canvas** logits `[vocab, C]` as a flat `Vec<f32>` (column-major:
+    /// column `j` = canvas position `j`, `vocab` contiguous). Drives the
+    /// non-autoregressive denoiser in [`diffusion`]. No KV cache: the whole
+    /// sequence is re-forwarded each step. Self-conditioning is wired later.
+    pub fn forward_diffusion(
+        &mut self,
+        model: &dyn crate::models::Model,
+        tokens: &[u32],
+        n_prompt: u32,
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
+        let weights = model.weights();
+        let mut outs = self.run_spec_record(weights, |ctx| {
+            let logits = model.record_forward_diffusion(ctx, tokens, n_prompt, None)?;
+            Ok(vec![logits.range()])
+        })?;
+        Ok(outs.pop().expect("one diffusion readback range"))
     }
 
     /// Batched embedding prefill: process all texts packed in `tokens`
