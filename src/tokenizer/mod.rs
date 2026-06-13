@@ -50,6 +50,7 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
 
     let bos_id = read_optional_u32(gguf, "tokenizer.ggml.bos_token_id");
     let eos_id = read_optional_u32(gguf, "tokenizer.ggml.eos_token_id");
+    let mask_id = read_optional_u32(gguf, "tokenizer.ggml.mask_token_id");
     let eot_id = read_optional_u32(gguf, "tokenizer.ggml.eot_token_id");
     let eom_id = read_optional_u32(gguf, "tokenizer.ggml.eom_token_id");
     let unk_id = read_optional_u32(gguf, "tokenizer.ggml.unknown_token_id");
@@ -88,6 +89,7 @@ pub fn build_tokenizer(gguf: &GgufFile) -> Result<TokenizerBundle, TokenizerErro
         model_kind,
         bos_id,
         eos_id,
+        mask_id,
         add_bos_default,
         add_eos_default,
         chat_template,

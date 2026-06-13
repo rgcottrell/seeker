@@ -11,6 +11,7 @@ use crate::inference::kv_cache::KvCache;
 use crate::inference::weights::{TensorView, WeightsHandle};
 use crate::tokenizer::TokenizerBundle;
 
+pub mod diffusiongemma;
 pub mod gemma4;
 pub mod gemma4_assistant;
 pub mod llama;
@@ -424,6 +425,46 @@ pub trait Model: Send + Sync {
     ) -> Result<MtpDraftOut, Box<dyn Error>> {
         Err("model does not support record_mtp_draft (MTP spec decode)".into())
     }
+
+    // ─── Diffusion (non-autoregressive) hooks (optional; default unsupported) ───
+
+    /// Canvas (block) length for **diffusion** models — `Some` only for
+    /// non-autoregressive text-diffusion models (diffusion-gemma). Callers use
+    /// this to detect a diffusion model and route generation through the
+    /// denoiser ([`crate::inference::diffusion`]) instead of the autoregressive
+    /// sample-one-token loop. Default `None` (autoregressive).
+    fn diffusion_canvas_length(&self) -> Option<u32> {
+        None
+    }
+
+    /// Record one bidirectional diffusion forward over `[prompt | canvas]` (the
+    /// UNIFIED phase). `tokens` is the full `P + C` sequence (prompt then
+    /// canvas); `n_prompt` = `P`, so the canvas is the trailing
+    /// `tokens.len() − n_prompt` tokens. Returns the **canvas** logits
+    /// `[vocab, C]` (column `j` = canvas position `j`, after the final-logit
+    /// softcap). `sc` carries the optional self-conditioning feed (the previous
+    /// step's canvas logits + gate/temperature); `None` ⇒ zero self-conditioning
+    /// (exact for step 0). Default: unsupported.
+    fn record_forward_diffusion(
+        &self,
+        _ctx: &mut DispatchContext,
+        _tokens: &[u32],
+        _n_prompt: u32,
+        _sc: Option<DiffusionScInput>,
+    ) -> Result<TensorView, Box<dyn Error>> {
+        Err("model does not support diffusion generation".into())
+    }
+}
+
+/// Self-conditioning feed for [`Model::record_forward_diffusion`]: the previous
+/// denoising step's canvas logits (`[vocab, C]`, F32, GPU-resident) plus the
+/// runtime gate and temperature. `use_sc` is `0.0` on the first step (gates the
+/// SC subgraph off) and `1.0` afterward; `temp_inv` is `1 / t_prev`.
+#[derive(Clone, Copy)]
+pub struct DiffusionScInput {
+    pub prev_logits: TensorView,
+    pub use_sc: f32,
+    pub temp_inv: f32,
 }
 
 /// Output of [`Model::record_forward_full`]: logits (last-position or all
@@ -498,6 +539,9 @@ pub fn open(
         .ok_or(ModelError::MissingMetadata("general.architecture"))?;
     match arch {
         "gemma4" => Ok(Box::new(gemma4::Gemma4Model::new(
+            gguf, weights, tokenizer,
+        )?)),
+        "diffusion-gemma" => Ok(Box::new(diffusiongemma::DiffusiongemmaModel::new(
             gguf, weights, tokenizer,
         )?)),
         "llama" => Ok(Box::new(llama::LlamaModel::new(gguf, weights, tokenizer)?)),

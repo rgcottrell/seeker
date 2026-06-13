@@ -524,6 +524,52 @@ pub fn record_moe_down_q8_0(
     )
 }
 
+/// Fold a per-expert scale (`ffn_down_exps.scale`, `[n_experts]` F32) into the
+/// routing weights in place: `weights[slot,token] *= scale[ids[slot,token]]`.
+/// DiffusionGemma applies a per-expert scale to each expert's down output;
+/// because the down step is linear and the routing-weight multiply is the next
+/// op, folding the scale into the (already top-k normalized) routing weights is
+/// mathematically identical and lets the fused `moe_down_*` kernel stay
+/// unchanged. Run after `record_topk_moe`, before the down step.
+///
+///   `ids` — `[n_experts, n_tokens]` u32 (topk output; slot k of token t at
+///           `t*n_experts + k`)
+///   `scale` — `[n_experts]` F32
+///   `weights` — `[n_expert_used, n_tokens]` F32, updated in place
+pub fn record_moe_expert_weight_scale(
+    ctx: &mut DispatchContext,
+    ids: BufferRange,
+    scale: TensorView,
+    weights: BufferRange,
+    n_expert_used: u32,
+    n_experts: u32,
+    n_tokens: u32,
+) -> Result<(), Box<dyn Error>> {
+    let total = n_expert_used * n_tokens;
+    let mut push = [0u8; 12];
+    push[0..4].copy_from_slice(&total.to_ne_bytes());
+    push[4..8].copy_from_slice(&n_expert_used.to_ne_bytes());
+    push[8..12].copy_from_slice(&n_experts.to_ne_bytes());
+
+    let key = PipelineKey::dense("moe_expert_weight_scale", 3, 12, Vec::new());
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::MOE_EXPERT_WEIGHT_SCALE_SPV.as_bytes(),
+    )?;
+    let workgroups = [total.div_ceil(256), 1, 1];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[ids, scale.range(), weights],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, weights);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
 fn record_moe_down_impl(
     ctx: &mut DispatchContext,

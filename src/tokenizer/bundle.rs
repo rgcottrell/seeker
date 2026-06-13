@@ -27,6 +27,9 @@ pub struct TokenizerBundle {
     pub model_kind: String,
     pub bos_id: Option<u32>,
     pub eos_id: Option<u32>,
+    /// `tokenizer.ggml.mask_token_id` — the diffusion mask token (e.g. `<mask>`
+    /// id 4 for diffusion-gemma). `None` for ordinary autoregressive models.
+    pub mask_id: Option<u32>,
     pub add_bos_default: bool,
     pub add_eos_default: bool,
     /// Raw `tokenizer.chat_template` from the GGUF (jinja2 source). `None`
