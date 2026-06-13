@@ -440,14 +440,12 @@ impl DiffusiongemmaModel {
             )?;
             self.ffn_moe(ctx, block, residual, il, n)?;
             // Region-aware per-layer scalar: prompt × enc, canvas × dec.
-            let enc = p.enc_out_scale[il];
-            let dec = p.out_scale[il];
             if big_p > 0 {
                 let prompt = col_slice(residual, 0, big_p as u64);
-                elementwise::record_scale(ctx, prompt, prompt, enc, 0.0)?;
+                elementwise::record_scale(ctx, prompt, prompt, p.enc_out_scale[il], 0.0)?;
             }
             let cv = col_slice(residual, big_p as u64, canvas as u64);
-            elementwise::record_scale(ctx, cv, cv, dec, 0.0)?;
+            elementwise::record_scale(ctx, cv, cv, p.out_scale[il], 0.0)?;
         }
         ctx.scratch_restore(layer_cp);
 
@@ -699,15 +697,54 @@ impl DiffusiongemmaModel {
         let ffn_h = ctx.alloc_tensor([ff_exp, n_used as u64, nu, 1], GgmlType::F32)?;
         elementwise::record_geglu_fused(ctx, gate_up, ffn_h)?;
         let routed = ctx.alloc_tensor([hidden, nu, 1, 1], GgmlType::F32)?;
-        moe::record_moe_down_q8_0(
-            ctx,
-            block.ffn_down_exps,
-            ffn_h,
-            ids,
-            weights_buf,
-            routed,
-            n_used,
-        )?;
+        // `ffn_down_exps` dtype is mixed per layer (Q8_0 / Q5_1 in the Q5_K_M
+        // checkpoint; Q5_K / Q6_K in others) — dispatch on the actual dtype.
+        match block.ffn_down_exps.dtype {
+            GgmlType::Q8_0 => moe::record_moe_down_q8_0(
+                ctx,
+                block.ffn_down_exps,
+                ffn_h,
+                ids,
+                weights_buf,
+                routed,
+                n_used,
+            )?,
+            GgmlType::Q5_1 => moe::record_moe_down_q5_1(
+                ctx,
+                block.ffn_down_exps,
+                ffn_h,
+                ids,
+                weights_buf,
+                routed,
+                n_used,
+            )?,
+            GgmlType::Q5_K => moe::record_moe_down_q5k(
+                ctx,
+                block.ffn_down_exps,
+                ffn_h,
+                ids,
+                weights_buf,
+                routed,
+                n_used,
+            )?,
+            GgmlType::Q6_K => moe::record_moe_down_q6k(
+                ctx,
+                block.ffn_down_exps,
+                ffn_h,
+                ids,
+                weights_buf,
+                routed,
+                n_used,
+            )?,
+            other => {
+                return Err(format!(
+                    "diffusion-gemma: ffn_down_exps dtype {other:?} unsupported \
+                     (need Q8_0/Q5_1/Q5_K/Q6_K)"
+                )
+                .into());
+            }
+        }
+        ctx.tap(&format!("ffn_moe_out-{il}"), routed)?;
         let moe_normed = ctx.alloc_tensor([hidden, nu, 1, 1], GgmlType::F32)?;
         rms_norm::record(ctx, routed, block.ffn_post_norm_2, moe_normed, eps)?;
 

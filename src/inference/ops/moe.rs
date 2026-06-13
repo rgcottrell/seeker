@@ -497,6 +497,33 @@ pub fn record_moe_down_q6k(
     )
 }
 
+/// Same shape contract as [`record_moe_down_q5k`] but for Q5_1 weights.
+/// DiffusionGemma's `ffn_down_exps` mix Q8_0 and Q5_1 per layer. Q5_1 is an
+/// affine quant (`x = q5·d + m`); the kernel reads scalar `data_b` (ffn_h), so
+/// the float4 alias at slot 4 is bound but unused.
+pub fn record_moe_down_q5_1(
+    ctx: &mut DispatchContext,
+    down_exps: TensorView,
+    ffn_h: TensorView,
+    ids: BufferRange,
+    routing_weights: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_moe_down_impl(
+        ctx,
+        down_exps,
+        ffn_h,
+        ids,
+        routing_weights,
+        dst,
+        n_expert_used,
+        "moe_down_q5_1",
+        shaders::MOE_DOWN_Q5_1_DEFAULT_SPV.as_bytes(),
+        /* bindings_with_b_v4= */ true,
+    )
+}
+
 /// Same shape contract as [`record_moe_down_q5k`] but for Q8_0 weights.
 /// The Unsloth UD-Q5_K_XL checkpoint quantizes a few blocks'
 /// `ffn_down_exps` as Q8_0 (the rest are Q6_K). Like the Q6_K path it

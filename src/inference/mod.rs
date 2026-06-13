@@ -1932,6 +1932,8 @@ impl Engine {
         #[cfg(feature = "profile_gpu")]
         self.profile.reset(&self.device, self.command_buffer);
 
+        #[cfg(feature = "gpu_debug")]
+        let taps;
         let ranges = {
             let mut ctx = DispatchContext {
                 flush: None,
@@ -1951,7 +1953,12 @@ impl Engine {
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
-            record(&mut ctx)?
+            let r = record(&mut ctx)?;
+            #[cfg(feature = "gpu_debug")]
+            {
+                taps = std::mem::take(&mut ctx.taps);
+            }
+            r
         };
 
         // Stage results into the HOST_CACHED readback buffer so the host read
@@ -1998,6 +2005,27 @@ impl Engine {
         }
         #[cfg(feature = "profile_gpu")]
         self.profile.readback_and_print(&self.device);
+
+        // Layer-by-layer tap dump (gpu_debug): print sum / max_abs / nan for each
+        // tap the model recorded, read directly from the host-visible scratch.
+        #[cfg(feature = "gpu_debug")]
+        if let Some(sp) = self.scratch.host_ptr {
+            for (name, range) in &taps {
+                if range.size % 4 != 0 {
+                    continue;
+                }
+                let n = (range.size / 4) as usize;
+                let mut buf = vec![0f32; n];
+                unsafe {
+                    let src = sp.add(range.offset as usize) as *const f32;
+                    std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+                }
+                let sum: f64 = buf.iter().map(|&x| x as f64).sum();
+                let max_abs = buf.iter().fold(0f32, |a, &x| a.max(x.abs()));
+                let nans = buf.iter().filter(|x| x.is_nan()).count();
+                eprintln!("TAP {name}: n={n} sum={sum:.4} max_abs={max_abs:.4} nans={nans}");
+            }
+        }
 
         let host_ptr = self
             .readback
