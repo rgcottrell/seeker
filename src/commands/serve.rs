@@ -214,6 +214,9 @@ pub struct ServeArgs {
     /// (concurrent requests fall back to plain batched decode).
     #[command(flatten)]
     spec: crate::commands::download::SpecDraftArgs,
+
+    #[command(flatten)]
+    diffusion: crate::commands::chat::DiffusionArgs,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -279,11 +282,20 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         "loaded tokenizer for serve",
     );
 
+    // diffusion-gemma (non-autoregressive) re-forwards [prompt|canvas] each step
+    // and never uses the KV cache; bound its context (the trained 256K would
+    // size a giant unused per-slot cache) and run requests sequentially.
+    let is_diffusion = gguf.architecture() == Some("diffusion-gemma");
+
     // `--ctx-size 0` (the default) means "use the model's full trained context"
     // (llama.cpp's `-c 0`); fall back to 4096 if the model omits the metadata.
     // Each of the `--parallel` slots gets a full `ctx_size` cache.
     let ctx_size = if args.ctx_size == 0 {
-        gguf.trained_ctx_len().unwrap_or(4096)
+        if is_diffusion {
+            4096
+        } else {
+            gguf.trained_ctx_len().unwrap_or(4096)
+        }
     } else {
         args.ctx_size
     };
@@ -390,6 +402,7 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
         embeddings: args.embeddings,
         pooling: args.pooling,
         embd_normalize: args.embd_normalize,
+        diffusion: is_diffusion.then(|| args.diffusion.to_config(args.max_tokens as usize)),
     });
     // The worker reports the *resolved* slot count (auto-sizing may differ from
     // the request) so `/slots` + `/props` report the real number.

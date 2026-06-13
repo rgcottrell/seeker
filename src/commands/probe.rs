@@ -461,6 +461,7 @@ async fn bench_concurrent(args: ProbeArgs) -> Result<(), Box<dyn Error>> {
         embeddings: false,
         pooling: None,
         embd_normalize: 2,
+        diffusion: None, // probe measures autoregressive throughput
     };
     let plan = BenchPlan {
         batches,

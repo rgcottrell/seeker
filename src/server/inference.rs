@@ -80,6 +80,10 @@ pub struct WorkerConfig {
     /// Default embedding normalization (`--embd-normalize`; -1/0/1/2/p). Per
     /// request overridable.
     pub embd_normalize: i32,
+    /// Diffusion denoiser config — `Some` only for `diffusion-gemma`. When set,
+    /// the worker serves each request sequentially through the non-autoregressive
+    /// denoiser instead of the continuous-batching scheduler.
+    pub diffusion: Option<crate::inference::diffusion::DiffusionConfig>,
 }
 
 /// Per-request generation parameters. The CLI sampling flags form the base
@@ -595,6 +599,12 @@ struct Worker {
     /// Embedding-mode state (final-norm weight + pooling), `Some` iff the server
     /// was started with `--embeddings`. Drives [`Worker::admit_embedding`].
     embed_ctx: Option<EmbedCtx>,
+    /// Non-autoregressive `diffusion-gemma` serving: when true, each request is
+    /// processed to completion sequentially via [`Worker::run_diffusion_job`]
+    /// (the continuous-batching scheduler doesn't apply). `diffusion_cfg` holds
+    /// the denoiser knobs; per-request `max_tokens` overrides it.
+    diffusion: bool,
+    diffusion_cfg: crate::inference::diffusion::DiffusionConfig,
 }
 
 /// Length of the longest common prefix of two token sequences.
@@ -757,7 +767,9 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     // to 1 and wedging the device on a single oversized slab). An explicit
     // `--ctx-size` is pinned — the `BatchKvCache` preflight fail-fasts instead.
     let mut ctx_size = cfg.ctx_size;
-    if cfg.ctx_auto && budget::fit_enabled() {
+    // diffusion serving never uses the per-slot KV cache, so skip the KV-based
+    // auto-fit (it would pick a huge ctx → huge unused cache + scratch).
+    if cfg.ctx_auto && budget::fit_enabled() && cfg.diffusion.is_none() {
         let align = engine
             .device
             .limits
@@ -860,7 +872,10 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     // memory budget (capped at `parallel_max`).
     // Embedding mode runs one synchronous forward per request on slot 0 — a
     // single slab is all it needs (no concurrent generation).
-    let n_slots = if cfg.embeddings {
+    let n_slots = if cfg.embeddings || cfg.diffusion.is_some() {
+        // Embedding mode and diffusion serving both run one synchronous forward
+        // per request on slot 0 (diffusion never touches the slot cache, but the
+        // Worker still needs one allocated slab) — a single slab is all they need.
         1
     } else if !model.supports_batch_decode() {
         // No batched-decode forward (e.g. gemma4): decode runs through the
@@ -1044,6 +1059,8 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
         spec_n_max,
         logical_ctx: ctx_size,
         embed_ctx,
+        diffusion: cfg.diffusion.is_some(),
+        diffusion_cfg: cfg.diffusion.clone().unwrap_or_default(),
     })
 }
 
@@ -1269,6 +1286,20 @@ fn worker_main(
     // `None` ⇒ all senders dropped ⇒ shut down (Engine drops on return).
     let unified = worker.unified;
     loop {
+        // diffusion-gemma: non-autoregressive, served one request at a time.
+        // Each Gen job runs its full denoiser loop here (no slabs / batching).
+        if worker.diffusion {
+            match jobs.blocking_recv() {
+                Some(WorkerRequest::Gen(job)) => worker.run_diffusion_job(job),
+                Some(WorkerRequest::Emb(job)) => {
+                    let _ = job.reply.send(Err(
+                        "server is not in embeddings mode; start it with --embeddings".into(),
+                    ));
+                }
+                None => return,
+            }
+            continue;
+        }
         if worker.active.is_empty() {
             // Idle: block for the next job (or shutdown).
             match jobs.blocking_recv() {
@@ -1544,6 +1575,90 @@ impl Worker {
         let view: Vec<(&[u32], u64)> = free.iter().map(|&(_, p, l)| (p, l)).collect();
         let pick = choose_slot(&view, new_tokens, None);
         Some(free[pick].0)
+    }
+
+    /// Serve one `diffusion-gemma` request to completion (sequential): render is
+    /// already done handler-side, so run the entropy-bound denoiser over the
+    /// prompt, stream each committed block as a `Delta`, and finish with `Done`.
+    /// No KV cache / slabs / batching — every step re-forwards `[prompt|canvas]`.
+    fn run_diffusion_job(&mut self, job: GenJob) {
+        let GenJob {
+            tokens: prompt,
+            config,
+            reply,
+            ..
+        } = job;
+        if prompt.is_empty() {
+            let _ =
+                reply.blocking_send(GenEvent::Error("empty prompt — nothing to generate".into()));
+            return;
+        }
+        let canvas_len = self.model.diffusion_canvas_length().unwrap_or(0) as usize;
+        let budget = self.logical_ctx as usize;
+        if prompt.len() + canvas_len > budget {
+            let _ = reply.blocking_send(GenEvent::Error(format!(
+                "prompt is {} tokens but the diffusion context is {budget} — diffusion needs \
+                 room for the prompt plus a {canvas_len}-token canvas; raise --ctx-size",
+                prompt.len()
+            )));
+            return;
+        }
+        let n_vocab = self.model.vocab_size() as usize;
+        let eog_ids: Vec<u32> = if config.ignore_eos {
+            Vec::new()
+        } else {
+            self.eog_ids.clone()
+        };
+        let mut cfg = self.diffusion_cfg.clone();
+        cfg.max_tokens = (config.max_tokens as usize)
+            .min(budget.saturating_sub(prompt.len() + canvas_len))
+            .max(1);
+
+        let prompt_tokens = prompt.len() as u32;
+        if reply
+            .blocking_send(GenEvent::Started { prompt_tokens })
+            .is_err()
+        {
+            return; // client disconnected
+        }
+
+        // Borrow split: `engine` (mut) drives the forward; `model` (shared) backs
+        // the decode `stream`; `reply` streams each block.
+        let mut stream = self.model.tokenizer().tokenizer.decode_stream(true);
+        let engine = &mut self.engine;
+        let model: &dyn crate::models::Model = &*self.model;
+        let result = crate::inference::diffusion::generate(
+            &prompt,
+            canvas_len,
+            n_vocab,
+            &eog_ids,
+            &cfg,
+            |full, n_prompt| engine.forward_diffusion(model, full, n_prompt),
+            |block| {
+                for &tok in block {
+                    if let Ok(Some(piece)) = stream.step(tok) {
+                        let _ = reply.blocking_send(GenEvent::Delta(piece));
+                    }
+                }
+            },
+        );
+        match result {
+            Ok(generated) => {
+                let stop_reason = if generated.len() >= cfg.max_tokens {
+                    StopReason::MaxTokens
+                } else {
+                    StopReason::Eos
+                };
+                let _ = reply.blocking_send(GenEvent::Done {
+                    stop_reason,
+                    prompt_tokens,
+                    completion_tokens: generated.len() as u32,
+                });
+            }
+            Err(e) => {
+                let _ = reply.blocking_send(GenEvent::Error(e.to_string()));
+            }
+        }
     }
 
     /// Admit one job: select a free slab, prefill it (with prefix-reuse), and
