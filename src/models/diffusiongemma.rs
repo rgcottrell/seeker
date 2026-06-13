@@ -26,13 +26,14 @@
 //! The FFN is the Gemma-4 **dual** block: a dense shared MLP **plus** a
 //! 128-expert MoE (the "A4B"), combined and post-normed (see [`Self::ffn_moe`]).
 //!
-//! **Status / not-yet-done:** the denoiser runs with self-conditioning OFF
-//! (`sc_use = 0`) — exact for step-0 logit parity (the Gate-A check) but
-//! quality-affecting for later steps; see [`Self::self_condition`]. The forward
-//! also takes the simple UNIFIED path (re-forwards `[prompt|canvas]` each step)
-//! and reads the `[vocab, C]` canvas logits back to the host for the per-position
-//! reduction — the prompt-KV cache, a GPU reduce, and device-resident
-//! self-conditioning are perf follow-ups.
+//! **Status:** GPU-validated on Strix Halo — the model responds to prompts.
+//! Self-conditioning uses a hard-argmax soft-embedding ([`Self::self_condition`]):
+//! a clean single-token feed that empirically beats a partial top-K blend on
+//! this high-entropy checkpoint (the exact full-softmax soft-embedding would need
+//! the transposed/dequantized embedding — a follow-up). The forward takes the
+//! simple UNIFIED path (re-forwards `[prompt|canvas]` each step) and reads the
+//! `[vocab, C]` canvas logits back to the host for the per-position reduction —
+//! the prompt-KV cache and a GPU-side reduce are perf follow-ups.
 
 use std::error::Error;
 
