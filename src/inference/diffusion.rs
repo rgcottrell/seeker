@@ -11,6 +11,14 @@
 //!
 //! The per-position host reduction reads the full `[vocab, C]` logits each step
 //! (a big readback); phase 4 moves it (and self-conditioning) onto the GPU.
+//!
+//! Debug env toggles (diagnosing the base-forward / convergence gap vs
+//! `llama-diffusion-cli`):
+//!   - `SEEKER_DIFF_DEBUG=1`       — per-step accepted/mean_H/held/argmax trace
+//!   - `SEEKER_DIFF_NOSC=1`        — force self-conditioning off every step
+//!   - `SEEKER_DIFF_FIXEDCANVAS=N` — init the canvas to all token `N` (parity)
+//!   - `SEEKER_DIFF_LOGITDUMP=1`   — dump top-5 logits for canvas pos 0..2 at
+//!     the first forward (matches the reference's `SEEKER_REF_LOGITDUMP`)
 
 use std::error::Error;
 
@@ -170,6 +178,13 @@ where
     let vocab_u = n_vocab as u32;
 
     let mut canvas: Vec<u32> = (0..c).map(|_| rng.gen_range(0..vocab_u)).collect();
+    // (debug) deterministic fixed canvas for cross-engine step-0 logit parity.
+    if let Some(tok) = std::env::var("SEEKER_DIFF_FIXEDCANVAS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        canvas.iter_mut().for_each(|c| *c = tok);
+    }
     let mut argmax_canvas = vec![0u32; c];
     let mut prev_argmax = vec![u32::MAX; c];
     // Self-conditioning feed: the previous step's full per-position softmax
@@ -189,12 +204,23 @@ where
         let t = cfg.t_min + (cfg.t_max - cfg.t_min) * (cur_step as f32 / s as f32);
         let temp_inv = 1.0 / t;
 
-        let sc = if have_prev {
+        let sc = if have_prev && std::env::var("SEEKER_DIFF_NOSC").is_err() {
             Some(probs.as_slice())
         } else {
             None
         };
         let logits = forward(&full, big_p as u32, sc)?;
+        // (debug) dump top-5 logits for the first few canvas positions at the
+        // first forward — for cross-engine base-forward parity vs the reference.
+        if !have_prev && std::env::var("SEEKER_DIFF_LOGITDUMP").is_ok() {
+            for pos in 0..3.min(c) {
+                let row = &logits[pos * n_vocab..(pos + 1) * n_vocab];
+                let mut idx: Vec<usize> = (0..n_vocab).collect();
+                idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+                let top: Vec<(usize, f32)> = idx[..5].iter().map(|&v| (v, row[v])).collect();
+                eprintln!("[logitdump] pos {pos}: {top:?}");
+            }
+        }
         if logits.len() != c * n_vocab {
             return Err(format!(
                 "diffusion forward returned {} logits, expected {}",
