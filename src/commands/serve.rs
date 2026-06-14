@@ -428,7 +428,18 @@ async fn build_loaded_state(args: &ServeArgs, path: PathBuf) -> Result<AppState,
     Ok(AppState::new(AppStateInit {
         tokenizer: Arc::new(bundle),
         inference: handle,
-        template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
+        template_kwargs: {
+            let mut kw = args.chat_template_kwargs.clone().unwrap_or_default();
+            // diffusion-gemma is a thinking/harmony model: with `enable_thinking`
+            // unset its template primes a closed empty `thought` channel that
+            // derails the canvas. Match llama.cpp's diffusion-cli (thinking ON by
+            // default); a user `--chat-template-kwargs` value still wins.
+            if is_diffusion {
+                kw.entry("enable_thinking".to_string())
+                    .or_insert(serde_json::Value::Bool(true));
+            }
+            kw
+        },
         default_sampler: args.sampler_config(&gg_sampling, ctx_size),
         default_max_tokens: args.max_tokens,
         default_ignore_eos: args.ignore_eos,

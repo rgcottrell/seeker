@@ -855,6 +855,10 @@ fn setup(cfg: &WorkerConfig) -> Result<Worker, Box<dyn Error>> {
     );
     engine.allocate_scratch(scratch_bytes)?;
 
+    // Build the self-conditioning embedding `sc_embT` once for diffusion models
+    // that need it (no-op otherwise) — see `Engine::build_diffusion_sc_embt`.
+    engine.build_diffusion_sc_embt(&mut *model)?;
+
     let cache_config = KvCacheConfig {
         k_dtype: cfg.cache_type_k,
         v_dtype: cfg.cache_type_v,

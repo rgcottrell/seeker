@@ -824,6 +824,42 @@ pub fn record_sigmoid(
 /// `get_rows`: dst[col, row] = src[col, indices[row]]. src has shape
 /// `[hidden, vocab]` (ggml: ne[0]=hidden, ne[1]=vocab), indices is `[L]` of
 /// u32, dst is `[hidden, L]`.
+/// Transpose + cast one vocab chunk of a dequantized `[n_embd, chunk]` F32
+/// `get_rows` slab (`src`, token `v`'s embedding contiguous at `v·n_embd + e`)
+/// into `dst` = the self-conditioning weight `sc_embT` in seeker's matmul-`a`
+/// layout `[K=n_vocab, M=n_embd]` (`a[k=v, m=e]` at `e·n_vocab + v`):
+///   `dst[e·n_vocab + (vocab_offset + v)] = f16(src[v·n_embd + e])`
+/// Used once at load to build the whole `[n_vocab, n_embd]` F16 weight chunk by
+/// chunk (`dst` is the full sc_embT range so the scattered writes land).
+pub fn record_transpose_cast_f32_f16(
+    ctx: &mut DispatchContext,
+    src: BufferRange,
+    dst: BufferRange,
+    n_embd: u32,
+    chunk: u32,
+    vocab_offset: u32,
+    n_vocab: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut push = Vec::with_capacity(16);
+    push.extend_from_slice(&n_embd.to_ne_bytes());
+    push.extend_from_slice(&chunk.to_ne_bytes());
+    push.extend_from_slice(&vocab_offset.to_ne_bytes());
+    push.extend_from_slice(&n_vocab.to_ne_bytes());
+
+    let key = PipelineKey::dense("transpose_cast_f32_f16", 2, 16, vec![]);
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::TRANSPOSE_CAST_F32_F16_SPV.as_bytes(),
+    )?;
+
+    let total = n_embd * chunk;
+    let workgroups = [total.div_ceil(256), 1, 1];
+    super::bind_and_dispatch(ctx, &pipeline, &[0, 1], &[src, dst], &push, workgroups)?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst);
+    Ok(())
+}
+
 pub fn record_get_rows(
     ctx: &mut DispatchContext,
     src: TensorView,

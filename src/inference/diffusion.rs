@@ -63,9 +63,10 @@ struct PosOut {
 
 /// Per-canvas-position reduction over one logits row (`[vocab]`): temperature-
 /// scaled argmax, partition function `Z`, Shannon entropy `H`, and an
-/// inverse-CDF multinomial sample using the pre-drawn uniform `u`. `exps` is a
-/// reusable `[vocab]` scratch (one per worker thread).
-fn reduce_position(row: &[f32], temp_inv: f32, u: f32, exps: &mut [f32]) -> PosOut {
+/// inverse-CDF multinomial sample using the pre-drawn uniform `u`. Writes the
+/// full normalized softmax distribution `softmax(row·temp_inv)` into
+/// `probs_row` (`[vocab]`) — the exact self-conditioning feed for the next step.
+fn reduce_position(row: &[f32], temp_inv: f32, u: f32, probs_row: &mut [f32]) -> PosOut {
     let n = row.len();
     let mut m = f32::NEG_INFINITY;
     let mut amax = 0u32;
@@ -76,19 +77,24 @@ fn reduce_position(row: &[f32], temp_inv: f32, u: f32, exps: &mut [f32]) -> PosO
             amax = v as u32;
         }
     }
+    // Pass 1: unnormalized exps into probs_row, accumulate Z.
     let mut z_sum = 0f32;
-    for v in 0..n {
-        let e = (row[v] * temp_inv - m).exp();
-        exps[v] = e;
+    for (slot, &lg) in probs_row.iter_mut().zip(row.iter()) {
+        let e = (lg * temp_inv - m).exp();
+        *slot = e;
         z_sum += e;
     }
+    // Pass 2: entropy + inverse-CDF sample (cumulative over the raw exps vs
+    // `u·Z`, as before), then normalize probs_row in place.
     let target = u * z_sum;
+    let inv_z = 1.0 / z_sum;
     let mut cum = 0f32;
     let mut h = 0f32;
     let mut sampled = (n - 1) as u32;
     let mut picked = false;
-    for (v, &e) in exps.iter().enumerate().take(n) {
-        let p = e / z_sum;
+    for (v, slot) in probs_row.iter_mut().enumerate() {
+        let e = *slot;
+        let p = e * inv_z;
         if p > 0.0 {
             h -= p * p.ln();
         }
@@ -97,6 +103,7 @@ fn reduce_position(row: &[f32], temp_inv: f32, u: f32, exps: &mut [f32]) -> PosO
             sampled = v as u32;
             picked = true;
         }
+        *slot = p;
     }
     PosOut {
         argmax: amax,
@@ -106,13 +113,15 @@ fn reduce_position(row: &[f32], temp_inv: f32, u: f32, exps: &mut [f32]) -> PosO
 }
 
 /// Reduce all `c` canvas positions of `logits` (`[vocab, c]`, column-major) in
-/// parallel across worker threads.
+/// parallel across worker threads, writing each position's full softmax into
+/// `probs` (`[vocab, c]`, column-major — the next step's SC feed).
 fn reduce_canvas(
     logits: &[f32],
     c: usize,
     n_vocab: usize,
     temp_inv: f32,
     u: &[f32],
+    probs: &mut [f32],
 ) -> Vec<PosOut> {
     let mut outs = vec![PosOut::default(); c];
     let n_threads = std::thread::available_parallelism()
@@ -121,14 +130,18 @@ fn reduce_canvas(
         .min(c.max(1));
     let chunk = c.div_ceil(n_threads.max(1));
     std::thread::scope(|scope| {
-        for (ci, out_chunk) in outs.chunks_mut(chunk).enumerate() {
+        for ((ci, out_chunk), probs_chunk) in outs
+            .chunks_mut(chunk)
+            .enumerate()
+            .zip(probs.chunks_mut(chunk * n_vocab))
+        {
             let base = ci * chunk;
             scope.spawn(move || {
-                let mut exps = vec![0f32; n_vocab];
                 for (j, slot) in out_chunk.iter_mut().enumerate() {
                     let pos = base + j;
                     let row = &logits[pos * n_vocab..(pos + 1) * n_vocab];
-                    *slot = reduce_position(row, temp_inv, u[pos], &mut exps);
+                    let probs_row = &mut probs_chunk[j * n_vocab..(j + 1) * n_vocab];
+                    *slot = reduce_position(row, temp_inv, u[pos], probs_row);
                 }
             });
         }
@@ -149,7 +162,7 @@ fn denoise_block<F>(
     forward: &mut F,
 ) -> Result<Vec<u32>, Box<dyn Error>>
 where
-    F: FnMut(&[u32], u32, Option<&[u32]>) -> Result<Vec<f32>, Box<dyn Error>>,
+    F: FnMut(&[u32], u32, Option<&[f32]>) -> Result<Vec<f32>, Box<dyn Error>>,
 {
     let big_p = prompt_ext.len();
     let c = canvas_len;
@@ -159,9 +172,12 @@ where
     let mut canvas: Vec<u32> = (0..c).map(|_| rng.gen_range(0..vocab_u)).collect();
     let mut argmax_canvas = vec![0u32; c];
     let mut prev_argmax = vec![u32::MAX; c];
-    // Self-conditioning feed: the previous step's argmax canvas (`None` on the
-    // first step of the block, which gates SC off — exact there).
-    let mut sc_prev: Option<Vec<u32>> = None;
+    // Self-conditioning feed: the previous step's full per-position softmax
+    // `[vocab, C]` (column-major). Reused across steps; `have_prev` gates it
+    // off on the first step (exact there). 268 MB at full vocab — kept on the
+    // host alongside the logits readback (phase 4 moves both onto the GPU).
+    let mut probs = vec![0f32; c * n_vocab];
+    let mut have_prev = false;
     let mut held = 0u32;
     let mut full: Vec<u32> = Vec::with_capacity(big_p + c);
 
@@ -173,7 +189,12 @@ where
         let t = cfg.t_min + (cfg.t_max - cfg.t_min) * (cur_step as f32 / s as f32);
         let temp_inv = 1.0 / t;
 
-        let logits = forward(&full, big_p as u32, sc_prev.as_deref())?;
+        let sc = if have_prev {
+            Some(probs.as_slice())
+        } else {
+            None
+        };
+        let logits = forward(&full, big_p as u32, sc)?;
         if logits.len() != c * n_vocab {
             return Err(format!(
                 "diffusion forward returned {} logits, expected {}",
@@ -188,7 +209,8 @@ where
         let u: Vec<f32> = (0..c).map(|_| rng.r#gen::<f32>()).collect();
         let renoise: Vec<u32> = (0..c).map(|_| rng.gen_range(0..vocab_u)).collect();
 
-        let outs = reduce_canvas(&logits, c, n_vocab, temp_inv, &u);
+        let outs = reduce_canvas(&logits, c, n_vocab, temp_inv, &u, &mut probs);
+        have_prev = true;
 
         // Accept the lowest-entropy positions whose cumulative entropy (before
         // this one) stays within the bound; renoise the rest.
@@ -231,8 +253,16 @@ where
             break;
         }
         prev_argmax.copy_from_slice(&argmax_canvas);
-        // Feed this step's prediction to the next step's self-conditioning.
-        sc_prev = Some(argmax_canvas.clone());
+        // `probs` (this step's softmax) is now the next step's SC feed; the
+        // `have_prev` gate (set after the forward) turns it on.
+        if std::env::var("SEEKER_DIFF_DEBUG").is_ok() {
+            let acc = accepted.iter().filter(|&&a| a).count();
+            let mean_h = entropy_sum / c as f32;
+            eprintln!(
+                "[diff] step {cur_step:>3} accepted={acc:>3}/{c} mean_H={mean_h:.4} held={held} argmax[..16]={:?}",
+                &argmax_canvas[..16.min(c)]
+            );
+        }
     }
 
     Ok(argmax_canvas)
@@ -252,7 +282,7 @@ pub fn generate<F>(
     mut on_block: impl FnMut(&[u32]),
 ) -> Result<Vec<u32>, Box<dyn Error>>
 where
-    F: FnMut(&[u32], u32, Option<&[u32]>) -> Result<Vec<f32>, Box<dyn Error>>,
+    F: FnMut(&[u32], u32, Option<&[f32]>) -> Result<Vec<f32>, Box<dyn Error>>,
 {
     let mut rng = StdRng::seed_from_u64(cfg.seed);
     let mut prompt_ext = prompt.to_vec();
@@ -328,7 +358,7 @@ mod tests {
         // Logits: position p gets argmax token (p<2 ? p+1 : 9).
         let forward = |full: &[u32],
                        n_prompt: u32,
-                       _sc: Option<&[u32]>|
+                       _sc: Option<&[f32]>|
          -> Result<Vec<f32>, Box<dyn Error>> {
             let c = full.len() - n_prompt as usize;
             let mut logits = vec![0f32; c * n_vocab];

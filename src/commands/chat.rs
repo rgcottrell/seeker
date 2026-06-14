@@ -573,6 +573,11 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     );
     engine.allocate_scratch(scratch_bytes)?;
 
+    // Build the self-conditioning embedding `sc_embT` (transposed/dequantized
+    // token_embd, [n_vocab, n_embd] F16) once for diffusion models that need it
+    // — no-op for every other model.
+    engine.build_diffusion_sc_embt(&mut *model)?;
+
     let dims = model.cache_dims();
     let cache_config = KvCacheConfig {
         k_dtype: args.cache_type_k,
@@ -688,7 +693,20 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         spec_n_max,
         context_shift: args.context_shift,
         keep_turns: args.keep,
-        template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
+        template_kwargs: {
+            let mut kw = args.chat_template_kwargs.clone().unwrap_or_default();
+            // diffusion-gemma is a thinking/harmony model: its chat template,
+            // with `enable_thinking` unset, primes a *closed* empty `thought`
+            // channel that derails the canvas (incoherent, duplicated output).
+            // llama.cpp's diffusion-cli defaults thinking ON; match it so the
+            // prompt ends cleanly at `<|turn>model\n`. The user can still pass
+            // `--chat-template-kwargs '{"enable_thinking":false}'` to override.
+            if is_diffusion {
+                kw.entry("enable_thinking".to_string())
+                    .or_insert(serde_json::Value::Bool(true));
+            }
+            kw
+        },
         mmproj_path,
         vision_ctx: None,
         pending_image: None,

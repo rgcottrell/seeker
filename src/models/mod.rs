@@ -444,21 +444,33 @@ pub trait Model: Send + Sync {
     /// `[vocab, C]` (column `j` = canvas position `j`, after the final-logit
     /// softcap).
     ///
-    /// `sc_prev_argmax` is the **self-conditioning** feed: `Some(tokens)` (one
-    /// per canvas position — the previous denoising step's argmax prediction)
-    /// turns the SC subgraph on; `None` (the first step) leaves it off, which is
-    /// exact there. The soft-embedding is approximated by the hard embedding of
-    /// these tokens (the SC softmax is extremely peaked under the temperature
-    /// schedule). Default: unsupported.
+    /// `sc_probs` is the **self-conditioning** feed: `Some(probs)` — the previous
+    /// denoising step's softmax distribution as a flat host slice `[vocab, C]`
+    /// (column-major, column `j` = canvas position `j`'s `softmax(logits·temp_inv)`)
+    /// — turns the SC subgraph on; `None` (the first step) leaves it off, which is
+    /// exact there. The model uploads it and computes the exact soft-embedding
+    /// `Σ_v probs·tok_embd` on the GPU via `sc_embT` (see
+    /// [`Self::diffusion_sc_build_info`]). Default: unsupported.
     fn record_forward_diffusion(
         &self,
         _ctx: &mut DispatchContext,
         _tokens: &[u32],
         _n_prompt: u32,
-        _sc_prev_argmax: Option<&[u32]>,
+        _sc_probs: Option<&[f32]>,
     ) -> Result<TensorView, Box<dyn Error>> {
         Err("model does not support diffusion generation".into())
     }
+
+    /// For a diffusion model whose self-conditioning needs the transposed/
+    /// dequantized embedding `sc_embT`, return `(token_embd, n_embd, n_vocab)`
+    /// so the engine can build it once at load. `None` ⇒ the model needs no
+    /// `sc_embT`. Default `None`.
+    fn diffusion_sc_build_info(&self) -> Option<(TensorView, u32, u32)> {
+        None
+    }
+
+    /// Hand the model its built `sc_embT` device buffer. Default no-op.
+    fn set_diffusion_sc_embt(&mut self, _region: crate::inference::memory::Region) {}
 }
 
 /// Output of [`Model::record_forward_full`]: logits (last-position or all

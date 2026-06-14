@@ -174,6 +174,10 @@ pub struct DiffusiongemmaModel {
     pub weights: DiffusiongemmaWeights,
     pub handle: WeightsHandle,
     pub tokenizer: TokenizerBundle,
+    /// Transposed/dequantized token embedding `[n_vocab, n_embd]` F16 in
+    /// matmul-`a` layout, built once at load by the engine for the exact
+    /// self-conditioning soft-embedding. `None` until built (or no SC).
+    pub sc_embt: Option<crate::inference::memory::Region>,
 }
 
 impl DiffusiongemmaModel {
@@ -189,6 +193,23 @@ impl DiffusiongemmaModel {
             weights,
             handle,
             tokenizer,
+            sc_embt: None,
+        })
+    }
+
+    /// `sc_embT` as a matmul-`a` view `[n_vocab, n_embd]` F16, if built.
+    fn sc_embt_view(&self) -> Option<TensorView> {
+        let region = self.sc_embt.as_ref()?;
+        let n_vocab = self.params.n_vocab as u64;
+        let n_embd = self.params.n_embd as u64;
+        Some(TensorView {
+            buffer: region.buffer,
+            byte_offset: 0,
+            byte_size: n_vocab * n_embd * 2,
+            dims: [n_vocab, n_embd, 1, 1],
+            byte_stride: [2, n_vocab * 2, n_vocab * n_embd * 2, n_vocab * n_embd * 2],
+            element_stride: [1, n_vocab, n_vocab * n_embd, n_vocab * n_embd],
+            dtype: GgmlType::F16,
         })
     }
 }
@@ -265,7 +286,14 @@ impl Model for DiffusiongemmaModel {
         let mask = 2 * l * l * 4;
         // lm_head computes only the canvas columns: [vocab, canvas_length].
         let logits = vocab * (p.canvas_length as u64).max(1) * 4;
-        let raw = per_layer + moe + residual + mask + logits;
+        // Exact self-conditioning uploads the previous step's softmax probs
+        // [vocab, canvas_length] F32 into scratch (matmul `b` for sc_embT).
+        let sc_probs = if p.has_sc {
+            vocab * (p.canvas_length as u64).max(1) * 4
+        } else {
+            0
+        };
+        let raw = per_layer + moe + residual + mask + logits + sc_probs;
         raw + raw / 3 + (64 << 20)
     }
 
@@ -288,9 +316,25 @@ impl Model for DiffusiongemmaModel {
         ctx: &mut DispatchContext,
         tokens: &[u32],
         n_prompt: u32,
-        sc_prev_argmax: Option<&[u32]>,
+        sc_probs: Option<&[f32]>,
     ) -> Result<TensorView, Box<dyn Error>> {
-        self.forward_unified(ctx, tokens, n_prompt, sc_prev_argmax)
+        self.forward_unified(ctx, tokens, n_prompt, sc_probs)
+    }
+
+    fn diffusion_sc_build_info(&self) -> Option<(TensorView, u32, u32)> {
+        if self.params.has_sc {
+            Some((
+                self.weights.token_embd,
+                self.params.n_embd,
+                self.params.n_vocab,
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn set_diffusion_sc_embt(&mut self, region: crate::inference::memory::Region) {
+        self.sc_embt = Some(region);
     }
 }
 
@@ -391,7 +435,7 @@ impl DiffusiongemmaModel {
         ctx: &mut DispatchContext,
         tokens: &[u32],
         n_prompt: u32,
-        sc_prev_argmax: Option<&[u32]>,
+        sc_probs: Option<&[f32]>,
     ) -> Result<TensorView, Box<dyn Error>> {
         let p = &self.params;
         let n = tokens.len() as u32;
@@ -424,7 +468,7 @@ impl DiffusiongemmaModel {
         let residual = ctx.alloc_tensor([hidden, nu, 1, 1], GgmlType::F32)?;
         elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, n, residual)?;
         elementwise::record_scale(ctx, residual, residual, p.embd_scale, 0.0)?;
-        self.canvas_embed(ctx, residual, big_p, canvas, sc_prev_argmax)?;
+        self.canvas_embed(ctx, residual, big_p, canvas, sc_probs)?;
 
         let layer_cp = ctx.scratch_checkpoint();
         for (il, block) in self.weights.blocks.iter().enumerate() {
@@ -478,14 +522,14 @@ impl DiffusiongemmaModel {
         residual: TensorView,
         big_p: u32,
         canvas: u32,
-        sc_prev_argmax: Option<&[u32]>,
+        sc_probs: Option<&[f32]>,
     ) -> Result<(), Box<dyn Error>> {
         let hidden = self.params.n_embd as u64;
         let canvas_view = col_slice(residual, big_p as u64, canvas as u64);
         // Self-conditioning adds its correction into `canvas_view` before the
         // norm; without it the canvas is just rms_norm_noscale.
-        if let Some(prev) = sc_prev_argmax {
-            self.self_condition(ctx, canvas_view, canvas, prev)?;
+        if let Some(probs) = sc_probs {
+            self.self_condition(ctx, canvas_view, canvas, probs)?;
         }
         // rms_norm(noscale) into a temp, then copy back into the canvas columns.
         let normed = ctx.alloc_tensor([hidden, canvas as u64, 1, 1], GgmlType::F32)?;
@@ -761,11 +805,13 @@ impl DiffusiongemmaModel {
 
     /// Self-conditioning: add the gated-MLP correction of the previous step's
     /// prediction into the canvas columns, before the canvas norm. Mirrors
-    /// llama.cpp's `dg_canvas_embed` SC subgraph, with the soft-embedding
-    /// `softmax(prev_logits·temp_inv) · tok_embd` approximated by the **hard**
-    /// embedding of `prev_argmax` (the SC softmax is extremely peaked under the
-    /// temperature schedule, so the argmax token carries ~all the mass):
-    ///   `soft = tok_embd[prev_argmax] · √n_embd`
+    /// llama.cpp's `dg_canvas_embed` SC subgraph **exactly**: the soft-embedding
+    /// is the full vocabulary expectation `Σ_v softmax(prev_logits·temp_inv)_v ·
+    /// tok_embd[:,v]`, computed as the matmul `sc_embT · probs` against the
+    /// transposed/dequantized embedding [`Self::sc_embt`] (built once at load),
+    /// where `probs` `[n_vocab, C]` is the previous step's per-position softmax
+    /// (column-major) uploaded by the engine:
+    ///   `soft = (sc_embT · probs) · √n_embd`
     ///   `n    = rms_norm(soft, sc_pre_norm)`
     ///   `canvas += sc_down( gelu(sc_gate·n) · (sc_up·n) )`
     fn self_condition(
@@ -773,31 +819,40 @@ impl DiffusiongemmaModel {
         ctx: &mut DispatchContext,
         canvas: TensorView,
         canvas_len: u32,
-        prev_argmax: &[u32],
+        probs: &[f32],
     ) -> Result<(), Box<dyn Error>> {
         let sc = self
             .weights
             .sc
             .as_ref()
             .ok_or("self-conditioning requested but self_cond_* weights are absent")?;
+        let sc_embt = self
+            .sc_embt_view()
+            .ok_or("self-conditioning requested but sc_embT is not built")?;
         let p = &self.params;
         let hidden = p.n_embd as u64;
         let n_ff = p.n_ff as u64;
         let c = canvas_len as u64;
+        let vocab = p.n_vocab as u64;
         let eps = p.rms_eps;
-        if prev_argmax.len() != canvas_len as usize {
+        if probs.len() as u64 != vocab * c {
             return Err(format!(
-                "self-conditioning: prev_argmax len {} != canvas {canvas_len}",
-                prev_argmax.len()
+                "self-conditioning: probs len {} != vocab·canvas {}",
+                probs.len(),
+                vocab * c
             )
             .into());
         }
 
-        // soft = √n_embd · tok_embd[prev_argmax]  (hard-argmax soft-embedding)
-        let idx = ctx.alloc_scratch(c * 4)?;
-        write_u32(ctx, idx, prev_argmax)?;
+        // Upload the previous step's softmax probs [vocab, C] (column-major) as
+        // the matmul `b` operand.
+        let probs_buf = ctx.alloc_tensor([vocab, c, 1, 1], GgmlType::F32)?;
+        write_f32(ctx, probs_buf.range(), probs)?;
+
+        // soft = √n_embd · (sc_embT · probs) = √n_embd · Σ_v probs_v·tok_embd[:,v]
+        //   sc_embT [K=n_vocab, M=n_embd] · probs [K=n_vocab, L=C] → soft [n_embd, C]
         let soft = ctx.alloc_tensor([hidden, c, 1, 1], GgmlType::F32)?;
-        elementwise::record_get_rows(ctx, self.weights.token_embd, idx, canvas_len, soft)?;
+        matmul::record(ctx, sc_embt, probs_buf, soft)?;
         elementwise::record_scale(ctx, soft, soft, p.embd_scale, 0.0)?;
 
         // n = rms_norm(soft, sc_pre_norm); gated MLP sc_down(gelu(sc_gate·n)·(sc_up·n))
@@ -963,6 +1018,22 @@ fn write_u32(
         .ok_or("scratch region not host-visible")?;
     unsafe {
         let dst = host_ptr.add(range.offset as usize) as *mut u32;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+    }
+    Ok(())
+}
+
+fn write_f32(
+    ctx: &mut DispatchContext,
+    range: crate::inference::buffer::BufferRange,
+    data: &[f32],
+) -> Result<(), Box<dyn Error>> {
+    let host_ptr = ctx
+        .scratch
+        .host_ptr
+        .ok_or("scratch region not host-visible")?;
+    unsafe {
+        let dst = host_ptr.add(range.offset as usize) as *mut f32;
         std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
     Ok(())
