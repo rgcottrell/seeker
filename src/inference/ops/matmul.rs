@@ -257,6 +257,13 @@ fn mmcm_variant(dtype: GgmlType) -> Option<MmCmVariant> {
             name: "mul_mm_cm_q8_0_f32",
             spv: shaders::MUL_MM_CM_Q8_0_F32_SPV.as_bytes(),
         },
+        // Q5_1 has a coopmat variant (shader already built it) — wire it so
+        // Q5_1 weights (e.g. diffusion-gemma's dense FFN down) take the fast
+        // N≥32 coopmat prefill path instead of falling to per-column matvec.
+        GgmlType::Q5_1 => MmCmVariant {
+            name: "mul_mm_cm_q5_1_f32",
+            spv: shaders::MUL_MM_CM_Q5_1_F32_SPV.as_bytes(),
+        },
         GgmlType::Q4_K => MmCmVariant {
             name: "mul_mm_cm_q4_k_f32",
             spv: shaders::MUL_MM_CM_Q4_K_F32_SPV.as_bytes(),
