@@ -370,7 +370,44 @@ fn scalar_fa_variant(
 /// the whole cache serially, starving the GPU and making per-token latency
 /// grow with context length.
 #[allow(clippy::too_many_arguments)] // high-arity by nature (dims/buffers/flags)
+/// Masked flash-attention with a **causal** host mask (the common case: the
+/// host mask is the within-chunk causal triangle, so the KV walk is clamped to
+/// the query position). For a non-causal (bidirectional-region) host mask such
+/// as the diffusion canvas, use [`record_masked_bidirectional`] instead.
 pub fn record(
+    ctx: &mut DispatchContext,
+    q: TensorView,
+    k: TensorView,
+    v: TensorView,
+    mask: Option<TensorView>,
+    out: TensorView,
+    params: FlashAttnParams,
+    kv_actual: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_impl(ctx, q, k, v, mask, out, params, kv_actual, false)
+}
+
+/// Masked flash-attention whose host mask is **non-causal** — it encodes
+/// bidirectional regions (the diffusion canvas attends to all keys, the prompt
+/// stays causal). The per-row KV walk must NOT be clamped to the query position
+/// (that would silently make the canvas causal); the full KV is walked and the
+/// explicit mask alone decides per-element visibility.
+#[allow(clippy::too_many_arguments)]
+pub fn record_masked_bidirectional(
+    ctx: &mut DispatchContext,
+    q: TensorView,
+    k: TensorView,
+    v: TensorView,
+    mask: Option<TensorView>,
+    out: TensorView,
+    params: FlashAttnParams,
+    kv_actual: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_impl(ctx, q, k, v, mask, out, params, kv_actual, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_impl(
     ctx: &mut DispatchContext,
     q: TensorView,
     k: TensorView,
@@ -383,6 +420,9 @@ pub fn record(
     // fast path binds the full cache layer (so `k.dims[1] = max_seq_len`)
     // and the shader bounds its iteration by `DecodeDyn::kv_len`.
     kv_actual: u32,
+    // When the host mask is non-causal (bidirectional regions), skip the
+    // per-row causal KV-walk clamp — the explicit mask decides visibility.
+    bidirectional: bool,
 ) -> Result<(), Box<dyn Error>> {
     debug_assert_eq!(q.dtype, GgmlType::F32);
     debug_assert_eq!(out.dtype, GgmlType::F32);
@@ -427,7 +467,7 @@ pub fn record(
         && params.ring_depth == 0
         && let Some(m) = mask
     {
-        return record_cm1(ctx, q, k, v, Some(m), out, params, kv_actual);
+        return record_cm1(ctx, q, k, v, Some(m), out, params, kv_actual, bidirectional);
     }
 
     // Vision coopmat FA (DEFAULT-ON): maskless full bidirectional attention over
@@ -442,7 +482,9 @@ pub fn record(
         && cm1_head_ok
         && params.ring_depth == 0
     {
-        return record_cm1(ctx, q, k, v, None, out, params, kv_actual);
+        // Maskless vision FA is already fully bidirectional (MASK_ENABLE=0, no
+        // walk clamp); the flag is irrelevant here.
+        return record_cm1(ctx, q, k, v, None, out, params, kv_actual, false);
     }
 
     let (variant_name, variant_spv) = scalar_fa_variant(k.dtype, v.dtype)?;
@@ -568,11 +610,13 @@ pub fn record(
     put_u(&mut push, &mut w, k_num);
 
     let spec_constants = vec![
-        FA_BC,             // Bc
-        params.head_dim_k, // HSK
-        params.head_dim_v, // HSV
-        mask_enable,       // MASK_ENABLE
-        0,                 // Clamp
+        FA_BC,                             // Bc
+        params.head_dim_k,                 // HSK
+        params.head_dim_v,                 // HSV
+        mask_enable,                       // MASK_ENABLE
+        0,                                 // Clamp
+        0,                                 // VARLEN (single-sequence path)
+        if bidirectional { 1 } else { 0 }, // BIDIRECTIONAL
     ];
 
     // `flash_attn.slang` runs one workgroup per (query-row, head, batch)
@@ -1287,6 +1331,7 @@ fn record_cm1(
     out: TensorView,
     params: FlashAttnParams,
     kv_actual: u32,
+    bidirectional: bool,
 ) -> Result<(), Box<dyn Error>> {
     // cm1 reads K/V coopmat-direct from global. The decoder cache is already
     // F16 and bound as the full max_seq_len layer, so its last-block reads are
@@ -1413,10 +1458,11 @@ fn record_cm1(
     put_u(&mut push, &mut w, k_num);
 
     let spec_constants = vec![
-        params.head_dim_k, // HSK
-        params.head_dim_v, // HSV
-        mask_enable,       // MASK_ENABLE (0 for the maskless vision tower)
-        1,                 // CLAMP — KV need not be a multiple of Bc=64
+        params.head_dim_k,                 // HSK
+        params.head_dim_v,                 // HSV
+        mask_enable,                       // MASK_ENABLE (0 for the maskless vision tower)
+        1,                                 // CLAMP — KV need not be a multiple of Bc=64
+        if bidirectional { 1 } else { 0 }, // BIDIRECTIONAL (non-causal host mask)
     ];
 
     let key = PipelineKey {

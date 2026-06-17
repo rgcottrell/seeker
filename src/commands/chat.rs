@@ -114,7 +114,9 @@ const BANNER: &str = r#"███████ ███████ ████
 /// flattened into both arg structs. Ignored for autoregressive models.
 #[derive(Args, Clone)]
 pub struct DiffusionArgs {
-    /// Max diffusion denoising steps per canvas block.
+    /// Max diffusion denoising steps per canvas block. The entropy-bound
+    /// denoiser adaptively stops once the canvas converges (typically ~12-18),
+    /// so this is an upper bound matching llama.cpp's default.
     #[arg(long = "diffusion-steps", default_value_t = 48)]
     pub diffusion_steps: u32,
     /// Temperature at the last (most confident) denoising step.

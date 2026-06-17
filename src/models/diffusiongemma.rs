@@ -469,6 +469,7 @@ impl DiffusiongemmaModel {
         elementwise::record_get_rows(ctx, self.weights.token_embd, token_buf, n, residual)?;
         elementwise::record_scale(ctx, residual, residual, p.embd_scale, 0.0)?;
         self.canvas_embed(ctx, residual, big_p, canvas, sc_probs)?;
+        ctx.mark(crate::inference::profile::BlockClass::Embed);
 
         let layer_cp = ctx.scratch_checkpoint();
         for (il, block) in self.weights.blocks.iter().enumerate() {
@@ -483,7 +484,9 @@ impl DiffusiongemmaModel {
                 il,
                 n,
             )?;
+            ctx.mark(crate::inference::profile::BlockClass::Attn);
             self.ffn_moe(ctx, block, residual, il, n)?;
+            ctx.mark(crate::inference::profile::BlockClass::MoE);
             // Region-aware per-layer scalar: prompt × enc, canvas × dec.
             if big_p > 0 {
                 let prompt = col_slice(residual, 0, big_p as u64);
@@ -500,8 +503,10 @@ impl DiffusiongemmaModel {
         let canvas_res = col_slice(residual, big_p as u64, canvas as u64);
         let final_norm = ctx.alloc_tensor([hidden, canvas as u64, 1, 1], GgmlType::F32)?;
         rms_norm::record(ctx, canvas_res, self.weights.output_norm, final_norm, eps)?;
+        ctx.mark(crate::inference::profile::BlockClass::Epilogue);
         let logits = ctx.alloc_tensor([vocab, canvas as u64, 1, 1], GgmlType::F32)?;
         matmul::record(ctx, lm_head, final_norm, logits)?;
+        ctx.mark(crate::inference::profile::BlockClass::LmHead);
 
         if p.final_logit_softcap != 0.0 {
             let cap = p.final_logit_softcap;
@@ -640,7 +645,13 @@ impl DiffusiongemmaModel {
         let k_perm = permute_to_attn(k_roped, head_dim, nu, n_head_kv);
         let v_perm = permute_to_attn(v_normed, head_dim, nu, n_head_kv);
         let attn_out = ctx.alloc_tensor([q_dim, nu, 1, 1], GgmlType::F32)?;
-        flash_attn::record(
+        // The region mask is NON-causal: canvas queries attend bidirectionally
+        // to all keys (only the prompt rows are causal). The default masked FA
+        // clamps the KV walk to the query position (valid only for a causal
+        // mask) — which would silently make the canvas causal. Use the
+        // bidirectional entry point so the full KV is walked and the explicit
+        // mask alone decides visibility.
+        flash_attn::record_masked_bidirectional(
             ctx,
             q_perm,
             k_perm,

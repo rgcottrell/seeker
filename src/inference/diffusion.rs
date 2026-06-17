@@ -12,11 +12,15 @@
 //! The per-position host reduction reads the full `[vocab, C]` logits each step
 //! (a big readback); phase 4 moves it (and self-conditioning) onto the GPU.
 //!
-//! Debug env toggles (diagnosing the base-forward / convergence gap vs
-//! `llama-diffusion-cli`):
+//! Debug env toggles (diagnosing the convergence gap vs `llama-diffusion-cli`):
 //!   - `SEEKER_DIFF_DEBUG=1`       — per-step accepted/mean_H/held/argmax trace
+//!     plus per-block trim/chain decisions
+//!   - `SEEKER_DIFF_TIMING=1`      — per-step forward vs host-reduce wall time
 //!   - `SEEKER_DIFF_NOSC=1`        — force self-conditioning off every step
 //!   - `SEEKER_DIFF_FIXEDCANVAS=N` — init the canvas to all token `N` (parity)
+//!   - `SEEKER_DIFF_CANVAS_FILE=p` — init the canvas to a comma/space-separated
+//!     token list from file `p` (cross-engine self-consistency: feed the
+//!     reference's converged canvas in and check the forward stays coherent)
 //!   - `SEEKER_DIFF_LOGITDUMP=1`   — dump top-5 logits for canvas pos 0..2 at
 //!     the first forward (matches the reference's `SEEKER_REF_LOGITDUMP`)
 
@@ -185,6 +189,20 @@ where
     {
         canvas.iter_mut().for_each(|c| *c = tok);
     }
+    // (debug) pin the canvas to a token list from a file (cross-engine
+    // self-consistency probe: feed the reference's coherent canvas in).
+    if let Ok(path) = std::env::var("SEEKER_DIFF_CANVAS_FILE") {
+        let text = std::fs::read_to_string(&path)?;
+        let toks: Vec<u32> = text
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<u32>())
+            .collect::<Result<_, _>>()?;
+        for (slot, &t) in canvas.iter_mut().zip(toks.iter()) {
+            *slot = t;
+        }
+        eprintln!("[diff] pinned canvas from {path}: {} tokens", toks.len());
+    }
     let mut argmax_canvas = vec![0u32; c];
     let mut prev_argmax = vec![u32::MAX; c];
     // Self-conditioning feed: the previous step's full per-position softmax
@@ -209,7 +227,10 @@ where
         } else {
             None
         };
+        let timing = std::env::var("SEEKER_DIFF_TIMING").is_ok();
+        let tf = std::time::Instant::now();
         let logits = forward(&full, big_p as u32, sc)?;
+        let fwd_ms = tf.elapsed().as_secs_f64() * 1e3;
         // (debug) dump top-5 logits for the first few canvas positions at the
         // first forward — for cross-engine base-forward parity vs the reference.
         if !have_prev && std::env::var("SEEKER_DIFF_LOGITDUMP").is_ok() {
@@ -235,7 +256,16 @@ where
         let u: Vec<f32> = (0..c).map(|_| rng.r#gen::<f32>()).collect();
         let renoise: Vec<u32> = (0..c).map(|_| rng.gen_range(0..vocab_u)).collect();
 
+        let tr = std::time::Instant::now();
         let outs = reduce_canvas(&logits, c, n_vocab, temp_inv, &u, &mut probs);
+        if timing {
+            eprintln!(
+                "[diff-timing] step {cur_step:>3} forward={fwd_ms:.1}ms reduce={:.1}ms (N={} C={})",
+                tr.elapsed().as_secs_f64() * 1e3,
+                full.len(),
+                c
+            );
+        }
         have_prev = true;
 
         // Accept the lowest-entropy positions whose cumulative entropy (before
@@ -268,7 +298,8 @@ where
         }
 
         // Adaptive stop: argmax stable for `stability_threshold` steps AND mean
-        // entropy below `confidence_threshold`.
+        // entropy below `confidence_threshold`. Fires once the canvas converges
+        // (typically ~12-18 steps), matching the reference.
         held = if prev_argmax == argmax_canvas {
             held + 1
         } else {
@@ -313,6 +344,7 @@ where
     let mut rng = StdRng::seed_from_u64(cfg.seed);
     let mut prompt_ext = prompt.to_vec();
     let mut generated: Vec<u32> = Vec::new();
+    let dbg = std::env::var("SEEKER_DIFF_DEBUG").is_ok();
 
     while generated.len() < cfg.max_tokens {
         let canvas = denoise_block(
@@ -326,10 +358,16 @@ where
 
         // Trim the block at the first end-of-generation token (exclusive).
         if let Some(e) = canvas.iter().position(|t| eog_ids.contains(t)) {
+            if dbg {
+                eprintln!("[diff] block trimmed at eog pos {e} ({e} tokens)");
+            }
             let emit = &canvas[..e];
             generated.extend_from_slice(emit);
             on_block(emit);
             break;
+        }
+        if dbg {
+            eprintln!("[diff] block chained (no eog in {} tokens)", canvas.len());
         }
         generated.extend_from_slice(&canvas);
         on_block(&canvas);
