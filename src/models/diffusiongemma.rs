@@ -749,7 +749,23 @@ impl DiffusiongemmaModel {
         let ex = ctx.alloc_tensor([hidden, nu, 1, 1], GgmlType::F32)?;
         rms_norm::record(ctx, residual, block.ffn_pre_norm_2, ex, eps)?;
         let gate_up = ctx.alloc_tensor([2 * ff_exp, n_used as u64, nu, 1], GgmlType::F32)?;
-        moe::record_matvec_q5k_id(ctx, block.ffn_gate_up_exps, ex, ids, gate_up, n_used)?;
+        // Grouped expert matvec (default-on for n>1, byte-identical): reuse each
+        // expert's weight slab across its tokens instead of re-reading it per
+        // token. Single-token decode keeps the per-token path. `SEEKER_MOE_NO_GROUP`
+        // forces the per-token path (escape hatch).
+        if n > 1 && std::env::var("SEEKER_MOE_NO_GROUP").is_err() {
+            moe::record_matvec_q5k_id_grouped(
+                ctx,
+                block.ffn_gate_up_exps,
+                ex,
+                ids,
+                gate_up,
+                n_used,
+                n_experts,
+            )?;
+        } else {
+            moe::record_matvec_q5k_id(ctx, block.ffn_gate_up_exps, ex, ids, gate_up, n_used)?;
+        }
         let ffn_h = ctx.alloc_tensor([ff_exp, n_used as u64, nu, 1], GgmlType::F32)?;
         elementwise::record_geglu_fused(ctx, gate_up, ffn_h)?;
         let routed = ctx.alloc_tensor([hidden, nu, 1, 1], GgmlType::F32)?;

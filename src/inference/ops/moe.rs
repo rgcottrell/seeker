@@ -433,6 +433,139 @@ fn record_matvec_kquant_id(
     Ok(())
 }
 
+// ── grouped expert matvec (weight reused across an expert's tokens) ──
+
+const MOEGROUP_PUSH_BYTES: u32 = 3 * 4;
+
+/// Counting-sort the `(token, expert-slot)` pairs by their selected expert id
+/// (from topk's `ids` buffer) so a grouped matvec can read each expert's weight
+/// once. Writes `group_pairs[n_used*n_tokens]` (packed `tok*n_used+slot`,
+/// grouped by expert) and `group_offsets[n_experts+1]`. Fenced.
+fn record_moe_group(
+    ctx: &mut DispatchContext,
+    ids: BufferRange,
+    group_pairs: BufferRange,
+    group_offsets: BufferRange,
+    n_tokens: u32,
+    n_used: u32,
+    n_experts: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut push = [0u8; MOEGROUP_PUSH_BYTES as usize];
+    push[0..4].copy_from_slice(&n_tokens.to_ne_bytes());
+    push[4..8].copy_from_slice(&n_used.to_ne_bytes());
+    push[8..12].copy_from_slice(&n_experts.to_ne_bytes());
+    let key = PipelineKey::dense("moe_group", 3, MOEGROUP_PUSH_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::MOE_GROUP_SPV.as_bytes())?;
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[ids, group_pairs, group_offsets],
+        &push,
+        [1, 1, 1],
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, group_pairs);
+    record_compute_barrier(ctx.device, ctx.cmd, group_offsets);
+    Ok(())
+}
+
+/// Grouped Q5_K expert matvec: a drop-in, byte-identical alternative to
+/// [`record_matvec_q5k_id`] that groups the `(token, expert)` pairs by expert
+/// and reads each expert's weight slab ONCE (reused across all its tokens),
+/// instead of re-reading it per token. The MoE prefill bottleneck is exactly
+/// that per-token weight re-read (a 128-expert MoE's active weights dwarf the
+/// APU cache), so grouping cuts the DRAM weight traffic. Output positions are
+/// identical to the per-token path, so it's lossless.
+pub fn record_matvec_q5k_id_grouped(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    ids: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+    n_experts: u32,
+) -> Result<(), Box<dyn Error>> {
+    let ncols = a.dims[0] as u32;
+    let n_rows = a.dims[1] as u32;
+    let n_tokens = b.dims[1] as u32;
+    let stride_d = n_rows;
+    let batch_stride_a = ncols * n_rows;
+    let batch_stride_d = n_rows * n_expert_used;
+
+    // Group the pairs by expert (scratch buffers, recomputed each layer).
+    let group_pairs = ctx.alloc_scratch((n_expert_used as u64) * (n_tokens as u64) * 4)?;
+    let group_offsets = ctx.alloc_scratch((n_experts as u64 + 1) * 4)?;
+    record_moe_group(
+        ctx,
+        ids,
+        group_pairs,
+        group_offsets,
+        n_tokens,
+        n_expert_used,
+        n_experts,
+    )?;
+
+    // Push mirrors the per-token id path's `MulMatVecParams` (the grouped shader
+    // reads the same strides; expert_i1 / nbi1 are unused — the expert comes
+    // from grid.z and the token/slot from group_pairs).
+    let mut push = [0u8; MULMATVEC_ID_PUSH_BYTES as usize];
+    let mut w = 0usize;
+    let mut put = |v: u32, w: &mut usize| {
+        push[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
+        *w += 4;
+    };
+    put(ncols, &mut w); // ncols
+    put(ncols, &mut w); // stride_a
+    put(ncols, &mut w); // stride_b
+    put(stride_d, &mut w); // stride_d
+    put(batch_stride_a, &mut w); // batch_stride_a
+    put(ncols, &mut w); // batch_stride_b (ne11 = 1)
+    put(batch_stride_d, &mut w); // batch_stride_d
+    put(0, &mut w); // fusion_flags
+    put(n_expert_used, &mut w); // nei0
+    put(1, &mut w); // ne11
+    put(0, &mut w); // expert_i1 (unused)
+    put(n_experts, &mut w); // nbi1 (unused)
+
+    // Grouped variant binds {0:data_a, 2:data_d, 3:packed16, 5:b_v2, 8:pairs,
+    // 9:offsets} (Slang strips data_b/packed32/ids). Spec: BLOCK_SIZE, NUM_ROWS,
+    // ACCUMULATE, NUM_COLS (no ID_TOKEN_ON_Z in this variant).
+    let binding_indices = vec![0u32, 2, 3, 5, 8, 9];
+    let key = PipelineKey {
+        name: "mul_mat_vec_q5_k_id_grouped".to_string(),
+        binding_indices: binding_indices.clone(),
+        push_size: MULMATVEC_ID_PUSH_BYTES,
+        spec_constants: vec![32, 2, 0, 1],
+        required_subgroup_size: Some(32),
+    };
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::MUL_MAT_VEC_Q5_K_ID_GROUPED_SPV.as_bytes(),
+    )?;
+    let buffers = vec![
+        a.range(),
+        dst.range(),
+        a.range(),
+        b.range(),
+        group_pairs,
+        group_offsets,
+    ];
+    let workgroups = [n_rows.div_ceil(2), 1, n_experts];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &binding_indices,
+        &buffers,
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
 // ── moe_down_q5_k (fused routing-weighted sum) ─────────────────────
 
 /// Push-constant block for `moe_down_q5_k.slang::MoeDownParams`.

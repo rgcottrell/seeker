@@ -1,8 +1,9 @@
 // Ported from llama.cpp ggml-vulkan mul_mat_vec_q5_k.comp, MIT license — see LICENSE.llama-cpp
 
 //@variants
-//  default: DATA_A_Q5_K=1 B_TYPE=float B_TYPEV2=float2 D_TYPE=float FLOAT_TYPE=float
-//  id:      DATA_A_Q5_K=1 B_TYPE=float B_TYPEV2=float2 D_TYPE=float FLOAT_TYPE=float MUL_MAT_ID=1
+//  default:    DATA_A_Q5_K=1 B_TYPE=float B_TYPEV2=float2 D_TYPE=float FLOAT_TYPE=float
+//  id:         DATA_A_Q5_K=1 B_TYPE=float B_TYPEV2=float2 D_TYPE=float FLOAT_TYPE=float MUL_MAT_ID=1
+//  id_grouped: DATA_A_Q5_K=1 B_TYPE=float B_TYPEV2=float2 D_TYPE=float FLOAT_TYPE=float MUL_MAT_ID=1 GROUPED=1
 //@end-variants
 
 import glsl;  // gl_WorkGroupSize / gl_NumWorkGroups
@@ -153,9 +154,64 @@ void compute_outputs(uint3 wg_id, uint tid_x, uint first_row, uint num_rows) {
     reduce_result(temp, d_offset, first_row, num_rows, tid_x);
 }
 
+#ifdef GROUPED
+// Grouped MoE matvec: one workgroup per (row-tile, expert). The expert's weight
+// slab is read ONCE per (row-tile) and reused across every token routed to it
+// (group_pairs[group_offsets[e] .. group_offsets[e+1]]), instead of re-reading
+// it per token. Output positions are IDENTICAL to the per-token id path
+// (d_offset = slot*stride_d + tok*batch_stride_d), so this is lossless.
+[[vk::binding(8, 0)]] StructuredBuffer<uint> group_pairs;   // [n_used × n_tokens], packed tok*n_used+slot
+[[vk::binding(9, 0)]] StructuredBuffer<uint> group_offsets; // [n_experts + 1]
+
+void grouped_main(uint expert, uint first_row, uint num_rows, uint tid_x) {
+    const uint start = group_offsets[expert];
+    const uint end   = group_offsets[expert + 1u];
+    if (start == end) { return; } // no tokens routed to this expert
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+    const uint it_size = BLOCK_SIZE / 16;
+    const uint itid    = tid_x % 16;
+    const uint ix      = tid_x / 16;
+    const uint il = itid / 4;
+    const uint ir = itid - 4 * il;
+    const uint v_im = il / 2;
+    const uint v_in = il % 2;
+    const uint l0       = 4 * ir + 2 * v_in;
+    const uint q_offset = 32 * v_im + l0;
+    const uint y_offset = 64 * v_im + l0;
+
+    const uint a_offset = expert * (p.batch_stride_a / QUANT_K);
+
+    for (uint g = start; g < end; ++g) {
+        const uint pair = group_pairs[g];
+        const uint tok  = pair / p.nei0;
+        const uint slot = pair - tok * p.nei0;
+        const uint b_offset = (slot % p.ne11) * p.stride_b + tok * p.batch_stride_b;
+        const uint d_offset = slot * p.stride_d + tok * p.batch_stride_d;
+
+        FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+        [unroll] for (uint jj = 0; jj < NUM_COLS; ++jj) {
+            [unroll] for (uint ii = 0; ii < NUM_ROWS; ++ii) { temp[jj][ii] = FLOAT_TYPE(0); }
+        }
+        [unroll] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+            calc_superblock(temp, a_offset, b_offset, v_im, l0, q_offset, y_offset,
+                            i, num_blocks_per_row, first_row, num_rows);
+        }
+        reduce_result(temp, d_offset, first_row, num_rows, tid_x);
+    }
+}
+#endif
+
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_GroupThreadID) {
+#ifdef GROUPED
+    const uint expert    = gl_WorkGroupID.z;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    if (first_row >= p.stride_d) { return; }
+    const uint num_rows = min(NUM_ROWS, p.stride_d - first_row);
+    grouped_main(expert, first_row, num_rows, gl_LocalInvocationID.x);
+#else
 #ifdef MUL_MAT_ID
     const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
 #else
@@ -168,4 +224,5 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
         if (first_row >= p.stride_d) { return; }
         compute_outputs(gl_WorkGroupID, gl_LocalInvocationID.x, first_row, p.stride_d - first_row);
     }
+#endif
 }
