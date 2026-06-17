@@ -771,7 +771,20 @@ impl DiffusiongemmaModel {
         let routed = ctx.alloc_tensor([hidden, nu, 1, 1], GgmlType::F32)?;
         // `ffn_down_exps` dtype is mixed per layer (Q8_0 / Q5_1 in the Q5_K_M
         // checkpoint; Q5_K / Q6_K in others) — dispatch on the actual dtype.
+        // Grouped down (default-on for n>1, byte-identical; `SEEKER_MOE_NO_GROUP`
+        // forces the per-token fused path).
+        let down_grouped = n > 1 && std::env::var("SEEKER_MOE_NO_GROUP").is_err();
         match block.ffn_down_exps.dtype {
+            GgmlType::Q8_0 if down_grouped => moe::record_moe_down_q8_0_grouped(
+                ctx,
+                block.ffn_down_exps,
+                ffn_h,
+                ids,
+                weights_buf,
+                routed,
+                n_used,
+                n_experts,
+            )?,
             GgmlType::Q8_0 => moe::record_moe_down_q8_0(
                 ctx,
                 block.ffn_down_exps,
@@ -780,6 +793,16 @@ impl DiffusiongemmaModel {
                 weights_buf,
                 routed,
                 n_used,
+            )?,
+            GgmlType::Q5_1 if down_grouped => moe::record_moe_down_q5_1_grouped(
+                ctx,
+                block.ffn_down_exps,
+                ffn_h,
+                ids,
+                weights_buf,
+                routed,
+                n_used,
+                n_experts,
             )?,
             GgmlType::Q5_1 => moe::record_moe_down_q5_1(
                 ctx,

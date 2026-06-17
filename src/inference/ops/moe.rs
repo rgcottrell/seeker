@@ -824,3 +824,210 @@ fn record_moe_down_impl(
     record_compute_barrier(ctx.device, ctx.cmd, dst.range());
     Ok(())
 }
+
+const MOEDOWN_GROUPED_PUSH_BYTES: u32 = 7 * 4;
+const MOEDOWN_SUM_PUSH_BYTES: u32 = 3 * 4;
+
+/// Routing-weighted cross-expert sum that folds the grouped down's per-pair
+/// partials (`inter[(tok*n_used+slot)*n_embd + m]`) into the per-token output,
+/// in slot order so it matches the fused kernel's k-loop (byte-identical).
+fn record_moe_down_sum(
+    ctx: &mut DispatchContext,
+    inter: BufferRange,
+    weights: BufferRange,
+    dst: TensorView,
+    n_embd: u32,
+    n_used: u32,
+    n_tokens: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut push = [0u8; MOEDOWN_SUM_PUSH_BYTES as usize];
+    push[0..4].copy_from_slice(&n_embd.to_ne_bytes());
+    push[4..8].copy_from_slice(&n_used.to_ne_bytes());
+    push[8..12].copy_from_slice(&n_tokens.to_ne_bytes());
+    let key = PipelineKey::dense("moe_down_sum", 3, MOEDOWN_SUM_PUSH_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::MOE_DOWN_SUM_SPV.as_bytes())?;
+    let workgroups = [n_embd.div_ceil(256), 1, n_tokens];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[inter, weights, dst.range()],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
+/// Grouped MoE down step: a byte-identical alternative to the fused
+/// `record_moe_down_*` that groups tokens by expert and reads each expert's down
+/// weight slab once (reused across its tokens) instead of re-reading per token —
+/// and replaces the per-token host dispatch loop with a single grouped dispatch.
+/// Un-fused: the grouped matvec writes per-pair partials to a scratch `inter`
+/// tensor, then [`record_moe_down_sum`] applies the (down-scale folded) routing
+/// weights in slot order. `routing_weights` must already have the per-expert
+/// down scale folded in (`record_moe_expert_weight_scale`). `ffn_h_b_v4` picks
+/// the ffn_h binding slot (Q8_0 reads it as float4 at slot 4; Q5_1 as scalar
+/// float at slot 1), matching each quant's per-token kernel.
+#[allow(clippy::too_many_arguments)]
+fn record_moe_down_grouped(
+    ctx: &mut DispatchContext,
+    down_exps: TensorView,
+    ffn_h: TensorView,
+    ids: BufferRange,
+    routing_weights: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+    n_experts: u32,
+    name: &'static str,
+    spv: &[u8],
+    ffn_h_b_v4: bool,
+) -> Result<(), Box<dyn Error>> {
+    let ncols = down_exps.dims[0] as u32; // ff
+    let n_embd = down_exps.dims[1] as u32;
+    let n_tokens = ffn_h.dims[2].max(1) as u32;
+    let n_pairs = n_expert_used * n_tokens;
+    let stride_a = ncols;
+    let stride_b = ncols;
+    let stride_d = n_embd;
+    let batch_stride_a = ncols * n_embd;
+    let batch_stride_b = ncols * n_expert_used; // ffn_h token stride
+
+    let group_pairs = ctx.alloc_scratch(n_pairs as u64 * 4)?;
+    let group_offsets = ctx.alloc_scratch((n_experts as u64 + 1) * 4)?;
+    record_moe_group(
+        ctx,
+        ids,
+        group_pairs,
+        group_offsets,
+        n_tokens,
+        n_expert_used,
+        n_experts,
+    )?;
+
+    let inter = ctx.alloc_scratch(n_embd as u64 * n_pairs as u64 * 4)?;
+
+    let mut push = [0u8; MOEDOWN_GROUPED_PUSH_BYTES as usize];
+    let mut w = 0usize;
+    let mut put = |v: u32, w: &mut usize| {
+        push[*w..*w + 4].copy_from_slice(&v.to_ne_bytes());
+        *w += 4;
+    };
+    put(ncols, &mut w);
+    put(stride_a, &mut w);
+    put(stride_b, &mut w);
+    put(stride_d, &mut w);
+    put(batch_stride_a, &mut w);
+    put(n_expert_used, &mut w);
+    put(batch_stride_b, &mut w);
+
+    // ffn_h binds at slot 4 (float4, Q8_0) or slot 1 (scalar float, Q5_1).
+    let (bind_idx, buffers) = if ffn_h_b_v4 {
+        (
+            vec![0u32, 2, 3, 4, 9, 10],
+            vec![
+                down_exps.range(),
+                inter,
+                down_exps.range(),
+                ffn_h.range(),
+                group_pairs,
+                group_offsets,
+            ],
+        )
+    } else {
+        (
+            vec![0u32, 1, 2, 3, 9, 10],
+            vec![
+                down_exps.range(),
+                ffn_h.range(),
+                inter,
+                down_exps.range(),
+                group_pairs,
+                group_offsets,
+            ],
+        )
+    };
+    let key = PipelineKey {
+        name: name.to_string(),
+        binding_indices: bind_idx.clone(),
+        push_size: MOEDOWN_GROUPED_PUSH_BYTES,
+        spec_constants: Vec::new(),
+        required_subgroup_size: Some(32),
+    };
+    let pipeline = *ctx.pipelines.get(ctx.device, key, spv)?;
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &bind_idx,
+        &buffers,
+        &push,
+        [n_embd.div_ceil(2), 1, n_experts],
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, inter);
+
+    record_moe_down_sum(
+        ctx,
+        inter,
+        routing_weights,
+        dst,
+        n_embd,
+        n_expert_used,
+        n_tokens,
+    )
+}
+
+/// Grouped Q8_0 down step (ffn_h as float4). See [`record_moe_down_grouped`].
+#[allow(clippy::too_many_arguments)]
+pub fn record_moe_down_q8_0_grouped(
+    ctx: &mut DispatchContext,
+    down_exps: TensorView,
+    ffn_h: TensorView,
+    ids: BufferRange,
+    routing_weights: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+    n_experts: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_moe_down_grouped(
+        ctx,
+        down_exps,
+        ffn_h,
+        ids,
+        routing_weights,
+        dst,
+        n_expert_used,
+        n_experts,
+        "moe_down_grouped_q8_0",
+        shaders::MOE_DOWN_GROUPED_Q8_0_SPV.as_bytes(),
+        /* ffn_h_b_v4 = */ true,
+    )
+}
+
+/// Grouped Q5_1 down step (ffn_h as scalar float). See [`record_moe_down_grouped`].
+#[allow(clippy::too_many_arguments)]
+pub fn record_moe_down_q5_1_grouped(
+    ctx: &mut DispatchContext,
+    down_exps: TensorView,
+    ffn_h: TensorView,
+    ids: BufferRange,
+    routing_weights: BufferRange,
+    dst: TensorView,
+    n_expert_used: u32,
+    n_experts: u32,
+) -> Result<(), Box<dyn Error>> {
+    record_moe_down_grouped(
+        ctx,
+        down_exps,
+        ffn_h,
+        ids,
+        routing_weights,
+        dst,
+        n_expert_used,
+        n_experts,
+        "moe_down_grouped_q5_1",
+        shaders::MOE_DOWN_GROUPED_Q5_1_SPV.as_bytes(),
+        /* ffn_h_b_v4 = */ false,
+    )
+}
