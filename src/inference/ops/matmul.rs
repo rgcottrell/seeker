@@ -40,6 +40,8 @@ const BN: u32 = 32;
 /// selects the kernel's `ALLOW_PARTIAL_N` staged store.
 const MM_CM_BM: u32 = 64;
 const MM_CM_BN: u32 = 64;
+/// `mul_mm_cm.slang`'s `BK` (K-step). Split-K slices must stay BK-aligned.
+const MM_CM_BK: u32 = 32;
 
 const MUL_MM_PARAMS_BYTES: u32 = 14 * 4;
 const MUL_MM_CM_PARAMS_BYTES: u32 = 14 * 4;
@@ -667,6 +669,102 @@ fn record_mul_mm_cm(
     if fence {
         record_compute_barrier(ctx.device, ctx.cmd, d.range());
     }
+    Ok(())
+}
+
+/// Coopmat matmul with split-K: parallelise the K reduction across `split_k`
+/// workgroups (on grid.z) so a huge-K / small-N matmul launches `split_k`× more
+/// tiles. Each split writes its partial M×N into a `[split_k, M, N]` scratch
+/// buffer; a reduce pass sums them. NOT bit-identical to the single-pass path
+/// (the partials are summed in a different order), so only the
+/// reproducibility-tolerant diffusion self-conditioning matmul uses it.
+/// `record` (auto-pick) never split-Ks, so every other caller is unchanged.
+pub fn record_split_k(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    b: TensorView,
+    d: TensorView,
+    split_k: u32,
+) -> Result<(), Box<dyn Error>> {
+    let variant = mmcm_variant(a.dtype)
+        .ok_or("matmul::record_split_k: no coopmat variant for this A dtype")?;
+    let k = a.dims[0] as u32;
+    let m = a.dims[1] as u32;
+    let n = b.dims[1] as u32;
+    if split_k <= 1 || k / split_k < MM_CM_BK {
+        // Too few K per split to bother — fall back to the single-pass path.
+        return record_mul_mm_cm(ctx, &variant, a, b, d, true);
+    }
+
+    let partial = !m.is_multiple_of(MM_CM_BM) || !n.is_multiple_of(MM_CM_BN);
+    let stride_a = k;
+    let stride_b = k;
+    let stride_d = m;
+    let batch_stride_a = m * k;
+    let batch_stride_b = n * k;
+    let batch_stride_d = m * n;
+    let mut push = [0u8; MUL_MM_CM_PARAMS_BYTES as usize];
+    let fields = [
+        m,
+        n,
+        k,
+        stride_a,
+        stride_b,
+        stride_d,
+        batch_stride_a,
+        batch_stride_b,
+        batch_stride_d,
+        1,
+        1,
+        1,
+        1,
+        1,
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    let mn = m as u64 * n as u64;
+    let partials = ctx.alloc_scratch(split_k as u64 * mn * 4)?;
+
+    let key = PipelineKey::dense(
+        variant.name,
+        3,
+        MUL_MM_CM_PARAMS_BYTES,
+        vec![partial as u32, split_k],
+    )
+    .with_subgroup_size(32);
+    let pipeline = *ctx.pipelines.get(ctx.device, key, variant.spv)?;
+    let workgroups = [m.div_ceil(MM_CM_BM), n.div_ceil(MM_CM_BN), split_k];
+    super::bind_and_dispatch(
+        ctx,
+        &pipeline,
+        &[0, 1, 2],
+        &[a.range(), b.range(), partials],
+        &push,
+        workgroups,
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, partials);
+
+    // Reduce the split_k partial tiles into the final output.
+    let mut rpush = [0u8; 8];
+    rpush[0..4].copy_from_slice(&(mn as u32).to_ne_bytes());
+    rpush[4..8].copy_from_slice(&split_k.to_ne_bytes());
+    let rkey = PipelineKey::dense("mul_mm_split_k_reduce", 2, 8, Vec::new());
+    let rpipeline = *ctx.pipelines.get(
+        ctx.device,
+        rkey,
+        crate::shaders::MUL_MM_SPLIT_K_REDUCE_SPV.as_bytes(),
+    )?;
+    super::bind_and_dispatch(
+        ctx,
+        &rpipeline,
+        &[0, 1],
+        &[partials, d.range()],
+        &rpush,
+        [(mn as u32).div_ceil(256), 1, 1],
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, d.range());
     Ok(())
 }
 

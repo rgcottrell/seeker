@@ -93,6 +93,15 @@ static const uint SUBGROUP_SIZE  = 32;
 // serve N % 16 ≠ 0 (e.g. the vision tower's n_pos=16104).
 [SpecializationConstant] const uint ALLOW_PARTIAL_N = 0;
 
+// Split-K: when > 1, parallelise the K reduction across SPLIT_K workgroups in
+// gl_WorkGroupID.z (which is otherwise the batch index — split-K is only used
+// for un-batched matmuls). Each split walks a BK-aligned K-slice and writes its
+// partial BM×BN tile to a `[SPLIT_K, M, N]` buffer at `split_idx*M*N`; a reduce
+// pass sums the SPLIT_K partials. Lifts occupancy for huge-K / small-N matmuls
+// (the diffusion self-conditioning `sc_embT·probs`, K=n_vocab=262144) that
+// otherwise launch too few tiles. SPLIT_K=1 (default) is byte-identical.
+[SpecializationConstant] const uint SPLIT_K = 1;
+
 // 2×2 subgroup grid over the BM×BN output. Each subgroup owns a WM×WN block,
 // which is a WMITER×WNITER grid of 16×16 CoopMat fragments. At BM=BN=64 that's
 // a 32×32 block per subgroup = 2×2 = 4 accumulator fragments each (register
@@ -885,7 +894,9 @@ void stage_a_tile(uint row0, uint k0, uint tid, uint a_base_blocks) {
 [numthreads(WORKGROUP_SIZE, 1, 1)]
 void main(uint3 gl_WorkGroupID         : SV_GroupID,
           uint3 gl_LocalInvocationID   : SV_GroupThreadID) {
-    const uint batch_idx = gl_WorkGroupID.z;
+    // Split-K repurposes gl_WorkGroupID.z as the K-split index (un-batched only).
+    const uint split_idx = (SPLIT_K > 1u) ? gl_WorkGroupID.z : 0u;
+    const uint batch_idx = (SPLIT_K > 1u) ? 0u : gl_WorkGroupID.z;
     const uint i13 = batch_idx / p.ne12;
     const uint i12 = batch_idx % p.ne12;
     const uint i03 = i13 / p.broadcast3;
@@ -901,7 +912,14 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
     const uint a_base = batch_idx_a * (p.batch_stride_a / QUANT_K);
 #endif
     const uint b_base = batch_idx   * p.batch_stride_b;
-    const uint d_base = batch_idx   * p.batch_stride_d;
+    // Split-K writes partial tiles into a [SPLIT_K, M, N] buffer (stride_d = M).
+    const uint d_base = (SPLIT_K > 1u) ? (split_idx * p.M * p.N)
+                                       : (batch_idx * p.batch_stride_d);
+
+    // BK-aligned K-slice walked by this split (whole K when SPLIT_K == 1).
+    const uint k_per   = (((p.K / SPLIT_K) + BK - 1u) / BK) * BK;
+    const uint k_start = split_idx * k_per;
+    const uint k_end   = min((split_idx + 1u) * k_per, p.K);
 
     const uint tid     = gl_LocalInvocationID.x;
     const uint warp_id = tid / SUBGROUP_SIZE;
@@ -927,7 +945,7 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
         }
     }
 
-    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+    for (uint k0 = k_start; k0 < k_end; k0 += BK) {
         stage_a_tile(row0, k0, tid, a_base);
 
         // B is dense — col-major in (K, N), staged the same way regardless of A type.

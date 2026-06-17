@@ -901,8 +901,20 @@ impl DiffusiongemmaModel {
 
         // soft = √n_embd · (sc_embT · probs) = √n_embd · Σ_v probs_v·tok_embd[:,v]
         //   sc_embT [K=n_vocab, M=n_embd] · probs [K=n_vocab, L=C] → soft [n_embd, C]
+        // K = n_vocab (262144) is huge while N = C (256) is small, so the
+        // single-pass coopmat launches too few tiles; split-K parallelises the
+        // K reduction (~3× faster). (Not bit-identical — the SC tolerates the
+        // different sum order; `SEEKER_SC_SPLIT_K=0` disables it.)
         let soft = ctx.alloc_tensor([hidden, c, 1, 1], GgmlType::F32)?;
-        matmul::record(ctx, sc_embt, probs_buf, soft)?;
+        let sc_split_k: u32 = std::env::var("SEEKER_SC_SPLIT_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        if sc_split_k > 1 {
+            matmul::record_split_k(ctx, sc_embt, probs_buf, soft, sc_split_k)?;
+        } else {
+            matmul::record(ctx, sc_embt, probs_buf, soft)?;
+        }
         elementwise::record_scale(ctx, soft, soft, p.embd_scale, 0.0)?;
 
         // n = rms_norm(soft, sc_pre_norm); gated MLP sc_down(gelu(sc_gate·n)·(sc_up·n))
