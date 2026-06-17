@@ -753,7 +753,22 @@ impl DiffusiongemmaModel {
         // expert's weight slab across its tokens instead of re-reading it per
         // token. Single-token decode keeps the per-token path. `SEEKER_MOE_NO_GROUP`
         // forces the per-token path (escape hatch).
-        if n > 1 && std::env::var("SEEKER_MOE_NO_GROUP").is_err() {
+        let gate_up_grouped = n > 1 && std::env::var("SEEKER_MOE_NO_GROUP").is_err();
+        // MMQ (integer-dot) expert matmuls: quantize the activation → q8_1, dot
+        // via HW packed int8. Default-on (coherent + ~10% faster on the MoE);
+        // `SEEKER_MOE_NO_MMQ` falls back to the float grouped path.
+        let gate_up_mmq = gate_up_grouped && std::env::var("SEEKER_MOE_NO_MMQ").is_err();
+        if gate_up_mmq {
+            moe::record_matvec_q5k_id_grouped_mmq(
+                ctx,
+                block.ffn_gate_up_exps,
+                ex,
+                ids,
+                gate_up,
+                n_used,
+                n_experts,
+            )?;
+        } else if gate_up_grouped {
             moe::record_matvec_q5k_id_grouped(
                 ctx,
                 block.ffn_gate_up_exps,
@@ -774,7 +789,20 @@ impl DiffusiongemmaModel {
         // Grouped down (default-on for n>1, byte-identical; `SEEKER_MOE_NO_GROUP`
         // forces the per-token fused path).
         let down_grouped = n > 1 && std::env::var("SEEKER_MOE_NO_GROUP").is_err();
+        // MMQ (integer-dot) down: quantize ffn_h → q8_1, dot via HW packed int8.
+        // Default-on (see the gate_up note); `SEEKER_MOE_NO_MMQ` opts out. Q8_0 only.
+        let mmq = down_grouped && std::env::var("SEEKER_MOE_NO_MMQ").is_err();
         match block.ffn_down_exps.dtype {
+            GgmlType::Q8_0 if mmq => moe::record_moe_down_q8_0_grouped_mmq(
+                ctx,
+                block.ffn_down_exps,
+                ffn_h,
+                ids,
+                weights_buf,
+                routed,
+                n_used,
+                n_experts,
+            )?,
             GgmlType::Q8_0 if down_grouped => moe::record_moe_down_q8_0_grouped(
                 ctx,
                 block.ffn_down_exps,
