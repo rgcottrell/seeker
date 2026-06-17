@@ -147,8 +147,15 @@ groupshared float16_t buf_a[BM * AS_STRIDE];
 groupshared float16_t buf_b[BN * BS_STRIDE];
 
 // Output staging for the partial-tile store (ALLOW_PARTIAL_N path only; unused
-// — and DCE'd — when ALLOW_PARTIAL_N == 0). One BM×BN f32 tile, local coords.
-groupshared float store_buf[BM * BN];
+// — and DCE'd — when ALLOW_PARTIAL_N == 0). One 16×16 fragment slot PER SUBGROUP
+// (not the whole BM×BN tile): the partial store walks the WMITER×WNITER
+// fragments one at a time, so 4 × 16×16 f32 = 4 KB suffices instead of
+// BM×BN = 16 KB. The smaller LDS footprint lifts occupancy on EVERY
+// non-64-aligned matmul (all workgroups allocate this, not just the boundary
+// tiles that use it) — diffusion's N=273 forward and autoregressive prefill
+// with a non-aligned prompt length alike.
+static const uint NUM_SUBGROUPS = WORKGROUP_SIZE / SUBGROUP_SIZE;
+groupshared float store_buf[NUM_SUBGROUPS * TM * TN];
 
 // Per-DATA_A_X: write a BM × BK tile of dequantized f16 into buf_a starting at
 // (row0, k0) in the global A coordinate system. WORKGROUP_SIZE threads cooperate.
@@ -1012,25 +1019,31 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
     // stride_d = M. Store<ColumnMajor> writes sums[r,c] to `base + r + c*stride`.
     if (ALLOW_PARTIAL_N != 0 && (col0 + BN > p.N || row0 + BM > p.M)) {
         // Partial output tile: a full 16×16 CoopMat store would overrun data_d.
-        // Stage every fragment into store_buf (row-major, local coords), then
-        // copy only the in-bounds (m<M, n<N) elements out. The branch is
-        // workgroup-uniform (row0/col0), so all warps reach the barrier.
+        // Walk this subgroup's WMITER×WNITER fragments one at a time: stage the
+        // fragment into the subgroup's own 16×16 slot, then copy only the
+        // in-bounds (m<M, n<N) elements out. The branch is workgroup-uniform
+        // (row0/col0), so all warps reach each barrier together. Using a
+        // per-subgroup slot instead of the whole BM×BN tile keeps LDS at 4 KB.
+        const uint sg_slot = warp_id * (TM * TN);
+        const uint lane = tid % SUBGROUP_SIZE;
         [unroll] for (uint im = 0; im < WMITER; im++) {
             [unroll] for (uint in = 0; in < WNITER; in++) {
-                const uint lrow = warp_r * WM + im * TM;
-                const uint lcol = warp_c * WN + in * TN;
                 sums[im][in].Store<CoopMatMatrixLayout::RowMajor>(
-                    store_buf, lrow * BN + lcol, BN);
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-        for (uint i = tid; i < BM * BN; i += WORKGROUP_SIZE) {
-            const uint lr = i / BN;
-            const uint lc = i % BN;
-            const uint gm = row0 + lr;
-            const uint gn = col0 + lc;
-            if (gm < p.M && gn < p.N) {
-                data_d[d_base + gn * p.stride_d + gm] = D_TYPE(store_buf[lr * BN + lc]);
+                    store_buf, sg_slot, TN);
+                GroupMemoryBarrierWithGroupSync();
+                const uint lrow0 = warp_r * WM + im * TM;
+                const uint lcol0 = warp_c * WN + in * TN;
+                for (uint e = lane; e < TM * TN; e += SUBGROUP_SIZE) {
+                    const uint lr = e / TN;
+                    const uint lc = e % TN;
+                    const uint gm = row0 + lrow0 + lr;
+                    const uint gn = col0 + lcol0 + lc;
+                    if (gm < p.M && gn < p.N) {
+                        data_d[d_base + gn * p.stride_d + gm]
+                            = D_TYPE(store_buf[sg_slot + lr * TN + lc]);
+                    }
+                }
+                GroupMemoryBarrierWithGroupSync();
             }
         }
     } else {
