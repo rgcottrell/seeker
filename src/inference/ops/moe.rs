@@ -531,13 +531,20 @@ pub fn record_matvec_q5k_id_grouped(
 
     // Grouped variant binds {0:data_a, 2:data_d, 3:packed16, 5:b_v2, 8:pairs,
     // 9:offsets} (Slang strips data_b/packed32/ids). Spec: BLOCK_SIZE, NUM_ROWS,
-    // ACCUMULATE, NUM_COLS (no ID_TOKEN_ON_Z in this variant).
+    // ACCUMULATE, NUM_COLS. NUM_COLS>1 dequantizes each weight superblock once
+    // and dots it against that many of the expert's tokens (gathered B/D
+    // offsets in-shader) — reuse the dequant, not just the weight read.
+    let num_cols: u32 = std::env::var("SEEKER_MOE_NC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&c: &u32| c >= 1)
+        .unwrap_or(4);
     let binding_indices = vec![0u32, 2, 3, 5, 8, 9];
     let key = PipelineKey {
         name: "mul_mat_vec_q5_k_id_grouped".to_string(),
         binding_indices: binding_indices.clone(),
         push_size: MULMATVEC_ID_PUSH_BYTES,
-        spec_constants: vec![32, 2, 0, 1],
+        spec_constants: vec![32, 2, 0, num_cols],
         required_subgroup_size: Some(32),
     };
     let pipeline = *ctx.pipelines.get(

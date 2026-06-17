@@ -11,8 +11,12 @@ import glsl;  // gl_WorkGroupSize / gl_NumWorkGroups
 #include "types.slang"
 #include "mul_mat_vec_head.slang"
 
+// `b_offsets[j]` is the base element offset of column j's B-vector. Callers
+// pass consecutive offsets (`j*batch_stride_b + b_offset`) for the dense/id
+// paths; the grouped path passes GATHERED per-token offsets so one dequant of
+// the A superblock is reused across NUM_COLS of an expert's (scattered) tokens.
 void calc_superblock(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
-                     uint a_offset, uint b_offset, uint v_im,
+                     uint a_offset, uint b_offsets[NUM_COLS], uint v_im,
                      uint l0, uint q_offset, uint y_offset,
                      uint i, uint num_blocks_per_row,
                      uint first_row, uint num_rows) {
@@ -87,14 +91,15 @@ void calc_superblock(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
         const FLOAT_TYPE q4_15 = qs64_80_hi4.w;
 
         [unroll] for (uint j = 0; j < NUM_COLS; ++j) {
-            float2 by10  = float2(data_b_v2[(j * p.batch_stride_b + b_offset + y1_idx) / 2     ]);
-            float2 by116 = float2(data_b_v2[(j * p.batch_stride_b + b_offset + y1_idx) / 2 +  8]);
-            float2 by132 = float2(data_b_v2[(j * p.batch_stride_b + b_offset + y1_idx) / 2 + 16]);
-            float2 by148 = float2(data_b_v2[(j * p.batch_stride_b + b_offset + y1_idx) / 2 + 24]);
-            float2 by20  = float2(data_b_v2[(j * p.batch_stride_b + b_offset + y2_idx) / 2     ]);
-            float2 by216 = float2(data_b_v2[(j * p.batch_stride_b + b_offset + y2_idx) / 2 +  8]);
-            float2 by232 = float2(data_b_v2[(j * p.batch_stride_b + b_offset + y2_idx) / 2 + 16]);
-            float2 by248 = float2(data_b_v2[(j * p.batch_stride_b + b_offset + y2_idx) / 2 + 24]);
+            const uint bo = b_offsets[j];
+            float2 by10  = float2(data_b_v2[(bo + y1_idx) / 2     ]);
+            float2 by116 = float2(data_b_v2[(bo + y1_idx) / 2 +  8]);
+            float2 by132 = float2(data_b_v2[(bo + y1_idx) / 2 + 16]);
+            float2 by148 = float2(data_b_v2[(bo + y1_idx) / 2 + 24]);
+            float2 by20  = float2(data_b_v2[(bo + y2_idx) / 2     ]);
+            float2 by216 = float2(data_b_v2[(bo + y2_idx) / 2 +  8]);
+            float2 by232 = float2(data_b_v2[(bo + y2_idx) / 2 + 16]);
+            float2 by248 = float2(data_b_v2[(bo + y2_idx) / 2 + 24]);
 
             const FLOAT_TYPE sx = mad(FLOAT_TYPE(by10.x),  q4_0,
                                   mad(FLOAT_TYPE(by10.y),  q4_1,
@@ -139,6 +144,12 @@ void compute_outputs(uint3 wg_id, uint tid_x, uint first_row, uint num_rows) {
     const uint q_offset = 32 * v_im + l0;
     const uint y_offset = 64 * v_im + l0;
 
+    // Dense/id columns are consecutive: b_offsets[j] = j*batch_stride_b + b_offset.
+    uint b_offsets[NUM_COLS];
+    [unroll] for (uint j = 0; j < NUM_COLS; ++j) {
+        b_offsets[j] = j * p.batch_stride_b + b_offset;
+    }
+
     FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
     [unroll] for (uint j = 0; j < NUM_COLS; ++j) {
         [unroll] for (uint i = 0; i < NUM_ROWS; ++i) {
@@ -147,7 +158,7 @@ void compute_outputs(uint3 wg_id, uint tid_x, uint first_row, uint num_rows) {
     }
 
     [unroll] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
-        calc_superblock(temp, a_offset, b_offset, v_im, l0, q_offset, y_offset,
+        calc_superblock(temp, a_offset, b_offsets, v_im, l0, q_offset, y_offset,
                         i, num_blocks_per_row, first_row, num_rows);
     }
 
@@ -162,6 +173,22 @@ void compute_outputs(uint3 wg_id, uint tid_x, uint first_row, uint num_rows) {
 // (d_offset = slot*stride_d + tok*batch_stride_d), so this is lossless.
 [[vk::binding(8, 0)]] StructuredBuffer<uint> group_pairs;   // [n_used × n_tokens], packed tok*n_used+slot
 [[vk::binding(9, 0)]] StructuredBuffer<uint> group_offsets; // [n_experts + 1]
+
+// Masked subgroup-reduce writing each column to its GATHERED output offset; the
+// partial last chunk's invalid columns (j >= nvalid) still take part in the
+// uniform WaveActiveSum but are not written.
+void reduce_nc(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
+               uint d_offsets[NUM_COLS], uint first_row, uint num_rows,
+               uint tid, uint nvalid) {
+    [unroll] for (uint j = 0; j < NUM_COLS; ++j) {
+        [unroll] for (uint n = 0; n < num_rows; ++n) {
+            const FLOAT_TYPE sum = WaveActiveSum(temp[j][n]);
+            if (tid == 0 && j < nvalid) {
+                data_d[d_offsets[j] + first_row + n] = D_TYPE(sum);
+            }
+        }
+    }
+}
 
 void grouped_main(uint expert, uint first_row, uint num_rows, uint tid_x) {
     const uint start = group_offsets[expert];
@@ -182,22 +209,30 @@ void grouped_main(uint expert, uint first_row, uint num_rows, uint tid_x) {
 
     const uint a_offset = expert * (p.batch_stride_a / QUANT_K);
 
-    for (uint g = start; g < end; ++g) {
-        const uint pair = group_pairs[g];
-        const uint tok  = pair / p.nei0;
-        const uint slot = pair - tok * p.nei0;
-        const uint b_offset = (slot % p.ne11) * p.stride_b + tok * p.batch_stride_b;
-        const uint d_offset = slot * p.stride_d + tok * p.batch_stride_d;
+    // Process the expert's tokens in chunks of NUM_COLS so each superblock of
+    // the weight slab is dequantized ONCE and dotted against NUM_COLS tokens.
+    for (uint chunk = start; chunk < end; chunk += NUM_COLS) {
+        const uint nvalid = min(NUM_COLS, end - chunk);
+        uint b_offsets[NUM_COLS];
+        uint d_offsets[NUM_COLS];
+        [unroll] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint idx  = (chunk + j < end) ? (chunk + j) : (end - 1u); // clamp pad
+            const uint pair = group_pairs[idx];
+            const uint tok  = pair / p.nei0;
+            const uint slot = pair - tok * p.nei0;
+            b_offsets[j] = (slot % p.ne11) * p.stride_b + tok * p.batch_stride_b;
+            d_offsets[j] = slot * p.stride_d + tok * p.batch_stride_d;
+        }
 
         FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
         [unroll] for (uint jj = 0; jj < NUM_COLS; ++jj) {
             [unroll] for (uint ii = 0; ii < NUM_ROWS; ++ii) { temp[jj][ii] = FLOAT_TYPE(0); }
         }
         [unroll] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
-            calc_superblock(temp, a_offset, b_offset, v_im, l0, q_offset, y_offset,
+            calc_superblock(temp, a_offset, b_offsets, v_im, l0, q_offset, y_offset,
                             i, num_blocks_per_row, first_row, num_rows);
         }
-        reduce_result(temp, d_offset, first_row, num_rows, tid_x);
+        reduce_nc(temp, d_offsets, first_row, num_rows, tid_x, nvalid);
     }
 }
 #endif
