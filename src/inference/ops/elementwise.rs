@@ -263,6 +263,16 @@ pub fn record_geglu_fused(
     debug_assert_eq!(a.dtype, GgmlType::F32);
     debug_assert_eq!(dst.dtype, GgmlType::F32);
     debug_assert_eq!(a.dims[0], dst.dims[0] * 2, "gate_up dim0 must be 2·ff");
+    // The nb* strides below are derived from dims, so both views must be
+    // contiguous (the gate/up split also assumes a unit dim0 stride). The sole
+    // caller passes freshly alloc'd contiguous tensors; assert the contract.
+    debug_assert!(
+        a.element_stride[0] == 1
+            && a.element_stride[1] == a.dims[0]
+            && dst.element_stride[0] == 1
+            && dst.element_stride[1] == dst.dims[0],
+        "record_geglu_fused requires contiguous gate_up/dst views"
+    );
 
     let ne00 = a.dims[0] as u32; // 2·ff (source row width)
     let ne20 = dst.dims[0] as u32; // ff (dst row width)

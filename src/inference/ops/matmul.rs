@@ -695,6 +695,16 @@ pub fn record_split_k(
 ) -> Result<(), Box<dyn Error>> {
     let variant = mmcm_variant(a.dtype)
         .ok_or("matmul::record_split_k: no coopmat variant for this A dtype")?;
+    // Split-K repurposes grid.z as the split index and hardcodes the batch/
+    // broadcast push fields to 1, so it only handles un-batched matmuls. Batched
+    // dims would be silently mis-addressed.
+    debug_assert!(
+        a.dims[2].max(1) == 1
+            && a.dims[3].max(1) == 1
+            && b.dims[2].max(1) == 1
+            && b.dims[3].max(1) == 1,
+        "record_split_k: batched dims (dim2/dim3 > 1) not supported"
+    );
     let k = a.dims[0] as u32;
     let m = a.dims[1] as u32;
     let n = b.dims[1] as u32;

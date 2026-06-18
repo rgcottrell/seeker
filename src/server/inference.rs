@@ -1631,17 +1631,30 @@ impl Worker {
         let mut stream = self.model.tokenizer().tokenizer.decode_stream(true);
         let engine = &mut self.engine;
         let model: &dyn crate::models::Model = &*self.model;
+        // If the client drops mid-denoise, a `blocking_send` in the block
+        // callback fails; flip this so the next forward step aborts rather than
+        // running the full (sequential) denoiser for a gone client.
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        use std::sync::atomic::Ordering::Relaxed;
         let result = crate::inference::diffusion::generate(
             &prompt,
             canvas_len,
             n_vocab,
             &eog_ids,
             &cfg,
-            |full, n_prompt, sc| engine.forward_diffusion(model, full, n_prompt, sc),
+            |full, n_prompt, sc| {
+                if cancelled.load(Relaxed) {
+                    return Err("client disconnected".into());
+                }
+                engine.forward_diffusion(model, full, n_prompt, sc)
+            },
             |block| {
                 for &tok in block {
-                    if let Ok(Some(piece)) = stream.step(tok) {
-                        let _ = reply.blocking_send(GenEvent::Delta(piece));
+                    if let Ok(Some(piece)) = stream.step(tok)
+                        && reply.blocking_send(GenEvent::Delta(piece)).is_err()
+                    {
+                        cancelled.store(true, Relaxed);
+                        return;
                     }
                 }
             },

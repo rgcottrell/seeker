@@ -924,7 +924,10 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
                                        : (batch_idx * p.batch_stride_d);
 
     // BK-aligned K-slice walked by this split (whole K when SPLIT_K == 1).
-    const uint k_per   = (((p.K / SPLIT_K) + BK - 1u) / BK) * BK;
+    // Ceil-divide K by SPLIT_K (then BK-round up) so the splits cover ALL of K —
+    // a floor here would drop up to SPLIT_K·BK tail elements when K isn't a
+    // multiple of SPLIT_K (k_start past k_end on the last split just no-ops).
+    const uint k_per   = ((((p.K + SPLIT_K - 1u) / SPLIT_K) + BK - 1u) / BK) * BK;
     const uint k_start = split_idx * k_per;
     const uint k_end   = min((split_idx + 1u) * k_per, p.K);
 

@@ -355,26 +355,37 @@ where
             &mut rng,
             &mut forward,
         )?;
+        // Cap every emitted slice to the remaining budget BEFORE `on_block` so
+        // the streamed output (chat/serve) never exceeds `max_tokens` — the
+        // callback sees exactly what the returned `generated` does.
+        let remaining = cfg.max_tokens - generated.len();
 
         // Trim the block at the first end-of-generation token (exclusive).
         if let Some(e) = canvas.iter().position(|t| eog_ids.contains(t)) {
+            let emit = &canvas[..e.min(remaining)];
             if dbg {
-                eprintln!("[diff] block trimmed at eog pos {e} ({e} tokens)");
+                eprintln!(
+                    "[diff] block trimmed at eog pos {e} ({} tokens)",
+                    emit.len()
+                );
             }
-            let emit = &canvas[..e];
             generated.extend_from_slice(emit);
             on_block(emit);
             break;
         }
+        // No eog: emit up to the remaining budget, stopping if it caps mid-block.
+        let emit = &canvas[..remaining.min(canvas.len())];
         if dbg {
-            eprintln!("[diff] block chained (no eog in {} tokens)", canvas.len());
+            eprintln!("[diff] block chained (no eog in {} tokens)", emit.len());
         }
-        generated.extend_from_slice(&canvas);
-        on_block(&canvas);
-        prompt_ext.extend_from_slice(&canvas);
+        generated.extend_from_slice(emit);
+        on_block(emit);
+        if emit.len() < canvas.len() {
+            break;
+        }
+        prompt_ext.extend_from_slice(emit);
     }
 
-    generated.truncate(cfg.max_tokens);
     Ok(generated)
 }
 

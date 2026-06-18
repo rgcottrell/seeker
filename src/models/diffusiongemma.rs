@@ -532,8 +532,13 @@ impl DiffusiongemmaModel {
         let hidden = self.params.n_embd as u64;
         let canvas_view = col_slice(residual, big_p as u64, canvas as u64);
         // Self-conditioning adds its correction into `canvas_view` before the
-        // norm; without it the canvas is just rms_norm_noscale.
-        if let Some(probs) = sc_probs {
+        // norm; without it the canvas is just rms_norm_noscale. Gate on `has_sc`
+        // — a checkpoint with no SC weights (sc_embt unbuilt) must run WITHOUT
+        // self-conditioning rather than error, even though the denoiser still
+        // hands us the previous step's probs.
+        if self.params.has_sc
+            && let Some(probs) = sc_probs
+        {
             self.self_condition(ctx, canvas_view, canvas, probs)?;
         }
         // rms_norm(noscale) into a temp, then copy back into the canvas columns.

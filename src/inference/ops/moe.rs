@@ -450,6 +450,16 @@ fn record_moe_group(
     n_used: u32,
     n_experts: u32,
 ) -> Result<(), Box<dyn Error>> {
+    // moe_group.slang sizes its `counts`/`wpos` groupshared arrays (and its
+    // thread count) at MAX_EXPERTS = 512 and indexes them by expert id, so a
+    // larger expert count would index out of bounds. All current MoE models fit
+    // (gemma 128, qwen 256); reject anything bigger rather than corrupt LDS.
+    const MAX_EXPERTS: u32 = 512;
+    if n_experts > MAX_EXPERTS {
+        return Err(
+            format!("moe_group supports at most {MAX_EXPERTS} experts, got {n_experts}").into(),
+        );
+    }
     let mut push = [0u8; MOEGROUP_PUSH_BYTES as usize];
     push[0..4].copy_from_slice(&n_tokens.to_ne_bytes());
     push[4..8].copy_from_slice(&n_used.to_ne_bytes());
@@ -1117,6 +1127,10 @@ fn record_quantize_q8_1(
     k: u32,
     n_cols: u32,
 ) -> Result<BufferRange, Box<dyn Error>> {
+    // q8_1 blocks are 32 elements; a non-multiple-of-32 K would silently drop the
+    // tail and feed the MMQ dot a truncated activation. All MMQ callers pass a
+    // 32-aligned K (n_embd / ff are multiples of 32), so this is a contract check.
+    debug_assert_eq!(k % 32, 0, "quantize_q8_1: K ({k}) must be a multiple of 32");
     let nblocks = (k / 32) * n_cols;
     let q8 = ctx.alloc_scratch(nblocks as u64 * Q8_1_BLOCK_BYTES)?;
     let mut push = [0u8; QUANTIZE_Q8_1_PUSH_BYTES as usize];
