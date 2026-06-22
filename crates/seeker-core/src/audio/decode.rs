@@ -1,7 +1,8 @@
 //! Audio file/byte decoding for the gemma4 `gemma4ua` audio encoder.
 //!
 //! The encoder wants **16 kHz mono f32 PCM** (raw samples, no mel/FFT — see
-//! [`super::encoder`]). This module decodes any container/codec symphonia is
+//! the audio encoder in `seeker-vulkan`). This module decodes any
+//! container/codec symphonia is
 //! built with (wav/mp3/flac/aac/alac/ogg-vorbis/mp4), downmixes to mono, and
 //! resamples to 16 kHz with `rubato` when the source rate differs.
 //!

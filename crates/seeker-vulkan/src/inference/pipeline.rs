@@ -61,6 +61,8 @@ pub struct PipelineCache {
 }
 
 impl PipelineCache {
+    // Constructed by `Engine::new`; not a `Default`-style value type.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             pipelines: HashMap::new(),

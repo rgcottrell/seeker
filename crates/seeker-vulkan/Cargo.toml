@@ -1,0 +1,23 @@
+[package]
+name = "seeker-vulkan"
+version.workspace = true
+edition.workspace = true
+
+# The Vulkan backend library: the inference Engine, all model architectures, the
+# GPU op kernels, and the compiled Slang shaders. `build.rs` compiles the
+# shaders with slangc into `OUT_DIR/shaders.rs`.
+[dependencies]
+seeker-core = { path = "../seeker-core" }
+ash = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# Forward to seeker-core so its const-fold accessors compile the same ON/OFF
+# path as the gated code in this crate. Every member that has `#[cfg(feature)]`
+# code must both declare AND enable the feature on itself — cargo does not
+# propagate a dependency's enabled feature into the dependent's own cfg.
+profile_gpu = ["seeker-core/profile_gpu"]
+gpu_debug = ["seeker-core/gpu_debug"]

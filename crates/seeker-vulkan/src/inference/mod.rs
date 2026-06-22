@@ -1752,7 +1752,7 @@ impl Engine {
     /// Each call is its own submit + fence-wait: scratch is reused across
     /// chunks, so the next chunk must not record until this chunk's GPU work
     /// (including the persistent conv/GDN state copy-back) has completed.
-    pub(crate) fn forward_kv_only(
+    pub fn forward_kv_only(
         &mut self,
         model: &dyn crate::models::Model,
         cache: &mut kv_cache::KvCache,

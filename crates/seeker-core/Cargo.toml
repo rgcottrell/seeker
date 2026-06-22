@@ -1,0 +1,28 @@
+[package]
+name = "seeker-core"
+version.workspace = true
+edition.workspace = true
+
+# Backend-neutral shared layer: GGUF parsing, tokenizers, chat templating,
+# runtime flags, and host-side image/audio decode. Depends on no other seeker
+# crate (and on nothing Vulkan) so future backends can reuse it as a sibling.
+[dependencies]
+image = { workspace = true }
+indexmap = { workspace = true }
+jiff = { workspace = true }
+memmap2 = { workspace = true }
+minijinja = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+tracing = { workspace = true }
+symphonia = { workspace = true }
+rubato = { workspace = true }
+
+[features]
+# Declared here because `runtime_flags.rs` `#[cfg(feature = …)]`-gates the
+# const-fold debug/profile accessors. The Vulkan code that actually uses these
+# lives in `seeker-vulkan`, which forwards the feature down to this crate.
+profile_gpu = []
+gpu_debug = []

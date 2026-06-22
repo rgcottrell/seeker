@@ -2252,7 +2252,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "seeker"
+name = "seeker-cli"
 version = "0.1.0"
 dependencies = [
  "ash",
@@ -2263,24 +2263,47 @@ dependencies = [
  "futures-util",
  "glob",
  "hf-hub",
- "image",
- "indexmap",
- "jiff",
- "memmap2",
- "minijinja",
- "rand 0.8.6",
- "rubato",
  "rustyline",
+ "seeker-core",
+ "seeker-vulkan",
  "serde",
  "serde_json",
- "symphonia",
- "thiserror 2.0.18",
  "tokenizers",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "seeker-core"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "indexmap",
+ "jiff",
+ "memmap2",
+ "minijinja",
+ "rubato",
+ "serde",
+ "serde_json",
+ "symphonia",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
+name = "seeker-vulkan"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "clap",
+ "rand 0.8.6",
+ "seeker-core",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

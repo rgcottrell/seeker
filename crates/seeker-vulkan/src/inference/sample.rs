@@ -272,6 +272,8 @@ impl Sampler {
     /// offsets were captured during the recording pass.
     ///
     /// Mutates the sampler RNG state — call exactly once per replay.
+    // `host_ptr` is a caller-mapped GPU scratch pointer (deref is `unsafe`-scoped).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn refresh_replay_inputs(
         &mut self,
         host_ptr: *mut u8,
