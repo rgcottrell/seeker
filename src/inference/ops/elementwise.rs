@@ -247,6 +247,87 @@ pub fn record_swiglu_split(
     Ok(())
 }
 
+/// Fused **GeGLU** over a single combined `gate_up` tensor (mode 0):
+/// `dst = gelu(a[..ff]) * a[ff..]`, where `a` is `[2·ff, n_used, N]` (gate =
+/// first half of dim0, up = second half) and `dst` is `[ff, n_used, N]`.
+/// DiffusionGemma's MoE experts ship a fused `ffn_gate_up_exps`, so one
+/// `matvec_id` yields the combined tensor and this collapses the split + gelu +
+/// mul into a single dispatch (the gelu matches `gelu.slang` / ggml's
+/// `ggml_geglu_split`). `a` may be strided (it usually is — a sub-tensor of the
+/// matvec output); `dst` is contiguous.
+pub fn record_geglu_fused(
+    ctx: &mut DispatchContext,
+    a: TensorView,
+    dst: TensorView,
+) -> Result<(), Box<dyn Error>> {
+    debug_assert_eq!(a.dtype, GgmlType::F32);
+    debug_assert_eq!(dst.dtype, GgmlType::F32);
+    debug_assert_eq!(a.dims[0], dst.dims[0] * 2, "gate_up dim0 must be 2·ff");
+    // The nb* strides below are derived from dims, so both views must be
+    // contiguous (the gate/up split also assumes a unit dim0 stride). The sole
+    // caller passes freshly alloc'd contiguous tensors; assert the contract.
+    debug_assert!(
+        a.element_stride[0] == 1
+            && a.element_stride[1] == a.dims[0]
+            && dst.element_stride[0] == 1
+            && dst.element_stride[1] == dst.dims[0],
+        "record_geglu_fused requires contiguous gate_up/dst views"
+    );
+
+    let ne00 = a.dims[0] as u32; // 2·ff (source row width)
+    let ne20 = dst.dims[0] as u32; // ff (dst row width)
+    let ne01 = a.dims[1] as u32;
+    let ne02 = a.dims[2] as u32;
+    let n_elements: u64 = dst.dims.iter().product();
+
+    // Source is contiguous [2·ff, n_used, N]; dst is contiguous [ff, n_used, N].
+    let nb01 = ne00;
+    let nb02 = ne00 * ne01;
+    let nb03 = ne00 * ne01 * ne02;
+    let nb11 = ne20;
+    let nb12 = ne20 * ne01;
+    let nb13 = ne20 * ne01 * ne02;
+
+    const GLU_PARAMS_BYTES: u32 = 16 * 4;
+    let mut push = [0u8; GLU_PARAMS_BYTES as usize];
+    let fields: [u32; 16] = [
+        n_elements as u32, // N (dst elements)
+        ne00,              // ne00 (src col count)
+        ne20,              // ne20 (dst col count)
+        0,                 // mode = 0 (fused gate_up: a, a+ne00/2)
+        0,                 // alpha (unused)
+        0,                 // limit (unused)
+        nb01,
+        nb02,
+        nb03,
+        ne01,
+        ne02,
+        nb11,
+        nb12,
+        nb13,
+        ne01, // ne11 (dst)
+        ne02, // ne12 (dst)
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        push[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    let key = PipelineKey::dense("geglu_f32", 3, GLU_PARAMS_BYTES, Vec::new());
+    let pipeline = *ctx
+        .pipelines
+        .get(ctx.device, key, shaders::GEGLU_F32_SPV.as_bytes())?;
+    // data_b (slot 1) is unused in mode 0; bind `a` to keep the layout valid.
+    record_glu_dispatch(
+        ctx,
+        pipeline,
+        &push,
+        n_elements,
+        &[a.range(), a.range(), dst.range()],
+    )?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst.range());
+    Ok(())
+}
+
 /// Fused `sigmoid(a) * b → dst` ("split-mode" sigmoid_mul) — same dispatch
 /// shape as `record_swiglu_split` but using the `sigmoid_mul.slang`
 /// kernel. The attention block's q-gate `sigmoid(q_gate) * attn_out`
@@ -753,6 +834,42 @@ pub fn record_sigmoid(
 /// `get_rows`: dst[col, row] = src[col, indices[row]]. src has shape
 /// `[hidden, vocab]` (ggml: ne[0]=hidden, ne[1]=vocab), indices is `[L]` of
 /// u32, dst is `[hidden, L]`.
+/// Transpose + cast one vocab chunk of a dequantized `[n_embd, chunk]` F32
+/// `get_rows` slab (`src`, token `v`'s embedding contiguous at `v·n_embd + e`)
+/// into `dst` = the self-conditioning weight `sc_embT` in seeker's matmul-`a`
+/// layout `[K=n_vocab, M=n_embd]` (`a[k=v, m=e]` at `e·n_vocab + v`):
+///   `dst[e·n_vocab + (vocab_offset + v)] = f16(src[v·n_embd + e])`
+/// Used once at load to build the whole `[n_vocab, n_embd]` F16 weight chunk by
+/// chunk (`dst` is the full sc_embT range so the scattered writes land).
+pub fn record_transpose_cast_f32_f16(
+    ctx: &mut DispatchContext,
+    src: BufferRange,
+    dst: BufferRange,
+    n_embd: u32,
+    chunk: u32,
+    vocab_offset: u32,
+    n_vocab: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut push = Vec::with_capacity(16);
+    push.extend_from_slice(&n_embd.to_ne_bytes());
+    push.extend_from_slice(&chunk.to_ne_bytes());
+    push.extend_from_slice(&vocab_offset.to_ne_bytes());
+    push.extend_from_slice(&n_vocab.to_ne_bytes());
+
+    let key = PipelineKey::dense("transpose_cast_f32_f16", 2, 16, vec![]);
+    let pipeline = *ctx.pipelines.get(
+        ctx.device,
+        key,
+        shaders::TRANSPOSE_CAST_F32_F16_SPV.as_bytes(),
+    )?;
+
+    let total = n_embd * chunk;
+    let workgroups = [total.div_ceil(256), 1, 1];
+    super::bind_and_dispatch(ctx, &pipeline, &[0, 1], &[src, dst], &push, workgroups)?;
+    record_compute_barrier(ctx.device, ctx.cmd, dst);
+    Ok(())
+}
+
 pub fn record_get_rows(
     ctx: &mut DispatchContext,
     src: TensorView,

@@ -46,6 +46,11 @@ static const uint MatBc          = 16;
 [SpecializationConstant] const uint HSV = 128;
 [SpecializationConstant] const uint MASK_ENABLE = 0;
 [SpecializationConstant] const uint CLAMP = 0;   // bounds-check KV cols past p.KV
+// 1 = the host mask is non-causal (bidirectional regions, e.g. diffusion
+// canvas): do NOT clamp the KV walk to the query position; walk the full KV
+// and let the per-element mask decide visibility. 0 = causal host mask (the
+// within-chunk triangle) → skip fully-masked trailing blocks (the fast path).
+[SpecializationConstant] const uint BIDIRECTIONAL = 0;
 
 // Head sizes rounded up to a multiple of 16 for the coopmat tiles. Padded
 // lanes are zero-filled in Q/K staging so they contribute 0 to QK^T.
@@ -185,7 +190,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     // (see m_off_base comment / write_causal_mask), so the largest row in this
     // tile sees no key past mask_kv_offset + (last row index). Clamp the walk
     // instead of computing fully-masked trailing blocks.
-    if (MASK_ENABLE != 0) {
+    if (MASK_ENABLE != 0 && BIDIRECTIONAL == 0u) {
         const uint max_qpos = p.mask_kv_offset + min(i_row0 + Br, p.N) - 1u;
         num_blocks = min(num_blocks, max_qpos / Bc + 1u);
     }

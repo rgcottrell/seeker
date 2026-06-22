@@ -93,6 +93,15 @@ static const uint SUBGROUP_SIZE  = 32;
 // serve N % 16 ≠ 0 (e.g. the vision tower's n_pos=16104).
 [SpecializationConstant] const uint ALLOW_PARTIAL_N = 0;
 
+// Split-K: when > 1, parallelise the K reduction across SPLIT_K workgroups in
+// gl_WorkGroupID.z (which is otherwise the batch index — split-K is only used
+// for un-batched matmuls). Each split walks a BK-aligned K-slice and writes its
+// partial BM×BN tile to a `[SPLIT_K, M, N]` buffer at `split_idx*M*N`; a reduce
+// pass sums the SPLIT_K partials. Lifts occupancy for huge-K / small-N matmuls
+// (the diffusion self-conditioning `sc_embT·probs`, K=n_vocab=262144) that
+// otherwise launch too few tiles. SPLIT_K=1 (default) is byte-identical.
+[SpecializationConstant] const uint SPLIT_K = 1;
+
 // 2×2 subgroup grid over the BM×BN output. Each subgroup owns a WM×WN block,
 // which is a WMITER×WNITER grid of 16×16 CoopMat fragments. At BM=BN=64 that's
 // a 32×32 block per subgroup = 2×2 = 4 accumulator fragments each (register
@@ -138,8 +147,15 @@ groupshared float16_t buf_a[BM * AS_STRIDE];
 groupshared float16_t buf_b[BN * BS_STRIDE];
 
 // Output staging for the partial-tile store (ALLOW_PARTIAL_N path only; unused
-// — and DCE'd — when ALLOW_PARTIAL_N == 0). One BM×BN f32 tile, local coords.
-groupshared float store_buf[BM * BN];
+// — and DCE'd — when ALLOW_PARTIAL_N == 0). One 16×16 fragment slot PER SUBGROUP
+// (not the whole BM×BN tile): the partial store walks the WMITER×WNITER
+// fragments one at a time, so 4 × 16×16 f32 = 4 KB suffices instead of
+// BM×BN = 16 KB. The smaller LDS footprint lifts occupancy on EVERY
+// non-64-aligned matmul (all workgroups allocate this, not just the boundary
+// tiles that use it) — diffusion's N=273 forward and autoregressive prefill
+// with a non-aligned prompt length alike.
+static const uint NUM_SUBGROUPS = WORKGROUP_SIZE / SUBGROUP_SIZE;
+groupshared float store_buf[NUM_SUBGROUPS * TM * TN];
 
 // Per-DATA_A_X: write a BM × BK tile of dequantized f16 into buf_a starting at
 // (row0, k0) in the global A coordinate system. WORKGROUP_SIZE threads cooperate.
@@ -885,7 +901,9 @@ void stage_a_tile(uint row0, uint k0, uint tid, uint a_base_blocks) {
 [numthreads(WORKGROUP_SIZE, 1, 1)]
 void main(uint3 gl_WorkGroupID         : SV_GroupID,
           uint3 gl_LocalInvocationID   : SV_GroupThreadID) {
-    const uint batch_idx = gl_WorkGroupID.z;
+    // Split-K repurposes gl_WorkGroupID.z as the K-split index (un-batched only).
+    const uint split_idx = (SPLIT_K > 1u) ? gl_WorkGroupID.z : 0u;
+    const uint batch_idx = (SPLIT_K > 1u) ? 0u : gl_WorkGroupID.z;
     const uint i13 = batch_idx / p.ne12;
     const uint i12 = batch_idx % p.ne12;
     const uint i03 = i13 / p.broadcast3;
@@ -901,7 +919,17 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
     const uint a_base = batch_idx_a * (p.batch_stride_a / QUANT_K);
 #endif
     const uint b_base = batch_idx   * p.batch_stride_b;
-    const uint d_base = batch_idx   * p.batch_stride_d;
+    // Split-K writes partial tiles into a [SPLIT_K, M, N] buffer (stride_d = M).
+    const uint d_base = (SPLIT_K > 1u) ? (split_idx * p.M * p.N)
+                                       : (batch_idx * p.batch_stride_d);
+
+    // BK-aligned K-slice walked by this split (whole K when SPLIT_K == 1).
+    // Ceil-divide K by SPLIT_K (then BK-round up) so the splits cover ALL of K —
+    // a floor here would drop up to SPLIT_K·BK tail elements when K isn't a
+    // multiple of SPLIT_K (k_start past k_end on the last split just no-ops).
+    const uint k_per   = ((((p.K + SPLIT_K - 1u) / SPLIT_K) + BK - 1u) / BK) * BK;
+    const uint k_start = split_idx * k_per;
+    const uint k_end   = min((split_idx + 1u) * k_per, p.K);
 
     const uint tid     = gl_LocalInvocationID.x;
     const uint warp_id = tid / SUBGROUP_SIZE;
@@ -927,7 +955,7 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
         }
     }
 
-    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+    for (uint k0 = k_start; k0 < k_end; k0 += BK) {
         stage_a_tile(row0, k0, tid, a_base);
 
         // B is dense — col-major in (K, N), staged the same way regardless of A type.
@@ -994,25 +1022,31 @@ void main(uint3 gl_WorkGroupID         : SV_GroupID,
     // stride_d = M. Store<ColumnMajor> writes sums[r,c] to `base + r + c*stride`.
     if (ALLOW_PARTIAL_N != 0 && (col0 + BN > p.N || row0 + BM > p.M)) {
         // Partial output tile: a full 16×16 CoopMat store would overrun data_d.
-        // Stage every fragment into store_buf (row-major, local coords), then
-        // copy only the in-bounds (m<M, n<N) elements out. The branch is
-        // workgroup-uniform (row0/col0), so all warps reach the barrier.
+        // Walk this subgroup's WMITER×WNITER fragments one at a time: stage the
+        // fragment into the subgroup's own 16×16 slot, then copy only the
+        // in-bounds (m<M, n<N) elements out. The branch is workgroup-uniform
+        // (row0/col0), so all warps reach each barrier together. Using a
+        // per-subgroup slot instead of the whole BM×BN tile keeps LDS at 4 KB.
+        const uint sg_slot = warp_id * (TM * TN);
+        const uint lane = tid % SUBGROUP_SIZE;
         [unroll] for (uint im = 0; im < WMITER; im++) {
             [unroll] for (uint in = 0; in < WNITER; in++) {
-                const uint lrow = warp_r * WM + im * TM;
-                const uint lcol = warp_c * WN + in * TN;
                 sums[im][in].Store<CoopMatMatrixLayout::RowMajor>(
-                    store_buf, lrow * BN + lcol, BN);
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-        for (uint i = tid; i < BM * BN; i += WORKGROUP_SIZE) {
-            const uint lr = i / BN;
-            const uint lc = i % BN;
-            const uint gm = row0 + lr;
-            const uint gn = col0 + lc;
-            if (gm < p.M && gn < p.N) {
-                data_d[d_base + gn * p.stride_d + gm] = D_TYPE(store_buf[lr * BN + lc]);
+                    store_buf, sg_slot, TN);
+                GroupMemoryBarrierWithGroupSync();
+                const uint lrow0 = warp_r * WM + im * TM;
+                const uint lcol0 = warp_c * WN + in * TN;
+                for (uint e = lane; e < TM * TN; e += SUBGROUP_SIZE) {
+                    const uint lr = e / TN;
+                    const uint lc = e % TN;
+                    const uint gm = row0 + lrow0 + lr;
+                    const uint gn = col0 + lcol0 + lc;
+                    if (gm < p.M && gn < p.N) {
+                        data_d[d_base + gn * p.stride_d + gm]
+                            = D_TYPE(store_buf[sg_slot + lr * TN + lc]);
+                    }
+                }
+                GroupMemoryBarrierWithGroupSync();
             }
         }
     } else {

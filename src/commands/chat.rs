@@ -110,6 +110,52 @@ const BANNER: &str = r#"███████ ███████ ████
      ██ ██      ██      ██ ██  ██      ██   ██
 ███████ ███████ ███████ ██  ██ ███████ ██   ██"#;
 
+/// Diffusion (`diffusion-gemma`) denoiser knobs. Shared by `chat` and `serve`;
+/// flattened into both arg structs. Ignored for autoregressive models.
+#[derive(Args, Clone)]
+pub struct DiffusionArgs {
+    /// Max diffusion denoising steps per canvas block. The entropy-bound
+    /// denoiser adaptively stops once the canvas converges (typically ~12-18),
+    /// so this is an upper bound matching llama.cpp's default.
+    #[arg(long = "diffusion-steps", default_value_t = 48)]
+    pub diffusion_steps: u32,
+    /// Temperature at the last (most confident) denoising step.
+    #[arg(long = "diffusion-t-min", default_value_t = 0.4)]
+    pub diffusion_t_min: f32,
+    /// Temperature at the first (most noisy) denoising step.
+    #[arg(long = "diffusion-t-max", default_value_t = 0.8)]
+    pub diffusion_t_max: f32,
+    /// Cumulative-entropy acceptance bound (nats).
+    #[arg(long = "diffusion-entropy-bound", default_value_t = 0.1)]
+    pub diffusion_entropy_bound: f32,
+    /// Steps the argmax canvas must hold stable before stopping.
+    #[arg(long = "diffusion-stability", default_value_t = 1)]
+    pub diffusion_stability: u32,
+    /// Mean-entropy threshold (nats) for early stopping.
+    #[arg(long = "diffusion-confidence", default_value_t = 0.005)]
+    pub diffusion_confidence: f32,
+    /// RNG seed for the denoiser (canvas init + multinomial draws).
+    #[arg(long = "diffusion-seed", default_value_t = 0)]
+    pub diffusion_seed: u64,
+}
+
+impl DiffusionArgs {
+    /// Build a [`DiffusionConfig`](crate::inference::diffusion::DiffusionConfig)
+    /// with `max_tokens` from the caller's reply budget.
+    pub fn to_config(&self, max_tokens: usize) -> crate::inference::diffusion::DiffusionConfig {
+        crate::inference::diffusion::DiffusionConfig {
+            steps: self.diffusion_steps,
+            t_min: self.diffusion_t_min,
+            t_max: self.diffusion_t_max,
+            entropy_bound: self.diffusion_entropy_bound,
+            stability_threshold: self.diffusion_stability,
+            confidence_threshold: self.diffusion_confidence,
+            seed: self.diffusion_seed,
+            max_tokens,
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct ChatArgs {
     /// HF repo id, optionally with a quant suffix: "ORG/NAME[:QUANT]". (short: -hf, -hfr)
@@ -141,6 +187,9 @@ pub struct ChatArgs {
     /// with `n_max > 0` enables MTP speculative decoding for replies.
     #[command(flatten)]
     spec: crate::commands::download::SpecDraftArgs,
+
+    #[command(flatten)]
+    diffusion: DiffusionArgs,
 
     /// Skip reading and writing the line-history file.
     #[arg(long)]
@@ -371,6 +420,12 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     let weights = engine.upload_weights(&gguf)?;
     let mut model = crate::models::open(&gguf, weights, bundle, args.spec.spec_draft_n_max > 0)?;
 
+    // diffusion-gemma is non-autoregressive: its forward re-runs the whole
+    // [prompt|canvas] each step and never uses the KV cache, so bound the
+    // context (the trained 256K would size a giant unused KV) and skip the
+    // KV-based auto-fit search below.
+    let is_diffusion = model.diffusion_canvas_length().is_some();
+
     // Optional MTP/EAGLE draft model for speculative decoding — a separate
     // gemma4 `gemma4-assistant` GGUF (local `--spec-draft-model` or HF
     // `--spec-draft-hf`, downloaded if absent). qwen35moe self-spec needs no
@@ -404,7 +459,13 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     // `--ctx-size 0` (the default) means "use the model's full trained context"
     // (llama.cpp's `-c 0`); fall back to 4096 if the model omits the metadata.
     let mut ctx_size = if args.ctx_size == 0 {
-        gguf.trained_ctx_len().unwrap_or(4096)
+        if is_diffusion {
+            // Bounds the single-pass [prompt|canvas] forward's scratch; the
+            // user can raise it for longer prompts.
+            4096
+        } else {
+            gguf.trained_ctx_len().unwrap_or(4096)
+        }
     } else {
         args.ctx_size
     };
@@ -415,7 +476,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
     // free memory, so a dense model with a 256K default starts instead of
     // wedging the device. An explicit `--ctx-size` is honored verbatim (the
     // holistic preflight in `allocate_kv_cache*` fail-fasts if it doesn't fit).
-    if args.ctx_size == 0 && budget::fit_enabled() {
+    if args.ctx_size == 0 && budget::fit_enabled() && !is_diffusion {
         let dims = model.cache_dims();
         let per_layer = model.cache_per_layer_dims();
         let align = engine
@@ -513,6 +574,11 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         /*max_batch=*/ 1,
     );
     engine.allocate_scratch(scratch_bytes)?;
+
+    // Build the self-conditioning embedding `sc_embT` (transposed/dequantized
+    // token_embd, [n_vocab, n_embd] F16) once for diffusion models that need it
+    // — no-op for every other model.
+    engine.build_diffusion_sc_embt(&mut *model)?;
 
     let dims = model.cache_dims();
     let cache_config = KvCacheConfig {
@@ -629,7 +695,20 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         spec_n_max,
         context_shift: args.context_shift,
         keep_turns: args.keep,
-        template_kwargs: args.chat_template_kwargs.clone().unwrap_or_default(),
+        template_kwargs: {
+            let mut kw = args.chat_template_kwargs.clone().unwrap_or_default();
+            // diffusion-gemma is a thinking/harmony model: its chat template,
+            // with `enable_thinking` unset, primes a *closed* empty `thought`
+            // channel that derails the canvas (incoherent, duplicated output).
+            // llama.cpp's diffusion-cli defaults thinking ON; match it so the
+            // prompt ends cleanly at `<|turn>model\n`. The user can still pass
+            // `--chat-template-kwargs '{"enable_thinking":false}'` to override.
+            if is_diffusion {
+                kw.entry("enable_thinking".to_string())
+                    .or_insert(serde_json::Value::Bool(true));
+            }
+            kw
+        },
         mmproj_path,
         vision_ctx: None,
         pending_image: None,
@@ -638,6 +717,7 @@ pub async fn run(args: ChatArgs) -> Result<(), Box<dyn Error>> {
         pending_audio: None,
         audio: None,
         scratch_bytes,
+        diffusion_cfg: args.diffusion.to_config(args.max_tokens as usize),
     };
 
     // Seed an optional system prompt (CLI flag or file) as messages[0].
@@ -830,6 +910,10 @@ struct ChatSession {
     /// run single-pass, unlike chunked text prefill) can grow it on demand
     /// without shrinking it back.
     scratch_bytes: u64,
+    /// Diffusion denoiser config — used only when the model is `diffusion-gemma`
+    /// (`model.diffusion_canvas_length().is_some()`); `generate` routes to the
+    /// non-autoregressive denoiser there instead of the sample-one-token loop.
+    diffusion_cfg: crate::inference::diffusion::DiffusionConfig,
 }
 
 /// Timing for one reply, used for the `[ Prompt … | Generation … ]` line.
@@ -1208,6 +1292,19 @@ impl ChatSession {
     /// not a bug; it's logged at debug when it happens. Preserving thinking via
     /// `--chat-template-kwargs` trades context growth for full prefix reuse.
     fn generate(
+        &mut self,
+        on_text: impl FnMut(&str, Segment),
+    ) -> Result<ReplyStats, Box<dyn Error>> {
+        // diffusion-gemma (non-autoregressive) takes the denoiser path; none of
+        // the autoregressive machinery below (KV prefix-reuse, single-token
+        // decode loop, spec decode) applies.
+        if self.model.diffusion_canvas_length().is_some() {
+            return self.generate_diffusion(on_text);
+        }
+        self.generate_autoregressive(on_text)
+    }
+
+    fn generate_autoregressive(
         &mut self,
         mut on_text: impl FnMut(&str, Segment),
     ) -> Result<ReplyStats, Box<dyn Error>> {
@@ -1668,6 +1765,89 @@ impl ChatSession {
             interrupted: cancelled,
             ctx_full,
             shifted_turns,
+        })
+    }
+
+    /// Non-autoregressive reply for `diffusion-gemma`: render the prompt, run
+    /// the entropy-bound denoiser (chaining 256-token canvas blocks until a stop
+    /// token or `max_tokens`), stream each committed block, and store the reply.
+    /// No KV cache / prefix reuse — every step re-forwards `[prompt|canvas]`.
+    fn generate_diffusion(
+        &mut self,
+        mut on_text: impl FnMut(&str, Segment),
+    ) -> Result<ReplyStats, Box<dyn Error>> {
+        let (_rendered, prompt_tokens, _media) = self.render_prompt()?;
+        if prompt_tokens.is_empty() {
+            return Err("empty prompt — nothing to generate".into());
+        }
+        let canvas_len = self
+            .model
+            .diffusion_canvas_length()
+            .ok_or("not a diffusion model")? as usize;
+        let n_vocab = self.model.vocab_size() as usize;
+        let eog_ids: Vec<u32> = self.eos_ids.clone();
+        // The single-pass forward over [prompt | k·canvas | canvas] must fit the
+        // scratch sized for `max_seq_len`. Bound total generation so the deepest
+        // block forward stays within it.
+        let budget = self.cache.config.max_seq_len as usize;
+        if prompt_tokens.len() + canvas_len > budget {
+            return Err(format!(
+                "prompt is {} tokens but --ctx-size is {} — diffusion needs room \
+                 for the prompt plus a {canvas_len}-token canvas; raise --ctx-size",
+                prompt_tokens.len(),
+                budget
+            )
+            .into());
+        }
+        let mut cfg = self.diffusion_cfg.clone();
+        cfg.max_tokens =
+            (self.max_tokens as usize).min(budget.saturating_sub(prompt_tokens.len() + canvas_len));
+
+        GENERATION_CANCELLED.store(false, Ordering::SeqCst);
+        let t0 = std::time::Instant::now();
+
+        // Split the borrow: `engine` (mut) drives the forward, `model` (shared)
+        // + its tokenizer-backed `stream` decode the streamed blocks.
+        let mut stream = self
+            .model
+            .tokenizer()
+            .tokenizer
+            .decode_stream(/* skip_special_tokens = */ true);
+        let engine = &mut self.engine;
+        let model: &dyn crate::models::Model = &*self.model;
+        let generated = crate::inference::diffusion::generate(
+            &prompt_tokens,
+            canvas_len,
+            n_vocab,
+            &eog_ids,
+            &cfg,
+            |full, n_prompt, sc| engine.forward_diffusion(model, full, n_prompt, sc),
+            |block| {
+                for &tok in block {
+                    if let Ok(Some(piece)) = stream.step(tok) {
+                        on_text(&piece, Segment::Final);
+                    }
+                }
+            },
+        )?;
+        let gen_secs = t0.elapsed().as_secs_f64();
+
+        let content = self
+            .model
+            .tokenizer()
+            .tokenizer
+            .decode(&generated, /* skip_special_tokens = */ true)
+            .map_err(|e| format!("decode failed: {e}"))?;
+        self.messages.push(ChatMessage::assistant(content, None));
+
+        Ok(ReplyStats {
+            prompt_tokens: prompt_tokens.len(),
+            prefill_secs: 0.0,
+            decode_tokens: generated.len(),
+            decode_secs: gen_secs,
+            interrupted: GENERATION_CANCELLED.load(Ordering::SeqCst),
+            ctx_full: false,
+            shifted_turns: 0,
         })
     }
 

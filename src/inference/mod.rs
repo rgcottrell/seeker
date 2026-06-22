@@ -13,6 +13,7 @@ pub mod context;
 pub mod decode_dyn;
 pub mod descriptor;
 pub mod device;
+pub mod diffusion;
 pub mod embed;
 pub mod kv_cache;
 pub mod memory;
@@ -1931,6 +1932,8 @@ impl Engine {
         #[cfg(feature = "profile_gpu")]
         self.profile.reset(&self.device, self.command_buffer);
 
+        #[cfg(feature = "gpu_debug")]
+        let taps;
         let ranges = {
             let mut ctx = DispatchContext {
                 flush: None,
@@ -1950,7 +1953,12 @@ impl Engine {
                 #[cfg(feature = "profile_gpu")]
                 profile: Some(&mut self.profile),
             };
-            record(&mut ctx)?
+            let r = record(&mut ctx)?;
+            #[cfg(feature = "gpu_debug")]
+            {
+                taps = std::mem::take(&mut ctx.taps);
+            }
+            r
         };
 
         // Stage results into the HOST_CACHED readback buffer so the host read
@@ -1997,6 +2005,27 @@ impl Engine {
         }
         #[cfg(feature = "profile_gpu")]
         self.profile.readback_and_print(&self.device);
+
+        // Layer-by-layer tap dump (gpu_debug): print sum / max_abs / nan for each
+        // tap the model recorded, read directly from the host-visible scratch.
+        #[cfg(feature = "gpu_debug")]
+        if let Some(sp) = self.scratch.host_ptr {
+            for (name, range) in &taps {
+                if range.size % 4 != 0 {
+                    continue;
+                }
+                let n = (range.size / 4) as usize;
+                let mut buf = vec![0f32; n];
+                unsafe {
+                    let src = sp.add(range.offset as usize) as *const f32;
+                    std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
+                }
+                let sum: f64 = buf.iter().map(|&x| x as f64).sum();
+                let max_abs = buf.iter().fold(0f32, |a, &x| a.max(x.abs()));
+                let nans = buf.iter().filter(|x| x.is_nan()).count();
+                eprintln!("TAP {name}: n={n} sum={sum:.4} max_abs={max_abs:.4} nans={nans}");
+            }
+        }
 
         let host_ptr = self
             .readback
@@ -2415,6 +2444,101 @@ impl Engine {
         let logits = outs[0].clone();
         let residual = outs[1].clone();
         Ok((logits, residual))
+    }
+
+    /// One bidirectional diffusion forward over `[prompt | canvas]`
+    /// (`tokens` = the full `P + C` sequence, `n_prompt = P`). Reads back the
+    /// **canvas** logits `[vocab, C]` as a flat `Vec<f32>` (column-major:
+    /// column `j` = canvas position `j`, `vocab` contiguous). Drives the
+    /// non-autoregressive denoiser in [`diffusion`]. No KV cache: the whole
+    /// sequence is re-forwarded each step. `sc_probs` is the self-conditioning
+    /// feed: the previous step's per-position softmax `[vocab, C]` (column-major
+    /// host slice), or `None` on the first step.
+    pub fn forward_diffusion(
+        &mut self,
+        model: &dyn crate::models::Model,
+        tokens: &[u32],
+        n_prompt: u32,
+        sc_probs: Option<&[f32]>,
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
+        let weights = model.weights();
+        let mut outs = self.run_spec_record(weights, |ctx| {
+            let logits = model.record_forward_diffusion(ctx, tokens, n_prompt, sc_probs)?;
+            Ok(vec![logits.range()])
+        })?;
+        Ok(outs.pop().expect("one diffusion readback range"))
+    }
+
+    /// Build the transposed/dequantized self-conditioning embedding `sc_embT`
+    /// (`[n_vocab, n_embd]` F16, matmul-`a` layout) once at load and hand it to
+    /// `model`. No-op for models without diffusion self-conditioning (see
+    /// [`crate::models::Model::diffusion_sc_build_info`]). The build dequantizes
+    /// `token_embd` chunk-by-chunk via `get_rows` and transposes each chunk into
+    /// the device-local `sc_embT` with `transpose_cast_f32_f16` — one submission
+    /// per chunk so each chunk's host-written row indices are consumed before
+    /// the next overwrites scratch.
+    pub fn build_diffusion_sc_embt(
+        &mut self,
+        model: &mut dyn crate::models::Model,
+    ) -> Result<(), Box<dyn Error>> {
+        let (tok_embd, n_embd, n_vocab) = match model.diffusion_sc_build_info() {
+            Some(info) => info,
+            None => return Ok(()),
+        };
+
+        let bytes = n_vocab as u64 * n_embd as u64 * 2;
+        let region = Region::new(
+            &self.device,
+            bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let sc_buffer = region.buffer;
+
+        // Chunk the vocab so each get_rows slab `[n_embd, CH]` keeps the
+        // 1D transpose dispatch grid within one X dimension (n_embd·CH ≤
+        // 65535·256). 4096 divides the 262144 vocab evenly.
+        const CH: u32 = 4096;
+        let weights = model.weights();
+        let mut v0 = 0u32;
+        while v0 < n_vocab {
+            let ch = CH.min(n_vocab - v0);
+            let sc_dst = BufferRange {
+                buffer: sc_buffer,
+                offset: 0,
+                size: bytes,
+            };
+            self.run_spec_record(weights, |ctx| {
+                let idx = ctx.alloc_scratch(ch as u64 * 4)?;
+                let host = ctx
+                    .scratch
+                    .host_ptr
+                    .ok_or("scratch region not host-visible")?;
+                unsafe {
+                    let dst = host.add(idx.offset as usize) as *mut u32;
+                    for i in 0..ch {
+                        *dst.add(i as usize) = v0 + i;
+                    }
+                }
+                let slab =
+                    ctx.alloc_tensor([n_embd as u64, ch as u64, 1, 1], crate::gguf::GgmlType::F32)?;
+                ops::elementwise::record_get_rows(ctx, tok_embd, idx, ch, slab)?;
+                ops::elementwise::record_transpose_cast_f32_f16(
+                    ctx,
+                    slab.range(),
+                    sc_dst,
+                    n_embd,
+                    ch,
+                    v0,
+                    n_vocab,
+                )?;
+                Ok(vec![])
+            })?;
+            v0 += ch;
+        }
+
+        model.set_diffusion_sc_embt(region);
+        Ok(())
     }
 
     /// Batched embedding prefill: process all texts packed in `tokens`

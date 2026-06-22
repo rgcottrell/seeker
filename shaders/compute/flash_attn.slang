@@ -75,6 +75,11 @@ import glsl;  // gl_SubgroupInvocationID, gl_LocalInvocationIndex
 // kernel uses the legacy single-sequence / batched-decode layout (push p.N rows,
 // p.nb03 batch stride, host mask for prefill causality).
 [SpecializationConstant] const uint VARLEN       = 0;
+// 1 = the host mask is non-causal (bidirectional regions, e.g. the diffusion
+// canvas): do NOT clamp the per-row KV walk to the query position; iterate the
+// full KV and let the per-element mask decide visibility. 0 = causal host mask
+// (the within-chunk triangle) → clamp the walk past the row (the fast path).
+[SpecializationConstant] const uint BIDIRECTIONAL = 0;
 
 static const uint WORKGROUP_SIZE = 32;
 
@@ -455,7 +460,7 @@ void main(uint3 gl_WorkGroupID : SV_GroupID, uint3 gl_LocalInvocationID : SV_Gro
     // and the m_off comment above): row i_row sees no key past
     // mask_kv_offset + i_row. Clamping the walk skips the fully-masked tail
     // blocks instead of computing and then discarding them.
-    if (VARLEN == 0u && MASK_ENABLE != 0u) {
+    if (VARLEN == 0u && MASK_ENABLE != 0u && BIDIRECTIONAL == 0u) {
         eff_kv = min(eff_kv, p.mask_kv_offset + i_row + 1u);
     }
     // Ring layer: iterate the physically-present slots [0, min(kv_len, depth)).
