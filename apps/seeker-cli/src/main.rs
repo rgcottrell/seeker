@@ -14,28 +14,19 @@ use crate::commands::run::{self as run_cmd, RunArgs};
 use crate::commands::serve::{self, ServeArgs};
 use crate::commands::tokenize::{self, TokenizeArgs};
 
-#[allow(dead_code)]
-mod audio;
-mod chat_template;
 mod commands;
-#[allow(dead_code)]
-mod gguf;
-#[allow(dead_code)]
-mod inference;
-#[allow(dead_code)]
-mod models;
-#[allow(dead_code)]
-mod runtime_flags;
+// Protocol structs carry deserialize-only fields (request shapes we accept but
+// don't all read), so dead code is allowed here — as in the original binary.
 #[allow(dead_code)]
 mod server;
-mod tokenizer;
-#[allow(dead_code)]
-mod vision;
 
-#[allow(dead_code)]
-mod shaders {
-    include!(concat!(env!("OUT_DIR"), "/shaders.rs"));
-}
+// Bring the backend (seeker-vulkan) and shared (seeker-core) modules into the
+// crate root so the existing `crate::{inference,models,vision,audio,gguf,
+// tokenizer,chat_template,runtime_flags}` paths in `commands/` and `server/`
+// resolve unchanged after the workspace split. (The compiled `shaders` module
+// now lives in seeker-vulkan; the CLI does not reference it directly.)
+use seeker_core::{chat_template, gguf, runtime_flags, tokenizer};
+use seeker_vulkan::{audio, inference, models, vision};
 
 #[derive(Parser)]
 #[command(name = "seeker", version, about = "Vulkan compute toolkit")]

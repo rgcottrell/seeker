@@ -346,6 +346,8 @@ impl Model for Qwen35MoeModel {
         ))
     }
 
+    // `host_ptr` is a caller-mapped GPU scratch pointer (deref is `unsafe`-scoped).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn refresh_replay_inputs(
         &self,
         host_ptr: *mut u8,

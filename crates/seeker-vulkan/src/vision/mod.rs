@@ -10,7 +10,9 @@ use crate::gguf::{GgufFile, MetadataValue};
 use crate::inference::weights::WeightsHandle;
 
 pub mod encoder;
-pub mod preprocess;
+// Host-side preprocessing now lives in seeker-core; re-export it here so
+// `crate::vision::preprocess` paths in this crate resolve unchanged.
+pub use seeker_core::vision::preprocess;
 
 /// The kind of vision projector shipped in an mmproj GGUF
 /// (`clip.projector_type`).

@@ -135,6 +135,9 @@ pub fn write_field_ctx<T: Copy>(
 /// Host-write a single field of an already-allocated `DecodeDyn` slot.
 /// Used by the replay path which has already resolved the mapped
 /// pointer once at the top of the call.
+// `host_ptr` is a caller-mapped GPU scratch pointer; the deref is contained in
+// an `unsafe` block (lint fires only because this is now exported lib API).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn write_field<T: Copy>(host_ptr: *mut u8, range_offset: u64, field_offset: usize, value: T) {
     debug_assert!(field_offset + std::mem::size_of::<T>() <= DecodeDyn::SIZE as usize);
     unsafe {

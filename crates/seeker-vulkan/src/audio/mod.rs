@@ -16,8 +16,10 @@ use std::error::Error;
 use crate::gguf::GgufFile;
 use crate::vision::{get_bool, get_str};
 
-pub mod decode;
 pub mod encoder;
+// Host-side decode now lives in seeker-core; re-export it here so
+// `crate::audio::decode` paths in this crate resolve unchanged.
+pub use seeker_core::audio::decode;
 
 /// The kind of audio projector shipped in an mmproj GGUF
 /// (`clip.audio.projector_type`).

@@ -1,9 +1,14 @@
-[package]
-name = "seeker"
+[workspace]
+resolver = "3"
+members = ["crates/seeker-core", "crates/seeker-vulkan", "apps/seeker-cli"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+# Dependencies shared across the workspace. Each member opts in with
+# `dep.workspace = true`, so versions/features are declared once here.
+[workspace.dependencies]
 ash = { git = "https://github.com/ash-rs/ash", branch = "master", features = ["provisional"] }
 axum = { version = "0.8", features = ["macros"] }
 clap = { version = "4", features = ["derive"] }
@@ -14,7 +19,7 @@ hf-hub = "0.5.0"
 # Image decode for vision (mmproj) preprocessing. Default features pull every
 # codec; we only need the common still formats, so trim to keep the dep tree
 # small. Used purely for *decoding* to interleaved RGB8 — the smart-resize is
-# hand-rolled in `src/vision/preprocess.rs` to byte-match llama.cpp's
+# hand-rolled in `seeker-core` `vision/preprocess.rs` to byte-match llama.cpp's
 # corner-aligned bilinear (the `image` crate's resampling filters use a
 # different convention).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
@@ -39,51 +44,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Audio decode for the gemma4 `gemma4ua` audio encoder (mmproj). Like `image`,
 # default features pull every codec; trim to the common still/streaming formats.
 # Used purely for *decoding* to interleaved f32 PCM — the encoder wants 16 kHz
-# mono, so `src/audio/decode.rs` downmixes and (if the source rate differs)
-# resamples to 16 kHz with `rubato`. A 16 kHz mono clip skips the resampler and
-# matches `llama-mtmd-cli` byte-for-byte.
+# mono, so `seeker-core` `audio/decode.rs` downmixes and (if the source rate
+# differs) resamples to 16 kHz with `rubato`. A 16 kHz mono clip skips the
+# resampler and matches `llama-mtmd-cli` byte-for-byte.
 symphonia = { version = "0.6.0", default-features = false, features = ["wav", "pcm", "adpcm", "mp3", "flac", "isomp4", "aac", "alac", "ogg", "vorbis"] }
 rubato = "3.0.0"
-
-[features]
-# GPU performance *measurement*. OFF by default: every
-# `DispatchContext::mark(…)` call site compiles to nothing, the
-# `ProfileRecorder` query-pool infrastructure isn't built, the
-# `SEEKER_PROFILE_FORWARD` per-token CPU/GPU timing path is gone, and
-# the per-dispatch / per-barrier counters are not incremented (no
-# `ctx.n_dispatches += 1` in the dispatch hot path, no thread-local
-# barrier counting). When ON, each forward writes ~80 timestamps into a
-# query pool, prints `PROF blocks: …` aggregated by `BlockClass`, and
-# `SEEKER_PROFILE_FORWARD=1` adds a per-token `PROF forward:` line with
-# dispatch/barrier counts — ~80 µs GPU overhead/token (~0.4 % of
-# decode), well below bench noise.
-profile_gpu = []
-
-# GPU correctness *debugging*. OFF by default: all of the following
-# compile to nothing so production builds carry zero overhead —
-#   * Vulkan `VK_LAYER_KHRONOS_validation` + `VK_EXT_debug_utils`
-#     messenger (also auto-enabled in debug builds via `debug_assertions`).
-#   * `DispatchContext::tap(…)` layer-by-layer diff-dump vs llama.cpp's
-#     `cb()` callback (`SEEKER_QWEN_DIFF_DUMP` / `…_DIRECT`) — call sites
-#     become an `#[inline(always)]` no-op, and the engine's tap-readback
-#     loops + the `taps` field disappear.
-#   * `SEEKER_BARRIER_PARANOID` whole-buffer-barrier race-hunting mode,
-#     checked per barrier (500–1500×/decode forward).
-#   * qwen35moe per-block ablations (`SEEKER_QWEN_NO_*`,
-#     `SEEKER_QWEN_ONLY_RMS`, `SEEKER_QWEN_MAX_LAYERS`,
-#     `SEEKER_QWEN_GDN_SCALE`, `SEEKER_QWEN_SSM_DUMP`).
-#   * `SEEKER_DECODE_REPLAY=0` legacy record-each-token diagnostic.
-#   * `SEEKER_CHAT_DEBUG` rendered-prompt dump.
-#   * The `SEEKER_*_TEST` / `*_DUMP` op smoke-test harnesses in `seeker run`.
-# Each debug flag accessor constant-folds to `false`/`None` when the
-# feature is off, so the surrounding branches are eliminated entirely.
-gpu_debug = []
 
 # Faster debug/test builds (release is left fully optimized). `line-tables-only`
 # keeps file:line in panics/backtraces but drops variable-level debuginfo, which
 # is the bulk of debuginfo generation + linking cost; `unpacked` keeps debuginfo
 # out of the linked artifact for a further link speedup. The test profile
-# inherits these from dev.
+# inherits these from dev. Profiles are only honored at the workspace root.
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
