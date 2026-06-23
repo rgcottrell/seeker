@@ -49,6 +49,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # resampler and matches `llama-mtmd-cli` byte-for-byte.
 symphonia = { version = "0.6.0", default-features = false, features = ["wav", "pcm", "adpcm", "mp3", "flac", "isomp4", "aac", "alac", "ogg", "vorbis"] }
 rubato = "3.0.0"
+# bf16 host<->NPU conversions for the seeker-npu backend (the NPU GEMM is bf16->f32).
+half = "2"
 
 # Faster debug/test builds (release is left fully optimized). `line-tables-only`
 # keeps file:line in panics/backtraces but drops variable-level debuginfo, which

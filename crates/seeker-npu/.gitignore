@@ -1,0 +1,4 @@
+# Generated AIE artifacts (xclbin + instruction blobs). Regenerate with the
+# per-kernel build scripts (e.g. kernels/gemm/build.sh) on a Strix Halo + AIE
+# toolchain; they are device/shape-specific and not checked in.
+kernels/**/build/
