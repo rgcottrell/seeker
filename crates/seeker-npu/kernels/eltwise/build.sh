@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 #
-# Build a fixed-size f32 element-wise kernel xclbin (+ instruction blob) for the
-# NPU and copy the artifacts to build/eltwise_<op>_<n>.{xclbin,insts.bin}.
+# Build a fixed-size element-wise kernel xclbin (+ instruction blob) for the NPU
+# and copy the artifacts to build/eltwise_<op>_<dtype>_<n>.{xclbin,insts.bin}.
 #
-# Usage:  build.sh <op> <n>          # op = add|mul,  n = element count (multiple of 1024)
+# Usage:  build.sh <op> <dtype> <n>   # op = add|mul,  dtype = f32|bf16,  n multiple of 1024
 #
 # Same prerequisites as kernels/gemm/build.sh (XRT, the AIE venv, raised memlock).
 set -euo pipefail
 
-OP=${1:?usage: build.sh <add|mul> <n>}
-N=${2:?usage: build.sh <add|mul> <n>}
+OP=${1:?usage: build.sh <add|mul> <f32|bf16> <n>}
+DTYPE=${2:?usage: build.sh <add|mul> <f32|bf16> <n>}
+N=${3:?usage: build.sh <add|mul> <f32|bf16> <n>}
 
 XRT_SETUP=${XRT_SETUP:-/opt/xilinx/xrt/setup.sh}
 VENV=${SEEKER_NPU_VENV:-$HOME/workspace/gpu-npu-demo/.venv}
@@ -27,11 +28,11 @@ workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
 cp "$here/eltwise.py" "$workdir/eltwise.py"
 
-echo "### building eltwise ${OP} n=${N} (f32) ..."
+echo "### building eltwise ${OP} ${DTYPE} n=${N} ..."
 # Isolated IRON cache (HOME -> workdir) so we copy exactly this build's artifact.
 (
   cd "$workdir"
-  HOME="$workdir" python eltwise.py --op "$OP" -n "$N"
+  HOME="$workdir" python eltwise.py --op "$OP" --dtype "$DTYPE" -n "$N"
 )
 
 cache=$(ls -td "$workdir"/.npu/cache/*/ 2>/dev/null | head -1)
@@ -39,6 +40,6 @@ if [ -z "$cache" ] || [ ! -f "$cache/final.xclbin" ]; then
   echo "error: build produced no final.xclbin under the isolated cache" >&2
   exit 1
 fi
-cp "$cache/final.xclbin" "$outdir/eltwise_${OP}_${N}.xclbin"
-cp "$cache/insts.bin" "$outdir/eltwise_${OP}_${N}.insts.bin"
-echo "wrote $outdir/eltwise_${OP}_${N}.{xclbin,insts.bin}"
+cp "$cache/final.xclbin" "$outdir/eltwise_${OP}_${DTYPE}_${N}.xclbin"
+cp "$cache/insts.bin" "$outdir/eltwise_${OP}_${DTYPE}_${N}.insts.bin"
+echo "wrote $outdir/eltwise_${OP}_${DTYPE}_${N}.{xclbin,insts.bin}"

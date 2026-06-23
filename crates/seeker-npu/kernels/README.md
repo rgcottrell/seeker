@@ -29,17 +29,19 @@ crates/seeker-npu/kernels/gemm/build.sh 2048 1024 256
 cargo run -p seeker-npu --example gemm        # uses 2048x1024x256 by default
 ```
 
-## eltwise/ — f32 element-wise add / mul
+## eltwise/ — element-wise add / mul (f32 or bf16)
 
-IRON `transform_binary` designs (`eltwise.py`), one xclbin per (op, N). `add` is
-the transformer residual add; `mul` is the SwiGLU `gate * up` product. Both are
-f32 in/out (the activation working dtype between GEMMs). N is the element count
-(a multiple of the 1024 tile).
+IRON `transform_binary` designs (`eltwise.py`), one xclbin per (op, dtype, N).
+`add` is the transformer residual add; `mul` is the SwiGLU `gate * up` product
+(and the RoPE rotation, paired with host sin/cos tables). N is the element count
+(a multiple of the 1024 tile). The forward runs **bf16 activations end-to-end**
+(GEMM is built bf16→bf16, with f32 accumulation internally), so no f32↔bf16 cast
+kernel is needed; the `f32` variants are kept for reference/testing.
 
 ```sh
-crates/seeker-npu/kernels/eltwise/build.sh add 4096
-crates/seeker-npu/kernels/eltwise/build.sh mul 4096
-cargo run -p seeker-npu --example eltwise      # validates add + mul vs host f32
+crates/seeker-npu/kernels/eltwise/build.sh add bf16 4096
+crates/seeker-npu/kernels/eltwise/build.sh mul bf16 4096
+cargo run -p seeker-npu --example eltwise      # validates add+mul × f32+bf16 vs host
 ```
 
 ## activation/ — bf16 SiLU
