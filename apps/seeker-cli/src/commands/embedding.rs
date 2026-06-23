@@ -11,12 +11,19 @@ use std::path::PathBuf;
 use clap::{Args, ValueEnum};
 
 use crate::commands::download::{self, HfResolveArgs, Resolved};
-use crate::gguf::GgufFile;
-use crate::inference::Engine;
-use crate::inference::embed::{self, Pooling};
-use crate::inference::kv_cache::{KvCacheConfig, parse_dtype};
-use crate::tokenizer::build_tokenizer;
-use crate::{gguf::GgmlType, models};
+use crate::gguf::{GgmlType, GgufFile};
+use crate::inference::embed::{self, Pooling, TextEmbedder};
+use crate::inference::embedder::VulkanEmbedder;
+use crate::inference::kv_cache::parse_dtype;
+
+/// Which compute backend runs the transformer forward.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Device {
+    /// The Vulkan iGPU backend (default).
+    Vulkan,
+    /// The Strix Halo NPU backend (requires a build with `--features npu`).
+    Npu,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -98,6 +105,11 @@ pub struct EmbeddingArgs {
     /// Physical micro-batch size for prefill (0 = single pass). Short: -ub.
     #[arg(long = "ubatch-size", default_value_t = 512)]
     ubatch_size: u32,
+
+    /// Compute backend: `vulkan` (default, iGPU) or `npu` (Strix Halo XDNA2;
+    /// requires a build with `--features npu`).
+    #[arg(long = "device", value_enum, default_value_t = Device::Vulkan)]
+    device: Device,
 }
 
 fn parse_dtype_arg(s: &str) -> Result<GgmlType, String> {
@@ -127,18 +139,18 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
     };
 
     let gguf = GgufFile::open(&resolved.main)?;
-    let bundle = build_tokenizer(&gguf)?;
-    if !bundle.add_eos_default {
-        tracing::warn!(
-            "model does not set tokenizer.ggml.add_eos_token; last-token pooling may not land \
-             on the intended EOS position"
-        );
-    }
 
-    let mut engine = Engine::new(args.ubatch_size, 2048)?;
-    tracing::info!(device = %engine.device.name(), "vulkan device opened for embedding");
-    let weights = engine.upload_weights(&gguf)?;
-    let model = models::open(&gguf, weights, bundle, /*spec_enabled=*/ false)?;
+    // Build the chosen backend (Vulkan today, NPU under `--features npu`). The
+    // backend owns the model + tokenizer and produces the pre-output_norm
+    // residual; the final norm + pool + normalize below are shared host-side.
+    let mut embedder = build_embedder(
+        args.device,
+        &gguf,
+        args.ubatch_size,
+        args.cache_type_k,
+        args.cache_type_v,
+    )?;
+    tracing::info!(device = %embedder.device_name(), "embedding backend ready");
 
     // Final-norm weights + eps, read host-side (norm tensors are F32 in both the
     // F16 and Q8_0 GGUFs). The arch prefix is whatever the GGUF declares.
@@ -190,38 +202,13 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
         return Err("no input — pass --prompt/-p (repeatable) or --prompt-file/-f".into());
     }
 
-    // Tokenize all inputs first so scratch + KV can be sized for the longest.
+    // Tokenize all inputs first so the backend can size scratch for the longest.
     let token_seqs: Vec<Vec<u32>> = inputs
         .iter()
-        .map(|t| {
-            model
-                .tokenizer()
-                .tokenizer
-                .encode(t.as_str(), /*add_special=*/ true)
-                .map(|e| e.get_ids().to_vec())
-                .map_err(|e| -> Box<dyn Error> { format!("tokenize failed: {e}").into() })
-        })
+        .map(|t| embedder.tokenize(t))
         .collect::<Result<_, _>>()?;
     let max_len = token_seqs.iter().map(|t| t.len()).max().unwrap_or(0).max(1) as u32;
-
-    // ---- allocate scratch + KV once at the max input length ----
-    let scratch = model.scratch_bytes_estimate(
-        args.ubatch_size,
-        max_len,
-        args.cache_type_k,
-        args.cache_type_v,
-        /*max_batch=*/ 1,
-    );
-    engine.allocate_scratch(scratch)?;
-    let dims = model.cache_dims();
-    let cache_config = KvCacheConfig {
-        k_dtype: args.cache_type_k,
-        v_dtype: args.cache_type_v,
-        max_seq_len: max_len,
-        n_head: dims.n_head,
-    };
-    let mut cache =
-        engine.allocate_kv_cache(dims.n_layer, dims.head_dim, dims.n_head_kv, cache_config)?;
+    embedder.reserve(max_len)?;
 
     // ---- per-input forward → pool → normalize ----
     // For Pooling::None each input expands to L vectors.
@@ -230,9 +217,7 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
         if tokens.is_empty() {
             return Err("empty input after tokenization".into());
         }
-        cache.reset();
-        let (_logits, residual) = engine
-            .forward_full_readback(&*model, &mut cache, tokens, 0, /*full_logits=*/ false)?;
+        let residual = embedder.embed_residual(tokens)?;
         // output_norm per position, pool, normalize (the shared host-side path).
         all.extend(embed::pool_and_normalize(
             &residual,
@@ -258,6 +243,25 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
         args.embd_normalize
     );
     Ok(())
+}
+
+/// Build the embedding backend for `device`. `--device npu` requires a build
+/// with `--features npu`; until that backend lands it returns a clear error.
+fn build_embedder(
+    device: Device,
+    gguf: &GgufFile,
+    ubatch: u32,
+    cache_k: GgmlType,
+    cache_v: GgmlType,
+) -> Result<Box<dyn TextEmbedder>, Box<dyn Error>> {
+    match device {
+        Device::Vulkan => Ok(Box::new(VulkanEmbedder::new(
+            gguf, ubatch, cache_k, cache_v,
+        )?)),
+        Device::Npu => Err("the NPU backend is not yet available (coming in a later \
+                            milestone); rebuild with `--features npu` once implemented"
+            .into()),
+    }
 }
 
 // ─── CLI-only output helpers ─────────────────────────────────────────

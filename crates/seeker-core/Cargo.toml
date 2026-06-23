@@ -7,6 +7,10 @@ edition.workspace = true
 # runtime flags, and host-side image/audio decode. Depends on no other seeker
 # crate (and on nothing Vulkan) so future backends can reuse it as a sibling.
 [dependencies]
+# `embed::Pooling` derives `clap::ValueEnum` so the CLI/serve parse `--pooling`
+# against the shared core type; `embed::TextEmbedder` is the backend-agnostic
+# embedding trait. clap derive is already a workspace dependency.
+clap = { workspace = true }
 image = { workspace = true }
 indexmap = { workspace = true }
 jiff = { workspace = true }

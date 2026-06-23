@@ -15,6 +15,7 @@ pub mod descriptor;
 pub mod device;
 pub mod diffusion;
 pub mod embed;
+pub mod embedder;
 pub mod kv_cache;
 pub mod memory;
 pub mod ops;

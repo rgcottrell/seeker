@@ -2280,6 +2280,7 @@ dependencies = [
 name = "seeker-core"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "image",
  "indexmap",
  "jiff",
