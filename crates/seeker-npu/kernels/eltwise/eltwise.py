@@ -12,6 +12,7 @@ import aie.iron as iron
 import numpy as np
 from aie.iron import CompileTime, In, Out
 from aie.iron.algorithms import transform_binary_typed
+from ml_dtypes import bfloat16
 
 
 @iron.jit
@@ -42,30 +43,36 @@ def eltwise_mul(
     return transform_binary_typed(lambda a, b: a * b, tensor_ty, tile_size=tile_size)
 
 
+_DTYPES = {"f32": np.float32, "bf16": bfloat16}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--op", choices=["add", "mul"], required=True)
+    p.add_argument("--dtype", choices=["f32", "bf16"], default="f32")
     p.add_argument("-n", "--num-elements", type=int, default=4096)
     args = p.parse_args()
+    dt = _DTYPES[args.dtype]
 
-    in0 = iron.rand((args.num_elements,), dtype=np.float32, device="npu")
-    in1 = iron.rand((args.num_elements,), dtype=np.float32, device="npu")
+    in0 = iron.rand((args.num_elements,), dtype=dt, device="npu")
+    in1 = iron.rand((args.num_elements,), dtype=dt, device="npu")
     out = iron.zeros_like(in0)
 
     design = eltwise_add if args.op == "add" else eltwise_mul
-    design(in0, in1, out, num_elements=args.num_elements, dtype=np.float32)
+    design(in0, in1, out, num_elements=args.num_elements, dtype=dt)
 
-    a = in0.numpy()
-    b = in1.numpy()
+    a = in0.numpy().astype(np.float32)
+    b = in1.numpy().astype(np.float32)
     expected = (a + b) if args.op == "add" else (a * b)
-    actual = out.numpy()
-    # f32 tolerance: the AIE vector op rounds in a different order than numpy, so
-    # bit-exactness (assert_pass) is too strict — a 1-ULP difference is correct.
-    if np.allclose(actual, expected, rtol=1e-3, atol=1e-5):
+    actual = out.numpy().astype(np.float32)
+    # AIE rounds in a different order than numpy; bf16 also loses mantissa bits, so
+    # use a dtype-appropriate tolerance (bit-exactness / assert_pass is too strict).
+    rtol, atol = (1e-3, 1e-5) if args.dtype == "f32" else (3e-2, 2e-2)
+    if np.allclose(actual, expected, rtol=rtol, atol=atol):
         print("PASS!")
     else:
         max_err = float(np.abs(actual - expected).max())
-        print(f"FAIL! eltwise {args.op} max_abs_err={max_err}")
+        print(f"FAIL! eltwise {args.op} {args.dtype} max_abs_err={max_err}")
         raise SystemExit(1)
 
 
