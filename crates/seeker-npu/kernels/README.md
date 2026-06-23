@@ -42,3 +42,17 @@ crates/seeker-npu/kernels/eltwise/build.sh mul 4096
 cargo run -p seeker-npu --example eltwise      # validates add + mul vs host f32
 ```
 
+## activation/ — bf16 SiLU
+
+`activation.py` wires the shipped mlir_aie AIE2P LUT microkernel (`silu.cc`) into
+an IRON design via `transform_parallel_typed` + `aie.iron.kernels.silu`. bf16
+in/out, fixed LUT tile of 1024 → N must be a multiple of 8192 (8 cols × 1024).
+SiLU is the SwiGLU gate activation; pair it with the eltwise `mul` for
+`silu(gate) * up`. As a LUT bf16 kernel it matches the host reference within a few
+percent (numpy `allclose` atol 2e-2 / rtol 3e-2).
+
+```sh
+crates/seeker-npu/kernels/activation/build.sh 8192
+cargo run -p seeker-npu --example silu         # validates vs host x*sigmoid(x)
+```
+
