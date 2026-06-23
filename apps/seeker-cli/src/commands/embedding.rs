@@ -218,6 +218,21 @@ pub async fn run(args: EmbeddingArgs) -> Result<(), Box<dyn Error>> {
             return Err("empty input after tokenization".into());
         }
         let residual = embedder.embed_residual(tokens)?;
+        // Enforce the TextEmbedder contract (`[n_embd * L]`, position-major) before
+        // pooling — `pool_and_normalize` divides by n_embd and would silently
+        // truncate a wrong-length residual. Catches backend (esp. NPU) shape bugs.
+        let expected = n_embd
+            .checked_mul(tokens.len())
+            .ok_or("embedding residual size overflow")?;
+        if residual.len() != expected {
+            return Err(format!(
+                "backend residual length {} != expected {} (n_embd={n_embd} × tokens={})",
+                residual.len(),
+                expected,
+                tokens.len()
+            )
+            .into());
+        }
         // output_norm per position, pool, normalize (the shared host-side path).
         all.extend(embed::pool_and_normalize(
             &residual,
