@@ -31,6 +31,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let m = env_usize("NPU_GEMM_M", 2048);
     let k = env_usize("NPU_GEMM_K", 1024);
     let n = env_usize("NPU_GEMM_N", 256);
+    // Enforce the whole_array tiling constraints up front so an invalid override
+    // fails clearly here rather than as a late XRT error or a 0-length panic.
+    if m == 0 || k == 0 || n == 0 {
+        return Err("NPU_GEMM_M/K/N must be > 0".into());
+    }
+    if !m.is_multiple_of(256) || !k.is_multiple_of(64) || !n.is_multiple_of(256) {
+        return Err(format!(
+            "invalid GEMM shape {m}x{k}x{n}: require M%256==0, K%64==0, N%256==0 (8 cols, 64x64x32 tile)"
+        )
+        .into());
+    }
     let stem = format!("gemm_{m}x{k}x{n}");
     let xclbin = artifact("NPU_GEMM_XCLBIN", &format!("{stem}.xclbin"));
     let insts = artifact("NPU_GEMM_INSTS", &format!("{stem}.insts.bin"));
