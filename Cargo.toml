@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/seeker-core", "crates/seeker-vulkan", "apps/seeker-cli"]
+members = ["crates/seeker-core", "crates/seeker-vulkan", "crates/seeker-npu", "apps/seeker-cli"]
 
 [workspace.package]
 version = "0.1.0"

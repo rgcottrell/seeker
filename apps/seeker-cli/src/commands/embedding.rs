@@ -273,9 +273,18 @@ fn build_embedder(
         Device::Vulkan => Ok(Box::new(VulkanEmbedder::new(
             gguf, ubatch, cache_k, cache_v,
         )?)),
-        Device::Npu => Err("the NPU backend is not yet available (coming in a later \
-                            milestone); rebuild with `--features npu` once implemented"
-            .into()),
+        Device::Npu => {
+            #[cfg(feature = "npu")]
+            {
+                let _ = (ubatch, cache_k, cache_v); // the NPU backend sizes its own buffers
+                Ok(Box::new(seeker_npu::Qwen3EmbeddingNpu::new(gguf)?))
+            }
+            #[cfg(not(feature = "npu"))]
+            {
+                let _ = (gguf, ubatch, cache_k, cache_v);
+                Err("seeker was built without NPU support; rebuild with `--features npu`".into())
+            }
+        }
     }
 }
 

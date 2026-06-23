@@ -14,6 +14,10 @@ path = "src/main.rs"
 [dependencies]
 seeker-core = { path = "../../crates/seeker-core" }
 seeker-vulkan = { path = "../../crates/seeker-vulkan" }
+# Optional NPU backend, enabled by the `npu` feature. Off by default so a plain
+# build never compiles the XRT shim. (The crate itself degrades to an XRT-free
+# stub when XILINX_XRT is absent, so even `--features npu` builds without an NPU.)
+seeker-npu = { path = "../../crates/seeker-npu", optional = true }
 ash = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
@@ -38,3 +42,6 @@ tracing-subscriber = { workspace = true }
 # core accessors flip together; missing a hop silently compiles the OFF path.
 profile_gpu = ["seeker-vulkan/profile_gpu", "seeker-core/profile_gpu"]
 gpu_debug = ["seeker-vulkan/gpu_debug", "seeker-core/gpu_debug"]
+# Compile + wire the Strix Halo NPU backend (`--device npu`). Needs XRT to do real
+# NPU work; builds (as a stub) without it.
+npu = ["dep:seeker-npu"]
