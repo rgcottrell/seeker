@@ -77,6 +77,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8192);
+    // Match the kernel/build contract: N a positive multiple of 8192 (8 cols ×
+    // 1024 tile). Otherwise the per-1024 comparison would skip a tail and could
+    // falsely PASS.
+    if n == 0 || !n.is_multiple_of(8192) {
+        return Err("NPU_NORM_N must be a positive multiple of 8192".into());
+    }
     run("rmsnorm", n)?;
     run("softmax", n)?;
     println!("PASS");
