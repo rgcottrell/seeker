@@ -7,6 +7,7 @@
 //! becomes a sibling crate that reuses it.
 
 pub mod chat_template;
+pub mod embed;
 pub mod gguf;
 pub mod runtime_flags;
 pub mod tokenizer;
