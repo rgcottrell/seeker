@@ -1,0 +1,20 @@
+[package]
+name = "seeker-npu"
+version.workspace = true
+edition.workspace = true
+description = "Strix Halo XDNA2 NPU backend for seeker (XRT/AIE)"
+# Coordinates linking of the C++/XRT shim compiled by build.rs.
+links = "npu_shim"
+
+# The NPU backend (Qwen3 embedding). Depends only on seeker-core (the
+# backend-neutral layer + the TextEmbedder trait); never on seeker-vulkan.
+#
+# build.rs compiles a C++/XRT shim and generates bindgen FFI. When XILINX_XRT is
+# absent (CI, non-Strix hosts) it builds an XRT-free stub instead, so the crate
+# still compiles + links everywhere; real NPU execution requires XRT at build time.
+[dependencies]
+seeker-core = { path = "../seeker-core" }
+
+[build-dependencies]
+cc = "1.2"
+bindgen = "0.71"
