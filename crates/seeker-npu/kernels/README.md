@@ -56,3 +56,20 @@ crates/seeker-npu/kernels/activation/build.sh 8192
 cargo run -p seeker-npu --example silu         # validates vs host x*sigmoid(x)
 ```
 
+## norm/ — bf16 RMSNorm + softmax
+
+`norm.py` builds two per-tile bf16 kernels (fixed tile 1024, N a multiple of 8192).
+Qwen3's `n_embd == 1024 == tile`, so a per-1024-tile op is exactly per-token.
+
+- **rmsnorm** wires `aie2p/rms_norm.cc` via `ExternalFunction`: `out = x *
+  invsqrt(mean(x²) + 1e-5)` with **gamma = 1** — the learned RMSNorm weight is
+  applied separately with the eltwise `mul`.
+- **softmax** uses the `aie.iron.kernels.softmax` wrapper (per-1024-tile softmax;
+  attention will lay scores out so each query's padded row fills a tile).
+
+```sh
+crates/seeker-npu/kernels/norm/build.sh rmsnorm 8192
+crates/seeker-npu/kernels/norm/build.sh softmax 8192
+cargo run -p seeker-npu --example norm         # validates both vs host f32
+```
+
