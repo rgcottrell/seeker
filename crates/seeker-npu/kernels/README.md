@@ -14,19 +14,23 @@ artifacts are device- and shape-specific and **not** checked in (see
 - `RLIMIT_MEMLOCK` raised (XRT locks tens of MB; the default 8 MB cap fails with
   an `mmap … MAP_LOCKED … EAGAIN`). e.g. `memlock unlimited` in limits.d.
 
-## gemm/ — bf16→f32 matmul (`C = A @ B`)
+## gemm/ — bf16 matmul (`C = A @ B`)
 
 The whole_array IRON design (`whole_array.py`, vendored from the gpu-npu-demo
 bring-up, Apache-2.0). Fixed-shape per (M, K, N); A is `[M,K]` row-major bf16, B
-is `[K,N]` row-major bf16, C is `[M,N]` row-major f32. Tiling requires
-`M % 256 == 0`, `K % 64 == 0`, `N % 256 == 0` (8 columns, default 64×64×32 tile);
+is `[K,N]` row-major bf16. Inputs are always bf16 (f32 accumulation internally);
+the **output dtype is selectable** — `f32` (default) or `bf16`. The forward uses
+`bf16` output so activations stay bf16 end-to-end (no f32↔bf16 cast). Tiling
+requires `M % 256 == 0`, `K % 64 == 0`, `N % 256 == 0` (8 columns, 64×64×32 tile);
 pad the token dim N up to a 256 bucket.
 
 ```sh
-# Build one shape (e.g. Qwen3 wq: q_dim x n_embd x L_bucket):
-crates/seeker-npu/kernels/gemm/build.sh 2048 1024 256
-# Validate it on the NPU against a host f32 reference:
-cargo run -p seeker-npu --example gemm        # uses 2048x1024x256 by default
+# Build a shape (Qwen3 wq: q_dim x n_embd x L_bucket). 4th arg = output dtype.
+crates/seeker-npu/kernels/gemm/build.sh 2048 1024 256        # bf16->f32 (gemm_2048x1024x256)
+crates/seeker-npu/kernels/gemm/build.sh 2048 1024 256 bf16   # bf16->bf16 (gemm_..._bf16)
+# Validate on the NPU vs a host f32 reference (f32 or bf16 output):
+cargo run -p seeker-npu --example gemm
+NPU_GEMM_DTYPE_OUT=bf16 cargo run -p seeker-npu --example gemm
 ```
 
 ## eltwise/ — element-wise add / mul (f32 or bf16)

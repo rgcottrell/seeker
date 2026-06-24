@@ -42,10 +42,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let stem = format!("gemm_{m}x{k}x{n}");
+    // Output dtype: f32 (default) or bf16 (the resident-activation forward path).
+    let dtype_out = std::env::var("NPU_GEMM_DTYPE_OUT").unwrap_or_else(|_| "f32".into());
+    // allclose tolerance per output dtype: bf16 output rounds the result to bf16's
+    // absolute grid (≈0.4% of the largest magnitude), which is large *relative* error
+    // on near-zero/cancellation entries but harmless for the embedding — so use
+    // atol + rtol·|want|, not pure relative.
+    let (out_bf16, out_esz, atol, rtol) = match dtype_out.as_str() {
+        "bf16" => (true, 2usize, 2e-2f32, 2e-2f32),
+        _ => (false, 4usize, 1e-4f32, 2e-2f32),
+    };
+    let stem = format!("gemm_{m}x{k}x{n}{}", if out_bf16 { "_bf16" } else { "" });
     let xclbin = artifact("NPU_GEMM_XCLBIN", &format!("{stem}.xclbin"));
     let insts = artifact("NPU_GEMM_INSTS", &format!("{stem}.insts.bin"));
-    println!("GEMM {m}x{k}x{n} bf16->f32  xclbin={}", xclbin.display());
+    println!(
+        "GEMM {m}x{k}x{n} bf16->{dtype_out}  xclbin={}",
+        xclbin.display()
+    );
 
     // Deterministic small inputs, rounded to bf16 (exactly what the NPU consumes).
     let a_bf: Vec<bf16> = (0..m * k)
@@ -80,13 +93,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut a_bo = ctx.alloc_data(m * k * 2)?; // bf16 = 2 bytes
     let mut b_bo = ctx.alloc_data(k * n * 2)?;
-    let mut c_bo = ctx.alloc_data(m * n * 4)?; // f32 = 4 bytes
+    let mut c_bo = ctx.alloc_data(m * n * out_esz)?; // f32 (4) or bf16 (2)
     // bf16 is bit-identical to u16; copy the raw bits into the device buffers.
     a_bo.as_mut_slice::<u16>()
         .copy_from_slice(&a_bf.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
     b_bo.as_mut_slice::<u16>()
         .copy_from_slice(&b_bf.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
-    c_bo.as_mut_slice::<f32>().fill(0.0);
+    c_bo.as_mut_bytes().fill(0);
     a_bo.sync_to_device()?;
     b_bo.sync_to_device()?;
     c_bo.sync_to_device()?;
@@ -94,26 +107,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ctx.run(&instr, insts_bytes.len() as u32, &[&a_bo, &b_bo, &c_bo])?;
     c_bo.sync_from_device()?;
 
-    // ── Compare ──
-    let got = c_bo.as_slice::<f32>();
+    // ── Compare (decode the output at its dtype) ──
+    let read = |i: usize| -> f32 {
+        if out_bf16 {
+            bf16::from_bits(c_bo.as_slice::<u16>()[i]).to_f32()
+        } else {
+            c_bo.as_slice::<f32>()[i]
+        }
+    };
     let mut max_abs = 0.0f32;
-    let mut max_rel = 0.0f32;
-    for (g, w) in got.iter().zip(&want) {
-        let abs = (g - w).abs();
+    let mut worst = 0.0f32; // (err - allclose tol); <= 0 means within tolerance
+    for (i, w) in want.iter().enumerate() {
+        let abs = (read(i) - w).abs();
         max_abs = max_abs.max(abs);
-        let denom = w.abs().max(1e-3);
-        max_rel = max_rel.max(abs / denom);
+        worst = worst.max(abs - (atol + rtol * w.abs()));
     }
     println!(
-        "max_abs_err={max_abs:.5}  max_rel_err={max_rel:.5}  c[0]={} (want {:.5})",
-        got[0], want[0]
+        "max_abs_err={max_abs:.5}  c[0]={} (want {:.5})  [allclose atol={atol} rtol={rtol}]",
+        read(0),
+        want[0]
     );
-    // bf16 inputs are applied identically host+NPU; the residual is f32 MAC-order /
-    // rounding noise over K accumulations — a small relative tolerance covers it.
-    if max_rel < 2e-2 {
+    if worst <= 0.0 {
         println!("PASS");
         Ok(())
     } else {
-        Err(format!("GEMM mismatch: max_rel_err {max_rel} >= 2e-2").into())
+        Err(format!("GEMM mismatch: exceeds allclose tol by {worst}").into())
     }
 }
