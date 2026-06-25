@@ -50,7 +50,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // atol + rtol·|want|, not pure relative.
     let (out_bf16, out_esz, atol, rtol) = match dtype_out.as_str() {
         "bf16" => (true, 2usize, 2e-2f32, 2e-2f32),
-        _ => (false, 4usize, 1e-4f32, 2e-2f32),
+        "f32" => (false, 4usize, 1e-4f32, 2e-2f32),
+        other => {
+            return Err(format!(
+                "unsupported NPU_GEMM_DTYPE_OUT {other:?} (expected \"f32\" or \"bf16\")"
+            )
+            .into());
+        }
     };
     let stem = format!("gemm_{m}x{k}x{n}{}", if out_bf16 { "_bf16" } else { "" });
     let xclbin = artifact("NPU_GEMM_XCLBIN", &format!("{stem}.xclbin"));
