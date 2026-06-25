@@ -36,9 +36,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if m == 0 || k == 0 || n == 0 {
         return Err("NPU_GEMM_M/K/N must be > 0".into());
     }
-    if !m.is_multiple_of(256) || !k.is_multiple_of(64) || !n.is_multiple_of(256) {
+    // M is %512 (not 256): the transfer-block needs M/(m·n_aie_rows) even, on top
+    // of M%(m·n_aie_rows)=256 — an unconditional constraint for the default c_col_maj.
+    if !m.is_multiple_of(512) || !k.is_multiple_of(64) || !n.is_multiple_of(256) {
         return Err(format!(
-            "invalid GEMM shape {m}x{k}x{n}: require M%256==0, K%64==0, N%256==0 (8 cols, 64x64x32 tile)"
+            "invalid GEMM shape {m}x{k}x{n}: require M%512==0, K%64==0, N%256==0 (8 cols, 64x64x32 tile)"
         )
         .into());
     }

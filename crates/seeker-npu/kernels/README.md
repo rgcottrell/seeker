@@ -21,16 +21,25 @@ bring-up, Apache-2.0). Fixed-shape per (M, K, N); A is `[M,K]` row-major bf16, B
 is `[K,N]` row-major bf16. Inputs are always bf16 (f32 accumulation internally);
 the **output dtype is selectable** — `f32` (default) or `bf16`. The forward uses
 `bf16` output so activations stay bf16 end-to-end (no f32↔bf16 cast). Tiling
-requires `M % 256 == 0`, `K % 64 == 0`, `N % 256 == 0` (8 columns, 64×64×32 tile);
-pad the token dim N up to a 256 bucket.
+requires `M % 512 == 0`, `K % 64 == 0`, `N % 256 == 0` (8 columns, 64×64×32 tile).
+(M is `% 512`, not 256: the design's transfer-block needs `M/(m·n_aie_rows)` even
+for the default `c_col_maj=0` — an *unconditional* constraint, independent of the
+b_col_maj flag below.)
+
+A 5th arg builds **`b_col_maj`** — B stored `[N,K]` (logical Bᵀ). The Qwen3 layer
+uses this so the weight is fed exactly as GGUF stores it (`[out][in]`) while
+activations stay token-major (`A = x[L,in]`), giving a transpose-free op chain
+where the output `q[L,out]` keeps per-head 128-chunks contiguous. (This is why the
+layer pads its token dim L up to 512 to satisfy the M constraint.)
 
 ```sh
-# Build a shape (Qwen3 wq: q_dim x n_embd x L_bucket). 4th arg = output dtype.
+# Generic (Qwen3 wq: q_dim x n_embd x L_bucket). 4th arg = output dtype.
 crates/seeker-npu/kernels/gemm/build.sh 2048 1024 256        # bf16->f32 (gemm_2048x1024x256)
 crates/seeker-npu/kernels/gemm/build.sh 2048 1024 256 bf16   # bf16->bf16 (gemm_..._bf16)
-# Validate on the NPU vs a host f32 reference (f32 or bf16 output):
-cargo run -p seeker-npu --example gemm
-NPU_GEMM_DTYPE_OUT=bf16 cargo run -p seeker-npu --example gemm
+# Layer-orientation wq: M=L(512) K=n_embd N=q_dim, bf16, b_col_maj (5th arg = 1):
+crates/seeker-npu/kernels/gemm/build.sh 512 1024 2048 bf16 1 # gemm_512x1024x2048_bcm_bf16
+cargo run -p seeker-npu --example gemm                       # generic GEMM vs host f32
+cargo run -p seeker-npu --example layer_proj                 # real-weight wq projection, cosine vs host
 ```
 
 ## eltwise/ — element-wise add / mul (f32 or bf16)
