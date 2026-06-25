@@ -35,6 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // GGUF dims [ne0,ne1] = [in,out] = [n_embd(K), q_dim(N)]; stored row-major as
     // [out][in] = [N][K], which is exactly the b_col_maj B operand.
+    if info.dims.len() != 2 {
+        return Err(format!("wq must be 2-D, got dims {:?}", info.dims).into());
+    }
     let (k, n) = (info.dims[0] as usize, info.dims[1] as usize); // K=n_embd, N=q_dim
     let m = L; // token dim
     println!(
@@ -49,7 +52,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .chunks_exact(2)
         .map(|b| bf16::from_f32(f16::from_le_bytes([b[0], b[1]]).to_f32()))
         .collect();
-    assert_eq!(b_bf.len(), n * k);
+    if b_bf.len() != n * k {
+        return Err(format!(
+            "wq has {} elements, expected {} ({n}×{k})",
+            b_bf.len(),
+            n * k
+        )
+        .into());
+    }
 
     // A = synthetic token-major activation x[L][n_embd] (a real X comes from
     // get_rows + RMSNorm in the next step).
