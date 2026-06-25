@@ -19,9 +19,14 @@ M=${1:?usage: build.sh M K N [dtype_out]}
 K=${2:?usage: build.sh M K N [dtype_out]}
 N=${3:?usage: build.sh M K N [dtype_out]}
 DTYPE_OUT=${4:-f32}
-# f32 keeps the bare name (back-compat); other dtypes get a suffix.
+# B column-major: B stored [N,K] (logical Bᵀ). The Qwen3 layer uses this so the
+# weight operand is fed exactly as GGUF stores it ([out][in]) while activations
+# stay token-major (A = x[L,in]), giving a transpose-free op chain.
+BCM=${5:-0}
+# f32 + row-major keep the bare name (back-compat); col-major / other dtypes suffix.
 suffix=""
-[ "$DTYPE_OUT" != "f32" ] && suffix="_${DTYPE_OUT}"
+[ "$BCM" = "1" ] && suffix="${suffix}_bcm"
+[ "$DTYPE_OUT" != "f32" ] && suffix="${suffix}_${DTYPE_OUT}"
 
 # Env overrides (defaults match the gpu-npu-demo bring-up on this box).
 XRT_SETUP=${XRT_SETUP:-/opt/xilinx/xrt/setup.sh}
@@ -36,7 +41,7 @@ source "$XRT_SETUP" >/dev/null 2>&1
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 
-echo "### building GEMM ${M}x${K}x${N} (bf16->${DTYPE_OUT}, 8 cols) ..."
+echo "### building GEMM ${M}x${K}x${N} (bf16->${DTYPE_OUT}, b_col_maj=${BCM}, 8 cols) ..."
 # Run from a scratch dir so the design's relative imports/cache behave like the
 # reference sweep; the design self-validates on the NPU and prints PASS/FAIL.
 workdir=$(mktemp -d)
@@ -51,7 +56,8 @@ cp "$here/whole_array.py" "$workdir/wa.py"
 (
   cd "$workdir"
   HOME="$workdir" python wa.py -M "$M" -K "$K" -N "$N" \
-    --dtype_in bf16 --dtype_out "$DTYPE_OUT" --n-aie-cols 8 --dev npu2 -w 1 -i 1
+    --dtype_in bf16 --dtype_out "$DTYPE_OUT" --b-col-maj "$BCM" \
+    --n-aie-cols 8 --dev npu2 -w 1 -i 1
 )
 
 cache=$(ls -td "$workdir"/.npu/cache/*/ 2>/dev/null | head -1)
