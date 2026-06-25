@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 #
-# Build a fixed-shape bf16->f32 GEMM xclbin (+ instruction blob) for the Strix
-# Halo NPU from the vendored IRON whole_array design, and copy the artifacts into
-# build/gemm_<M>x<K>x<N>.{xclbin,insts.bin}.
+# Build a fixed-shape bf16 GEMM xclbin (+ instruction blob) for the Strix Halo NPU
+# from the vendored IRON whole_array design, and copy the artifacts into
+# build/gemm_<M>x<K>x<N>[_<dtype_out>].{xclbin,insts.bin}.
 #
-# Usage:  build.sh <M> <K> <N>        # e.g. build.sh 2048 1024 256  (Qwen3 wq, L=256)
+# Usage:  build.sh <M> <K> <N> [dtype_out]   # dtype_out = f32 (default) | bf16
+#   e.g.  build.sh 2048 1024 256        (Qwen3 wq, bf16->f32; name gemm_2048x1024x256)
+#         build.sh 2048 1024 256 bf16   (resident-activation forward; gemm_..._bf16)
+#
+# Inputs are always bf16 (f32 accumulation internally). dtype_out=bf16 keeps the
+# whole forward in bf16 so no f32<->bf16 cast is needed between ops.
 #
 # Requires the AIE toolchain (Python 3.12 venv with mlir_aie + llvm-aie/Peano) and
-# XRT. The NPU also needs RLIMIT_MEMLOCK raised (XRT locks tens of MB). The IRON
-# JIT writes final.xclbin + insts.bin into ~/.npu/cache/<hash>/; we copy the newest.
+# XRT. The NPU also needs RLIMIT_MEMLOCK raised (XRT locks tens of MB).
 set -euo pipefail
 
-M=${1:?usage: build.sh M K N}
-K=${2:?usage: build.sh M K N}
-N=${3:?usage: build.sh M K N}
+M=${1:?usage: build.sh M K N [dtype_out]}
+K=${2:?usage: build.sh M K N [dtype_out]}
+N=${3:?usage: build.sh M K N [dtype_out]}
+DTYPE_OUT=${4:-f32}
+# f32 keeps the bare name (back-compat); other dtypes get a suffix.
+suffix=""
+[ "$DTYPE_OUT" != "f32" ] && suffix="_${DTYPE_OUT}"
 
 # Env overrides (defaults match the gpu-npu-demo bring-up on this box).
 XRT_SETUP=${XRT_SETUP:-/opt/xilinx/xrt/setup.sh}
@@ -28,7 +36,7 @@ source "$XRT_SETUP" >/dev/null 2>&1
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 
-echo "### building GEMM ${M}x${K}x${N} (bf16->f32, 8 cols) ..."
+echo "### building GEMM ${M}x${K}x${N} (bf16->${DTYPE_OUT}, 8 cols) ..."
 # Run from a scratch dir so the design's relative imports/cache behave like the
 # reference sweep; the design self-validates on the NPU and prints PASS/FAIL.
 workdir=$(mktemp -d)
@@ -43,7 +51,7 @@ cp "$here/whole_array.py" "$workdir/wa.py"
 (
   cd "$workdir"
   HOME="$workdir" python wa.py -M "$M" -K "$K" -N "$N" \
-    --dtype_in bf16 --dtype_out f32 --n-aie-cols 8 --dev npu2 -w 1 -i 1
+    --dtype_in bf16 --dtype_out "$DTYPE_OUT" --n-aie-cols 8 --dev npu2 -w 1 -i 1
 )
 
 cache=$(ls -td "$workdir"/.npu/cache/*/ 2>/dev/null | head -1)
@@ -51,6 +59,6 @@ if [ -z "$cache" ] || [ ! -f "$cache/final.xclbin" ]; then
   echo "error: build produced no final.xclbin under the isolated cache" >&2
   exit 1
 fi
-cp "$cache/final.xclbin" "$outdir/gemm_${M}x${K}x${N}.xclbin"
-cp "$cache/insts.bin" "$outdir/gemm_${M}x${K}x${N}.insts.bin"
-echo "wrote $outdir/gemm_${M}x${K}x${N}.{xclbin,insts.bin}"
+cp "$cache/final.xclbin" "$outdir/gemm_${M}x${K}x${N}${suffix}.xclbin"
+cp "$cache/insts.bin" "$outdir/gemm_${M}x${K}x${N}${suffix}.insts.bin"
+echo "wrote $outdir/gemm_${M}x${K}x${N}${suffix}.{xclbin,insts.bin}"
