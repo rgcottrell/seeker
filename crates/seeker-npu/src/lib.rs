@@ -5,13 +5,16 @@
 //! `~/workspace/gpu-npu-demo` bring-up; [`Qwen3EmbeddingNpu`] implements the
 //! backend-neutral [`seeker_core::embed::TextEmbedder`] trait.
 //!
-//! M1 (this commit) brings up the crate + the XRT plumbing and a `vadd` example;
-//! the AIE kernel library and the real forward pass land in later milestones, so
-//! [`Qwen3EmbeddingNpu::embed_residual`] currently returns a not-implemented error.
+//! [`Qwen3EmbeddingNpu`] runs the full forward on the NPU (see
+//! [`qwen3::Qwen3Forward`]) and returns the pre-`output_norm` residual; the shared
+//! host-side `output_norm` + pool + L2 in `seeker_core::embed` finishes the
+//! embedding. The AIE xclbins are fixed-shape (built for a token block of
+//! [`qwen3::L_PAD`]); see `crates/seeker-npu/kernels/` for the build scripts.
 
 mod sys;
 
 pub mod npu;
+pub mod qwen3;
 
 use std::error::Error;
 
@@ -19,25 +22,20 @@ use seeker_core::embed::TextEmbedder;
 use seeker_core::gguf::GgufFile;
 use seeker_core::tokenizer::{TokenizerBundle, build_tokenizer};
 
+use crate::qwen3::Qwen3Forward;
+
 /// Qwen3-Embedding on the Strix Halo NPU.
-///
-/// Holds the GGUF-derived tokenizer + dims now; the on-NPU weight upload + forward
-/// land with the AIE kernel library (M2+).
 pub struct Qwen3EmbeddingNpu {
     tokenizer: TokenizerBundle,
-    n_embd: usize,
+    model: Qwen3Forward,
 }
 
 impl Qwen3EmbeddingNpu {
-    /// Read the tokenizer + `n_embd` from `gguf`. Does not yet upload weights to
-    /// the NPU (that arrives with the kernel library).
+    /// Read the tokenizer + config and dequantize all weights to bf16 from `gguf`.
     pub fn new(gguf: &GgufFile) -> Result<Self, Box<dyn Error>> {
         let tokenizer = build_tokenizer(gguf)?;
-        let arch = gguf.architecture().unwrap_or("");
-        let n_embd = gguf
-            .meta_u32(&format!("{arch}.embedding_length"))
-            .ok_or("missing <arch>.embedding_length")? as usize;
-        Ok(Self { tokenizer, n_embd })
+        let model = Qwen3Forward::load(gguf)?;
+        Ok(Self { tokenizer, model })
     }
 }
 
@@ -50,15 +48,12 @@ impl TextEmbedder for Qwen3EmbeddingNpu {
             .map_err(|e| -> Box<dyn Error> { format!("tokenize failed: {e}").into() })
     }
 
-    fn embed_residual(&mut self, _tokens: &[u32]) -> Result<Vec<f32>, Box<dyn Error>> {
-        Err(
-            "NPU embedding backend not yet implemented (AIE kernels land in a later milestone)"
-                .into(),
-        )
+    fn embed_residual(&mut self, tokens: &[u32]) -> Result<Vec<f32>, Box<dyn Error>> {
+        self.model.forward(tokens)
     }
 
     fn n_embd(&self) -> usize {
-        self.n_embd
+        self.model.n_embd
     }
 
     fn device_name(&self) -> String {
