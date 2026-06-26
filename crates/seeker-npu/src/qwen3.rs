@@ -46,8 +46,12 @@ fn bits(v: &[f32]) -> Vec<u16> {
 fn deq(v: &[u16]) -> Vec<f32> {
     v.iter().map(|&b| bf16::from_bits(b).to_f32()).collect()
 }
+/// True iff env var `k` is set to a truthy value (so `FOO=0`/`false` disables it,
+/// not merely-present).
 fn env_host(k: &str) -> bool {
-    std::env::var(k).is_ok()
+    std::env::var(k)
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
 }
 /// eps used by the host-f32 op fallbacks (matches the GGUF; the NPU rms_norm.cc uses 1e-5).
 const HOST_EPS: f32 = 1e-6;
@@ -199,6 +203,10 @@ fn f16_f32(gguf: &GgufFile, name: &str) -> Result<Vec<f32>, Box<dyn Error>> {
 }
 
 fn f32_vec(gguf: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>, Box<dyn Error>> {
+    let info = gguf.tensor(name).ok_or(format!("missing {name}"))?;
+    if info.ggml_type != GgmlType::F32 {
+        return Err(format!("{name} must be F32, got {:?}", info.ggml_type).into());
+    }
     let raw = gguf.tensor_data(name).ok_or(format!("missing {name}"))?;
     if raw.len() != len * 4 {
         return Err(format!("{name} expected F32[{len}], got {} bytes", raw.len()).into());
@@ -226,8 +234,23 @@ impl Qwen3Forward {
         let q_dim = gguf.tensor("blk.0.attn_q.weight").ok_or("missing wq")?.dims[1] as usize;
         let kv_dim = gguf.tensor("blk.0.attn_v.weight").ok_or("missing wv")?.dims[1] as usize;
         let head_dim = q_dim / n_head;
-        if head_dim != HEAD_DIM {
-            return Err(format!("NPU backend built for head_dim=128, model has {head_dim}").into());
+        // The xclbins are fixed-shape (Qwen3-Embedding-0.6B). Reject any model whose
+        // dims differ — the kernels would under/over-size the operand/output BOs.
+        let want = [
+            ("head_dim", head_dim, HEAD_DIM),
+            ("n_embd", n_embd, 1024),
+            ("q_dim", q_dim, 2048),
+            ("kv_dim", kv_dim, 1024),
+            ("n_ff", n_ff, 3072),
+        ];
+        for (name, got, exp) in want {
+            if got != exp {
+                return Err(format!(
+                    "NPU backend has fixed-shape kernels for Qwen3-Embedding-0.6B \
+                     ({name}={exp}); this model has {name}={got}"
+                )
+                .into());
+            }
         }
         let rope_base = gguf
             .meta_f32(&format!("{arch}.rope.freq_base"))
@@ -597,18 +620,27 @@ impl Qwen3Forward {
                 n_ff,
             )?;
             let u = self.gemm_bcm("gemm_512x1024x3072_bcm", &xn2w, &ly.up, L_PAD, n_embd, n_ff)?;
-            let gs = if env_host("SEEKER_NPU_ONCHIP_OPS") {
-                self.kernels
-                    .run("activation", "silu_1572864", &[&bits(&g)], L_PAD * n_ff)?
+            // SwiGLU: silu(gate) * up. Default = host f32 (the whole product, so it isn't
+            // rounded to bf16 early and the default path needs no eltwise/activation
+            // xclbins — only the GEMMs). On-chip path uses the bf16 silu + mul kernels.
+            let hidden = if env_host("SEEKER_NPU_ONCHIP_OPS") {
+                let gs =
+                    self.kernels
+                        .run("activation", "silu_1572864", &[&bits(&g)], L_PAD * n_ff)?;
+                self.kernels.run(
+                    "eltwise",
+                    "eltwise_mul_bf16_1572864",
+                    &[&gs, &bits(&u)],
+                    L_PAD * n_ff,
+                )?
             } else {
-                bits(&g.iter().map(|x| x / (1.0 + (-x).exp())).collect::<Vec<_>>())
+                bits(
+                    &g.iter()
+                        .zip(&u)
+                        .map(|(gv, uv)| (gv / (1.0 + (-gv).exp())) * uv)
+                        .collect::<Vec<_>>(),
+                )
             };
-            let hidden = self.kernels.run(
-                "eltwise",
-                "eltwise_mul_bf16_1572864",
-                &[&gs, &bits(&u)],
-                L_PAD * n_ff,
-            )?;
             let dn = self.gemm_bcm(
                 "gemm_512x3072x1024_bcm",
                 &hidden,
