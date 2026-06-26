@@ -22,9 +22,10 @@ fn main() {
         "gemm_512x128x1024_bcm",
         "gemm_512x1024x256",
     ];
-    // Hold distinct xclbins resident.
+    // Confirm all 7 hybrid GEMM xclbins co-reside (a sanity check, NOT a cap — the list
+    // is only 7 long, so success just means 7/7 fit, not that 7 is the maximum).
     let mut held: Vec<Context> = Vec::new();
-    println!("-- distinct xclbins held simultaneously --");
+    println!("-- the 7 distinct hybrid GEMM xclbins held simultaneously --");
     for (i, s) in stems.iter().enumerate() {
         match Context::new(&gemm(s), "MLIR_AIE") {
             Ok(c) => {
@@ -37,7 +38,7 @@ fn main() {
             }
         }
     }
-    let distinct = held.len();
+    let distinct_ok = held.len() == stems.len();
     held.clear();
 
     // Hold N copies of the SAME xclbin resident (does the cap count handles or columns?).
@@ -59,5 +60,8 @@ fn main() {
             }
         }
     }
-    println!("\ncap: {distinct} distinct, {n} same-xclbin held concurrently");
+    println!(
+        "\nall 7 hybrid GEMM xclbins co-resident: {distinct_ok}; \
+         concurrent HW-context cap: {n}"
+    );
 }

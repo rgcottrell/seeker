@@ -60,10 +60,14 @@ const HOST_EPS: f32 = 1e-6;
 
 /// A loaded xclbin: its device [`Context`] and the synced instruction buffer, reused
 /// across every dispatch of that kernel (the xclbin load + instr sync happen once).
+///
+/// Field order matters: the `instr` Buffer is allocated from `ctx`, so it's declared
+/// first to be dropped first (Rust drops fields in declaration order) — the buffer is
+/// freed while its Context is still alive, not after the Context is destroyed.
 struct Loaded {
-    ctx: Context,
     instr: Buffer,
     ninstr: u32,
+    ctx: Context,
 }
 
 /// The XDNA2 NPU caps concurrent hardware contexts at 16 (`CREATE_HWCTX` EINVAL past
@@ -94,13 +98,19 @@ impl KernelRunner {
         }
     }
 
-    /// Ensure `stem` is loaded (loading + evicting LRU if at the HW-context cap on a
+    /// Cache key for a kernel: `subdir/stem` (stems can repeat across subdirs).
+    fn key(subdir: &str, stem: &str) -> String {
+        format!("{subdir}/{stem}")
+    }
+
+    /// Ensure the kernel is loaded (loading + evicting LRU if at the HW-context cap on a
     /// miss) and mark it most-recently-used.
     fn ensure(&self, subdir: &str, stem: &str) -> Result<(), Box<dyn Error>> {
-        if self.cache.borrow().contains_key(stem) {
+        let key = Self::key(subdir, stem);
+        if self.cache.borrow().contains_key(&key) {
             let mut lru = self.lru.borrow_mut();
-            lru.retain(|s| s != stem);
-            lru.push(stem.to_string());
+            lru.retain(|s| s != &key);
+            lru.push(key);
             return Ok(());
         }
         // Miss: evict LRU entries (dropping their Context frees the HW slot) so the new
@@ -118,8 +128,8 @@ impl KernelRunner {
         let ninstr = insts.len() as u32;
         self.cache
             .borrow_mut()
-            .insert(stem.to_string(), Loaded { ctx, instr, ninstr });
-        self.lru.borrow_mut().push(stem.to_string());
+            .insert(key.clone(), Loaded { instr, ninstr, ctx });
+        self.lru.borrow_mut().push(key);
         Ok(())
     }
 
@@ -153,7 +163,7 @@ impl KernelRunner {
     ) -> Result<Vec<u16>, Box<dyn Error>> {
         self.ensure(subdir, stem)?;
         let cache = self.cache.borrow();
-        let out = Self::dispatch(&cache[stem], inputs, out_elems * 2)?;
+        let out = Self::dispatch(&cache[&Self::key(subdir, stem)], inputs, out_elems * 2)?;
         Ok(out.as_slice::<u16>().to_vec())
     }
 
@@ -168,7 +178,7 @@ impl KernelRunner {
     ) -> Result<Vec<f32>, Box<dyn Error>> {
         self.ensure(subdir, stem)?;
         let cache = self.cache.borrow();
-        let out = Self::dispatch(&cache[stem], inputs, out_elems * 4)?;
+        let out = Self::dispatch(&cache[&Self::key(subdir, stem)], inputs, out_elems * 4)?;
         Ok(out.as_slice::<f32>().to_vec())
     }
 }
