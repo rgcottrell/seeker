@@ -22,6 +22,8 @@
 //! Activations round-trip to the host between ops (each op is its own xclbin, created
 //! and dropped per call — the XDNA2 NPU caps concurrent hardware contexts). Keeping
 //! activations resident and caching contexts on-NPU are M5 perf levers.
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 
@@ -56,15 +58,28 @@ fn env_host(k: &str) -> bool {
 /// eps used by the host-f32 op fallbacks (matches the GGUF; the NPU rms_norm.cc uses 1e-5).
 const HOST_EPS: f32 = 1e-6;
 
-/// Runs fixed-shape AIE kernels by xclbin name from a kernels directory.
-///
-/// A fresh device [`Context`] is created (and dropped) per op. The XDNA2 NPU caps
-/// the number of concurrent hardware contexts, so we cannot hold every kernel's
-/// Context resident at once (`CREATE_HWCTX` fails with EINVAL) — one live Context at
-/// a time is the safe pattern. Caching Contexts under that cap, and keeping
-/// activations resident across ops, are M5 perf levers.
+/// A loaded xclbin: its device [`Context`] and the synced instruction buffer, reused
+/// across every dispatch of that kernel (the xclbin load + instr sync happen once).
+struct Loaded {
+    ctx: Context,
+    instr: Buffer,
+    ninstr: u32,
+}
+
+/// The XDNA2 NPU caps concurrent hardware contexts at 16 (`CREATE_HWCTX` EINVAL past
+/// that), so the cache is bounded and evicts least-recently-used. The hybrid forward
+/// uses only 7 distinct GEMM xclbins, well under the cap → nothing is evicted; the
+/// on-chip path's ~18 distinct kernels evict a few per layer.
+const CTX_CACHE_CAP: usize = 15;
+
+/// Runs fixed-shape AIE kernels by xclbin name, caching loaded Contexts (M5: avoids
+/// reloading the xclbin + re-syncing instructions on every one of the ~1000 dispatches
+/// a forward issues). `Loaded` is stored by value (no `Rc`) to keep the embedder
+/// `Send`. Keeping activations resident across ops is the remaining lever.
 struct KernelRunner {
     dir: PathBuf,
+    cache: RefCell<HashMap<String, Loaded>>,
+    lru: RefCell<Vec<String>>, // front = least-recently-used
 }
 
 impl KernelRunner {
@@ -72,11 +87,63 @@ impl KernelRunner {
         let dir = std::env::var("SEEKER_NPU_KERNEL_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels"));
-        Self { dir }
+        Self {
+            dir,
+            cache: RefCell::new(HashMap::new()),
+            lru: RefCell::new(Vec::new()),
+        }
     }
 
-    /// Run one kernel: load its xclbin, alloc a BO per bf16-bit input + an output BO,
-    /// bind in order (inputs.., output), run, return the output bf16 bits.
+    /// Ensure `stem` is loaded (loading + evicting LRU if at the HW-context cap on a
+    /// miss) and mark it most-recently-used.
+    fn ensure(&self, subdir: &str, stem: &str) -> Result<(), Box<dyn Error>> {
+        if self.cache.borrow().contains_key(stem) {
+            let mut lru = self.lru.borrow_mut();
+            lru.retain(|s| s != stem);
+            lru.push(stem.to_string());
+            return Ok(());
+        }
+        // Miss: evict LRU entries (dropping their Context frees the HW slot) so the new
+        // load stays within the cap, THEN create the new Context.
+        while self.cache.borrow().len() >= CTX_CACHE_CAP {
+            let victim = self.lru.borrow_mut().remove(0);
+            self.cache.borrow_mut().remove(&victim);
+        }
+        let base = self.dir.join(subdir).join("build").join(stem);
+        let ctx = Context::new(&base.with_extension("xclbin"), "MLIR_AIE")?;
+        let insts = std::fs::read(base.with_extension("insts.bin"))?;
+        let mut instr = ctx.alloc_instr(insts.len())?;
+        instr.as_mut_bytes().copy_from_slice(&insts);
+        instr.sync_to_device()?;
+        let ninstr = insts.len() as u32;
+        self.cache
+            .borrow_mut()
+            .insert(stem.to_string(), Loaded { ctx, instr, ninstr });
+        self.lru.borrow_mut().push(stem.to_string());
+        Ok(())
+    }
+
+    /// Alloc a BO per bf16-bit input + an output BO of `out_bytes`, bind in order
+    /// (inputs.., output), run, return the output BO.
+    fn dispatch(k: &Loaded, inputs: &[&[u16]], out_bytes: usize) -> Result<Buffer, Box<dyn Error>> {
+        let mut bos: Vec<Buffer> = Vec::with_capacity(inputs.len());
+        for inp in inputs {
+            let mut b = k.ctx.alloc_data(inp.len() * 2)?;
+            b.as_mut_slice::<u16>().copy_from_slice(inp);
+            b.sync_to_device()?;
+            bos.push(b);
+        }
+        let mut out = k.ctx.alloc_data(out_bytes)?;
+        out.as_mut_bytes().fill(0);
+        out.sync_to_device()?;
+        let refs: Vec<&Buffer> = bos.iter().chain(std::iter::once(&out)).collect();
+        k.ctx.run(&k.instr, k.ninstr, &refs)?;
+        drop(refs);
+        out.sync_from_device()?;
+        Ok(out)
+    }
+
+    /// Run one kernel with a bf16 output, returning the output bf16 bits.
     fn run(
         &self,
         subdir: &str,
@@ -84,32 +151,14 @@ impl KernelRunner {
         inputs: &[&[u16]],
         out_elems: usize,
     ) -> Result<Vec<u16>, Box<dyn Error>> {
-        let base = self.dir.join(subdir).join("build").join(stem);
-        let ctx = Context::new(&base.with_extension("xclbin"), "MLIR_AIE")?;
-        let insts = std::fs::read(base.with_extension("insts.bin"))?;
-        let mut instr = ctx.alloc_instr(insts.len())?;
-        instr.as_mut_bytes().copy_from_slice(&insts);
-        instr.sync_to_device()?;
-        let mut bos: Vec<Buffer> = Vec::with_capacity(inputs.len());
-        for inp in inputs {
-            let mut b = ctx.alloc_data(inp.len() * 2)?;
-            b.as_mut_slice::<u16>().copy_from_slice(inp);
-            b.sync_to_device()?;
-            bos.push(b);
-        }
-        let mut out = ctx.alloc_data(out_elems * 2)?;
-        out.as_mut_bytes().fill(0);
-        out.sync_to_device()?;
-        let refs: Vec<&Buffer> = bos.iter().chain(std::iter::once(&out)).collect();
-        ctx.run(&instr, insts.len() as u32, &refs)?;
-        drop(refs);
-        out.sync_from_device()?;
+        self.ensure(subdir, stem)?;
+        let cache = self.cache.borrow();
+        let out = Self::dispatch(&cache[stem], inputs, out_elems * 2)?;
         Ok(out.as_slice::<u16>().to_vec())
     }
 
     /// Like [`run`](Self::run) but the output BO is f32 (4 bytes/elem) — for the
-    /// f32-output GEMMs, whose f32 accumulation is essential to accuracy. Inputs stay
-    /// bf16 bits.
+    /// f32-output GEMMs, whose f32 accumulation is essential to accuracy.
     fn run_f32out(
         &self,
         subdir: &str,
@@ -117,26 +166,9 @@ impl KernelRunner {
         inputs: &[&[u16]],
         out_elems: usize,
     ) -> Result<Vec<f32>, Box<dyn Error>> {
-        let base = self.dir.join(subdir).join("build").join(stem);
-        let ctx = Context::new(&base.with_extension("xclbin"), "MLIR_AIE")?;
-        let insts = std::fs::read(base.with_extension("insts.bin"))?;
-        let mut instr = ctx.alloc_instr(insts.len())?;
-        instr.as_mut_bytes().copy_from_slice(&insts);
-        instr.sync_to_device()?;
-        let mut bos: Vec<Buffer> = Vec::with_capacity(inputs.len());
-        for inp in inputs {
-            let mut b = ctx.alloc_data(inp.len() * 2)?;
-            b.as_mut_slice::<u16>().copy_from_slice(inp);
-            b.sync_to_device()?;
-            bos.push(b);
-        }
-        let mut out = ctx.alloc_data(out_elems * 4)?;
-        out.as_mut_bytes().fill(0);
-        out.sync_to_device()?;
-        let refs: Vec<&Buffer> = bos.iter().chain(std::iter::once(&out)).collect();
-        ctx.run(&instr, insts.len() as u32, &refs)?;
-        drop(refs);
-        out.sync_from_device()?;
+        self.ensure(subdir, stem)?;
+        let cache = self.cache.borrow();
+        let out = Self::dispatch(&cache[stem], inputs, out_elems * 4)?;
         Ok(out.as_slice::<f32>().to_vec())
     }
 }
