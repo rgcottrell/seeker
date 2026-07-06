@@ -61,11 +61,18 @@ const HOST_EPS: f32 = 1e-6;
 /// A loaded xclbin: its device [`Context`] and the synced instruction buffer, reused
 /// across every dispatch of that kernel (the xclbin load + instr sync happen once).
 ///
-/// Field order matters: the `instr` Buffer is allocated from `ctx`, so it's declared
-/// first to be dropped first (Rust drops fields in declaration order) — the buffer is
-/// freed while its Context is still alive, not after the Context is destroyed.
+/// Field order matters: Buffers (`instr`, `bos`) are allocated from `ctx`, so they're
+/// declared before it to be dropped first (Rust drops fields in declaration order) —
+/// freed while their Context is still alive, not after it's destroyed.
+///
+/// `bos` are the reusable operand/output BOs. Every kernel here is fixed-shape, so a
+/// given stem is always dispatched with the same operand sizes → the BOs are allocated
+/// once (on the first dispatch) and reused, avoiding a pinned-memory alloc/free of
+/// ~3–4 BOs on each of the ~1000 dispatches a forward issues (the dominant per-dispatch
+/// overhead on this unified-memory APU, where the DMA sync itself is nearly free).
 struct Loaded {
     instr: Buffer,
+    bos: RefCell<Vec<Buffer>>, // [input0.., output]; empty until the first dispatch
     ninstr: u32,
     ctx: Context,
 }
@@ -138,31 +145,42 @@ impl KernelRunner {
         instr.as_mut_bytes().copy_from_slice(&insts);
         instr.sync_to_device()?;
         let ninstr = insts.len() as u32;
-        self.cache
-            .borrow_mut()
-            .insert(key.clone(), Loaded { instr, ninstr, ctx });
+        self.cache.borrow_mut().insert(
+            key.clone(),
+            Loaded {
+                instr,
+                bos: RefCell::new(Vec::new()),
+                ninstr,
+                ctx,
+            },
+        );
         self.lru.borrow_mut().push(key);
         Ok(())
     }
 
-    /// Alloc a BO per bf16-bit input + an output BO of `out_bytes`, bind in order
-    /// (inputs.., output), run, return the output BO.
-    fn dispatch(k: &Loaded, inputs: &[&[u16]], out_bytes: usize) -> Result<Buffer, Box<dyn Error>> {
-        let mut bos: Vec<Buffer> = Vec::with_capacity(inputs.len());
-        for inp in inputs {
-            let mut b = k.ctx.alloc_data(inp.len() * 2)?;
-            b.as_mut_slice::<u16>().copy_from_slice(inp);
-            b.sync_to_device()?;
-            bos.push(b);
+    /// Copy `inputs` into the kernel's pooled input BOs (allocating the pool — one BO
+    /// per input + an `out_bytes` output — on the first dispatch, reusing it after),
+    /// bind in order (inputs.., output), run, and sync the output back. The output is
+    /// left in the last pooled BO for the caller to read.
+    fn dispatch(k: &Loaded, inputs: &[&[u16]], out_bytes: usize) -> Result<(), Box<dyn Error>> {
+        let mut pool = k.bos.borrow_mut();
+        if pool.is_empty() {
+            for inp in inputs {
+                pool.push(k.ctx.alloc_data(inp.len() * 2)?);
+            }
+            pool.push(k.ctx.alloc_data(out_bytes)?);
         }
-        let mut out = k.ctx.alloc_data(out_bytes)?;
-        out.as_mut_bytes().fill(0);
-        out.sync_to_device()?;
-        let refs: Vec<&Buffer> = bos.iter().chain(std::iter::once(&out)).collect();
+        for (bo, inp) in pool.iter_mut().zip(inputs) {
+            bo.as_mut_slice::<u16>().copy_from_slice(inp);
+            bo.sync_to_device()?;
+        }
+        let last = pool.len() - 1;
+        pool[last].sync_to_device()?; // DPU ABI: sync the (write-only) output before the run
+        let refs: Vec<&Buffer> = pool.iter().collect();
         k.ctx.run(&k.instr, k.ninstr, &refs)?;
         drop(refs);
-        out.sync_from_device()?;
-        Ok(out)
+        pool[last].sync_from_device()?;
+        Ok(())
     }
 
     /// Run one kernel with a bf16 output, returning the output bf16 bits.
@@ -176,9 +194,10 @@ impl KernelRunner {
         self.ensure(subdir, stem)?;
         let t0 = std::time::Instant::now();
         let cache = self.cache.borrow();
-        let out = Self::dispatch(&cache[&Self::key(subdir, stem)], inputs, out_elems * 2)?;
+        let k = &cache[&Self::key(subdir, stem)];
+        Self::dispatch(k, inputs, out_elems * 2)?;
         self.tick(stem, t0.elapsed());
-        Ok(out.as_slice::<u16>().to_vec())
+        Ok(k.bos.borrow().last().unwrap().as_slice::<u16>().to_vec())
     }
 
     fn tick(&self, stem: &str, dur: std::time::Duration) {
@@ -204,9 +223,10 @@ impl KernelRunner {
         self.ensure(subdir, stem)?;
         let t0 = std::time::Instant::now();
         let cache = self.cache.borrow();
-        let out = Self::dispatch(&cache[&Self::key(subdir, stem)], inputs, out_elems * 4)?;
+        let k = &cache[&Self::key(subdir, stem)];
+        Self::dispatch(k, inputs, out_elems * 4)?;
         self.tick(stem, t0.elapsed());
-        Ok(out.as_slice::<f32>().to_vec())
+        Ok(k.bos.borrow().last().unwrap().as_slice::<f32>().to_vec())
     }
 }
 
