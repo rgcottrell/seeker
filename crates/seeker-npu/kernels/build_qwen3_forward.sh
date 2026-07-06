@@ -31,13 +31,12 @@ if [ "${1:-}" = "--onchip" ]; then
   "$here/norm/build.sh" rmsnorm 524288 1024     # input / ffn RMSNorm
   "$here/norm/build.sh" rmsnorm 1048576 128     # per-head q-norm
   "$here/norm/build.sh" rmsnorm 524288 128      # per-head k-norm
-  "$here/norm/build.sh" softmax 8388608         # batched attention softmax
+  "$here/norm/build.sh" softmax 1048576         # per-KV-pair attention softmax (mb·KEYS)
   "$here/eltwise/build.sh" mul bf16 524288      # ·norm-weight (n_embd width) + k rope muls
   "$here/eltwise/build.sh" mul bf16 1048576     # q norm-weight + q rope muls
   "$here/eltwise/build.sh" mul bf16 1572864     # SwiGLU silu(gate) * up
   "$here/eltwise/build.sh" add bf16 524288      # k rope add
-  "$here/eltwise/build.sh" add bf16 1048576     # q rope add
-  "$here/eltwise/build.sh" add bf16 8388608     # attention mask add
+  "$here/eltwise/build.sh" add bf16 1048576     # q rope add + per-KV-pair attention mask add
   "$here/activation/build.sh" 1572864           # SiLU
 fi
 

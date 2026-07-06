@@ -42,11 +42,22 @@ const KEYS: usize = 1024; // L_PAD padded up to the softmax tile width
 const VPAD: usize = 256; // head_dim padded up to the GEMM N%256 rule
 const MASK_NEG: f32 = -1e4;
 
-fn bits(v: &[f32]) -> Vec<u16> {
-    v.iter().map(|x| bf16::from_f32(*x).to_bits()).collect()
+/// f32 → bf16 bits, branchless round-to-nearest-even. For the finite activations here
+/// this is numerically identical to `bf16::from_f32(x).to_bits()` but far cheaper (no
+/// NaN/inf/subnormal branches) — and these conversions are the bulk of the host time.
+#[inline]
+fn f32_to_bf16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }
+fn bits(v: &[f32]) -> Vec<u16> {
+    v.iter().map(|&x| f32_to_bf16_bits(x)).collect()
+}
+/// bf16 bits → f32 — an exact left-shift (bf16 is the high 16 bits of f32).
 fn deq(v: &[u16]) -> Vec<f32> {
-    v.iter().map(|&b| bf16::from_bits(b).to_f32()).collect()
+    v.iter()
+        .map(|&b| f32::from_bits((b as u32) << 16))
+        .collect()
 }
 /// True iff env var `k` is set to a truthy value (so `FOO=0`/`false` disables it,
 /// not merely-present).
@@ -546,12 +557,43 @@ impl Qwen3Forward {
         // GQA batching: the `gqa` Q-heads sharing a KV head share K and V, so stack them
         // along M and do ONE dense GEMM per KV head (M = gqa·L_PAD) instead of one per
         // Q-head — halving the QKᵀ / ·V dispatch count (the attention dispatch overhead
-        // dominates). The scores/probs buffer keeps the per-Q-head layout, so the softmax
-        // is unchanged. The M=gqa·512 kernels are fixed-shape (Qwen3-Embedding gqa=2).
+        // dominates). The M=gqa·512 kernels are fixed-shape (Qwen3-Embedding gqa=2).
+        //
+        // Each KV head is fully independent, so its softmax reads the QKᵀ GEMM output
+        // directly and writes a per-pair [mb][KEYS] probs buffer — never a global
+        // [n_head][L_PAD][KEYS] one. That drops the split (GEMM rows → global scores) and
+        // stack (global probs → GEMM rows) copies of the two 8.4M-element buffers per
+        // layer — the bulk of the attention host time post-BO-reuse.
+        //
+        // The QKᵀ (·) and ·V GEMMs stay in two SEPARATE phases (all QKᵀ, then all ·V)
+        // rather than a per-pair QKᵀ→·V pipeline: interleaving them forces an XDNA2
+        // hardware-context swap between the two xclbins on every pair (16/layer vs 1),
+        // which costs far more than the host copies it would save.
         let mb = gqa * L_PAD; // batched M = 1024
         let (qf, kf, vf) = (deq(q), deq(k), v);
-        let mut scores = vec![0.0f32; n_head * L_PAD * KEYS];
+        let onchip = env_host("SEEKER_NPU_ONCHIP_OPS");
+        // Causal + pad-column mask for one KV pair: row = sub·L_PAD + tq, so the mask is
+        // the same for every pair (depends only on tq = row % L_PAD) — build it once.
+        let mask_bits = onchip.then(|| {
+            let mut mask = vec![0.0f32; mb * KEYS];
+            for sub in 0..gqa {
+                for tq in 0..L_PAD {
+                    let row = (sub * L_PAD + tq) * KEYS;
+                    for tk in 0..KEYS {
+                        if tk > tq || tk >= L_PAD {
+                            mask[row + tk] = MASK_NEG;
+                        }
+                    }
+                }
+            }
+            bits(&mask)
+        });
+        // Phase 1: QKᵀ + softmax → per-pair probs (the QKᵀ xclbin stays resident; the
+        // default softmax is host, so no context swap interleaves the GEMMs).
+        let mut e = vec![0.0f32; KEYS];
+        let mut pair_probs: Vec<Vec<u16>> = Vec::with_capacity(n_kv);
         for kv in 0..n_kv {
+            // Stack the gqa Q-heads' q rows (they share this pair's K).
             let mut q_pair = vec![0.0f32; mb * HEAD_DIM];
             let mut k_kv = vec![0.0f32; KEYS * HEAD_DIM]; // [keys][128] bcm; rows≥L = 0
             for t in 0..L_PAD {
@@ -572,77 +614,53 @@ impl Qwen3Forward {
                 HEAD_DIM,
                 KEYS,
             )?;
-            // s rows [sub·L_PAD .. (sub+1)·L_PAD) are Q-head (gqa·kv + sub)'s scores.
-            for sub in 0..gqa {
-                let h = gqa * kv + sub;
-                scores[h * L_PAD * KEYS..(h + 1) * L_PAD * KEYS]
-                    .copy_from_slice(&s[sub * L_PAD * KEYS..(sub + 1) * L_PAD * KEYS]);
-            }
-        }
-        let n_sc = n_head * L_PAD * KEYS;
-        let probs = if env_host("SEEKER_NPU_ONCHIP_OPS") {
-            // causal + pad-column mask (broadcast across heads), batched NPU softmax.
-            let mut mask = vec![0.0f32; n_sc];
-            for h in 0..n_head {
-                for tq in 0..L_PAD {
-                    let row = (h * L_PAD + tq) * KEYS;
-                    for tk in 0..KEYS {
-                        if tk > tq || tk >= L_PAD {
-                            mask[row + tk] = MASK_NEG;
+            // Softmax over KEYS per row. Rows [sub·L_PAD .. (sub+1)·L_PAD) are Q-head
+            // (gqa·kv + sub); the pair layout already matches the ·V GEMM's M.
+            let probs_pair = if let Some(ref mask_bits) = mask_bits {
+                let masked = self.kernels.run(
+                    "eltwise",
+                    "eltwise_add_bf16_1048576",
+                    &[&bits(&s), mask_bits],
+                    mb * KEYS,
+                )?;
+                self.kernels
+                    .run("norm", "softmax_1048576", &[&masked], mb * KEYS)?
+            } else {
+                // Host f32 (default): causal softmax per row with accurate exp, written
+                // straight to bf16. Only the first `l` (real) query rows per sub-block are
+                // computed — the pad rows feed nothing real and their probs stay 0 — which
+                // cuts both the O(l²) softmax and the conversion down from the fixed 512
+                // to the true prompt length.
+                let mut p = vec![0u16; mb * KEYS];
+                for sub in 0..gqa {
+                    for tq in 0..l {
+                        let row = (sub * L_PAD + tq) * KEYS;
+                        let mx = s[row..=row + tq].iter().cloned().fold(f32::MIN, f32::max);
+                        let mut den = 0.0f32;
+                        for tk in 0..=tq {
+                            e[tk] = (s[row + tk] - mx).exp();
+                            den += e[tk];
+                        }
+                        for tk in 0..=tq {
+                            p[row + tk] = f32_to_bf16_bits(e[tk] / den);
                         }
                     }
                 }
-            }
-            let scores = self.kernels.run(
-                "eltwise",
-                "eltwise_add_bf16_8388608",
-                &[&bits(&scores), &bits(&mask)],
-                n_sc,
-            )?;
-            self.kernels
-                .run("norm", "softmax_8388608", &[&scores], n_sc)?
-        } else {
-            // Host f32 (default): causal softmax per row with accurate exp, written
-            // straight to bf16. Only the first `l` (real) query rows are computed — the
-            // pad rows feed nothing real and their probs stay 0 — which cuts both the
-            // O(l²) softmax and the [n_head·L_PAD·KEYS] conversion down from the fixed
-            // 512 to the true prompt length.
-            let sf = &scores;
-            let mut p = vec![0u16; n_sc];
-            let mut e = vec![0.0f32; KEYS];
-            for h in 0..n_head {
-                for tq in 0..l {
-                    let row = (h * L_PAD + tq) * KEYS;
-                    let mx = sf[row..=row + tq].iter().cloned().fold(f32::MIN, f32::max);
-                    let mut den = 0.0f32;
-                    for tk in 0..=tq {
-                        e[tk] = (sf[row + tk] - mx).exp();
-                        den += e[tk];
-                    }
-                    for tk in 0..=tq {
-                        p[row + tk] = bf16::from_f32(e[tk] / den).to_bits();
-                    }
-                }
-            }
-            p
-        };
+                p
+            };
+            pair_probs.push(probs_pair);
+        }
+        // Phase 2: ·V (the ·V xclbin now stays resident across all pairs).
         let mut attn_out = vec![0.0f32; L_PAD * q_dim];
-        for kv in 0..n_kv {
+        for (kv, probs_pair) in pair_probs.iter().enumerate() {
             let mut v_kv = vec![0.0f32; KEYS * VPAD]; // [keys][256]; cols≥128, rows≥L = 0
             for t in 0..L_PAD {
                 let vo = t * kv_dim + kv * HEAD_DIM;
                 v_kv[t * VPAD..t * VPAD + HEAD_DIM].copy_from_slice(&vf[vo..vo + HEAD_DIM]);
             }
-            // Stack the gqa Q-heads' probs along M (they share v_kv).
-            let mut probs_pair = vec![0u16; mb * KEYS];
-            for sub in 0..gqa {
-                let h = gqa * kv + sub;
-                probs_pair[sub * L_PAD * KEYS..(sub + 1) * L_PAD * KEYS]
-                    .copy_from_slice(&probs[h * L_PAD * KEYS..(h + 1) * L_PAD * KEYS]);
-            }
             let o = self.gemm_rm(
                 "gemm_1024x1024x256",
-                &probs_pair,
+                probs_pair,
                 &bits(&v_kv),
                 mb,
                 KEYS,
@@ -774,7 +792,7 @@ impl Qwen3Forward {
                 let mut h = vec![0u16; L_PAD * n_ff];
                 for i in 0..l * n_ff {
                     let (gv, uv) = (g[i], u[i]);
-                    h[i] = bf16::from_f32((gv / (1.0 + (-gv).exp())) * uv).to_bits();
+                    h[i] = f32_to_bf16_bits((gv / (1.0 + (-gv).exp())) * uv);
                 }
                 h
             };
