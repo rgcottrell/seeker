@@ -111,6 +111,10 @@ def _build_design(
 
     silu_kernel = None
     if fused_silu:
+        assert dtype_out_str == "bf16" and dtype_in_str == "bf16", (
+            f"fused SiLU is bf16-only (silu.cc is a bf16 LUT), got dtype_in={dtype_in_str} "
+            f"dtype_out={dtype_out_str}"
+        )
         assert (
             m * n == 1024
         ), f"fused SiLU needs the (m, n) output tile to be 1024 elems, got m*n={m * n}"
@@ -423,44 +427,6 @@ def whole_array(
     )
 
 
-def generate_taps(
-    M,
-    K,
-    N,
-    m,
-    k,
-    n,
-    n_aie_cols,
-    dtype_in_str,
-    dtype_out_str,
-    b_col_maj=0,
-    c_col_maj=0,
-    emulate_bf16_mmul_with_bfp16=False,
-    dev="npu",
-):
-    """Return ``(A_taps, B_taps, C_taps)`` for the visualization notebook."""
-    dev_obj = _device_for(dev, n_aie_cols)
-    set_current_device(dev_obj)
-    return _build_design(
-        dev_obj,
-        M,
-        K,
-        N,
-        m,
-        k,
-        n,
-        n_aie_cols,
-        dtype_in_str,
-        dtype_out_str,
-        b_col_maj,
-        c_col_maj,
-        emulate_bf16_mmul_with_bfp16,
-        use_chess=False,
-        scalar=False,
-        generate_taps=True,
-    )
-
-
 def _make_argparser():
     p = argparse.ArgumentParser(prog="AIE Matrix Multiplication (Whole Array)")
     add_compile_args(p, short_dev=None)
@@ -514,7 +480,8 @@ def _validate_shape_args(opts):
         sys.exit(
             f"-N {opts.N} must be a multiple of -n * --n-aie-cols ({opts.n} * {opts.n_aie_cols} = {opts.n * opts.n_aie_cols})"
         )
-    tb_n_rows = 2
+    # tb_n_rows mirrors _build_design: (4 if not c_col_maj else 2) // 2.
+    tb_n_rows = 2 if not opts.c_col_maj else 1
     n_row_blocks = opts.M // opts.m // n_aie_rows
     if n_row_blocks % tb_n_rows != 0:
         sys.exit(

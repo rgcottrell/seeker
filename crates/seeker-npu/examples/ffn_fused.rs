@@ -24,6 +24,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tensor("blk.0.ffn_gate.weight")
         .ok_or("missing ffn_gate")?
         .dims[1] as usize;
+    // The fused xclbin is fixed-shape (Qwen3-Embedding-0.6B); reject a model whose dims
+    // don't match, or the BOs wouldn't line up with what the kernel reads/writes.
+    if (n_embd, n_ff) != (1024, 3072) {
+        return Err(format!(
+            "ffn_silu_512x1024x3072_bcm is built for n_embd=1024 n_ff=3072; \
+             this model has n_embd={n_embd} n_ff={n_ff}"
+        )
+        .into());
+    }
     println!(
         "fused FFN gate: SiLU(x2 · ffn_gateᵀ) in one NPU dispatch — n_embd={n_embd} n_ff={n_ff} L={L}"
     );
