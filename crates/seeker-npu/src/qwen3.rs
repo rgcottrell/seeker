@@ -462,7 +462,7 @@ impl Qwen3Forward {
     /// host by default (the hybrid: the bf16 LUT rms_norm kernel is too lossy over many
     /// layers); `SEEKER_NPU_ONCHIP_OPS` runs it on the NPU instead (for future
     /// f32-precision NPU-kernel work / measurement).
-    fn norm_mul(&self, x: &[f32], weight: &[f32]) -> Result<Vec<u16>, Box<dyn Error>> {
+    fn norm_mul(&self, x: &[f32], weight: &[f32], l: usize) -> Result<Vec<u16>, Box<dyn Error>> {
         let w = weight.len();
         let n = L_PAD * w;
         if env_host("SEEKER_NPU_ONCHIP_OPS") {
@@ -474,8 +474,10 @@ impl Qwen3Forward {
                 .kernels
                 .run("eltwise", "eltwise_mul_bf16_524288", &[&xn, &bits(&wt)], n);
         }
+        // Only the first `l` (real) token rows matter; the pad rows feed nothing real
+        // (causal attention + discarded output), so leave them zero.
         let mut out = vec![0.0f32; n];
-        for t in 0..L_PAD {
+        for t in 0..l {
             let col = &x[t * w..(t + 1) * w];
             let ms = col.iter().map(|v| v * v).sum::<f32>() / w as f32;
             let inv = 1.0 / (ms + HOST_EPS).sqrt();
@@ -494,6 +496,7 @@ impl Qwen3Forward {
         norm_w: &[f32],
         cos: &[u16],
         sin: &[u16],
+        l: usize,
     ) -> Result<Vec<u16>, Box<dyn Error>> {
         let n = L_PAD * n_heads * HEAD_DIM;
         if env_host("SEEKER_NPU_ONCHIP_OPS") {
@@ -512,7 +515,7 @@ impl Qwen3Forward {
         let (pf, cf, sf) = (deq(proj), deq(cos), deq(sin));
         let d = n_heads * HEAD_DIM;
         let mut out = vec![0.0f32; n];
-        for t in 0..L_PAD {
+        for t in 0..l {
             for h in 0..n_heads {
                 let b = t * d + h * HEAD_DIM;
                 let head = &pf[b..b + HEAD_DIM];
@@ -531,7 +534,13 @@ impl Qwen3Forward {
 
     /// GQA causal attention → attn_out[L_PAD][q_dim] f32. q is pre-scaled; k is bf16
     /// bits (post-rope), v is the f32 value projection.
-    fn attention(&self, q: &[u16], k: &[u16], v: &[f32]) -> Result<Vec<f32>, Box<dyn Error>> {
+    fn attention(
+        &self,
+        q: &[u16],
+        k: &[u16],
+        v: &[f32],
+        l: usize,
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
         let (n_head, n_kv, q_dim, kv_dim) = (self.n_head, self.n_kv, self.q_dim, self.kv_dim);
         let gqa = n_head / n_kv;
         let (qf, kf, vf) = (deq(q), deq(k), v);
@@ -580,29 +589,29 @@ impl Qwen3Forward {
             self.kernels
                 .run("norm", "softmax_8388608", &[&scores], n_sc)?
         } else {
-            // Host f32 (default): causal softmax per row with accurate exp.
+            // Host f32 (default): causal softmax per row with accurate exp, written
+            // straight to bf16. Only the first `l` (real) query rows are computed — the
+            // pad rows feed nothing real and their probs stay 0 — which cuts both the
+            // O(l²) softmax and the [n_head·L_PAD·KEYS] conversion down from the fixed
+            // 512 to the true prompt length.
             let sf = &scores;
-            let mut p = vec![0.0f32; n_sc];
+            let mut p = vec![0u16; n_sc];
+            let mut e = vec![0.0f32; KEYS];
             for h in 0..n_head {
-                for tq in 0..L_PAD {
+                for tq in 0..l {
                     let row = (h * L_PAD + tq) * KEYS;
-                    let last = tq.min(L_PAD - 1);
-                    let mx = sf[row..=row + last]
-                        .iter()
-                        .cloned()
-                        .fold(f32::MIN, f32::max);
+                    let mx = sf[row..=row + tq].iter().cloned().fold(f32::MIN, f32::max);
                     let mut den = 0.0f32;
-                    for tk in 0..=last {
-                        let e = (sf[row + tk] - mx).exp();
-                        p[row + tk] = e;
-                        den += e;
+                    for tk in 0..=tq {
+                        e[tk] = (sf[row + tk] - mx).exp();
+                        den += e[tk];
                     }
-                    for tk in 0..=last {
-                        p[row + tk] /= den;
+                    for tk in 0..=tq {
+                        p[row + tk] = bf16::from_f32(e[tk] / den).to_bits();
                     }
                 }
             }
-            bits(&p)
+            p
         };
         let mut attn_out = vec![0.0f32; L_PAD * q_dim];
         for h in 0..n_head {
@@ -666,7 +675,7 @@ impl Qwen3Forward {
             .unwrap_or(self.layers.len());
         for ly in self.layers.iter().take(max) {
             // ---- attention block (GEMMs output f32; bf16 only as kernel inputs) ----
-            let xnw = self.norm_mul(&resid, &ly.attn_norm)?;
+            let xnw = self.norm_mul(&resid, &ly.attn_norm, l)?;
             let q = self.gemm_bcm("gemm_512x1024x2048_bcm", &xnw, &ly.wq, L_PAD, n_embd, q_dim)?;
             let k = self.gemm_bcm(
                 "gemm_512x1024x1024_bcm",
@@ -684,9 +693,10 @@ impl Qwen3Forward {
                 n_embd,
                 kv_dim,
             )?;
-            let q_roped = self.qk_norm_rope(&bits(&q), self.n_head, &ly.q_norm, &cos_q, &sin_q)?;
-            let k_roped = self.qk_norm_rope(&bits(&k), self.n_kv, &ly.k_norm, &cos_k, &sin_k)?;
-            let attn = self.attention(&q_roped, &k_roped, &v)?;
+            let q_roped =
+                self.qk_norm_rope(&bits(&q), self.n_head, &ly.q_norm, &cos_q, &sin_q, l)?;
+            let k_roped = self.qk_norm_rope(&bits(&k), self.n_kv, &ly.k_norm, &cos_k, &sin_k, l)?;
+            let attn = self.attention(&q_roped, &k_roped, &v, l)?;
             let proj = self.gemm_bcm(
                 "gemm_512x2048x1024_bcm",
                 &bits(&attn),
@@ -700,7 +710,7 @@ impl Qwen3Forward {
             }
 
             // ---- FFN block ----
-            let xn2w = self.norm_mul(&resid, &ly.ffn_norm)?;
+            let xn2w = self.norm_mul(&resid, &ly.ffn_norm, l)?;
             let g = self.gemm_bcm(
                 "gemm_512x1024x3072_bcm",
                 &xn2w,
@@ -736,12 +746,14 @@ impl Qwen3Forward {
                     L_PAD * n_ff,
                 )?
             } else {
-                bits(
-                    &g.iter()
-                        .zip(&u)
-                        .map(|(gv, uv)| (gv / (1.0 + (-gv).exp())) * uv)
-                        .collect::<Vec<_>>(),
-                )
+                // Host f32 SwiGLU straight to bf16, first `l` rows only (pad rows of
+                // gate/up are already 0 → product 0).
+                let mut h = vec![0u16; L_PAD * n_ff];
+                for i in 0..l * n_ff {
+                    let (gv, uv) = (g[i], u[i]);
+                    h[i] = bf16::from_f32((gv / (1.0 + (-gv).exp())) * uv).to_bits();
+                }
+                h
             };
             let dn = self.gemm_bcm(
                 "gemm_512x3072x1024_bcm",
