@@ -693,7 +693,19 @@ impl Qwen3Forward {
             // SwiGLU: silu(gate) * up. Default = host f32 (the whole product, so it isn't
             // rounded to bf16 early and the default path needs no eltwise/activation
             // xclbins — only the GEMMs). On-chip path uses the bf16 silu + mul kernels.
-            let hidden = if env_host("SEEKER_NPU_ONCHIP_OPS") {
+            let hidden = if env_host("SEEKER_NPU_FUSED_FFN") {
+                // Fused SwiGLU: silu(gate)*up in one NPU dispatch (silu_mul.cc). MEASURED
+                // NET-NEGATIVE as a *separate* dispatch (+87ms NPU vs −38ms host over 28
+                // layers = ~+30ms): the FFN is compute-bound and the host swiglu is cheap,
+                // so a round-trip to the NPU doesn't pay. Default off; a real win needs
+                // *on-chip* fusion (fold silu*mul into the gate/up GEMM, no round-trip).
+                self.kernels.run(
+                    "fused",
+                    "swiglu_1572864",
+                    &[&bits(&g), &bits(&u)],
+                    L_PAD * n_ff,
+                )?
+            } else if env_host("SEEKER_NPU_ONCHIP_OPS") {
                 let gs =
                     self.kernels
                         .run("activation", "silu_1572864", &[&bits(&g)], L_PAD * n_ff)?;
