@@ -84,6 +84,8 @@ struct KernelRunner {
     dir: PathBuf,
     cache: RefCell<HashMap<String, Loaded>>,
     lru: RefCell<Vec<String>>, // front = least-recently-used
+    // (count, total dispatch time) per kernel stem, for SEEKER_NPU_TIMING.
+    timing: RefCell<HashMap<String, (u32, std::time::Duration)>>,
 }
 
 impl KernelRunner {
@@ -95,7 +97,17 @@ impl KernelRunner {
             dir,
             cache: RefCell::new(HashMap::new()),
             lru: RefCell::new(Vec::new()),
+            timing: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Total NPU-dispatch time + per-stem breakdown (only populated under SEEKER_NPU_TIMING).
+    fn timing_report(&self) -> (std::time::Duration, Vec<(String, u32, std::time::Duration)>) {
+        let t = self.timing.borrow();
+        let total = t.values().map(|(_, d)| *d).sum();
+        let mut rows: Vec<_> = t.iter().map(|(s, (c, d))| (s.clone(), *c, *d)).collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+        (total, rows)
     }
 
     /// Cache key for a kernel: `subdir/stem` (stems can repeat across subdirs).
@@ -162,9 +174,22 @@ impl KernelRunner {
         out_elems: usize,
     ) -> Result<Vec<u16>, Box<dyn Error>> {
         self.ensure(subdir, stem)?;
+        let t0 = std::time::Instant::now();
         let cache = self.cache.borrow();
         let out = Self::dispatch(&cache[&Self::key(subdir, stem)], inputs, out_elems * 2)?;
+        self.tick(stem, t0.elapsed());
         Ok(out.as_slice::<u16>().to_vec())
+    }
+
+    fn tick(&self, stem: &str, dur: std::time::Duration) {
+        if env_host("SEEKER_NPU_TIMING") {
+            let mut t = self.timing.borrow_mut();
+            let e = t
+                .entry(stem.to_string())
+                .or_insert((0, std::time::Duration::ZERO));
+            e.0 += 1;
+            e.1 += dur;
+        }
     }
 
     /// Like [`run`](Self::run) but the output BO is f32 (4 bytes/elem) — for the
@@ -177,8 +202,10 @@ impl KernelRunner {
         out_elems: usize,
     ) -> Result<Vec<f32>, Box<dyn Error>> {
         self.ensure(subdir, stem)?;
+        let t0 = std::time::Instant::now();
         let cache = self.cache.borrow();
         let out = Self::dispatch(&cache[&Self::key(subdir, stem)], inputs, out_elems * 4)?;
+        self.tick(stem, t0.elapsed());
         Ok(out.as_slice::<f32>().to_vec())
     }
 }
@@ -588,6 +615,7 @@ impl Qwen3Forward {
         if l == 0 || l > L_PAD {
             return Err(format!("NPU backend handles 1..={L_PAD} tokens, got {l}").into());
         }
+        let t_fwd = std::time::Instant::now();
         let (n_embd, q_dim, kv_dim, n_ff) = (self.n_embd, self.q_dim, self.kv_dim, self.n_ff);
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
@@ -698,6 +726,25 @@ impl Qwen3Forward {
 
         // Return the real tokens' residual (token-major), already f32.
         resid.truncate(l * n_embd);
+        if env_host("SEEKER_NPU_TIMING") {
+            let total = t_fwd.elapsed();
+            let (npu, rows) = self.kernels.timing_report();
+            eprintln!(
+                "── forward {:.0}ms: NPU dispatch {:.0}ms ({:.0}%), host {:.0}ms ({:.0}%) ──",
+                total.as_secs_f64() * 1e3,
+                npu.as_secs_f64() * 1e3,
+                npu.as_secs_f64() / total.as_secs_f64() * 100.0,
+                (total - npu).as_secs_f64() * 1e3,
+                (total - npu).as_secs_f64() / total.as_secs_f64() * 100.0,
+            );
+            for (stem, count, dur) in rows {
+                eprintln!(
+                    "   {:>5}× {:>7.0}ms  {stem}",
+                    count,
+                    dur.as_secs_f64() * 1e3
+                );
+            }
+        }
         Ok(resid)
     }
 }
