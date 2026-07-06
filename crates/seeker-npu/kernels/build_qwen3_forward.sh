@@ -21,9 +21,10 @@ echo "### f32-output GEMMs (token block M=512; the hybrid forward's NPU work) ##
 "$here/gemm/build.sh" 512 2048 1024 f32 1   # wo      (K=q_dim,   N=n_embd)
 "$here/gemm/build.sh" 512 1024 3072 f32 1   # gate/up (K=n_embd,  N=n_ff)
 "$here/gemm/build.sh" 512 3072 1024 f32 1   # down    (K=n_ff,    N=n_embd)
-"$here/gemm/build.sh" 512 128 1024 f32 1    # QKᵀ     (K=head_dim, N=keys padded to 1024)
+# Attention (GQA-batched: M=1024 = 2 Q-heads stacked, sharing one KV head's K/V).
+"$here/gemm/build.sh" 1024 128 1024 f32 1   # QKᵀ     (K=head_dim, N=keys=1024)
 # Row-major-B ·V GEMM (V feature dim padded 128->256 for the N%256 rule).
-"$here/gemm/build.sh" 512 1024 256 f32 0    # ·V      (K=keys, N=256)
+"$here/gemm/build.sh" 1024 1024 256 f32 0   # ·V      (K=keys, N=256)
 
 if [ "${1:-}" = "--onchip" ]; then
   echo "### bf16 on-chip norm/softmax/silu (SEEKER_NPU_ONCHIP_OPS path) ###"

@@ -543,28 +543,41 @@ impl Qwen3Forward {
     ) -> Result<Vec<f32>, Box<dyn Error>> {
         let (n_head, n_kv, q_dim, kv_dim) = (self.n_head, self.n_kv, self.q_dim, self.kv_dim);
         let gqa = n_head / n_kv;
+        // GQA batching: the `gqa` Q-heads sharing a KV head share K and V, so stack them
+        // along M and do ONE dense GEMM per KV head (M = gqa·L_PAD) instead of one per
+        // Q-head — halving the QKᵀ / ·V dispatch count (the attention dispatch overhead
+        // dominates). The scores/probs buffer keeps the per-Q-head layout, so the softmax
+        // is unchanged. The M=gqa·512 kernels are fixed-shape (Qwen3-Embedding gqa=2).
+        let mb = gqa * L_PAD; // batched M = 1024
         let (qf, kf, vf) = (deq(q), deq(k), v);
         let mut scores = vec![0.0f32; n_head * L_PAD * KEYS];
-        for h in 0..n_head {
-            let kv = h / gqa;
-            let (mut q_h, mut k_pad) = (
-                vec![0.0f32; L_PAD * HEAD_DIM],
-                vec![0.0f32; KEYS * HEAD_DIM],
-            );
+        for kv in 0..n_kv {
+            let mut q_pair = vec![0.0f32; mb * HEAD_DIM];
+            let mut k_kv = vec![0.0f32; KEYS * HEAD_DIM]; // [keys][128] bcm; rows≥L = 0
             for t in 0..L_PAD {
-                let (qo, ko) = (t * q_dim + h * HEAD_DIM, t * kv_dim + kv * HEAD_DIM);
-                q_h[t * HEAD_DIM..(t + 1) * HEAD_DIM].copy_from_slice(&qf[qo..qo + HEAD_DIM]);
-                k_pad[t * HEAD_DIM..(t + 1) * HEAD_DIM].copy_from_slice(&kf[ko..ko + HEAD_DIM]);
+                let ko = t * kv_dim + kv * HEAD_DIM;
+                k_kv[t * HEAD_DIM..(t + 1) * HEAD_DIM].copy_from_slice(&kf[ko..ko + HEAD_DIM]);
+                for sub in 0..gqa {
+                    let qo = t * q_dim + (gqa * kv + sub) * HEAD_DIM;
+                    let row = sub * L_PAD + t;
+                    q_pair[row * HEAD_DIM..(row + 1) * HEAD_DIM]
+                        .copy_from_slice(&qf[qo..qo + HEAD_DIM]);
+                }
             }
             let s = self.gemm_bcm(
-                "gemm_512x128x1024_bcm",
-                &bits(&q_h),
-                &bits(&k_pad),
-                L_PAD,
+                "gemm_1024x128x1024_bcm",
+                &bits(&q_pair),
+                &bits(&k_kv),
+                mb,
                 HEAD_DIM,
                 KEYS,
             )?;
-            scores[h * L_PAD * KEYS..(h + 1) * L_PAD * KEYS].copy_from_slice(&s);
+            // s rows [sub·L_PAD .. (sub+1)·L_PAD) are Q-head (gqa·kv + sub)'s scores.
+            for sub in 0..gqa {
+                let h = gqa * kv + sub;
+                scores[h * L_PAD * KEYS..(h + 1) * L_PAD * KEYS]
+                    .copy_from_slice(&s[sub * L_PAD * KEYS..(sub + 1) * L_PAD * KEYS]);
+            }
         }
         let n_sc = n_head * L_PAD * KEYS;
         let probs = if env_host("SEEKER_NPU_ONCHIP_OPS") {
@@ -614,24 +627,34 @@ impl Qwen3Forward {
             p
         };
         let mut attn_out = vec![0.0f32; L_PAD * q_dim];
-        for h in 0..n_head {
-            let kv = h / gqa;
-            let mut v_pad = vec![0.0f32; KEYS * VPAD];
+        for kv in 0..n_kv {
+            let mut v_kv = vec![0.0f32; KEYS * VPAD]; // [keys][256]; cols≥128, rows≥L = 0
             for t in 0..L_PAD {
                 let vo = t * kv_dim + kv * HEAD_DIM;
-                v_pad[t * VPAD..t * VPAD + HEAD_DIM].copy_from_slice(&vf[vo..vo + HEAD_DIM]);
+                v_kv[t * VPAD..t * VPAD + HEAD_DIM].copy_from_slice(&vf[vo..vo + HEAD_DIM]);
+            }
+            // Stack the gqa Q-heads' probs along M (they share v_kv).
+            let mut probs_pair = vec![0u16; mb * KEYS];
+            for sub in 0..gqa {
+                let h = gqa * kv + sub;
+                probs_pair[sub * L_PAD * KEYS..(sub + 1) * L_PAD * KEYS]
+                    .copy_from_slice(&probs[h * L_PAD * KEYS..(h + 1) * L_PAD * KEYS]);
             }
             let o = self.gemm_rm(
-                "gemm_512x1024x256",
-                &probs[h * L_PAD * KEYS..(h + 1) * L_PAD * KEYS],
-                &bits(&v_pad),
-                L_PAD,
+                "gemm_1024x1024x256",
+                &probs_pair,
+                &bits(&v_kv),
+                mb,
                 KEYS,
                 VPAD,
             )?;
-            for t in 0..L_PAD {
-                let ao = t * q_dim + h * HEAD_DIM;
-                attn_out[ao..ao + HEAD_DIM].copy_from_slice(&o[t * VPAD..t * VPAD + HEAD_DIM]);
+            for sub in 0..gqa {
+                let h = gqa * kv + sub;
+                for t in 0..L_PAD {
+                    let ao = t * q_dim + h * HEAD_DIM;
+                    let orow = (sub * L_PAD + t) * VPAD;
+                    attn_out[ao..ao + HEAD_DIM].copy_from_slice(&o[orow..orow + HEAD_DIM]);
+                }
             }
         }
         Ok(attn_out)
