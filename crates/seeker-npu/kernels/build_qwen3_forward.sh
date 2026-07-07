@@ -29,14 +29,16 @@ echo "### f32-output GEMMs (token block M=512; the hybrid forward's NPU work) ##
 echo "### 128-token bucket (short-prompt kernels; m=16 weights, m=32/n=16 attention) ###"
 # Same shapes at M=128 so prompts of <=128 tokens run far fewer GEMM FLOPs (the
 # forward picks the smallest bucket >= l). The smaller M needs -m 16 (M % 2·m·4 == 0);
-# attention (N=128, no key/value padding at this size) also needs -n 16.
-"$here/gemm/build.sh" 128 1024 2048 f32 1 16     # wq
-"$here/gemm/build.sh" 128 1024 1024 f32 1 16     # wk, wv
-"$here/gemm/build.sh" 128 2048 1024 f32 1 16     # wo
-"$here/gemm/build.sh" 128 1024 3072 f32 1 16     # gate/up
-"$here/gemm/build.sh" 128 3072 1024 f32 1 16     # down
-"$here/gemm/build.sh" 256 128 128 f32 1 32 16    # QKᵀ (M=gqa·128, keys=128)
-"$here/gemm/build.sh" 256 128 128 f32 0 32 16    # ·V  (keys=128, vpad=128)
+# attention (N=128, no key/value padding at this size) also needs -n 16. The weight
+# GEMMs also take -k 256 (8th arg): the deeper K-tile is ~20–30% faster at m=16 and
+# still fits L1 (bit-identical result). The K=128 attention GEMMs keep the default k.
+"$here/gemm/build.sh" 128 1024 2048 f32 1 16 "" 256   # wq
+"$here/gemm/build.sh" 128 1024 1024 f32 1 16 "" 256   # wk, wv
+"$here/gemm/build.sh" 128 2048 1024 f32 1 16 "" 256   # wo
+"$here/gemm/build.sh" 128 1024 3072 f32 1 16 "" 256   # gate/up
+"$here/gemm/build.sh" 128 3072 1024 f32 1 16 "" 256   # down
+"$here/gemm/build.sh" 256 128 128 f32 1 32 16         # QKᵀ (M=gqa·128, keys=128)
+"$here/gemm/build.sh" 256 128 128 f32 0 32 16         # ·V  (keys=128, vpad=128)
 
 echo "### 256-token bucket (128 < l <= 256; m=32 weights) ###"
 # M=256 needs -m 32. Attention is M=gqa·256=512 (default m=64); keys=256 and vpad=128
