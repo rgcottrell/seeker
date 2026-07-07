@@ -159,13 +159,21 @@ const CTX_CACHE_CAP: usize = 15;
 /// Runs fixed-shape AIE kernels by xclbin name, caching loaded Contexts (M5: avoids
 /// reloading the xclbin + re-syncing instructions on every one of the ~1000 dispatches
 /// a forward issues). `Loaded` is stored by value (no `Rc`) to keep the embedder
-/// `Send`. Keeping activations resident across ops is the remaining lever.
+/// `Send`. (Keeping *activations* resident across ops isn't viable here — the hybrid
+/// does the norm/rope/softmax/SiLU in f32 on the host, which needs the data host-side;
+/// resident *weights* are the tractable variant, see [`Self::run_f32out_w`].)
 struct KernelRunner {
     dir: PathBuf,
     cache: RefCell<HashMap<String, Loaded>>,
     lru: RefCell<Vec<String>>, // front = least-recently-used
     // (count, total dispatch time) per kernel stem, for SEEKER_NPU_TIMING.
     timing: RefCell<HashMap<String, (u32, std::time::Duration)>>,
+    // Resident weight BOs, keyed by (kernel key, weight ptr): a GEMM weight is
+    // immutable across the whole run, so it's uploaded to its own BO once and reused
+    // instead of re-copied into the shared input BO on every dispatch (the weight is
+    // ~4–6 MB and re-copied 28× per forward). Keyed by ptr so wk/wv, which share a
+    // kernel, get distinct BOs. Never evicted (the resident set is the model weights).
+    wbos: RefCell<HashMap<(String, usize), Buffer>>,
 }
 
 impl KernelRunner {
@@ -178,6 +186,7 @@ impl KernelRunner {
             cache: RefCell::new(HashMap::new()),
             lru: RefCell::new(Vec::new()),
             timing: RefCell::new(HashMap::new()),
+            wbos: RefCell::new(HashMap::new()),
         }
     }
 
@@ -300,6 +309,51 @@ impl KernelRunner {
         Self::dispatch(k, inputs, out_elems * 4)?;
         self.tick(stem, t0.elapsed());
         Ok(k.bos.borrow().last().unwrap().as_slice::<f32>().to_vec())
+    }
+
+    /// f32-output GEMM with a RESIDENT weight: the activation `act` is copied per call,
+    /// but the immutable `weight` lives in its own BO (uploaded once, keyed by ptr), so
+    /// it isn't re-copied into an input BO every dispatch. The kernel binds
+    /// [act, weight, out]; the per-kernel pool holds just [act, out].
+    fn run_f32out_w(
+        &self,
+        subdir: &str,
+        stem: &str,
+        act: &[u16],
+        weight: &[u16],
+        out_elems: usize,
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
+        self.ensure(subdir, stem)?;
+        let key = Self::key(subdir, stem);
+        let wkey = (key.clone(), weight.as_ptr() as usize);
+        let t0 = std::time::Instant::now();
+        let cache = self.cache.borrow();
+        let k = &cache[&key];
+        // Upload the weight to its resident BO once (copy + sync happen a single time).
+        if !self.wbos.borrow().contains_key(&wkey) {
+            let mut wbo = k.ctx.alloc_data(weight.len() * 2)?;
+            wbo.as_mut_slice::<u16>().copy_from_slice(weight);
+            wbo.sync_to_device()?;
+            self.wbos.borrow_mut().insert(wkey.clone(), wbo);
+        }
+        let wbos = self.wbos.borrow();
+        let wbo = &wbos[&wkey];
+        {
+            let mut pool = k.bos.borrow_mut(); // [act, out]
+            if pool.is_empty() {
+                pool.push(k.ctx.alloc_data(act.len() * 2)?);
+                pool.push(k.ctx.alloc_data(out_elems * 4)?);
+            }
+            pool[0].as_mut_slice::<u16>().copy_from_slice(act);
+            pool[0].sync_to_device()?;
+            pool[1].sync_to_device()?; // sync the write-only output before the run
+            let refs: Vec<&Buffer> = vec![&pool[0], wbo, &pool[1]];
+            k.ctx.run(&k.instr, k.ninstr, &refs)?;
+            drop(refs);
+            pool[1].sync_from_device()?;
+        }
+        self.tick(stem, t0.elapsed());
+        Ok(k.bos.borrow()[1].as_slice::<f32>().to_vec())
     }
 }
 
@@ -503,6 +557,43 @@ impl Qwen3Forward {
             return Ok(out);
         }
         self.kernels.run_f32out("gemm", stem, &[a, b], m * n)
+    }
+
+    /// [`gemm_bcm`](Self::gemm_bcm) for a GEMM whose `b` is a persistent layer weight.
+    /// With `SEEKER_NPU_RESIDENT_WEIGHTS` set, `b` feeds a resident BO (uploaded once)
+    /// instead of being re-copied every dispatch — the ~4–6 MB weight is otherwise
+    /// re-copied 28× per forward. This is a SUSTAINED-workload lever (serve/batch): it
+    /// trades a one-time upload of the whole weight set (~the model size, on the first
+    /// forward) for ~9% off every later forward, so it only pays back past ~5 forwards.
+    /// Default off, so the one-shot CLI keeps its faster cold path.
+    fn gemm_bcm_w(
+        &self,
+        stem: &str,
+        a: &[u16],
+        b: &[u16],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
+        if env_host("SEEKER_NPU_HOST_GEMM") {
+            let (af, bf) = (deq(a), deq(b));
+            let mut out = vec![0.0f32; m * n];
+            for mi in 0..m {
+                for ni in 0..n {
+                    let mut acc = 0.0f32;
+                    for ki in 0..k {
+                        acc += af[mi * k + ki] * bf[ni * k + ki];
+                    }
+                    out[mi * n + ni] = acc;
+                }
+            }
+            return Ok(out);
+        }
+        if env_host("SEEKER_NPU_RESIDENT_WEIGHTS") {
+            self.kernels.run_f32out_w("gemm", stem, a, b, m * n)
+        } else {
+            self.kernels.run_f32out("gemm", stem, &[a, b], m * n)
+        }
     }
 
     /// Row-major-B GEMM: out[m][n] = Σ_k A[m][k]·B[k][n] (the ·V layout), f32 output.
@@ -758,6 +849,12 @@ impl Qwen3Forward {
             return Err(format!("NPU backend handles 1..={L_PAD} tokens, got {l}").into());
         }
         let t_fwd = std::time::Instant::now();
+        if env_host("SEEKER_NPU_TIMING") {
+            // Per-forward report: clear the cumulative counters so each forward stands
+            // alone (else timing_report's cross-forward sum exceeds this forward's total,
+            // underflowing the `total - npu` host split on the 2nd forward).
+            self.kernels.timing.borrow_mut().clear();
+        }
         let (n_embd, q_dim, kv_dim, n_ff) = (self.n_embd, self.q_dim, self.kv_dim, self.n_ff);
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
@@ -802,23 +899,23 @@ impl Qwen3Forward {
         for ly in self.layers.iter().take(max) {
             // ---- attention block (GEMMs output f32; bf16 only as kernel inputs) ----
             let xnw = self.norm_mul(&resid, &ly.attn_norm, l, lpad)?;
-            let q = self.gemm_bcm(sh.wq, &xnw, &ly.wq, lpad, n_embd, q_dim)?;
-            let k = self.gemm_bcm(sh.wkv, &xnw, &ly.wk, lpad, n_embd, kv_dim)?;
-            let v = self.gemm_bcm(sh.wkv, &xnw, &ly.wv, lpad, n_embd, kv_dim)?;
+            let q = self.gemm_bcm_w(sh.wq, &xnw, &ly.wq, lpad, n_embd, q_dim)?;
+            let k = self.gemm_bcm_w(sh.wkv, &xnw, &ly.wk, lpad, n_embd, kv_dim)?;
+            let v = self.gemm_bcm_w(sh.wkv, &xnw, &ly.wv, lpad, n_embd, kv_dim)?;
             let q_roped =
                 self.qk_norm_rope(&bits(&q), self.n_head, &ly.q_norm, &cos_q, &sin_q, l, lpad)?;
             let k_roped =
                 self.qk_norm_rope(&bits(&k), self.n_kv, &ly.k_norm, &cos_k, &sin_k, l, lpad)?;
             let attn = self.attention(&q_roped, &k_roped, &v, l, sh)?;
-            let proj = self.gemm_bcm(sh.wo, &attn, &ly.wo, lpad, q_dim, n_embd)?;
+            let proj = self.gemm_bcm_w(sh.wo, &attn, &ly.wo, lpad, q_dim, n_embd)?;
             for (r, p) in resid.iter_mut().zip(&proj) {
                 *r += p;
             }
 
             // ---- FFN block ----
             let xn2w = self.norm_mul(&resid, &ly.ffn_norm, l, lpad)?;
-            let g = self.gemm_bcm(sh.gate_up, &xn2w, &ly.gate, lpad, n_embd, n_ff)?;
-            let u = self.gemm_bcm(sh.gate_up, &xn2w, &ly.up, lpad, n_embd, n_ff)?;
+            let g = self.gemm_bcm_w(sh.gate_up, &xn2w, &ly.gate, lpad, n_embd, n_ff)?;
+            let u = self.gemm_bcm_w(sh.gate_up, &xn2w, &ly.up, lpad, n_embd, n_ff)?;
             // SwiGLU: silu(gate) * up. Default = host f32 (the whole product, so it isn't
             // rounded to bf16 early and the default path needs no eltwise/activation
             // xclbins — only the GEMMs). On-chip path uses the bf16 silu + mul kernels.
@@ -854,7 +951,7 @@ impl Qwen3Forward {
                 }
                 h
             };
-            let dn = self.gemm_bcm(sh.down, &hidden, &ly.down, lpad, n_ff, n_embd)?;
+            let dn = self.gemm_bcm_w(sh.down, &hidden, &ly.down, lpad, n_ff, n_embd)?;
             for (r, d) in resid.iter_mut().zip(&dn) {
                 *r += d;
             }
