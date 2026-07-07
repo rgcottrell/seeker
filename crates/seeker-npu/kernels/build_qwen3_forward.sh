@@ -15,9 +15,10 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
 echo "### f32-output GEMMs (token block M=512; the hybrid forward's NPU work) ###"
-# b_col_maj weight GEMMs: wq, wk/wv, wo, ffn gate/up, ffn down, and QKᵀ.
-"$here/gemm/build.sh" 512 1024 2048 f32 1   # wq      (K=n_embd,  N=q_dim)
-"$here/gemm/build.sh" 512 1024 1024 f32 1   # wk, wv  (K=n_embd,  N=kv_dim)
+# b_col_maj weight GEMMs: fused QKV, wo, ffn gate/up, ffn down, and QKᵀ.
+# Q|K|V are fused into one N=q_dim+2·kv_dim=4096 GEMM (one dispatch for three); gate/up
+# stay two dispatches (their fused N=6144 trips an AIE DMA-stride limit at M=512).
+"$here/gemm/build.sh" 512 1024 4096 f32 1   # QKV     (K=n_embd,  N=q_dim+2·kv_dim)
 "$here/gemm/build.sh" 512 2048 1024 f32 1   # wo      (K=q_dim,   N=n_embd)
 "$here/gemm/build.sh" 512 1024 3072 f32 1   # gate/up (K=n_embd,  N=n_ff)
 "$here/gemm/build.sh" 512 3072 1024 f32 1   # down    (K=n_ff,    N=n_embd)
@@ -32,8 +33,7 @@ echo "### 128-token bucket (short-prompt kernels; m=16 weights, m=32/n=16 attent
 # attention (N=128, no key/value padding at this size) also needs -n 16. The weight
 # GEMMs also take -k 256 (8th arg): the deeper K-tile is ~20–30% faster at m=16 and
 # still fits L1 (bit-identical result). The K=128 attention GEMMs keep the default k.
-"$here/gemm/build.sh" 128 1024 2048 f32 1 16 "" 256   # wq
-"$here/gemm/build.sh" 128 1024 1024 f32 1 16 "" 256   # wk, wv
+"$here/gemm/build.sh" 128 1024 4096 f32 1 16 "" 256   # QKV (fused)
 "$here/gemm/build.sh" 128 2048 1024 f32 1 16 "" 256   # wo
 "$here/gemm/build.sh" 128 1024 3072 f32 1 16 "" 256   # gate/up
 "$here/gemm/build.sh" 128 3072 1024 f32 1 16 "" 256   # down
@@ -43,8 +43,7 @@ echo "### 128-token bucket (short-prompt kernels; m=16 weights, m=32/n=16 attent
 echo "### 256-token bucket (128 < l <= 256; m=32 weights) ###"
 # M=256 needs -m 32. Attention is M=gqa·256=512 (default m=64); keys=256 and vpad=128
 # are tile-aligned, so QKᵀ keeps the default -n and ·V needs -n 16 for N=128.
-"$here/gemm/build.sh" 256 1024 2048 f32 1 32     # wq
-"$here/gemm/build.sh" 256 1024 1024 f32 1 32     # wk, wv
+"$here/gemm/build.sh" 256 1024 4096 f32 1 32     # QKV (fused)
 "$here/gemm/build.sh" 256 2048 1024 f32 1 32     # wo
 "$here/gemm/build.sh" 256 1024 3072 f32 1 32     # gate/up
 "$here/gemm/build.sh" 256 3072 1024 f32 1 32     # down

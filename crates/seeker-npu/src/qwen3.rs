@@ -47,12 +47,13 @@ const MASK_NEG: f32 = -1e4;
 /// key dim collapses 1024→128 and value width 256→128. The on-chip op path (its
 /// norm/softmax/silu xclbins are 512-only) always uses [`B512`].
 struct Shape {
-    lpad: usize, // token block = weight-GEMM M
-    keys: usize, // padded key count = QKᵀ N and ·V K
-    vpad: usize, // padded value width = ·V N
-    wq: &'static str,
-    wkv: &'static str,
+    lpad: usize,       // token block = weight-GEMM M
+    keys: usize,       // padded key count = QKᵀ N and ·V K
+    vpad: usize,       // padded value width = ·V N
+    qkv: &'static str, // fused Q|K|V proj (N = q_dim + 2·kv_dim), one dispatch for 3
     wo: &'static str,
+    // gate/up are NOT fused: the fused N=2·n_ff=6144 GEMM trips an AIE DMA-stride limit
+    // at M=512 (B512). Left as two dispatches.
     gate_up: &'static str,
     down: &'static str,
     qkt: &'static str, // QKᵀ (b_col_maj), M = gqa·lpad
@@ -64,8 +65,7 @@ const B512: Shape = Shape {
     lpad: 512,
     keys: 1024,
     vpad: 256,
-    wq: "gemm_512x1024x2048_bcm",
-    wkv: "gemm_512x1024x1024_bcm",
+    qkv: "gemm_512x1024x4096_bcm",
     wo: "gemm_512x2048x1024_bcm",
     gate_up: "gemm_512x1024x3072_bcm",
     down: "gemm_512x3072x1024_bcm",
@@ -78,8 +78,7 @@ const B128: Shape = Shape {
     lpad: 128,
     keys: 128,
     vpad: 128,
-    wq: "gemm_128x1024x2048_bcm",
-    wkv: "gemm_128x1024x1024_bcm",
+    qkv: "gemm_128x1024x4096_bcm",
     wo: "gemm_128x2048x1024_bcm",
     gate_up: "gemm_128x1024x3072_bcm",
     down: "gemm_128x3072x1024_bcm",
@@ -92,8 +91,7 @@ const B256: Shape = Shape {
     lpad: 256,
     keys: 256,
     vpad: 128,
-    wq: "gemm_256x1024x2048_bcm",
-    wkv: "gemm_256x1024x1024_bcm",
+    qkv: "gemm_256x1024x4096_bcm",
     wo: "gemm_256x2048x1024_bcm",
     gate_up: "gemm_256x1024x3072_bcm",
     down: "gemm_256x3072x1024_bcm",
@@ -149,11 +147,11 @@ struct Loaded {
 
 /// The XDNA2 NPU caps concurrent hardware contexts at 16 (`CREATE_HWCTX` EINVAL past
 /// that), so the cache is bounded and evicts least-recently-used. A single forward uses
-/// 7 distinct GEMM xclbins (one bucket) — always cached for the whole 28-layer loop, so
-/// the BO reuse never thrashes within a forward. The three buckets total 21 xclbins, so
-/// a process that mixes all three prompt sizes evicts across forwards (7 reloads on the
-/// first layer after a bucket switch), but a single-size workload stays fully warm. The
-/// on-chip path's ~18 distinct kernels evict a few per layer.
+/// 6 distinct GEMM xclbins (one bucket: qkv, wo, gate_up, down, QKᵀ, ·V) — always cached
+/// for the whole 28-layer loop, so the BO reuse never thrashes within a forward. The
+/// three buckets total 18 xclbins, so a process that mixes all three prompt sizes evicts
+/// across forwards (6 reloads on the first layer after a bucket switch), but a single-size
+/// workload stays fully warm. The on-chip path's ~18 distinct kernels evict a few per layer.
 const CTX_CACHE_CAP: usize = 15;
 
 /// Runs fixed-shape AIE kernels by xclbin name, caching loaded Contexts (M5: avoids
@@ -361,9 +359,9 @@ impl KernelRunner {
 /// `[out][in]` order), norm weights as f32 (broadcast/tiled per use).
 struct Layer {
     attn_norm: Vec<f32>,
-    wq: Vec<u16>,
-    wk: Vec<u16>,
-    wv: Vec<u16>,
+    // Q|K|V fused along the output dim (GGUF stores each as [out][in] row-major, so a
+    // flat concat is exactly the [q_dim+2·kv_dim][n_embd] fused weight) → one GEMM.
+    wqkv: Vec<u16>,
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
     wo: Vec<u16>,
@@ -475,11 +473,15 @@ impl Qwen3Forward {
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let p = format!("blk.{i}");
+            // Q|K|V concatenated along the output dim → one fused proj GEMM. GGUF stores
+            // each weight as [out][in] row-major, so flat concatenation is exactly the
+            // [q_dim + 2·kv_dim][n_embd] operand the fused kernel wants.
+            let mut wqkv = f16_bits(gguf, &format!("{p}.attn_q.weight"))?;
+            wqkv.extend(f16_bits(gguf, &format!("{p}.attn_k.weight"))?);
+            wqkv.extend(f16_bits(gguf, &format!("{p}.attn_v.weight"))?);
             layers.push(Layer {
                 attn_norm: f32_vec(gguf, &format!("{p}.attn_norm.weight"), n_embd)?,
-                wq: f16_bits(gguf, &format!("{p}.attn_q.weight"))?,
-                wk: f16_bits(gguf, &format!("{p}.attn_k.weight"))?,
-                wv: f16_bits(gguf, &format!("{p}.attn_v.weight"))?,
+                wqkv,
                 q_norm: f32_vec(gguf, &format!("{p}.attn_q_norm.weight"), HEAD_DIM)?,
                 k_norm: f32_vec(gguf, &format!("{p}.attn_k_norm.weight"), HEAD_DIM)?,
                 wo: f16_bits(gguf, &format!("{p}.attn_output.weight"))?,
@@ -899,9 +901,24 @@ impl Qwen3Forward {
         for ly in self.layers.iter().take(max) {
             // ---- attention block (GEMMs output f32; bf16 only as kernel inputs) ----
             let xnw = self.norm_mul(&resid, &ly.attn_norm, l, lpad)?;
-            let q = self.gemm_bcm_w(sh.wq, &xnw, &ly.wq, lpad, n_embd, q_dim)?;
-            let k = self.gemm_bcm_w(sh.wkv, &xnw, &ly.wk, lpad, n_embd, kv_dim)?;
-            let v = self.gemm_bcm_w(sh.wkv, &xnw, &ly.wv, lpad, n_embd, kv_dim)?;
+            // Fused Q|K|V projection in one dispatch (the three shared xnw). The output
+            // rows are [q(q_dim) | k(kv_dim) | v(kv_dim)]; split them back into contiguous
+            // q/k/v (only the real `l` rows) for the per-head norm/rope + attention.
+            let qkv = self.gemm_bcm_w(sh.qkv, &xnw, &ly.wqkv, lpad, n_embd, q_dim + 2 * kv_dim)?;
+            let (mut q, mut k, mut v) = (
+                vec![0.0f32; lpad * q_dim],
+                vec![0.0f32; lpad * kv_dim],
+                vec![0.0f32; lpad * kv_dim],
+            );
+            let stride = q_dim + 2 * kv_dim;
+            for t in 0..l {
+                let b = t * stride;
+                q[t * q_dim..(t + 1) * q_dim].copy_from_slice(&qkv[b..b + q_dim]);
+                k[t * kv_dim..(t + 1) * kv_dim]
+                    .copy_from_slice(&qkv[b + q_dim..b + q_dim + kv_dim]);
+                v[t * kv_dim..(t + 1) * kv_dim]
+                    .copy_from_slice(&qkv[b + q_dim + kv_dim..b + stride]);
+            }
             let q_roped =
                 self.qk_norm_rope(&bits(&q), self.n_head, &ly.q_norm, &cos_q, &sin_q, l, lpad)?;
             let k_roped =
