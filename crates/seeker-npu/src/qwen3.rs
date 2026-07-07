@@ -32,15 +32,60 @@ use seeker_core::gguf::{GgmlType, GgufFile};
 
 use crate::npu::{Buffer, Context};
 
-/// Token block width the AIE kernels are built for (the GEMM M%512 constraint).
+/// Largest token block the AIE kernels are built for (the GEMM M%512 constraint).
 pub const L_PAD: usize = 512;
 const HEAD_DIM: usize = 128;
 // NB: every RMSNorm runs on the aie2p `rms_norm.cc` kernel, which hardcodes
 // eps = 1e-5 (Qwen3 config is 1e-6; the difference is negligible against a
 // mean-square of ~O(1) over the normed dimension).
-const KEYS: usize = 1024; // L_PAD padded up to the softmax tile width
-const VPAD: usize = 256; // head_dim padded up to the GEMM N%256 rule
 const MASK_NEG: f32 = -1e4;
+
+/// A token-block **bucket**: the fixed kernel shapes a prompt runs in. The forward
+/// pads a prompt of `l` tokens up to the smallest bucket's `lpad ≥ l`, so the GEMMs
+/// are sized to the real length instead of always the 512 max. For short prompts the
+/// 128-bucket cuts the NPU GEMM FLOPs several-fold — dramatically for attention, whose
+/// key dim collapses 1024→128 and value width 256→128. The on-chip op path (its
+/// norm/softmax/silu xclbins are 512-only) always uses [`B512`].
+struct Shape {
+    lpad: usize, // token block = weight-GEMM M
+    keys: usize, // padded key count = QKᵀ N and ·V K
+    vpad: usize, // padded value width = ·V N
+    wq: &'static str,
+    wkv: &'static str,
+    wo: &'static str,
+    gate_up: &'static str,
+    down: &'static str,
+    qkt: &'static str, // QKᵀ (b_col_maj), M = gqa·lpad
+    av: &'static str,  // ·V (row-major B), M = gqa·lpad
+}
+
+/// Full 512-token block (KEYS padded to the 1024 softmax tile, VPAD to the N%256 rule).
+const B512: Shape = Shape {
+    lpad: 512,
+    keys: 1024,
+    vpad: 256,
+    wq: "gemm_512x1024x2048_bcm",
+    wkv: "gemm_512x1024x1024_bcm",
+    wo: "gemm_512x2048x1024_bcm",
+    gate_up: "gemm_512x1024x3072_bcm",
+    down: "gemm_512x3072x1024_bcm",
+    qkt: "gemm_1024x128x1024_bcm",
+    av: "gemm_1024x1024x256",
+};
+/// 128-token block for short prompts (m=16 weight tiles, m=32/n=16 attention; keys and
+/// value width need no padding at this size).
+const B128: Shape = Shape {
+    lpad: 128,
+    keys: 128,
+    vpad: 128,
+    wq: "gemm_128x1024x2048_bcm",
+    wkv: "gemm_128x1024x1024_bcm",
+    wo: "gemm_128x2048x1024_bcm",
+    gate_up: "gemm_128x1024x3072_bcm",
+    down: "gemm_128x3072x1024_bcm",
+    qkt: "gemm_256x128x128_bcm",
+    av: "gemm_256x128x128",
+};
 
 /// f32 → bf16 bits, branchless round-to-nearest-even. For the finite activations here
 /// this is numerically identical to `bf16::from_f32(x).to_bits()` but far cheaper (no
@@ -89,9 +134,10 @@ struct Loaded {
 }
 
 /// The XDNA2 NPU caps concurrent hardware contexts at 16 (`CREATE_HWCTX` EINVAL past
-/// that), so the cache is bounded and evicts least-recently-used. The hybrid forward
-/// uses only 7 distinct GEMM xclbins, well under the cap → nothing is evicted; the
-/// on-chip path's ~18 distinct kernels evict a few per layer.
+/// that), so the cache is bounded and evicts least-recently-used. A single forward uses
+/// 7 distinct GEMM xclbins (one bucket); a process serving both short and long prompts
+/// touches both buckets = 14, still under the cap → nothing is evicted. The on-chip
+/// path's ~18 distinct kernels evict a few per layer.
 const CTX_CACHE_CAP: usize = 15;
 
 /// Runs fixed-shape AIE kernels by xclbin name, caching loaded Contexts (M5: avoids
@@ -391,10 +437,10 @@ impl Qwen3Forward {
 
     /// NEOX cos/sin tables broadcast to token-major `[L_PAD][n_heads·128]`, optionally
     /// pre-multiplied by `scale` (used to fold the attention scale into q).
-    fn rope_tables(&self, n_heads: usize, scale: f32) -> (Vec<u16>, Vec<u16>) {
+    fn rope_tables(&self, n_heads: usize, scale: f32, lpad: usize) -> (Vec<u16>, Vec<u16>) {
         let d = n_heads * HEAD_DIM;
-        let (mut cos, mut sin) = (vec![0.0f32; L_PAD * d], vec![0.0f32; L_PAD * d]);
-        for t in 0..L_PAD {
+        let (mut cos, mut sin) = (vec![0.0f32; lpad * d], vec![0.0f32; lpad * d]);
+        for t in 0..lpad {
             for i in 0..d {
                 let j = (i % HEAD_DIM) % (HEAD_DIM / 2);
                 let theta = t as f32 * self.rope_base.powf(-2.0 * j as f32 / HEAD_DIM as f32);
@@ -473,14 +519,20 @@ impl Qwen3Forward {
     /// host by default (the hybrid: the bf16 LUT rms_norm kernel is too lossy over many
     /// layers); `SEEKER_NPU_ONCHIP_OPS` runs it on the NPU instead (for future
     /// f32-precision NPU-kernel work / measurement).
-    fn norm_mul(&self, x: &[f32], weight: &[f32], l: usize) -> Result<Vec<u16>, Box<dyn Error>> {
+    fn norm_mul(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        l: usize,
+        lpad: usize,
+    ) -> Result<Vec<u16>, Box<dyn Error>> {
         let w = weight.len();
-        let n = L_PAD * w;
+        let n = lpad * w;
         if env_host("SEEKER_NPU_ONCHIP_OPS") {
             let xn = self
                 .kernels
                 .run("norm", "rmsnorm_1024_524288", &[&bits(x)], n)?;
-            let wt = tile(weight, w, L_PAD);
+            let wt = tile(weight, w, lpad);
             return self
                 .kernels
                 .run("eltwise", "eltwise_mul_bf16_524288", &[&xn, &bits(&wt)], n);
@@ -500,6 +552,7 @@ impl Qwen3Forward {
     }
 
     /// Per-head RMSNorm(128)·norm_w + NEOX RoPE on the NPU (cos/sin may carry scale).
+    #[allow(clippy::too_many_arguments)]
     fn qk_norm_rope(
         &self,
         proj: &[u16],
@@ -508,8 +561,9 @@ impl Qwen3Forward {
         cos: &[u16],
         sin: &[u16],
         l: usize,
+        lpad: usize,
     ) -> Result<Vec<u16>, Box<dyn Error>> {
-        let n = L_PAD * n_heads * HEAD_DIM;
+        let n = lpad * n_heads * HEAD_DIM;
         if env_host("SEEKER_NPU_ONCHIP_OPS") {
             let (rms, mul, add) = Self::rms_mul_name(n);
             let normed = self.kernels.run("norm", &rms, &[proj], n)?;
@@ -543,52 +597,52 @@ impl Qwen3Forward {
         Ok(bits(&out))
     }
 
-    /// GQA causal attention → attn_out[L_PAD][q_dim] as bf16 bits (the O-proj GEMM's
+    /// GQA causal attention → attn_out[lpad][q_dim] as bf16 bits (the O-proj GEMM's
     /// input — converted in the gather so the caller needs no `bits(&attn)`). q is
-    /// pre-scaled; k is bf16 bits (post-rope), v is the f32 value projection.
+    /// pre-scaled; k is bf16 bits (post-rope), v is the f32 value projection. `sh` is
+    /// the token-block bucket (kernel shapes + key/value padding).
     fn attention(
         &self,
         q: &[u16],
         k: &[u16],
         v: &[f32],
         l: usize,
+        sh: &Shape,
     ) -> Result<Vec<u16>, Box<dyn Error>> {
         let (n_head, n_kv, q_dim, kv_dim) = (self.n_head, self.n_kv, self.q_dim, self.kv_dim);
         let gqa = n_head / n_kv;
+        let (lpad, keys, vpad) = (sh.lpad, sh.keys, sh.vpad);
         // GQA batching: the `gqa` Q-heads sharing a KV head share K and V, so stack them
-        // along M and do ONE dense GEMM per KV head (M = gqa·L_PAD) instead of one per
-        // Q-head — halving the QKᵀ / ·V dispatch count (the attention dispatch overhead
-        // dominates). The M=gqa·512 kernels are fixed-shape (Qwen3-Embedding gqa=2).
+        // along M and do ONE dense GEMM per KV head (M = gqa·lpad) instead of one per
+        // Q-head — halving the QKᵀ / ·V dispatch count.
         //
         // Each KV head is fully independent, so its softmax reads the QKᵀ GEMM output
-        // directly and writes a per-pair [mb][KEYS] probs buffer — never a global
-        // [n_head][L_PAD][KEYS] one. That drops the split (GEMM rows → global scores) and
-        // stack (global probs → GEMM rows) copies of the two 8.4M-element buffers per
-        // layer — the bulk of the attention host time post-BO-reuse.
+        // directly and writes a per-pair [mb][keys] probs buffer — never a global
+        // [n_head][lpad][keys] one. That drops the split (GEMM rows → global scores) and
+        // stack (global probs → GEMM rows) copies of the two big buffers per layer.
         //
         // The QKᵀ (·) and ·V GEMMs stay in two SEPARATE phases (all QKᵀ, then all ·V)
         // rather than a per-pair QKᵀ→·V pipeline: interleaving them forces an XDNA2
         // hardware-context swap between the two xclbins on every pair (16/layer vs 1),
         // which costs far more than the host copies it would save.
-        let mb = gqa * L_PAD; // batched M = 1024
+        let mb = gqa * lpad;
         // q and k arrive as bf16 bits (post-rope, pre-scaled) and feed the QKᵀ GEMM as
         // bf16 — so we reshuffle their u16 words straight into the batched operands with
         // NO deq/re-bits round-trip. v is the f32 value projection, converted per element
         // as it's gathered. Only the first `l` token rows are real; the operand buffers
-        // are allocated full (zeroed) so the fixed-shape kernels see a 512-padded input,
-        // but we only touch the real rows — the pad rows stay 0 (Q·Kᵀ 0, causally masked;
-        // the pad output rows are never read). For a short prompt the pad rows and the
-        // eliminated conversions are the bulk of the attention host bandwidth.
+        // are allocated full (zeroed) so the fixed-shape kernels see a padded input, but
+        // we only touch the real rows — the pad rows stay 0 (Q·Kᵀ 0, causally masked; the
+        // pad output rows are never read).
         let onchip = env_host("SEEKER_NPU_ONCHIP_OPS");
-        // Causal + pad-column mask for one KV pair: row = sub·L_PAD + tq, so the mask is
-        // the same for every pair (depends only on tq = row % L_PAD) — build it once.
+        // Causal + pad-column mask for one KV pair: row = sub·lpad + tq, so the mask is
+        // the same for every pair (depends only on tq = row % lpad) — build it once.
         let mask_bits = onchip.then(|| {
-            let mut mask = vec![0.0f32; mb * KEYS];
+            let mut mask = vec![0.0f32; mb * keys];
             for sub in 0..gqa {
-                for tq in 0..L_PAD {
-                    let row = (sub * L_PAD + tq) * KEYS;
-                    for tk in 0..KEYS {
-                        if tk > tq || tk >= L_PAD {
+                for tq in 0..lpad {
+                    let row = (sub * lpad + tq) * keys;
+                    for tk in 0..keys {
+                        if tk > tq || tk >= lpad {
                             mask[row + tk] = MASK_NEG;
                         }
                     }
@@ -598,44 +652,42 @@ impl Qwen3Forward {
         });
         // Phase 1: QKᵀ + softmax → per-pair probs (the QKᵀ xclbin stays resident; the
         // default softmax is host, so no context swap interleaves the GEMMs).
-        let mut e = vec![0.0f32; KEYS];
+        let mut e = vec![0.0f32; keys];
         let mut pair_probs: Vec<Vec<u16>> = Vec::with_capacity(n_kv);
         for kv in 0..n_kv {
             // Stack the gqa Q-heads' q rows (they share this pair's K).
             let mut q_pair = vec![0u16; mb * HEAD_DIM]; // bf16 bits; rows≥l = 0
-            let mut k_kv = vec![0u16; KEYS * HEAD_DIM]; // bf16 bits, [keys][128] bcm
+            let mut k_kv = vec![0u16; keys * HEAD_DIM]; // bf16 bits, [keys][128] bcm
             for t in 0..l {
                 let ko = t * kv_dim + kv * HEAD_DIM;
                 k_kv[t * HEAD_DIM..(t + 1) * HEAD_DIM].copy_from_slice(&k[ko..ko + HEAD_DIM]);
                 for sub in 0..gqa {
                     let qo = t * q_dim + (gqa * kv + sub) * HEAD_DIM;
-                    let row = sub * L_PAD + t;
+                    let row = sub * lpad + t;
                     q_pair[row * HEAD_DIM..(row + 1) * HEAD_DIM]
                         .copy_from_slice(&q[qo..qo + HEAD_DIM]);
                 }
             }
-            let s = self.gemm_bcm("gemm_1024x128x1024_bcm", &q_pair, &k_kv, mb, HEAD_DIM, KEYS)?;
-            // Softmax over KEYS per row. Rows [sub·L_PAD .. (sub+1)·L_PAD) are Q-head
+            let s = self.gemm_bcm(sh.qkt, &q_pair, &k_kv, mb, HEAD_DIM, keys)?;
+            // Softmax over keys per row. Rows [sub·lpad .. (sub+1)·lpad) are Q-head
             // (gqa·kv + sub); the pair layout already matches the ·V GEMM's M.
             let probs_pair = if let Some(ref mask_bits) = mask_bits {
                 let masked = self.kernels.run(
                     "eltwise",
                     "eltwise_add_bf16_1048576",
                     &[&bits(&s), mask_bits],
-                    mb * KEYS,
+                    mb * keys,
                 )?;
                 self.kernels
-                    .run("norm", "softmax_1048576", &[&masked], mb * KEYS)?
+                    .run("norm", "softmax_1048576", &[&masked], mb * keys)?
             } else {
                 // Host f32 (default): causal softmax per row with accurate exp, written
                 // straight to bf16. Only the first `l` (real) query rows per sub-block are
-                // computed — the pad rows feed nothing real and their probs stay 0 — which
-                // cuts both the O(l²) softmax and the conversion down from the fixed 512
-                // to the true prompt length.
-                let mut p = vec![0u16; mb * KEYS];
+                // computed — the pad rows feed nothing real and their probs stay 0.
+                let mut p = vec![0u16; mb * keys];
                 for sub in 0..gqa {
                     for tq in 0..l {
-                        let row = (sub * L_PAD + tq) * KEYS;
+                        let row = (sub * lpad + tq) * keys;
                         let mx = s[row..=row + tq].iter().cloned().fold(f32::MIN, f32::max);
                         let mut den = 0.0f32;
                         for tk in 0..=tq {
@@ -652,24 +704,24 @@ impl Qwen3Forward {
             pair_probs.push(probs_pair);
         }
         // Phase 2: ·V (the ·V xclbin now stays resident across all pairs).
-        let mut attn_out = vec![0u16; L_PAD * q_dim]; // bf16 bits (O-proj GEMM input)
+        let mut attn_out = vec![0u16; lpad * q_dim]; // bf16 bits (O-proj GEMM input)
         for (kv, probs_pair) in pair_probs.iter().enumerate() {
-            let mut v_kv = vec![0u16; KEYS * VPAD]; // bf16 bits, [keys][256]; cols≥128, rows≥l = 0
+            let mut v_kv = vec![0u16; keys * vpad]; // bf16 bits, [keys][vpad]; rows≥l = 0
             for t in 0..l {
                 let vo = t * kv_dim + kv * HEAD_DIM;
-                for (dst, &sv) in v_kv[t * VPAD..t * VPAD + HEAD_DIM]
+                for (dst, &sv) in v_kv[t * vpad..t * vpad + HEAD_DIM]
                     .iter_mut()
                     .zip(&v[vo..vo + HEAD_DIM])
                 {
                     *dst = f32_to_bf16_bits(sv);
                 }
             }
-            let o = self.gemm_rm("gemm_1024x1024x256", probs_pair, &v_kv, mb, KEYS, VPAD)?;
+            let o = self.gemm_rm(sh.av, probs_pair, &v_kv, mb, keys, vpad)?;
             for sub in 0..gqa {
                 let h = gqa * kv + sub;
                 for t in 0..l {
                     let ao = t * q_dim + h * HEAD_DIM;
-                    let orow = (sub * L_PAD + t) * VPAD;
+                    let orow = (sub * lpad + t) * vpad;
                     for (dst, &ov) in attn_out[ao..ao + HEAD_DIM]
                         .iter_mut()
                         .zip(&o[orow..orow + HEAD_DIM])
@@ -693,9 +745,20 @@ impl Qwen3Forward {
         let (n_embd, q_dim, kv_dim, n_ff) = (self.n_embd, self.q_dim, self.kv_dim, self.n_ff);
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
+        // Pick the smallest token-block bucket that fits the prompt: short prompts run
+        // the 128-block kernels (far fewer GEMM FLOPs) instead of always the 512 max.
+        // The on-chip op and fused-FFN xclbins are 512-only, so those paths stay B512.
+        let full_only = env_host("SEEKER_NPU_ONCHIP_OPS") || env_host("SEEKER_NPU_FUSED_FFN");
+        let sh: &Shape = if !full_only && l <= B128.lpad {
+            &B128
+        } else {
+            &B512
+        };
+        let lpad = sh.lpad;
+
         // get_rows (host): seed the token block; pad positions get token 0.
-        let mut x = vec![0.0f32; L_PAD * n_embd];
-        for t in 0..L_PAD {
+        let mut x = vec![0.0f32; lpad * n_embd];
+        for t in 0..lpad {
             let id = if t < l { tokens[t] as usize } else { 0 };
             if id >= self.vocab {
                 return Err(format!("token id {id} >= vocab {}", self.vocab).into());
@@ -704,8 +767,8 @@ impl Qwen3Forward {
                 .copy_from_slice(&self.token_embd[id * n_embd..(id + 1) * n_embd]);
         }
 
-        let (cos_q, sin_q) = self.rope_tables(self.n_head, scale);
-        let (cos_k, sin_k) = self.rope_tables(self.n_kv, 1.0);
+        let (cos_q, sin_q) = self.rope_tables(self.n_head, scale, lpad);
+        let (cos_k, sin_k) = self.rope_tables(self.n_kv, 1.0, lpad);
 
         // The residual stream stays f32 across layers (Vulkan keeps it f32 too):
         // bf16 here loses the small per-layer increments once the residual grows
@@ -720,51 +783,24 @@ impl Qwen3Forward {
             .unwrap_or(self.layers.len());
         for ly in self.layers.iter().take(max) {
             // ---- attention block (GEMMs output f32; bf16 only as kernel inputs) ----
-            let xnw = self.norm_mul(&resid, &ly.attn_norm, l)?;
-            let q = self.gemm_bcm("gemm_512x1024x2048_bcm", &xnw, &ly.wq, L_PAD, n_embd, q_dim)?;
-            let k = self.gemm_bcm(
-                "gemm_512x1024x1024_bcm",
-                &xnw,
-                &ly.wk,
-                L_PAD,
-                n_embd,
-                kv_dim,
-            )?;
-            let v = self.gemm_bcm(
-                "gemm_512x1024x1024_bcm",
-                &xnw,
-                &ly.wv,
-                L_PAD,
-                n_embd,
-                kv_dim,
-            )?;
+            let xnw = self.norm_mul(&resid, &ly.attn_norm, l, lpad)?;
+            let q = self.gemm_bcm(sh.wq, &xnw, &ly.wq, lpad, n_embd, q_dim)?;
+            let k = self.gemm_bcm(sh.wkv, &xnw, &ly.wk, lpad, n_embd, kv_dim)?;
+            let v = self.gemm_bcm(sh.wkv, &xnw, &ly.wv, lpad, n_embd, kv_dim)?;
             let q_roped =
-                self.qk_norm_rope(&bits(&q), self.n_head, &ly.q_norm, &cos_q, &sin_q, l)?;
-            let k_roped = self.qk_norm_rope(&bits(&k), self.n_kv, &ly.k_norm, &cos_k, &sin_k, l)?;
-            let attn = self.attention(&q_roped, &k_roped, &v, l)?;
-            let proj = self.gemm_bcm(
-                "gemm_512x2048x1024_bcm",
-                &attn,
-                &ly.wo,
-                L_PAD,
-                q_dim,
-                n_embd,
-            )?;
+                self.qk_norm_rope(&bits(&q), self.n_head, &ly.q_norm, &cos_q, &sin_q, l, lpad)?;
+            let k_roped =
+                self.qk_norm_rope(&bits(&k), self.n_kv, &ly.k_norm, &cos_k, &sin_k, l, lpad)?;
+            let attn = self.attention(&q_roped, &k_roped, &v, l, sh)?;
+            let proj = self.gemm_bcm(sh.wo, &attn, &ly.wo, lpad, q_dim, n_embd)?;
             for (r, p) in resid.iter_mut().zip(&proj) {
                 *r += p;
             }
 
             // ---- FFN block ----
-            let xn2w = self.norm_mul(&resid, &ly.ffn_norm, l)?;
-            let g = self.gemm_bcm(
-                "gemm_512x1024x3072_bcm",
-                &xn2w,
-                &ly.gate,
-                L_PAD,
-                n_embd,
-                n_ff,
-            )?;
-            let u = self.gemm_bcm("gemm_512x1024x3072_bcm", &xn2w, &ly.up, L_PAD, n_embd, n_ff)?;
+            let xn2w = self.norm_mul(&resid, &ly.ffn_norm, l, lpad)?;
+            let g = self.gemm_bcm(sh.gate_up, &xn2w, &ly.gate, lpad, n_embd, n_ff)?;
+            let u = self.gemm_bcm(sh.gate_up, &xn2w, &ly.up, lpad, n_embd, n_ff)?;
             // SwiGLU: silu(gate) * up. Default = host f32 (the whole product, so it isn't
             // rounded to bf16 early and the default path needs no eltwise/activation
             // xclbins — only the GEMMs). On-chip path uses the bf16 silu + mul kernels.
@@ -778,36 +814,29 @@ impl Qwen3Forward {
                     "fused",
                     "swiglu_1572864",
                     &[&bits(&g), &bits(&u)],
-                    L_PAD * n_ff,
+                    lpad * n_ff,
                 )?
             } else if env_host("SEEKER_NPU_ONCHIP_OPS") {
                 let gs =
                     self.kernels
-                        .run("activation", "silu_1572864", &[&bits(&g)], L_PAD * n_ff)?;
+                        .run("activation", "silu_1572864", &[&bits(&g)], lpad * n_ff)?;
                 self.kernels.run(
                     "eltwise",
                     "eltwise_mul_bf16_1572864",
                     &[&gs, &bits(&u)],
-                    L_PAD * n_ff,
+                    lpad * n_ff,
                 )?
             } else {
                 // Host f32 SwiGLU straight to bf16, first `l` rows only (pad rows of
                 // gate/up are already 0 → product 0).
-                let mut h = vec![0u16; L_PAD * n_ff];
+                let mut h = vec![0u16; lpad * n_ff];
                 for i in 0..l * n_ff {
                     let (gv, uv) = (g[i], u[i]);
                     h[i] = f32_to_bf16_bits((gv / (1.0 + (-gv).exp())) * uv);
                 }
                 h
             };
-            let dn = self.gemm_bcm(
-                "gemm_512x3072x1024_bcm",
-                &hidden,
-                &ly.down,
-                L_PAD,
-                n_ff,
-                n_embd,
-            )?;
+            let dn = self.gemm_bcm(sh.down, &hidden, &ly.down, lpad, n_ff, n_embd)?;
             for (r, d) in resid.iter_mut().zip(&dn) {
                 *r += d;
             }

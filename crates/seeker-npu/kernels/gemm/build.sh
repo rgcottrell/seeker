@@ -34,6 +34,14 @@ DTYPE_OUT=${4:-f32}
 # weight operand is fed exactly as GGUF stores it ([out][in]) while activations
 # stay token-major (A = x[L,in]), giving a transpose-free op chain.
 BCM=${5:-0}
+# Optional per-core M-tile. Smaller M needs a smaller -m (M must be a multiple of
+# 2·m·n_aie_rows = 2·m·4), which is how the M-bucketed short-prompt kernels get
+# M<512 (m=16 → M=128). Empty → wa.py's default (m=64). The stem already carries M,
+# so no name collision.
+MTILE=${6:-}
+# Optional per-core N-tile (N must be a multiple of n·n_aie_cols = n·8). The small
+# attention buckets (N=128) need n=16; the wide weight Ns keep the default (n=32).
+NTILE=${7:-}
 # f32 + row-major keep the bare name (back-compat); col-major / other dtypes suffix.
 suffix=""
 [ "$BCM" = "1" ] && suffix="${suffix}_bcm"
@@ -69,6 +77,7 @@ verify_rc=0
   cd "$workdir"
   HOME="$workdir" python wa.py -M "$M" -K "$K" -N "$N" \
     --dtype_in bf16 --dtype_out "$DTYPE_OUT" --b-col-maj "$BCM" \
+    ${MTILE:+-m "$MTILE"} ${NTILE:+-n "$NTILE"} \
     --n-aie-cols 8 --dev npu2 -w 1 -i 1
 ) || verify_rc=$?
 
