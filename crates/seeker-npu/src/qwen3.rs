@@ -86,6 +86,20 @@ const B128: Shape = Shape {
     qkt: "gemm_256x128x128_bcm",
     av: "gemm_256x128x128",
 };
+/// 256-token block (m=32 weights; attention M=gqa·256=512, keys=256 and vpad=128 both
+/// tile-aligned so no padding). Covers the 128 < l ≤ 256 range.
+const B256: Shape = Shape {
+    lpad: 256,
+    keys: 256,
+    vpad: 128,
+    wq: "gemm_256x1024x2048_bcm",
+    wkv: "gemm_256x1024x1024_bcm",
+    wo: "gemm_256x2048x1024_bcm",
+    gate_up: "gemm_256x1024x3072_bcm",
+    down: "gemm_256x3072x1024_bcm",
+    qkt: "gemm_512x128x256_bcm",
+    av: "gemm_512x256x128",
+};
 
 /// f32 → bf16 bits, branchless round-to-nearest-even. For the finite activations here
 /// this is numerically identical to `bf16::from_f32(x).to_bits()` but far cheaper (no
@@ -135,9 +149,11 @@ struct Loaded {
 
 /// The XDNA2 NPU caps concurrent hardware contexts at 16 (`CREATE_HWCTX` EINVAL past
 /// that), so the cache is bounded and evicts least-recently-used. A single forward uses
-/// 7 distinct GEMM xclbins (one bucket); a process serving both short and long prompts
-/// touches both buckets = 14, still under the cap → nothing is evicted. The on-chip
-/// path's ~18 distinct kernels evict a few per layer.
+/// 7 distinct GEMM xclbins (one bucket) — always cached for the whole 28-layer loop, so
+/// the BO reuse never thrashes within a forward. The three buckets total 21 xclbins, so
+/// a process that mixes all three prompt sizes evicts across forwards (7 reloads on the
+/// first layer after a bucket switch), but a single-size workload stays fully warm. The
+/// on-chip path's ~18 distinct kernels evict a few per layer.
 const CTX_CACHE_CAP: usize = 15;
 
 /// Runs fixed-shape AIE kernels by xclbin name, caching loaded Contexts (M5: avoids
@@ -746,13 +762,15 @@ impl Qwen3Forward {
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
         // Pick the smallest token-block bucket that fits the prompt: short prompts run
-        // the 128-block kernels (far fewer GEMM FLOPs) instead of always the 512 max.
+        // the 128/256-block kernels (far fewer GEMM FLOPs) instead of always the 512 max.
         // The on-chip op and fused-FFN xclbins are 512-only, so those paths stay B512.
         let full_only = env_host("SEEKER_NPU_ONCHIP_OPS") || env_host("SEEKER_NPU_FUSED_FFN");
-        let sh: &Shape = if !full_only && l <= B128.lpad {
+        let sh: &Shape = if full_only || l > B256.lpad {
+            &B512
+        } else if l <= B128.lpad {
             &B128
         } else {
-            &B512
+            &B256
         };
         let lpad = sh.lpad;
 
