@@ -543,15 +543,16 @@ impl Qwen3Forward {
         Ok(bits(&out))
     }
 
-    /// GQA causal attention → attn_out[L_PAD][q_dim] f32. q is pre-scaled; k is bf16
-    /// bits (post-rope), v is the f32 value projection.
+    /// GQA causal attention → attn_out[L_PAD][q_dim] as bf16 bits (the O-proj GEMM's
+    /// input — converted in the gather so the caller needs no `bits(&attn)`). q is
+    /// pre-scaled; k is bf16 bits (post-rope), v is the f32 value projection.
     fn attention(
         &self,
         q: &[u16],
         k: &[u16],
         v: &[f32],
         l: usize,
-    ) -> Result<Vec<f32>, Box<dyn Error>> {
+    ) -> Result<Vec<u16>, Box<dyn Error>> {
         let (n_head, n_kv, q_dim, kv_dim) = (self.n_head, self.n_kv, self.q_dim, self.kv_dim);
         let gqa = n_head / n_kv;
         // GQA batching: the `gqa` Q-heads sharing a KV head share K and V, so stack them
@@ -570,7 +571,14 @@ impl Qwen3Forward {
         // hardware-context swap between the two xclbins on every pair (16/layer vs 1),
         // which costs far more than the host copies it would save.
         let mb = gqa * L_PAD; // batched M = 1024
-        let (qf, kf, vf) = (deq(q), deq(k), v);
+        // q and k arrive as bf16 bits (post-rope, pre-scaled) and feed the QKᵀ GEMM as
+        // bf16 — so we reshuffle their u16 words straight into the batched operands with
+        // NO deq/re-bits round-trip. v is the f32 value projection, converted per element
+        // as it's gathered. Only the first `l` token rows are real; the operand buffers
+        // are allocated full (zeroed) so the fixed-shape kernels see a 512-padded input,
+        // but we only touch the real rows — the pad rows stay 0 (Q·Kᵀ 0, causally masked;
+        // the pad output rows are never read). For a short prompt the pad rows and the
+        // eliminated conversions are the bulk of the attention host bandwidth.
         let onchip = env_host("SEEKER_NPU_ONCHIP_OPS");
         // Causal + pad-column mask for one KV pair: row = sub·L_PAD + tq, so the mask is
         // the same for every pair (depends only on tq = row % L_PAD) — build it once.
@@ -594,26 +602,19 @@ impl Qwen3Forward {
         let mut pair_probs: Vec<Vec<u16>> = Vec::with_capacity(n_kv);
         for kv in 0..n_kv {
             // Stack the gqa Q-heads' q rows (they share this pair's K).
-            let mut q_pair = vec![0.0f32; mb * HEAD_DIM];
-            let mut k_kv = vec![0.0f32; KEYS * HEAD_DIM]; // [keys][128] bcm; rows≥L = 0
-            for t in 0..L_PAD {
+            let mut q_pair = vec![0u16; mb * HEAD_DIM]; // bf16 bits; rows≥l = 0
+            let mut k_kv = vec![0u16; KEYS * HEAD_DIM]; // bf16 bits, [keys][128] bcm
+            for t in 0..l {
                 let ko = t * kv_dim + kv * HEAD_DIM;
-                k_kv[t * HEAD_DIM..(t + 1) * HEAD_DIM].copy_from_slice(&kf[ko..ko + HEAD_DIM]);
+                k_kv[t * HEAD_DIM..(t + 1) * HEAD_DIM].copy_from_slice(&k[ko..ko + HEAD_DIM]);
                 for sub in 0..gqa {
                     let qo = t * q_dim + (gqa * kv + sub) * HEAD_DIM;
                     let row = sub * L_PAD + t;
                     q_pair[row * HEAD_DIM..(row + 1) * HEAD_DIM]
-                        .copy_from_slice(&qf[qo..qo + HEAD_DIM]);
+                        .copy_from_slice(&q[qo..qo + HEAD_DIM]);
                 }
             }
-            let s = self.gemm_bcm(
-                "gemm_1024x128x1024_bcm",
-                &bits(&q_pair),
-                &bits(&k_kv),
-                mb,
-                HEAD_DIM,
-                KEYS,
-            )?;
+            let s = self.gemm_bcm("gemm_1024x128x1024_bcm", &q_pair, &k_kv, mb, HEAD_DIM, KEYS)?;
             // Softmax over KEYS per row. Rows [sub·L_PAD .. (sub+1)·L_PAD) are Q-head
             // (gqa·kv + sub); the pair layout already matches the ·V GEMM's M.
             let probs_pair = if let Some(ref mask_bits) = mask_bits {
@@ -651,27 +652,30 @@ impl Qwen3Forward {
             pair_probs.push(probs_pair);
         }
         // Phase 2: ·V (the ·V xclbin now stays resident across all pairs).
-        let mut attn_out = vec![0.0f32; L_PAD * q_dim];
+        let mut attn_out = vec![0u16; L_PAD * q_dim]; // bf16 bits (O-proj GEMM input)
         for (kv, probs_pair) in pair_probs.iter().enumerate() {
-            let mut v_kv = vec![0.0f32; KEYS * VPAD]; // [keys][256]; cols≥128, rows≥L = 0
-            for t in 0..L_PAD {
+            let mut v_kv = vec![0u16; KEYS * VPAD]; // bf16 bits, [keys][256]; cols≥128, rows≥l = 0
+            for t in 0..l {
                 let vo = t * kv_dim + kv * HEAD_DIM;
-                v_kv[t * VPAD..t * VPAD + HEAD_DIM].copy_from_slice(&vf[vo..vo + HEAD_DIM]);
+                for (dst, &sv) in v_kv[t * VPAD..t * VPAD + HEAD_DIM]
+                    .iter_mut()
+                    .zip(&v[vo..vo + HEAD_DIM])
+                {
+                    *dst = f32_to_bf16_bits(sv);
+                }
             }
-            let o = self.gemm_rm(
-                "gemm_1024x1024x256",
-                probs_pair,
-                &bits(&v_kv),
-                mb,
-                KEYS,
-                VPAD,
-            )?;
+            let o = self.gemm_rm("gemm_1024x1024x256", probs_pair, &v_kv, mb, KEYS, VPAD)?;
             for sub in 0..gqa {
                 let h = gqa * kv + sub;
-                for t in 0..L_PAD {
+                for t in 0..l {
                     let ao = t * q_dim + h * HEAD_DIM;
                     let orow = (sub * L_PAD + t) * VPAD;
-                    attn_out[ao..ao + HEAD_DIM].copy_from_slice(&o[orow..orow + HEAD_DIM]);
+                    for (dst, &ov) in attn_out[ao..ao + HEAD_DIM]
+                        .iter_mut()
+                        .zip(&o[orow..orow + HEAD_DIM])
+                    {
+                        *dst = f32_to_bf16_bits(ov);
+                    }
                 }
             }
         }
@@ -740,7 +744,7 @@ impl Qwen3Forward {
             let attn = self.attention(&q_roped, &k_roped, &v, l)?;
             let proj = self.gemm_bcm(
                 "gemm_512x2048x1024_bcm",
-                &bits(&attn),
+                &attn,
                 &ly.wo,
                 L_PAD,
                 q_dim,
