@@ -42,6 +42,11 @@ MTILE=${6:-}
 # Optional per-core N-tile (N must be a multiple of n·n_aie_cols = n·8). The small
 # attention buckets (N=128) need n=16; the wide weight Ns keep the default (n=32).
 NTILE=${7:-}
+# Optional per-core K-tile (K-reduction depth per mmul pass; K must be a multiple of k,
+# and k of the mmul's `s`). Deeper k amortizes the mmul setup — for the m=16 short-prompt
+# kernels, k=256 is ~20–30% faster than the default k=64 and still fits L1 (bigger m
+# tiles overflow, so leave them at the default). Result is bit-identical (same reduction).
+KTILE=${8:-}
 # f32 + row-major keep the bare name (back-compat); col-major / other dtypes suffix.
 suffix=""
 [ "$BCM" = "1" ] && suffix="${suffix}_bcm"
@@ -77,7 +82,7 @@ verify_rc=0
   cd "$workdir"
   HOME="$workdir" python wa.py -M "$M" -K "$K" -N "$N" \
     --dtype_in bf16 --dtype_out "$DTYPE_OUT" --b-col-maj "$BCM" \
-    ${MTILE:+-m "$MTILE"} ${NTILE:+-n "$NTILE"} \
+    ${MTILE:+-m "$MTILE"} ${NTILE:+-n "$NTILE"} ${KTILE:+-k "$KTILE"} \
     --n-aie-cols 8 --dev npu2 -w 1 -i 1
 ) || verify_rc=$?
 
