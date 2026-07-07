@@ -38,6 +38,17 @@ echo "### 128-token bucket (short-prompt kernels; m=16 weights, m=32/n=16 attent
 "$here/gemm/build.sh" 256 128 128 f32 1 32 16    # QKᵀ (M=gqa·128, keys=128)
 "$here/gemm/build.sh" 256 128 128 f32 0 32 16    # ·V  (keys=128, vpad=128)
 
+echo "### 256-token bucket (128 < l <= 256; m=32 weights) ###"
+# M=256 needs -m 32. Attention is M=gqa·256=512 (default m=64); keys=256 and vpad=128
+# are tile-aligned, so QKᵀ keeps the default -n and ·V needs -n 16 for N=128.
+"$here/gemm/build.sh" 256 1024 2048 f32 1 32     # wq
+"$here/gemm/build.sh" 256 1024 1024 f32 1 32     # wk, wv
+"$here/gemm/build.sh" 256 2048 1024 f32 1 32     # wo
+"$here/gemm/build.sh" 256 1024 3072 f32 1 32     # gate/up
+"$here/gemm/build.sh" 256 3072 1024 f32 1 32     # down
+"$here/gemm/build.sh" 512 128 256 f32 1          # QKᵀ (M=gqa·256, keys=256)
+"$here/gemm/build.sh" 512 256 128 f32 0 64 16    # ·V  (keys=256, vpad=128)
+
 if [ "${1:-}" = "--onchip" ]; then
   echo "### bf16 on-chip norm/softmax/silu (SEEKER_NPU_ONCHIP_OPS path) ###"
   "$here/norm/build.sh" rmsnorm 524288 1024     # input / ffn RMSNorm
