@@ -36,6 +36,7 @@ echo "### 128-token bucket (short-prompt kernels; m=16 weights, m=32/n=16 attent
 "$here/gemm/build.sh" 128 1024 4096 f32 1 16 "" 256   # QKV (fused)
 "$here/gemm/build.sh" 128 2048 1024 f32 1 16 "" 256   # wo
 "$here/gemm/build.sh" 128 1024 6144 f32 1 16 "" 256   # gate|up (fused)
+"$here/gemm/build.sh" 128 1024 3072 f32 1 16 "" 256   # gate/up split baseline
 "$here/gemm/build.sh" 128 3072 1024 f32 1 16 "" 256   # down
 "$here/gemm/build.sh" 256 128 128 f32 1 32 16         # QKᵀ (M=gqa·128, keys=128)
 "$here/gemm/build.sh" 256 128 128 f32 0 32 16         # ·V  (keys=128, vpad=128)
