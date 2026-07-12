@@ -52,9 +52,12 @@ struct Shape {
     vpad: usize,       // padded value width = ·V N
     qkv: &'static str, // fused Q|K|V proj (N = q_dim + 2·kv_dim), one dispatch for 3
     wo: &'static str,
-    // gate/up are NOT fused: the fused N=2·n_ff=6144 GEMM trips an AIE DMA-stride limit
-    // at M=512 (B512). Left as two dispatches.
+    // B128 fuses gate|up into N=2·n_ff=6144. B256 measured slightly slower end to
+    // end despite a faster kernel, and B512 trips an AIE DMA-stride limit, so both
+    // retain the N=3072 kernel and two dispatches.
     gate_up: &'static str,
+    gate_up_split: &'static str,
+    fused_gate_up: bool,
     down: &'static str,
     qkt: &'static str, // QKᵀ (b_col_maj), M = gqa·lpad
     av: &'static str,  // ·V (row-major B), M = gqa·lpad
@@ -68,6 +71,8 @@ const B512: Shape = Shape {
     qkv: "gemm_512x1024x4096_bcm",
     wo: "gemm_512x2048x1024_bcm",
     gate_up: "gemm_512x1024x3072_bcm",
+    gate_up_split: "gemm_512x1024x3072_bcm",
+    fused_gate_up: false,
     down: "gemm_512x3072x1024_bcm",
     qkt: "gemm_1024x128x1024_bcm",
     av: "gemm_1024x1024x256",
@@ -80,7 +85,9 @@ const B128: Shape = Shape {
     vpad: 128,
     qkv: "gemm_128x1024x4096_bcm",
     wo: "gemm_128x2048x1024_bcm",
-    gate_up: "gemm_128x1024x3072_bcm",
+    gate_up: "gemm_128x1024x6144_bcm",
+    gate_up_split: "gemm_128x1024x3072_bcm",
+    fused_gate_up: true,
     down: "gemm_128x3072x1024_bcm",
     qkt: "gemm_256x128x128_bcm",
     av: "gemm_256x128x128",
@@ -94,6 +101,8 @@ const B256: Shape = Shape {
     qkv: "gemm_256x1024x4096_bcm",
     wo: "gemm_256x2048x1024_bcm",
     gate_up: "gemm_256x1024x3072_bcm",
+    gate_up_split: "gemm_256x1024x3072_bcm",
+    fused_gate_up: false,
     down: "gemm_256x3072x1024_bcm",
     qkt: "gemm_512x128x256_bcm",
     av: "gemm_512x256x128",
@@ -115,6 +124,43 @@ fn deq(v: &[u16]) -> Vec<f32> {
     v.iter()
         .map(|&b| f32::from_bits((b as u32) << 16))
         .collect()
+}
+
+/// Split token-major `[Q|K|V]` f32 projection rows directly into their padded bf16
+/// operands. Padding stays zero for the fixed-shape downstream kernels.
+fn split_qkv_bf16(
+    qkv: &[f32],
+    l: usize,
+    lpad: usize,
+    q_dim: usize,
+    kv_dim: usize,
+) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    let (mut q, mut k, mut v) = (
+        vec![0u16; lpad * q_dim],
+        vec![0u16; lpad * kv_dim],
+        vec![0u16; lpad * kv_dim],
+    );
+    let stride = q_dim + 2 * kv_dim;
+    debug_assert_eq!(qkv.len(), lpad * stride);
+    for t in 0..l {
+        let src = &qkv[t * stride..(t + 1) * stride];
+        for (dst, &x) in q[t * q_dim..(t + 1) * q_dim].iter_mut().zip(&src[..q_dim]) {
+            *dst = f32_to_bf16_bits(x);
+        }
+        for (dst, &x) in k[t * kv_dim..(t + 1) * kv_dim]
+            .iter_mut()
+            .zip(&src[q_dim..q_dim + kv_dim])
+        {
+            *dst = f32_to_bf16_bits(x);
+        }
+        for (dst, &x) in v[t * kv_dim..(t + 1) * kv_dim]
+            .iter_mut()
+            .zip(&src[q_dim + kv_dim..])
+        {
+            *dst = f32_to_bf16_bits(x);
+        }
+    }
+    (q, k, v)
 }
 /// True iff env var `k` is set to a truthy value (so `FOO=0`/`false` disables it,
 /// not merely-present).
@@ -256,9 +302,11 @@ impl KernelRunner {
         }
         let last = pool.len() - 1;
         pool[last].sync_to_device()?; // DPU ABI: sync the (write-only) output before the run
-        let refs: Vec<&Buffer> = pool.iter().collect();
-        k.ctx.run(&k.instr, k.ninstr, &refs)?;
-        drop(refs);
+        match pool.as_slice() {
+            [input, output] => k.ctx.run(&k.instr, k.ninstr, &[input, output])?,
+            [input0, input1, output] => k.ctx.run(&k.instr, k.ninstr, &[input0, input1, output])?,
+            _ => return Err(format!("unsupported NPU buffer count {}", pool.len()).into()),
+        }
         pool[last].sync_from_device()?;
         Ok(())
     }
@@ -345,9 +393,8 @@ impl KernelRunner {
             pool[0].as_mut_slice::<u16>().copy_from_slice(act);
             pool[0].sync_to_device()?;
             pool[1].sync_to_device()?; // sync the write-only output before the run
-            let refs: Vec<&Buffer> = vec![&pool[0], wbo, &pool[1]];
+            let refs = [&pool[0], wbo, &pool[1]];
             k.ctx.run(&k.instr, k.ninstr, &refs)?;
-            drop(refs);
             pool[1].sync_from_device()?;
         }
         self.tick(stem, t0.elapsed());
@@ -366,8 +413,10 @@ struct Layer {
     k_norm: Vec<f32>,
     wo: Vec<u16>,
     ffn_norm: Vec<f32>,
-    gate: Vec<u16>,
-    up: Vec<u16>,
+    // gate|up concatenated along the output dimension. The short-token buckets feed
+    // the whole operand to one N=6144 GEMM; B512 feeds each contiguous half to its
+    // N=3072 kernel because the fused shape exceeds an AIE DMA-stride limit.
+    gate_up: Vec<u16>,
     down: Vec<u16>,
 }
 
@@ -479,6 +528,8 @@ impl Qwen3Forward {
             let mut wqkv = f16_bits(gguf, &format!("{p}.attn_q.weight"))?;
             wqkv.extend(f16_bits(gguf, &format!("{p}.attn_k.weight"))?);
             wqkv.extend(f16_bits(gguf, &format!("{p}.attn_v.weight"))?);
+            let mut gate_up = f16_bits(gguf, &format!("{p}.ffn_gate.weight"))?;
+            gate_up.extend(f16_bits(gguf, &format!("{p}.ffn_up.weight"))?);
             layers.push(Layer {
                 attn_norm: f32_vec(gguf, &format!("{p}.attn_norm.weight"), n_embd)?,
                 wqkv,
@@ -486,8 +537,7 @@ impl Qwen3Forward {
                 k_norm: f32_vec(gguf, &format!("{p}.attn_k_norm.weight"), HEAD_DIM)?,
                 wo: f16_bits(gguf, &format!("{p}.attn_output.weight"))?,
                 ffn_norm: f32_vec(gguf, &format!("{p}.ffn_norm.weight"), n_embd)?,
-                gate: f16_bits(gguf, &format!("{p}.ffn_gate.weight"))?,
-                up: f16_bits(gguf, &format!("{p}.ffn_up.weight"))?,
+                gate_up,
                 down: f16_bits(gguf, &format!("{p}.ffn_down.weight"))?,
             });
         }
@@ -708,13 +758,13 @@ impl Qwen3Forward {
 
     /// GQA causal attention → attn_out[lpad][q_dim] as bf16 bits (the O-proj GEMM's
     /// input — converted in the gather so the caller needs no `bits(&attn)`). q is
-    /// pre-scaled; k is bf16 bits (post-rope), v is the f32 value projection. `sh` is
+    /// pre-scaled; k is bf16 bits (post-rope), and v is bf16 projection output. `sh` is
     /// the token-block bucket (kernel shapes + key/value padding).
     fn attention(
         &self,
         q: &[u16],
         k: &[u16],
-        v: &[f32],
+        v: &[u16],
         l: usize,
         sh: &Shape,
     ) -> Result<Vec<u16>, Box<dyn Error>> {
@@ -737,8 +787,8 @@ impl Qwen3Forward {
         let mb = gqa * lpad;
         // q and k arrive as bf16 bits (post-rope, pre-scaled) and feed the QKᵀ GEMM as
         // bf16 — so we reshuffle their u16 words straight into the batched operands with
-        // NO deq/re-bits round-trip. v is the f32 value projection, converted per element
-        // as it's gathered. Only the first `l` token rows are real; the operand buffers
+        // NO deq/re-bits round-trip. v is likewise already bf16, so its gather is a direct
+        // copy. Only the first `l` token rows are real; the operand buffers
         // are allocated full (zeroed) so the fixed-shape kernels see a padded input, but
         // we only touch the real rows — the pad rows stay 0 (Q·Kᵀ 0, causally masked; the
         // pad output rows are never read).
@@ -763,10 +813,13 @@ impl Qwen3Forward {
         // default softmax is host, so no context swap interleaves the GEMMs).
         let mut e = vec![0.0f32; keys];
         let mut pair_probs: Vec<Vec<u16>> = Vec::with_capacity(n_kv);
+        // Reuse fixed-shape staging across KV heads. Every live row is overwritten
+        // below and the initially-zero pad rows never change, so no per-head clear or
+        // allocation is needed.
+        let mut q_pair = vec![0u16; mb * HEAD_DIM]; // bf16; rows >= l stay zero
+        let mut k_kv = vec![0u16; keys * HEAD_DIM]; // bf16 [keys][128]
         for kv in 0..n_kv {
             // Stack the gqa Q-heads' q rows (they share this pair's K).
-            let mut q_pair = vec![0u16; mb * HEAD_DIM]; // bf16 bits; rows≥l = 0
-            let mut k_kv = vec![0u16; keys * HEAD_DIM]; // bf16 bits, [keys][128] bcm
             for t in 0..l {
                 let ko = t * kv_dim + kv * HEAD_DIM;
                 k_kv[t * HEAD_DIM..(t + 1) * HEAD_DIM].copy_from_slice(&k[ko..ko + HEAD_DIM]);
@@ -814,16 +867,11 @@ impl Qwen3Forward {
         }
         // Phase 2: ·V (the ·V xclbin now stays resident across all pairs).
         let mut attn_out = vec![0u16; lpad * q_dim]; // bf16 bits (O-proj GEMM input)
+        let mut v_kv = vec![0u16; keys * vpad]; // bf16 [keys][vpad]; padding stays zero
         for (kv, probs_pair) in pair_probs.iter().enumerate() {
-            let mut v_kv = vec![0u16; keys * vpad]; // bf16 bits, [keys][vpad]; rows≥l = 0
             for t in 0..l {
                 let vo = t * kv_dim + kv * HEAD_DIM;
-                for (dst, &sv) in v_kv[t * vpad..t * vpad + HEAD_DIM]
-                    .iter_mut()
-                    .zip(&v[vo..vo + HEAD_DIM])
-                {
-                    *dst = f32_to_bf16_bits(sv);
-                }
+                v_kv[t * vpad..t * vpad + HEAD_DIM].copy_from_slice(&v[vo..vo + HEAD_DIM]);
             }
             let o = self.gemm_rm(sh.av, probs_pair, &v_kv, mb, keys, vpad)?;
             for sub in 0..gqa {
@@ -905,24 +953,10 @@ impl Qwen3Forward {
             // rows are [q(q_dim) | k(kv_dim) | v(kv_dim)]; split them back into contiguous
             // q/k/v (only the real `l` rows) for the per-head norm/rope + attention.
             let qkv = self.gemm_bcm_w(sh.qkv, &xnw, &ly.wqkv, lpad, n_embd, q_dim + 2 * kv_dim)?;
-            let (mut q, mut k, mut v) = (
-                vec![0.0f32; lpad * q_dim],
-                vec![0.0f32; lpad * kv_dim],
-                vec![0.0f32; lpad * kv_dim],
-            );
-            let stride = q_dim + 2 * kv_dim;
-            for t in 0..l {
-                let b = t * stride;
-                q[t * q_dim..(t + 1) * q_dim].copy_from_slice(&qkv[b..b + q_dim]);
-                k[t * kv_dim..(t + 1) * kv_dim]
-                    .copy_from_slice(&qkv[b + q_dim..b + q_dim + kv_dim]);
-                v[t * kv_dim..(t + 1) * kv_dim]
-                    .copy_from_slice(&qkv[b + q_dim + kv_dim..b + stride]);
-            }
+            let (q, k, v) = split_qkv_bf16(&qkv, l, lpad, q_dim, kv_dim);
             let q_roped =
-                self.qk_norm_rope(&bits(&q), self.n_head, &ly.q_norm, &cos_q, &sin_q, l, lpad)?;
-            let k_roped =
-                self.qk_norm_rope(&bits(&k), self.n_kv, &ly.k_norm, &cos_k, &sin_k, l, lpad)?;
+                self.qk_norm_rope(&q, self.n_head, &ly.q_norm, &cos_q, &sin_q, l, lpad)?;
+            let k_roped = self.qk_norm_rope(&k, self.n_kv, &ly.k_norm, &cos_k, &sin_k, l, lpad)?;
             let attn = self.attention(&q_roped, &k_roped, &v, l, sh)?;
             let proj = self.gemm_bcm_w(sh.wo, &attn, &ly.wo, lpad, q_dim, n_embd)?;
             for (r, p) in resid.iter_mut().zip(&proj) {
@@ -931,8 +965,40 @@ impl Qwen3Forward {
 
             // ---- FFN block ----
             let xn2w = self.norm_mul(&resid, &ly.ffn_norm, l, lpad)?;
-            let g = self.gemm_bcm_w(sh.gate_up, &xn2w, &ly.gate, lpad, n_embd, n_ff)?;
-            let u = self.gemm_bcm_w(sh.gate_up, &xn2w, &ly.up, lpad, n_embd, n_ff)?;
+            // Diagnostic baseline knob for measuring the fused projection against the
+            // former two-dispatch path on identical code and hardware.
+            let fused_gate_up = sh.fused_gate_up && !env_host("SEEKER_NPU_SPLIT_GATE_UP");
+            let (gu, g, u) = if fused_gate_up {
+                // Short-token buckets can project gate|up together. Rows come back as
+                // [gate(n_ff) | up(n_ff)], avoiding one weight upload/run/readback per
+                // layer as well as duplicate activation upload.
+                (
+                    self.gemm_bcm_w(sh.gate_up, &xn2w, &ly.gate_up, lpad, n_embd, 2 * n_ff)?,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            } else {
+                let weight_elems = n_ff * n_embd;
+                (
+                    Vec::new(),
+                    self.gemm_bcm_w(
+                        sh.gate_up_split,
+                        &xn2w,
+                        &ly.gate_up[..weight_elems],
+                        lpad,
+                        n_embd,
+                        n_ff,
+                    )?,
+                    self.gemm_bcm_w(
+                        sh.gate_up_split,
+                        &xn2w,
+                        &ly.gate_up[weight_elems..],
+                        lpad,
+                        n_embd,
+                        n_ff,
+                    )?,
+                )
+            };
             // SwiGLU: silu(gate) * up. Default = host f32 (the whole product, so it isn't
             // rounded to bf16 early and the default path needs no eltwise/activation
             // xclbins — only the GEMMs). On-chip path uses the bf16 silu + mul kernels.
@@ -962,9 +1028,17 @@ impl Qwen3Forward {
                 // Host f32 SwiGLU straight to bf16, first `l` rows only (pad rows of
                 // gate/up are already 0 → product 0).
                 let mut h = vec![0u16; lpad * n_ff];
-                for i in 0..l * n_ff {
-                    let (gv, uv) = (g[i], u[i]);
-                    h[i] = f32_to_bf16_bits((gv / (1.0 + (-gv).exp())) * uv);
+                for t in 0..l {
+                    for i in 0..n_ff {
+                        let (gv, uv) = if fused_gate_up {
+                            let row = t * 2 * n_ff;
+                            (gu[row + i], gu[row + n_ff + i])
+                        } else {
+                            let idx = t * n_ff + i;
+                            (g[idx], u[idx])
+                        };
+                        h[t * n_ff + i] = f32_to_bf16_bits((gv / (1.0 + (-gv).exp())) * uv);
+                    }
                 }
                 h
             };
@@ -1015,4 +1089,20 @@ fn rot_half(x: &[f32]) -> Vec<f32> {
 /// Broadcast an `[width]` weight to token-major `[rows][width]`.
 fn tile(w: &[f32], width: usize, rows: usize) -> Vec<f32> {
     (0..rows * width).map(|i| w[i % width]).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_qkv_converts_live_rows_and_zeroes_padding() {
+        // Two live rows plus one padded row; each row is Q[2], K[1], V[1].
+        let src = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 9.0, 9.0, 9.0];
+        let (q, k, v) = split_qkv_bf16(&src, 2, 3, 2, 1);
+        let b = |x| f32_to_bf16_bits(x);
+        assert_eq!(q, vec![b(1.0), b(2.0), b(5.0), b(6.0), 0, 0]);
+        assert_eq!(k, vec![b(3.0), b(7.0), 0]);
+        assert_eq!(v, vec![b(4.0), b(8.0), 0]);
+    }
 }

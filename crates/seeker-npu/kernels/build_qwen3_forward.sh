@@ -16,8 +16,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 echo "### f32-output GEMMs (token block M=512; the hybrid forward's NPU work) ###"
 # b_col_maj weight GEMMs: fused QKV, wo, ffn gate/up, ffn down, and QKᵀ.
-# Q|K|V are fused into one N=q_dim+2·kv_dim=4096 GEMM (one dispatch for three); gate/up
-# stay two dispatches (their fused N=6144 trips an AIE DMA-stride limit at M=512).
+# Q|K|V are fused into one N=q_dim+2·kv_dim=4096 GEMM (one dispatch for three). Gate/up
+# stay two dispatches only at B512 (its fused N=6144 trips an AIE DMA-stride limit).
 "$here/gemm/build.sh" 512 1024 4096 f32 1   # QKV     (K=n_embd,  N=q_dim+2·kv_dim)
 "$here/gemm/build.sh" 512 2048 1024 f32 1   # wo      (K=q_dim,   N=n_embd)
 "$here/gemm/build.sh" 512 1024 3072 f32 1   # gate/up (K=n_embd,  N=n_ff)
@@ -35,7 +35,8 @@ echo "### 128-token bucket (short-prompt kernels; m=16 weights, m=32/n=16 attent
 # still fits L1 (bit-identical result). The K=128 attention GEMMs keep the default k.
 "$here/gemm/build.sh" 128 1024 4096 f32 1 16 "" 256   # QKV (fused)
 "$here/gemm/build.sh" 128 2048 1024 f32 1 16 "" 256   # wo
-"$here/gemm/build.sh" 128 1024 3072 f32 1 16 "" 256   # gate/up
+"$here/gemm/build.sh" 128 1024 6144 f32 1 16 "" 256   # gate|up (fused)
+"$here/gemm/build.sh" 128 1024 3072 f32 1 16 "" 256   # gate/up split baseline
 "$here/gemm/build.sh" 128 3072 1024 f32 1 16 "" 256   # down
 "$here/gemm/build.sh" 256 128 128 f32 1 32 16         # QKᵀ (M=gqa·128, keys=128)
 "$here/gemm/build.sh" 256 128 128 f32 0 32 16         # ·V  (keys=128, vpad=128)
@@ -45,7 +46,7 @@ echo "### 256-token bucket (128 < l <= 256; m=32 weights) ###"
 # are tile-aligned, so QKᵀ keeps the default -n and ·V needs -n 16 for N=128.
 "$here/gemm/build.sh" 256 1024 4096 f32 1 32     # QKV (fused)
 "$here/gemm/build.sh" 256 2048 1024 f32 1 32     # wo
-"$here/gemm/build.sh" 256 1024 3072 f32 1 32     # gate/up
+"$here/gemm/build.sh" 256 1024 3072 f32 1 32     # gate/up (split; fused regresses E2E)
 "$here/gemm/build.sh" 256 3072 1024 f32 1 32     # down
 "$here/gemm/build.sh" 512 128 256 f32 1          # QKᵀ (M=gqa·256, keys=256)
 "$here/gemm/build.sh" 512 256 128 f32 0 64 16    # ·V  (keys=256, vpad=128)

@@ -110,7 +110,21 @@ impl Context {
     /// Run the kernel (opcode 3): instruction buffer + its byte count, then the
     /// data buffers bound to kernel args 3.. . Blocks until the run completes.
     pub fn run(&self, instr: &Buffer, ninstr_bytes: u32, buffers: &[&Buffer]) -> Result<()> {
-        let mut raw: Vec<sys::npu_buffer_t> = buffers.iter().map(|b| b.ptr).collect();
+        // Every current AIE kernel has at most three data buffers. Keep the common
+        // handle list on the stack: a full embedding forward invokes this hundreds
+        // of times, so allocating a temporary Vec here shows up as pure host overhead.
+        const STACK_CAP: usize = 4;
+        let mut stack = [ptr::null_mut(); STACK_CAP];
+        let mut heap;
+        let raw = if buffers.len() <= STACK_CAP {
+            for (dst, src) in stack.iter_mut().zip(buffers) {
+                *dst = src.ptr;
+            }
+            &mut stack[..buffers.len()]
+        } else {
+            heap = buffers.iter().map(|b| b.ptr).collect::<Vec<_>>();
+            &mut heap
+        };
         check(unsafe {
             sys::npu_run(
                 self.ptr,
