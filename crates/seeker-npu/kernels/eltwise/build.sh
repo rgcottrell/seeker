@@ -26,13 +26,14 @@ source "$VENV/bin/activate"
 
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
-cp "$here/eltwise.py" "$workdir/eltwise.py"
 
 echo "### building eltwise ${OP} ${DTYPE} n=${N} ..."
 # Isolated IRON cache (HOME -> workdir) so we copy exactly this build's artifact.
+# Run the script from its real dir (not a copy) so the ExternalFunction can
+# resolve eltwise.cc next to it (mirrors fused/build.sh's swiglu path).
 (
   cd "$workdir"
-  HOME="$workdir" python eltwise.py --op "$OP" --dtype "$DTYPE" -n "$N"
+  HOME="$workdir" python "$here/eltwise.py" --op "$OP" --dtype "$DTYPE" -n "$N"
 )
 
 cache=$(ls -td "$workdir"/.npu/cache/*/ 2>/dev/null | head -1)
