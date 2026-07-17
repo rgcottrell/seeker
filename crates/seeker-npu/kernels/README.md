@@ -44,10 +44,12 @@ cargo run -p seeker-npu --example layer_proj                 # real-weight wq pr
 
 ## eltwise/ — element-wise add / mul (f32 or bf16)
 
-IRON `transform_binary` designs (`eltwise.py`), one xclbin per (op, dtype, N).
-`add` is the transformer residual add; `mul` is the SwiGLU `gate * up` product
-(and the RoPE rotation, paired with host sin/cos tables). N is the element count
-(a multiple of the 1024 tile). The forward runs **bf16 activations end-to-end**
+IRON `transform_binary` designs (`eltwise.py`) that wire the local `eltwise.cc`
+AIE microkernel (16-wide vectorised bf16/f32 add/mul) via `ExternalFunction`, one
+xclbin per (op, dtype, N). `add` is the transformer residual add; `mul` is the
+SwiGLU `gate * up` product (and the RoPE rotation, paired with host sin/cos
+tables). N is the element count (a multiple of the 1024 tile). The forward runs
+**bf16 activations end-to-end**
 (GEMM is built bf16→bf16, with f32 accumulation internally), so no f32↔bf16 cast
 kernel is needed; the `f32` variants are kept for reference/testing.
 
